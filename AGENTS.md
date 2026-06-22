@@ -77,6 +77,50 @@ nix develop -c ./gradlew build
 nix develop -c ./gradlew test
 ```
 
+## Android Device Testing
+
+Use a physical Android 12+ device with USB debugging enabled. The target hardware is `B02PTT-FF01`.
+
+Check that ADB can see the device:
+
+```sh
+nix develop --no-write-lock-file -c adb devices
+```
+
+The expected state is `<serial>    device`. If the state is `unauthorized`, accept the USB debugging prompt on the phone.
+
+Install the debug build:
+
+```sh
+nix develop --no-write-lock-file -c gradle installDebug
+```
+
+Launch the app:
+
+```sh
+nix develop --no-write-lock-file -c adb shell am start -n dev.nilp0inter.subspace/.MainActivity
+```
+
+In-app test flow:
+
+- Tap `Grant permissions`.
+- Enable Bluetooth if needed.
+- Put `B02PTT-FF01` in pairing mode.
+- Tap `Scan for device`.
+- Tap `Pair device` if found unpaired.
+- Tap `Connect serial`.
+- If `Headset audio capability` stays unavailable, open Android Bluetooth settings, connect the headset/calls profile, then retry readiness checks.
+
+Manual acceptance checks:
+
+- Press/release PTT; the monitor must show `pressed` and `released`.
+- Press Group; hardware mode must change to `Control`.
+- Press PTT while in Control; hardware mode must return to `Active`.
+- In Control mode, press Volume Up and Volume Down; each row must show `clicked` and return to `idle` after 300 ms.
+- Enable echo, hold PTT, speak, release; beep, recording, and playback must route through the headset, not the phone.
+- Switch to another app while serial is connected; echo must continue working and Android must show the `Subspace connected` foreground-service notification.
+- Tap `Disconnect serial`; the foreground-service notification must be removed.
+
 ## Android Project Constraints
 
 Use the SDK supplied by the flake. Do not create or rely on `local.properties` for SDK discovery unless explicitly required by Android tooling; it is ignored by Git.

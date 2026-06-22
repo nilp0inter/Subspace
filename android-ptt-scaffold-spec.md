@@ -244,8 +244,10 @@ Known tokens:
 | `C:SOS*` | SOS | Long-pressed | 4 |
 | `C:GP*` | Group | Pressed | 6 |
 | `C:GR*` | Group | Released | 6 |
-| `C:VP*` | Volume Up | Clicked | 2 |
-| `C:VM*` | Volume Down | Clicked | 3 |
+| `C:VP*` | Volume Down | Clicked | 3 |
+| `C:VM*` | Volume Up | Clicked | 2 |
+
+The `VP` and `VM` token names are not semantic labels. Hardware testing showed that `C:VP*` is Volume Down and `C:VM*` is Volume Up on the target `B02PTT-FF01` unit.
 
 Parser requirements:
 
