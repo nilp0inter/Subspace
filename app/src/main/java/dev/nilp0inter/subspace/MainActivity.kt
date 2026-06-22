@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -24,6 +25,7 @@ import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
+import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
@@ -52,6 +54,7 @@ class MainActivity : ComponentActivity() {
             val currentServiceState by rememberUpdatedState(currentService)
             val state by currentService?.appState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(AppState()) }
+            var route by remember { mutableStateOf(MainRoute.Dashboard) }
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
@@ -105,10 +108,20 @@ class MainActivity : ComponentActivity() {
 
             SubspaceTheme {
                 Surface {
-                    if (state.readyForMonitor) {
-                        MonitorScreen(state.monitor, actions)
-                    } else {
-                        ConnectionScreen(state.connection, actions)
+                    BackHandler(enabled = route != MainRoute.Dashboard) {
+                        route = MainRoute.Dashboard
+                    }
+
+                    when (route) {
+                        MainRoute.Dashboard -> MainDashboardScreen(
+                            connected = state.readyForMonitor,
+                            onConnectionClick = {
+                                route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
+                            },
+                        )
+
+                        MainRoute.Connection -> ConnectionScreen(state.connection, actions)
+                        MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
                     }
                 }
             }
@@ -137,4 +150,6 @@ class MainActivity : ComponentActivity() {
         service = null
         super.onStop()
     }
+
+    private enum class MainRoute { Dashboard, Connection, Monitor }
 }

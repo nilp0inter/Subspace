@@ -1,14 +1,15 @@
 # Subspace
 
-Native Android MVP for validating the `B02PTT-FF01` Bluetooth PTT device.
+Native Android app for the `B02PTT-FF01` Bluetooth PTT device.
 
 Current implementation status is tracked in `STATUS.md`.
 
 ## Scope
 
-The app implements the scaffold in `android-ptt-scaffold-spec.md`:
+The app started as the scaffold in `android-ptt-scaffold-spec.md` and is now being evolved into the final operator interface:
 
-- two screens: connection and monitor
+- main dashboard with device connection status and mock channel cards
+- legacy connection and monitor screens retained as device validation tools
 - Bluetooth Classic SPP/RFCOMM serial connection
 - raw button token parsing and hardware mode tracking
 - Bluetooth SCO communication-audio route validation

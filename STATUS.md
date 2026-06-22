@@ -4,13 +4,15 @@ Last updated: 2026-06-23
 
 ## Current State
 
-The Android MVP scaffold is implemented as a native Kotlin/Compose app for validating the `B02PTT-FF01` Bluetooth PTT device.
+The Android app is implemented as a native Kotlin/Compose app for the `B02PTT-FF01` Bluetooth PTT device. The Bluetooth proof-of-concept now works and the app is starting to move toward the final operator interface.
 
 Implemented:
 
 - Gradle Android project using Kotlin, Compose, min SDK 31, target SDK 35, and Nix-provided Android tooling.
-- Connection screen for permissions, Bluetooth readiness, target discovery, pairing, SPP connection, and SCO availability.
-- Monitor screen for hardware mode, button states, echo controls, SCO state, and echo state.
+- Main dashboard as the default app view, with device connection status and static mock channel cards.
+- Legacy connection screen for permissions, Bluetooth readiness, target discovery, pairing, SPP connection, and SCO availability.
+- Legacy monitor screen for hardware mode, button states, echo controls, SCO state, and echo state.
+- Dashboard connection indicator routes to the legacy connection view when not ready and the legacy monitor view when ready.
 - Bluetooth Classic SPP/RFCOMM serial connection using UUID `00001101-0000-1000-8000-00805f9b34fb`.
 - Serial parser for split, concatenated, NUL-suffixed, and noisy tokens.
 - Hardware mode tracking for Active and Control modes.
@@ -42,6 +44,7 @@ Reported working on physical Android hardware with `B02PTT-FF01`:
 
 - App install and launch.
 - Connection flow to monitor screen.
+- Main dashboard launch, disconnected indicator routing, connected indicator routing, and back-to-dashboard behavior.
 - PTT echo behavior.
 - Background echo continuation after switching apps was implemented via foreground service and should be retested after reinstalling the latest debug build.
 - Volume Up and Volume Down mapping was corrected after hardware testing.
@@ -73,5 +76,6 @@ nix develop --no-write-lock-file -c gradle installDebug
 ## Next Useful Work
 
 - Re-run the full manual acceptance checklist in `AGENTS.md` on the latest installed build.
+- Replace mock dashboard channels with the first real channel behavior.
 - Add lightweight logging around SPP events and SCO route changes if manual testing reveals intermittent route loss.
 - Add an in-app raw event/debug panel only if hardware debugging continues to require it.
