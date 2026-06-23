@@ -4,12 +4,15 @@ Last updated: 2026-06-23
 
 ## Current State
 
-The Android app is implemented as a native Kotlin/Compose app for the `B02PTT-FF01` Bluetooth PTT device. The Bluetooth proof-of-concept now works and the app is starting to move toward the final operator interface.
+The Android app is implemented as a native Kotlin/Compose app for the
+`B02PTT-FF01` Bluetooth PTT device. The Bluetooth proof-of-concept works, the
+main dashboard is now the default view, and the app is moving from hardware
+validation toward the channel-router model defined in `PRODUCT_VISION.md`.
 
 Implemented:
 
 - Gradle Android project using Kotlin, Compose, min SDK 31, target SDK 35, and Nix-provided Android tooling.
-- Main dashboard as the default app view, with device connection status and static mock channel cards.
+- Main dashboard as the default app view, with device connection status and static channel cards.
 - Legacy connection screen for permissions, Bluetooth readiness, target discovery, pairing, SPP connection, and SCO availability.
 - Legacy monitor screen for hardware mode, button states, echo controls, SCO state, and echo state.
 - Dashboard connection indicator routes to the legacy connection view when not ready and the legacy monitor view when ready.
@@ -70,12 +73,22 @@ nix develop --no-write-lock-file -c gradle installDebug
 - No hidden Bluetooth APIs.
 - No A2DP path.
 - No phone speaker or phone microphone fallback.
-- No persistent recording storage.
-- No STT, TTS, command execution, cloud services, menus, or automation beyond service lifecycle safety.
+
+## Product Gap To Vision
+
+Not implemented yet:
+
+- Real channel routing from captured PTT audio.
+- Persistent channel list, channel configuration, or channel-specific behavior.
+- Persistent message history.
+- Inbound message streams, pending unheard message state, or last-heard message state.
+- Autoplay, replay, skip, backlog consumption, or priority-channel capture.
+- Hardware-driven channel menu, channel confirmation, or channel history mode.
+- STT, TTS, command execution, webhooks, cloud services, assistant channels, integrations, or advanced pipelines.
 
 ## Next Useful Work
 
 - Re-run the full manual acceptance checklist in `AGENTS.md` on the latest installed build.
-- Replace mock dashboard channels with the first real channel behavior.
+- Replace static dashboard channels with the first real channel behavior.
 - Add lightweight logging around SPP events and SCO route changes if manual testing reveals intermittent route loss.
 - Add an in-app raw event/debug panel only if hardware debugging continues to require it.

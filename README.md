@@ -1,23 +1,40 @@
 # Subspace
 
-Native Android app for the `B02PTT-FF01` Bluetooth PTT device.
+Subspace is a hardware-first, voice-first Android channel router for the
+`B02PTT-FF01` Bluetooth PTT device.
 
-Current implementation status is tracked in `STATUS.md`.
+The product goal is a programmable radio for voice tools: the user selects a
+channel, holds PTT, speaks, releases, and lets that channel decide whether to
+record, transcribe, forward, automate, respond, or do nothing immediately. The
+phone screen is a monitor and configuration surface; the core live loop should
+work from hardware controls whenever possible.
 
-## Scope
+`PRODUCT_VISION.md` is the canonical product north star.
 
-The app started as the scaffold in `android-ptt-scaffold-spec.md` and is now being evolved into the final operator interface:
+## Current Implementation
 
-- main dashboard with device connection status and mock channel cards
-- legacy connection and monitor screens retained as device validation tools
-- Bluetooth Classic SPP/RFCOMM serial connection
-- raw button token parsing and hardware mode tracking
-- Bluetooth SCO communication-audio route validation
-- in-memory PTT echo test with ready beep, recording, playback, and SCO keep-warm
-- foreground service ownership while serial monitoring is active, so PTT echo can continue after switching apps
-- bundled Chakra Petch and Inter fonts plus the visual identity from `VISUAL_IDENTITY.md`
+The current app is an implementation step toward that model. It validates the
+target hardware and provides the first operator dashboard:
 
-Out of scope remains unchanged: no STT, no TTS, no command execution, no cloud service, no persistent recordings, no A2DP, no hidden Android Bluetooth APIs, and no phone mic/speaker fallback.
+- Main dashboard with device connection status and static channel cards.
+- Legacy connection and monitor screens retained as hardware validation tools.
+- Bluetooth Classic SPP/RFCOMM serial connection.
+- Raw button token parsing and hardware mode tracking.
+- Bluetooth SCO communication-audio route validation.
+- In-memory PTT echo test with ready beep, recording, playback, and SCO keep-warm.
+- Foreground service ownership while serial monitoring is active, so echo can continue after switching apps.
+- Bundled Chakra Petch and Inter fonts plus the visual identity from `VISUAL_IDENTITY.md`.
+
+Real channel routing, persistent channel history, channel configuration, channel
+backlog, replay/skip behavior, priority-channel capture, and hardware-driven
+channel/history navigation are not implemented yet.
+
+## Repository Docs
+
+- `PRODUCT_VISION.md`: long-term product model and interaction behavior.
+- `STATUS.md`: current implementation state, verified behavior, and next work.
+- `VISUAL_IDENTITY.md`: visual language, typography, palette, and UI principles.
+- `AGENTS.md`: development environment, tooling, and manual device-test instructions.
 
 ## Build
 
