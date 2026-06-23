@@ -3,4 +3,6 @@
 .kotlin/
 build/
 local.properties
+.android/
 .opencode
+rust/target/

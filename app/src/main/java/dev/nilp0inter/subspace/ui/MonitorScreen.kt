@@ -30,6 +30,7 @@ import dev.nilp0inter.subspace.model.ClickButtonState
 import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.MonitorState
+import dev.nilp0inter.subspace.model.SttStatus
 import dev.nilp0inter.subspace.model.TwoStateButton
 import dev.nilp0inter.subspace.model.displayText
 
@@ -60,6 +61,7 @@ fun MonitorScreen(
         PttStatusCard(state, accent)
         ButtonTable(state.buttons)
         EchoControls(state, actions)
+        SttControls(state, actions)
         AudioStatus(state)
 
         OutlinedButton(onClick = actions::disconnectSerial, modifier = Modifier.fillMaxWidth()) {
@@ -161,6 +163,55 @@ private fun TimingButton(
         Button(onClick = onClick, modifier = modifier) { Text(label) }
     } else {
         OutlinedButton(onClick = onClick, modifier = modifier) { Text(label) }
+    }
+}
+
+@Composable
+private fun SttControls(state: MonitorState, actions: PttUiActions) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("STT TEST", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Parakeet v3 on-device · ${state.sttModelStatus.displayText()}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Switch(checked = state.sttEnabled, onCheckedChange = actions::setSttEnabled)
+            }
+
+            val statusText = state.sttStatus.displayText()
+            val transcript = state.sttTranscript
+            val boxText = when (state.sttStatus) {
+                is SttStatus.Transcribed -> transcript.ifBlank { statusText }
+                SttStatus.Idle -> if (transcript.isBlank()) "No transcript yet" else transcript
+                else -> statusText
+            }
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = boxText,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
     }
 }
 

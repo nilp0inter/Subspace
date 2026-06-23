@@ -12,4 +12,5 @@ interface PttUiActions {
     fun disconnectSerial()
     fun setEchoEnabled(enabled: Boolean)
     fun setEchoTimingMode(mode: EchoTimingMode)
+    fun setSttEnabled(enabled: Boolean)
 }

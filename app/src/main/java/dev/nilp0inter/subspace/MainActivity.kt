@@ -103,6 +103,10 @@ class MainActivity : ComponentActivity() {
                     override fun setEchoTimingMode(mode: EchoTimingMode) {
                         currentServiceState?.setEchoTimingMode(mode)
                     }
+
+                    override fun setSttEnabled(enabled: Boolean) {
+                        currentServiceState?.setSttEnabled(enabled)
+                    }
                 }
             }
 

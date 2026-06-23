@@ -22,18 +22,26 @@ import dev.nilp0inter.subspace.R
 import dev.nilp0inter.subspace.audio.AndroidPcmOutput
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.InMemoryRecorder
+import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
+import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.ScoAudioController
+import dev.nilp0inter.subspace.audio.SttController
+import dev.nilp0inter.subspace.audio.SttTranscriber
+import dev.nilp0inter.subspace.audio.TranscriptionOutcome
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DevicePresence
+import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.HeadsetAudioState
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.PermissionState
 import dev.nilp0inter.subspace.model.RawButtonEvent
 import dev.nilp0inter.subspace.model.SppState
+import dev.nilp0inter.subspace.model.SttModelStatus
+import dev.nilp0inter.subspace.model.SttStatus
 import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import kotlinx.coroutines.CoroutineScope
@@ -56,6 +64,9 @@ class PttForegroundService : Service() {
     private lateinit var scanner: DeviceScanner
     private lateinit var sco: ScoAudioController
     private lateinit var echo: EchoController
+    private var sttController: SttController? = null
+    private var sttTranscriber: SttTranscriber? = null
+    private var sttModelStatusJob: Job? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private var targetDevice: BluetoothDevice? = null
@@ -84,6 +95,12 @@ class PttForegroundService : Service() {
             output = AndroidPcmOutput(audioManager),
         )
 
+        // STT controller. The transcriber is constructed lazily because it
+        // depends on the JNI native library being packaged in the APK. If the
+        // native library is not available (e.g. running on host), STT stays
+        // disabled and the rest of the service works unchanged.
+        initializeStt(audioManager)
+
         serviceScope.launch {
             sco.state.collect { state ->
                 updateMonitor { it.copy(scoState = state) }
@@ -96,6 +113,52 @@ class PttForegroundService : Service() {
         }
 
         refreshReadiness()
+    }
+
+    private fun initializeStt(audioManager: AudioManager) {
+        val transcriber = try {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val modelDir = ParakeetAssetExtractor.extract(this, PARAKEET_ASSET_VERSION)
+            ParakeetJniTranscriber(
+                nativeLibDir = nativeLibDir,
+                modelDir = modelDir.absolutePath,
+            )
+        } catch (err: Throwable) {
+            // Native library or asset extraction unavailable. STT stays disabled;
+            // echo and serial behavior continue to work.
+            android.util.Log.w(TAG, "STT transcriber unavailable: ${err.message}")
+            null
+        }
+        sttTranscriber = transcriber
+        if (transcriber != null) {
+            sttController = SttController(
+                scope = serviceScope,
+                sco = sco,
+                recorder = InMemoryRecorder(serviceScope),
+                output = AndroidPcmOutput(audioManager),
+                transcriber = transcriber,
+            )
+            sttModelStatusJob = serviceScope.launch {
+                var lastStatus: SttModelStatus? = null
+                while (true) {
+                    val status = transcriber.modelStatus
+                    if (status != lastStatus) {
+                        lastStatus = status
+                        updateMonitor { it.copy(sttModelStatus = status) }
+                    }
+                    kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
+                }
+            }
+            serviceScope.launch {
+                sttController?.status?.collect { status ->
+                    updateMonitor {
+                        val newTranscript = (status as? SttStatus.Transcribed)?.text
+                            ?: it.sttTranscript
+                        it.copy(sttStatus = status, sttTranscript = newTranscript)
+                    }
+                }
+            }
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -113,11 +176,14 @@ class PttForegroundService : Service() {
         serialJob?.cancel()
         sppStateJob?.cancel()
         sppClient?.disconnect()
+        sttModelStatusJob?.cancel()
         echo.cancelAndRelease()
+        sttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         super.onDestroy()
     }
 
+    @SuppressLint("MissingPermission")
     fun refreshReadiness() {
         val missing = RequiredPermissions.missing(this)
         val permissions = if (missing.isEmpty()) PermissionState.Granted else PermissionState.Missing
@@ -162,6 +228,7 @@ class PttForegroundService : Service() {
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun scanForDevice() {
         serviceScope.launch {
             refreshReadiness()
@@ -232,14 +299,57 @@ class PttForegroundService : Service() {
         sppClient = null
         updateConnection { it.copy(spp = SppState.Disconnected) }
         echo.cancelAndRelease()
+        sttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
     }
 
     fun setEchoEnabled(enabled: Boolean) {
+        if (enabled) {
+            // Mutual exclusion: enabling echo disables STT.
+            sttController?.let { stt ->
+                if (stt.enabled) {
+                    stt.setEnabled(false)
+                    stt.cancelAndRelease()
+                    updateMonitor {
+                        it.copy(
+                            sttEnabled = false,
+                            sttStatus = SttStatus.Idle,
+                        )
+                    }
+                }
+            }
+        }
         echo.setEnabled(enabled)
         updateMonitor { it.copy(echoEnabled = enabled) }
+    }
+
+    fun setSttEnabled(enabled: Boolean) {
+        val stt = sttController
+        if (stt == null) {
+            // STT unavailable (no native lib); never report enabled.
+            updateMonitor { it.copy(sttEnabled = false) }
+            return
+        }
+        if (enabled) {
+            // Mutual exclusion: enabling STT disables echo.
+            if (echo.enabled) {
+                echo.setEnabled(false)
+                echo.cancelAndRelease()
+                updateMonitor {
+                    it.copy(
+                        echoEnabled = false,
+                        echoStatus = EchoStatus.Idle,
+                    )
+                }
+            }
+        } else {
+            stt.cancelAndRelease()
+            updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
+        }
+        stt.setEnabled(enabled)
+        updateMonitor { it.copy(sttEnabled = enabled) }
     }
 
     fun setEchoTimingMode(mode: EchoTimingMode) {
@@ -257,12 +367,30 @@ class PttForegroundService : Service() {
         }
 
         when (event) {
-            RawButtonEvent.PttPressed -> echo.onPttPressed()
-            RawButtonEvent.PttReleased -> echo.onPttReleased()
+            RawButtonEvent.PttPressed -> dispatchPttPressed()
+            RawButtonEvent.PttReleased -> dispatchPttReleased()
             RawButtonEvent.VolumeUpClicked,
             RawButtonEvent.VolumeDownClicked,
             -> scheduleVolumeExpiry()
             else -> Unit
+        }
+    }
+
+    private fun dispatchPttPressed() {
+        val stt = sttController
+        if (stt != null && stt.enabled) {
+            stt.onPttPressed()
+        } else if (echo.enabled) {
+            echo.onPttPressed()
+        }
+    }
+
+    private fun dispatchPttReleased() {
+        val stt = sttController
+        if (stt != null && stt.enabled) {
+            stt.onPttReleased()
+        } else if (echo.enabled) {
+            echo.onPttReleased()
         }
     }
 
@@ -336,6 +464,7 @@ class PttForegroundService : Service() {
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
         echo.cancelAndRelease("SPP disconnected")
+        sttController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {
@@ -495,5 +624,9 @@ class PttForegroundService : Service() {
 
         const val NOTIFICATION_CHANNEL_ID = "subspace_device_link"
         const val NOTIFICATION_ID = 41
+
+        private const val TAG = "SubspacePttService"
+        private const val PARAKEET_ASSET_VERSION = "int8-2026-06-23"
+        private const val STT_MODEL_POLL_MS = 500L
     }
 }
