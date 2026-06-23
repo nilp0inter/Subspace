@@ -27,6 +27,11 @@ import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
+import dev.nilp0inter.subspace.audio.SupertonicAssetExtractor
+import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
+import dev.nilp0inter.subspace.audio.TtsController
+import dev.nilp0inter.subspace.audio.SttTtsController
+import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TranscriptionOutcome
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
@@ -42,6 +47,13 @@ import dev.nilp0inter.subspace.model.RawButtonEvent
 import dev.nilp0inter.subspace.model.SppState
 import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.SttStatus
+import dev.nilp0inter.subspace.model.SttTtsStatus
+import dev.nilp0inter.subspace.model.TtsStatus
+import dev.nilp0inter.subspace.model.DEFAULT_TTS_TEXT
+import dev.nilp0inter.subspace.model.DEFAULT_TTS_VOICE_STYLE
+import dev.nilp0inter.subspace.model.DEFAULT_TTS_LANG
+import dev.nilp0inter.subspace.model.DEFAULT_TTS_TOTAL_STEPS
+import dev.nilp0inter.subspace.model.DEFAULT_TTS_SPEED
 import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +79,10 @@ class PttForegroundService : Service() {
     private var sttController: SttController? = null
     private var sttTranscriber: SttTranscriber? = null
     private var sttModelStatusJob: Job? = null
+    private var ttsController: TtsController? = null
+    private var ttsSynthesizer: TtsSynthesizer? = null
+    private var ttsModelStatusJob: Job? = null
+    private var sttTtsController: SttTtsController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private var targetDevice: BluetoothDevice? = null
@@ -100,6 +116,11 @@ class PttForegroundService : Service() {
         // native library is not available (e.g. running on host), STT stays
         // disabled and the rest of the service works unchanged.
         initializeStt(audioManager)
+
+        // TTS controller. The synthesizer is constructed lazily for the same
+        // reasons as STT. If the native library is not available, TTS stays
+        // disabled and the rest of the service works unchanged.
+        initializeTts(audioManager)
 
         serviceScope.launch {
             sco.state.collect { state ->
@@ -161,6 +182,60 @@ class PttForegroundService : Service() {
         }
     }
 
+    private fun initializeTts(audioManager: AudioManager) {
+        val synth = try {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val modelDir = SupertonicAssetExtractor.extract(this, SUPERTONIC_ASSET_VERSION)
+            SupertonicJniSynthesizer(
+                nativeLibDir = nativeLibDir,
+                modelDir = modelDir.absolutePath,
+            )
+        } catch (err: Throwable) {
+            android.util.Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
+            null
+        }
+        ttsSynthesizer = synth
+        if (synth != null) {
+            ttsController = TtsController(
+                scope = serviceScope,
+                sco = sco,
+                output = AndroidPcmOutput(audioManager),
+                synthesizer = synth,
+            )
+            sttTtsController = SttTtsController(
+                scope = serviceScope,
+                sco = sco,
+                recorder = InMemoryRecorder(serviceScope),
+                output = AndroidPcmOutput(audioManager),
+                transcriber = sttTranscriber ?: return,
+                synthesizer = synth,
+            )
+            ttsModelStatusJob = serviceScope.launch {
+                var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
+                while (true) {
+                    val status = synth.modelStatus
+                    if (status != lastStatus) {
+                        lastStatus = status
+                        updateMonitor { it.copy(ttsModelStatus = status) }
+                    }
+                    kotlinx.coroutines.delay(TTS_MODEL_POLL_MS)
+                }
+            }
+            serviceScope.launch {
+                ttsController?.status?.collect { status ->
+                    updateMonitor { it.copy(ttsStatus = status) }
+                }
+            }
+            serviceScope.launch {
+                sttTtsController?.status?.collect { status ->
+                    val transcript = (status as? SttTtsStatus.Transcript)?.text
+                        ?: _appState.value.monitor.sttTtsTranscript
+                    updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -177,8 +252,11 @@ class PttForegroundService : Service() {
         sppStateJob?.cancel()
         sppClient?.disconnect()
         sttModelStatusJob?.cancel()
+        ttsModelStatusJob?.cancel()
         echo.cancelAndRelease()
         sttController?.cancelAndRelease()
+        ttsController?.cancelAndRelease()
+        sttTtsController?.cancelAndRelease()
         stopForegroundIfNeeded()
         super.onDestroy()
     }
@@ -300,6 +378,8 @@ class PttForegroundService : Service() {
         updateConnection { it.copy(spp = SppState.Disconnected) }
         echo.cancelAndRelease()
         sttController?.cancelAndRelease()
+        ttsController?.cancelAndRelease()
+        sttTtsController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
@@ -307,19 +387,9 @@ class PttForegroundService : Service() {
 
     fun setEchoEnabled(enabled: Boolean) {
         if (enabled) {
-            // Mutual exclusion: enabling echo disables STT.
-            sttController?.let { stt ->
-                if (stt.enabled) {
-                    stt.setEnabled(false)
-                    stt.cancelAndRelease()
-                    updateMonitor {
-                        it.copy(
-                            sttEnabled = false,
-                            sttStatus = SttStatus.Idle,
-                        )
-                    }
-                }
-            }
+            disableStt()
+            disableTts()
+            disableSttTts()
         }
         echo.setEnabled(enabled)
         updateMonitor { it.copy(echoEnabled = enabled) }
@@ -328,22 +398,13 @@ class PttForegroundService : Service() {
     fun setSttEnabled(enabled: Boolean) {
         val stt = sttController
         if (stt == null) {
-            // STT unavailable (no native lib); never report enabled.
             updateMonitor { it.copy(sttEnabled = false) }
             return
         }
         if (enabled) {
-            // Mutual exclusion: enabling STT disables echo.
-            if (echo.enabled) {
-                echo.setEnabled(false)
-                echo.cancelAndRelease()
-                updateMonitor {
-                    it.copy(
-                        echoEnabled = false,
-                        echoStatus = EchoStatus.Idle,
-                    )
-                }
-            }
+            disableEcho()
+            disableTts()
+            disableSttTts()
         } else {
             stt.cancelAndRelease()
             updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
@@ -352,9 +413,123 @@ class PttForegroundService : Service() {
         updateMonitor { it.copy(sttEnabled = enabled) }
     }
 
+    fun setTtsEnabled(enabled: Boolean) {
+        val tts = ttsController
+        if (tts == null) {
+            updateMonitor { it.copy(ttsEnabled = false) }
+            return
+        }
+        if (enabled) {
+            disableEcho()
+            disableStt()
+            disableSttTts()
+        } else {
+            tts.cancelAndRelease()
+            updateMonitor { it.copy(ttsStatus = TtsStatus.Idle) }
+        }
+        tts.setEnabled(enabled)
+        updateMonitor { it.copy(ttsEnabled = enabled) }
+    }
+
+    fun setSttTtsEnabled(enabled: Boolean) {
+        val sttTts = sttTtsController
+        if (sttTts == null) {
+            updateMonitor { it.copy(sttTtsEnabled = false) }
+            return
+        }
+        if (enabled) {
+            disableEcho()
+            disableStt()
+            disableTts()
+        } else {
+            sttTts.cancelAndRelease()
+            updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
+        }
+        sttTts.setEnabled(enabled)
+        updateMonitor { it.copy(sttTtsEnabled = enabled) }
+    }
+
+    private fun disableEcho() {
+        if (echo.enabled) {
+            echo.setEnabled(false)
+            echo.cancelAndRelease()
+            updateMonitor { it.copy(echoEnabled = false, echoStatus = EchoStatus.Idle) }
+        }
+    }
+
+    private fun disableStt() {
+        sttController?.let { stt ->
+            if (stt.enabled) {
+                stt.setEnabled(false)
+                stt.cancelAndRelease()
+                updateMonitor { it.copy(sttEnabled = false, sttStatus = SttStatus.Idle) }
+            }
+        }
+    }
+
+    private fun disableTts() {
+        ttsController?.let { tts ->
+            if (tts.enabled) {
+                tts.setEnabled(false)
+                tts.cancelAndRelease()
+                updateMonitor { it.copy(ttsEnabled = false, ttsStatus = TtsStatus.Idle) }
+            }
+        }
+    }
+
+    private fun disableSttTts() {
+        sttTtsController?.let { sttTts ->
+            if (sttTts.enabled) {
+                sttTts.setEnabled(false)
+                sttTts.cancelAndRelease()
+                updateMonitor { it.copy(sttTtsEnabled = false, sttTtsStatus = SttTtsStatus.Idle) }
+            }
+        }
+    }
+
     fun setEchoTimingMode(mode: EchoTimingMode) {
         echo.setTimingMode(mode)
         updateMonitor { it.copy(echoTimingMode = mode) }
+    }
+
+    fun setTtsText(text: String) {
+        updateMonitor { it.copy(ttsText = text) }
+    }
+
+    fun setTtsVoiceStyle(style: String) {
+        updateMonitor { it.copy(ttsVoiceStyle = style) }
+    }
+
+    fun setTtsLang(lang: String) {
+        updateMonitor { it.copy(ttsLang = lang) }
+    }
+
+    fun setTtsTotalSteps(steps: Int) {
+        updateMonitor { it.copy(ttsTotalSteps = steps) }
+    }
+
+    fun setTtsSpeed(speed: Float) {
+        updateMonitor { it.copy(ttsSpeed = speed) }
+    }
+
+    fun requestTtsSynthesis() {
+        val tts = ttsController ?: return
+        if (!tts.enabled) return
+        val monitor = _appState.value.monitor
+        val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath
+        tts.synthesize(
+            text = monitor.ttsText,
+            voiceStylePath = voiceStylePath,
+            lang = monitor.ttsLang,
+            totalSteps = monitor.ttsTotalSteps,
+            speed = monitor.ttsSpeed,
+            scoRate = SCO_RATE,
+        )
+    }
+
+    private fun voiceStyleFile(style: String): java.io.File {
+        val modelDir = SupertonicAssetExtractor.extract(this, SUPERTONIC_ASSET_VERSION)
+        return java.io.File(modelDir, "$style.json")
     }
 
     private fun handleRawButtonEvent(event: RawButtonEvent) {
@@ -377,20 +552,38 @@ class PttForegroundService : Service() {
     }
 
     private fun dispatchPttPressed() {
-        val stt = sttController
-        if (stt != null && stt.enabled) {
-            stt.onPttPressed()
-        } else if (echo.enabled) {
-            echo.onPttPressed()
+        val monitor = _appState.value.monitor
+        when {
+            sttTtsController?.enabled == true -> sttTtsController?.onPttPressed()
+            ttsController?.enabled == true -> {
+                val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath
+                ttsController?.onPttPressed(
+                    text = monitor.ttsText,
+                    voiceStylePath = voiceStylePath,
+                    lang = monitor.ttsLang,
+                    totalSteps = monitor.ttsTotalSteps,
+                    speed = monitor.ttsSpeed,
+                    scoRate = SCO_RATE,
+                )
+            }
+            sttController?.enabled == true -> sttController?.onPttPressed()
+            echo.enabled -> echo.onPttPressed()
         }
     }
 
     private fun dispatchPttReleased() {
-        val stt = sttController
-        if (stt != null && stt.enabled) {
-            stt.onPttReleased()
-        } else if (echo.enabled) {
-            echo.onPttReleased()
+        val monitor = _appState.value.monitor
+        when {
+            sttTtsController?.enabled == true -> sttTtsController?.onPttReleased(
+                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
+                lang = monitor.ttsLang,
+                totalSteps = monitor.ttsTotalSteps,
+                speed = monitor.ttsSpeed,
+                scoRate = SCO_RATE,
+            )
+            ttsController?.enabled == true -> ttsController?.onPttReleased()
+            sttController?.enabled == true -> sttController?.onPttReleased()
+            echo.enabled -> echo.onPttReleased()
         }
     }
 
@@ -465,6 +658,8 @@ class PttForegroundService : Service() {
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
         echo.cancelAndRelease("SPP disconnected")
         sttController?.cancelAndRelease()
+        ttsController?.cancelAndRelease()
+        sttTtsController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {
@@ -627,6 +822,9 @@ class PttForegroundService : Service() {
 
         private const val TAG = "SubspacePttService"
         private const val PARAKEET_ASSET_VERSION = "int8-2026-06-23"
+        private const val SUPERTONIC_ASSET_VERSION = "supertonic-3-2026-06-24"
         private const val STT_MODEL_POLL_MS = 500L
+        private const val TTS_MODEL_POLL_MS = 500L
+        private const val SCO_RATE = 16_000
     }
 }

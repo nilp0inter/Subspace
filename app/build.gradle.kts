@@ -52,10 +52,14 @@ android {
 
     sourceSets {
         getByName("main") {
-            // The Parakeet model assets are downloaded into
-            // build/generated/assets/parakeet by the `downloadParakeetAssets`
-            // task and wired as a runtime assets source root.
-            assets.srcDirs("src/main/assets", layout.buildDirectory.dir("generated/assets/parakeet"))
+            // The Parakeet and Supertonic model assets are downloaded into
+            // build/generated/assets/{parakeet,supertonic} by their respective
+            // download tasks and wired as runtime assets source roots.
+            assets.srcDirs(
+                "src/main/assets",
+                layout.buildDirectory.dir("generated/assets/parakeet"),
+                layout.buildDirectory.dir("generated/assets/supertonic"),
+            )
             jniLibs.srcDirs("src/main/jniLibs", layout.buildDirectory.dir("generated/jniLibs"))
         }
     }
@@ -67,6 +71,12 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+            // Both `subspace-parakeet` and `subspace-supertonic` dynamically
+            // load the same `libonnxruntime.so` (provided by the ONNX Runtime
+            // Android AAR). The AAR may also package its own copy; pick the
+            // first one and deduplicate the rest so the APK ships exactly one
+            // ONNX Runtime native library shared by both native crates.
+            pickFirsts += setOf("**/libonnxruntime.so")
         }
     }
 
@@ -100,63 +110,89 @@ dependencies {
 }
 
 // ---------------------------------------------------------------------------
-// Parakeet native library (Rust via cargo-ndk)
+// Native libraries (Rust via cargo-ndk)
 // ---------------------------------------------------------------------------
 
-val parakeetTargets = mapOf(
+val nativeTargets = mapOf(
     "arm64-v8a" to "aarch64-linux-android",
 )
 
-val parakeetBuildDir = layout.buildDirectory.dir("generated/parakeet")
-val parakeetJniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
+val jniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
 
-val buildParakeetNative by tasks.registering {
-    group = "parakeet"
-    description = "Cross-compiles the Subspace Parakeet Rust crate for Android ABIs using cargo-ndk."
-    val outputsDir = parakeetJniLibsDir
-    outputs.dir(outputsDir)
-    val rootDir = rootProject.projectDir
-    inputs.dir(file("$rootDir/rust/subspace-parakeet/src"))
-    inputs.file(file("$rootDir/rust/Cargo.toml"))
-    inputs.file(file("$rootDir/rust/subspace-parakeet/Cargo.toml"))
-    doLast {
-        val baseDir = file("$rootDir/rust")
-        val cargo = resolveOnPath("cargo") ?: "cargo"
-        val ndk = System.getenv("ANDROID_NDK_HOME") ?: System.getenv("NDK_DIR")
-        require(!ndk.isNullOrBlank()) {
-            "ANDROID_NDK_HOME/NDK_DIR must be set (use `nix develop`)."
-        }
-        parakeetTargets.forEach { (abi, target) ->
-            val outDir = outputsDir.get().dir(abi)
-            outDir.asFile.mkdirs()
-            val process = ProcessBuilder(
-                cargo, "ndk",
-                "-t", target,
-                "--manifest-path", "subspace-parakeet/Cargo.toml",
-                "build", "--release",
-            ).apply {
-                directory(baseDir)
-                redirectErrorStream(true)
-                val env = environment()
-                env["ANDROID_NDK_HOME"] = ndk
-                env["CARGO_NDK_TARGET_API"] = "31"
-            }.start()
-            val output = process.inputStream.bufferedReader().readText()
-            val exit = process.waitFor()
-            if (exit != 0) {
-                throw GradleException("cargo ndk build failed for $abi:\n$output")
+/**
+ * Cross-compile a Rust cdylib crate for the active Android ABIs using
+ * cargo-ndk, then copy the resulting `.so` into the generated jniLibs dir.
+ *
+ * Both `subspace-parakeet` and `subspace-supertonic` are built this way and
+ * share the same ONNX Runtime native dependency (`libonnxruntime.so`) provided
+ * by the ONNX Runtime Android AAR. The app therefore ships exactly one ONNX
+ * Runtime native library (see `packaging.jniLibs.pickFirsts`).
+ */
+fun registerNativeBuildTask(
+    taskName: String,
+    crateDir: String,
+    libName: String,
+): TaskProvider<org.gradle.api.DefaultTask> =
+    tasks.register<org.gradle.api.DefaultTask>(taskName) {
+        group = "native"
+        description = "Cross-compiles the $crateDir Rust crate for Android ABIs using cargo-ndk."
+        val outputsDir = jniLibsDir
+        outputs.dir(outputsDir)
+        val rootDir = rootProject.projectDir
+        inputs.dir(file("$rootDir/rust/$crateDir/src"))
+        inputs.file(file("$rootDir/rust/Cargo.toml"))
+        inputs.file(file("$rootDir/rust/$crateDir/Cargo.toml"))
+        doLast {
+            val baseDir = file("$rootDir/rust")
+            val cargo = resolveOnPath("cargo") ?: "cargo"
+            val ndk = System.getenv("ANDROID_NDK_HOME") ?: System.getenv("NDK_DIR")
+            require(!ndk.isNullOrBlank()) {
+                "ANDROID_NDK_HOME/NDK_DIR must be set (use `nix develop`)."
             }
-            val so = file("$baseDir/target/$target/release/libsubspace_parakeet.so")
-            if (!so.exists()) {
-                throw GradleException("missing $so after cargo ndk build")
+            nativeTargets.forEach { (abi, target) ->
+                val outDir = outputsDir.get().dir(abi)
+                outDir.asFile.mkdirs()
+                val process = ProcessBuilder(
+                    cargo, "ndk",
+                    "-t", target,
+                    "--manifest-path", "$crateDir/Cargo.toml",
+                    "build", "--release",
+                ).apply {
+                    directory(baseDir)
+                    redirectErrorStream(true)
+                    val env = environment()
+                    env["ANDROID_NDK_HOME"] = ndk
+                    env["CARGO_NDK_TARGET_API"] = "31"
+                }.start()
+                val output = process.inputStream.bufferedReader().readText()
+                val exit = process.waitFor()
+                if (exit != 0) {
+                    throw GradleException("cargo ndk build failed for $abi ($crateDir):\n$output")
+                }
+                val so = file("$baseDir/target/$target/release/$libName")
+                if (!so.exists()) {
+                    throw GradleException("missing $so after cargo ndk build")
+                }
+                so.copyTo(outDir.file(libName).asFile, overwrite = true)
             }
-            so.copyTo(outDir.file("libsubspace_parakeet.so").asFile, overwrite = true)
         }
     }
-}
+
+val buildParakeetNative = registerNativeBuildTask(
+    "buildParakeetNative",
+    "subspace-parakeet",
+    "libsubspace_parakeet.so",
+)
+
+val buildSupertonicNative = registerNativeBuildTask(
+    "buildSupertonicNative",
+    "subspace-supertonic",
+    "libsubspace_supertonic.so",
+)
 
 tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(buildParakeetNative)
+    dependsOn(buildSupertonicNative)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +269,154 @@ tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(downloadParakeetAssets)
 }
 
+// ---------------------------------------------------------------------------
+// Supertonic model asset download (ONNX, configs, voice styles)
+// ---------------------------------------------------------------------------
+
+val supertonicAssetDir = layout.buildDirectory.dir("generated/assets/supertonic")
+
+// Supertonic 3 assets live under `onnx/` and `voice_styles/` in the
+// `Supertone/supertonic-3` HuggingFace repo. They are downloaded into the flat
+// generated assets dir (flattening the HF subdir layout) so the Android asset
+// source set and `SupertonicAssetExtractor` see them at the top level.
+val supertonicAssetSpecs = listOf(
+    SupertonicAsset(
+        hfPath = "onnx/duration_predictor.onnx",
+        localName = "duration_predictor.onnx",
+        sha256 = "c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db",
+    ),
+    SupertonicAsset(
+        hfPath = "onnx/text_encoder.onnx",
+        localName = "text_encoder.onnx",
+        sha256 = "c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff",
+    ),
+    SupertonicAsset(
+        hfPath = "onnx/vector_estimator.onnx",
+        localName = "vector_estimator.onnx",
+        sha256 = "883ac868ea0275ef0e991524dc64f16b3c0376efd7c320af6b53f5b780d7c61c",
+    ),
+    SupertonicAsset(
+        hfPath = "onnx/vocoder.onnx",
+        localName = "vocoder.onnx",
+        sha256 = "085de76dd8e8d5836d6ca66826601f615939218f90e519f70ee8a36ed2a4c4ba",
+    ),
+    SupertonicAsset(
+        hfPath = "onnx/tts.json",
+        localName = "tts.json",
+        sha256 = "42078d3aef1cd43ab43021f3c54f47d2d75ceb4e75f627f118890128b06a0d09",
+    ),
+    SupertonicAsset(
+        hfPath = "onnx/unicode_indexer.json",
+        localName = "unicode_indexer.json",
+        sha256 = "9bf7346e43883a81f8645c81224f786d43c5b57f3641f6e7671a7d6c493cb24f",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/F1.json",
+        localName = "F1.json",
+        sha256 = "bbdec6ee00231c2c742ad05483df5334cab3b52fda3ba38e6a07059c4563dbc2",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/F2.json",
+        localName = "F2.json",
+        sha256 = "7c722c6a72707b1a77f035d67f0d1351ba187738e06f7683e8c72b1df3477fc6",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/F3.json",
+        localName = "F3.json",
+        sha256 = "12f6ef2573baa2defa1128069cb59f203e3ab67c92af77b42df8a0e3a2f7c6ab",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/F4.json",
+        localName = "F4.json",
+        sha256 = "c2fa764c1225a76dfc3e2c73e8aa4f70d9ee48793860eb34c295fff01c2e032b",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/F5.json",
+        localName = "F5.json",
+        sha256 = "45966e73316415626cf41a7d1c6f3b4c70dbc1ba2bee5c1978ef0ce33244fc8d",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/M1.json",
+        localName = "M1.json",
+        sha256 = "e35604687f5d23694b8e91593a93eec0e4eca6c0b02bb8ed69139ab2ea6b0a5b",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/M2.json",
+        localName = "M2.json",
+        sha256 = "b76cbf62bac707c710cf0ae5aba5e31eea1a6339a9734bfae33ab98499534a50",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/M3.json",
+        localName = "M3.json",
+        sha256 = "ea1ac35ccb91b0d7ecad533a2fbd0eec10c91513d8951e3b25fbba99954e159b",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/M4.json",
+        localName = "M4.json",
+        sha256 = "ca8eefad4fcd989c9379032ff3e50738adc547eeb5e221b82593a6d7b3bac303",
+    ),
+    SupertonicAsset(
+        hfPath = "voice_styles/M5.json",
+        localName = "M5.json",
+        sha256 = "dd22b92740314321f8ae11c5e87f8dd60d060f15dd3a632b5adf77f471f77af2",
+    ),
+)
+
+val downloadSupertonicAssets by tasks.registering {
+    group = "supertonic"
+    description = "Downloads Supertonic 3 ONNX models, configs, and voice styles with SHA-256 verification via the HuggingFace Hub CLI."
+    val outDir = supertonicAssetDir
+    outputs.dir(outDir)
+    supertonicAssetSpecs.forEach { spec ->
+        outputs.file(outDir.map { it.file(spec.localName) })
+    }
+    doLast {
+        outDir.get().asFile.mkdirs()
+        val repo = "Supertone/supertonic-3"
+        val hfBin = System.getenv("HF_BIN") ?: resolveOnPath("hf") ?: "hf"
+        logger.lifecycle("Downloading Supertonic assets from HuggingFace repo {} via {}", repo, hfBin)
+        // Download each asset into the flat output dir, flattening the HF
+        // `onnx/` and `voice_styles/` subdirs. hf downloads to the subdir path
+        // under local-dir, so we download into a staging dir and move files.
+        val staging = outDir.get().asFile.resolve(".staging").apply { mkdirs() }
+        try {
+            val download = ProcessBuilder(
+                hfBin, "download", repo,
+                "--local-dir", staging.absolutePath,
+                *supertonicAssetSpecs.map { it.hfPath }.toTypedArray(),
+            ).apply {
+                redirectErrorStream(true)
+                val env = environment()
+                env["HF_HUB_ENABLE_HF_TRANSFER"] = env.getOrDefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+            }.start()
+            val downloadOutput = download.inputStream.bufferedReader().readText()
+            val downloadExit = download.waitFor()
+            if (downloadExit != 0) {
+                throw GradleException("hf download failed:\n$downloadOutput")
+            }
+            supertonicAssetSpecs.forEach { spec ->
+                val staged = staging.resolve(spec.hfPath)
+                check(staged.exists()) {
+                    "hf download did not produce expected file ${spec.hfPath} at ${staged.absolutePath}"
+                }
+                val target = outDir.get().file(spec.localName).asFile
+                staged.copyTo(target, overwrite = true)
+                val actual = sha256OfFile(target)
+                check(actual == spec.sha256) {
+                    "SHA-256 mismatch for ${spec.localName}: expected ${spec.sha256}, got $actual"
+                }
+                logger.lifecycle("Supertonic asset {} verified", spec.localName)
+            }
+        } finally {
+            staging.deleteRecursively()
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(downloadSupertonicAssets)
+}
+
 fun sha256OfFile(file: File): String {
     val md = MessageDigest.getInstance("SHA-256")
     file.inputStream().use { input ->
@@ -260,5 +444,11 @@ fun resolveOnPath(executable: String): String? {
 
 data class ParakeetAsset(
     val name: String,
+    val sha256: String,
+)
+
+data class SupertonicAsset(
+    val hfPath: String,
+    val localName: String,
     val sha256: String,
 )

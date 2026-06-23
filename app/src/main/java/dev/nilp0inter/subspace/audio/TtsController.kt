@@ -1,0 +1,175 @@
+package dev.nilp0inter.subspace.audio
+
+import dev.nilp0inter.subspace.model.ScoState
+import dev.nilp0inter.subspace.model.TtsModelStatus
+import dev.nilp0inter.subspace.model.TtsStatus
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * TTS test controller.
+ *
+ * Synthesizes speech from text on demand and plays it back through the
+ * connected Bluetooth SCO route. Does not record. PTT press while enabled
+ * triggers synthesis (repurposed as a non-recording trigger); PTT release is a
+ * no-op for this controller (playback runs to completion unless cancelled).
+ *
+ * On synthesis request while enabled: acquire SCO, synthesize off the main
+ * thread with the current text/parameters, resample 44.1 kHz → SCO rate, play
+ * through [PcmOutput], release SCO after a keep-warm window, and report status
+ * at each stage. Handles empty text, model-not-ready, synthesis failure,
+ * playback completion, and cancellation.
+ */
+class TtsController(
+    private val scope: CoroutineScope,
+    private val sco: ScoRoute,
+    private val output: PcmOutput,
+    private val synthesizer: TtsSynthesizer,
+    private val synthesisDispatcher: CoroutineDispatcher = Dispatchers.Default,
+) {
+    private val _status = MutableStateFlow<TtsStatus>(TtsStatus.Idle)
+    val status: StateFlow<TtsStatus> = _status.asStateFlow()
+
+    var enabled: Boolean = false
+        private set
+
+    private var synthesisJob: Job? = null
+    private var closeScoJob: Job? = null
+
+    fun setEnabled(value: Boolean) {
+        enabled = value
+        if (!value && synthesisJob?.isActive != true) {
+            _status.value = TtsStatus.Idle
+        }
+    }
+
+    /**
+     * Request synthesis with the given parameters. Called from the UI
+     * "Synthesize" control or from PTT press.
+     */
+    fun synthesize(
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
+        if (!enabled) return
+        if (text.isBlank()) {
+            _status.value = TtsStatus.EmptyText
+            return
+        }
+        synthesisJob?.cancel()
+        closeScoJob?.cancel()
+        synthesisJob = scope.launch {
+            runSynthesis(text, voiceStylePath, lang, totalSteps, speed, scoRate)
+        }
+    }
+
+    /** PTT press repurposed as a synthesis trigger (no recording). */
+    fun onPttPressed(
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
+        synthesize(text, voiceStylePath, lang, totalSteps, speed, scoRate)
+    }
+
+    /** PTT release is a no-op for the TTS controller. */
+    fun onPttReleased() {
+        // No-op: playback runs to completion unless cancelled.
+    }
+
+    /** Cancel any active or pending TTS work and release resources. */
+    fun cancelAndRelease() {
+        synthesisJob?.cancel()
+        closeScoJob?.cancel()
+        sco.release()
+        _status.value = TtsStatus.Idle
+    }
+
+    private suspend fun runSynthesis(
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
+        runCatching {
+            _status.value = TtsStatus.WaitingForModel
+            if (!sco.acquire()) {
+                _status.value = TtsStatus.Error("SCO unavailable")
+                return
+            }
+
+            _status.value = TtsStatus.Synthesizing
+            val request = SynthesisRequest(
+                text = text,
+                voiceStylePath = voiceStylePath,
+                lang = lang,
+                totalSteps = totalSteps,
+                speed = speed,
+            )
+            val outcome = withContext(synthesisDispatcher) { synthesizer.synthesize(request) }
+
+            when (outcome) {
+                is SynthesisOutcome.Success -> {
+                    if (outcome.samples.isEmpty()) {
+                        _status.value = TtsStatus.Error("Synthesis produced no audio")
+                        sco.release()
+                        return
+                    }
+                    _status.value = TtsStatus.Playing
+                    val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
+                    if (playback.isEmpty) {
+                        _status.value = TtsStatus.Idle
+                        releaseScoAfterWarmup()
+                        return
+                    }
+                    output.play(playback)
+                    _status.value = TtsStatus.Idle
+                    releaseScoAfterWarmup()
+                }
+                is SynthesisOutcome.ModelNotReady -> {
+                    _status.value = TtsStatus.Error("TTS model not ready")
+                    sco.release()
+                }
+                is SynthesisOutcome.Failure -> {
+                    _status.value = TtsStatus.Error(outcome.reason)
+                    sco.release()
+                }
+                SynthesisOutcome.EmptyText -> {
+                    _status.value = TtsStatus.EmptyText
+                    sco.release()
+                }
+            }
+        }.onFailure { error ->
+            _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
+            sco.release()
+        }
+    }
+
+    private fun releaseScoAfterWarmup() {
+        closeScoJob = scope.launch {
+            delay(SCO_WARMUP_MS)
+            sco.release()
+        }
+    }
+
+    companion object {
+        private const val SCO_WARMUP_MS = 30_000L
+    }
+}

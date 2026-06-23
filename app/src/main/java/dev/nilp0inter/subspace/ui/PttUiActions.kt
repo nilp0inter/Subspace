@@ -13,4 +13,12 @@ interface PttUiActions {
     fun setEchoEnabled(enabled: Boolean)
     fun setEchoTimingMode(mode: EchoTimingMode)
     fun setSttEnabled(enabled: Boolean)
+    fun setTtsEnabled(enabled: Boolean)
+    fun setSttTtsEnabled(enabled: Boolean)
+    fun setTtsText(text: String)
+    fun setTtsVoiceStyle(style: String)
+    fun setTtsLang(lang: String)
+    fun setTtsTotalSteps(steps: Int)
+    fun setTtsSpeed(speed: Float)
+    fun requestTtsSynthesis()
 }

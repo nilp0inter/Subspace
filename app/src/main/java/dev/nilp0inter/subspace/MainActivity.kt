@@ -107,6 +107,38 @@ class MainActivity : ComponentActivity() {
                     override fun setSttEnabled(enabled: Boolean) {
                         currentServiceState?.setSttEnabled(enabled)
                     }
+
+                    override fun setTtsEnabled(enabled: Boolean) {
+                        currentServiceState?.setTtsEnabled(enabled)
+                    }
+
+                    override fun setSttTtsEnabled(enabled: Boolean) {
+                        currentServiceState?.setSttTtsEnabled(enabled)
+                    }
+
+                    override fun setTtsText(text: String) {
+                        currentServiceState?.setTtsText(text)
+                    }
+
+                    override fun setTtsVoiceStyle(style: String) {
+                        currentServiceState?.setTtsVoiceStyle(style)
+                    }
+
+                    override fun setTtsLang(lang: String) {
+                        currentServiceState?.setTtsLang(lang)
+                    }
+
+                    override fun setTtsTotalSteps(steps: Int) {
+                        currentServiceState?.setTtsTotalSteps(steps)
+                    }
+
+                    override fun setTtsSpeed(speed: Float) {
+                        currentServiceState?.setTtsSpeed(speed)
+                    }
+
+                    override fun requestTtsSynthesis() {
+                        currentServiceState?.requestTtsSynthesis()
+                    }
                 }
             }
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["subspace-parakeet"]
+members = ["subspace-parakeet", "subspace-supertonic"]
 resolver = "2"
 
 [profile.release]

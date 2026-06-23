@@ -2,6 +2,7 @@ package dev.nilp0inter.subspace.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -14,12 +15,20 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -31,6 +40,10 @@ import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.SttStatus
+import dev.nilp0inter.subspace.model.SttTtsStatus
+import dev.nilp0inter.subspace.model.TTS_LANGS
+import dev.nilp0inter.subspace.model.TTS_VOICE_STYLES
+import dev.nilp0inter.subspace.model.TtsStatus
 import dev.nilp0inter.subspace.model.TwoStateButton
 import dev.nilp0inter.subspace.model.displayText
 
@@ -62,6 +75,8 @@ fun MonitorScreen(
         ButtonTable(state.buttons)
         EchoControls(state, actions)
         SttControls(state, actions)
+        TtsControls(state, actions)
+        SttTtsControls(state, actions)
         AudioStatus(state)
 
         OutlinedButton(onClick = actions::disconnectSerial, modifier = Modifier.fillMaxWidth()) {
@@ -216,6 +231,190 @@ private fun SttControls(state: MonitorState, actions: PttUiActions) {
 }
 
 @Composable
+private fun TtsControls(state: MonitorState, actions: PttUiActions) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("TTS TEST", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Supertonic 3 on-device · ${state.ttsModelStatus.displayText()}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Switch(checked = state.ttsEnabled, onCheckedChange = actions::setTtsEnabled)
+            }
+
+            OutlinedTextField(
+                value = state.ttsText,
+                onValueChange = actions::setTtsText,
+                label = { Text("Text to synthesize") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = false,
+                minLines = 2,
+                maxLines = 4,
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ParameterDropdown(
+                    label = "Voice",
+                    selected = state.ttsVoiceStyle,
+                    options = TTS_VOICE_STYLES,
+                    onSelect = actions::setTtsVoiceStyle,
+                    modifier = Modifier.weight(1f),
+                )
+                ParameterDropdown(
+                    label = "Language",
+                    selected = state.ttsLang,
+                    options = TTS_LANGS,
+                    onSelect = actions::setTtsLang,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Steps", style = MaterialTheme.typography.bodyMedium)
+                val stepOptions = listOf(1, 2, 4, 8, 16, 32)
+                stepOptions.forEach { steps ->
+                    TimingButton(
+                        selected = state.ttsTotalSteps == steps,
+                        label = steps.toString(),
+                        onClick = { actions.setTtsTotalSteps(steps) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Speed", style = MaterialTheme.typography.bodyMedium)
+                val speedOptions = listOf(0.8f, 1.0f, 1.05f, 1.2f, 1.5f)
+                speedOptions.forEach { speed ->
+                    TimingButton(
+                        selected = state.ttsSpeed == speed,
+                        label = "%.2f".format(speed),
+                        onClick = { actions.setTtsSpeed(speed) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            Button(
+                onClick = actions::requestTtsSynthesis,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = state.ttsEnabled,
+            ) {
+                Text("Synthesize")
+            }
+
+            val statusText = state.ttsStatus.displayText()
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = statusText,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SttTtsControls(state: MonitorState, actions: PttUiActions) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("STT↔TTS TEST", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        "Hold PTT to record, release to transcribe + synthesize",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                Switch(checked = state.sttTtsEnabled, onCheckedChange = actions::setSttTtsEnabled)
+            }
+
+            val boxText = when (state.sttTtsStatus) {
+                is SttTtsStatus.Transcript -> state.sttTtsTranscript.ifBlank { state.sttTtsStatus.displayText() }
+                SttTtsStatus.Idle -> if (state.sttTtsTranscript.isBlank()) "No transcript yet" else state.sttTtsTranscript
+                else -> state.sttTtsStatus.displayText()
+            }
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                ),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = boxText,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(12.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ParameterDropdown(
+    label: String,
+    selected: String,
+    options: List<String>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        OutlinedButton(
+            onClick = { expanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("$label: $selected")
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option) },
+                    onClick = {
+                        onSelect(option)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun AudioStatus(state: MonitorState) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -227,6 +426,8 @@ private fun AudioStatus(state: MonitorState) {
             Spacer(Modifier.height(12.dp))
             MonitorRow("SCO", state.scoState.displayText())
             MonitorRow("Echo", state.echoStatus.displayText())
+            MonitorRow("TTS", state.ttsStatus.displayText())
+            MonitorRow("STT↔TTS", state.sttTtsStatus.displayText())
         }
     }
 }
