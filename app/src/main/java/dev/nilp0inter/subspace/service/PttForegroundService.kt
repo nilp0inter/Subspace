@@ -62,6 +62,8 @@ class PttForegroundService : Service() {
     private var sppClient: SppClient? = null
     private var serialJob: Job? = null
     private var sppStateJob: Job? = null
+    private val reconnectPolicy = ReconnectPolicy()
+    private var reconnectJob: Job? = null
     private var foreground = false
 
     inner class LocalBinder : Binder() {
@@ -106,6 +108,8 @@ class PttForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        reconnectPolicy.clearMonitoring()
+        reconnectJob?.cancel()
         serialJob?.cancel()
         sppStateJob?.cancel()
         sppClient?.disconnect()
@@ -202,50 +206,30 @@ class PttForegroundService : Service() {
     fun connectSerial() {
         val adapter = bluetoothAdapter ?: return
         if (serialJob?.isActive == true) return
+        reconnectPolicy.startMonitoring()
+        reconnectJob?.cancel()
 
         serviceScope.launch {
             refreshReadiness()
             if (_appState.value.connection.permissions != PermissionState.Granted) return@launch
             if (!_appState.value.connection.bluetoothEnabled) return@launch
 
-            val device = runCatching { scanner.bondedTarget() }.getOrNull() ?: targetDevice
-            if (device == null || device.bondState != BluetoothDevice.BOND_BONDED) {
+            val device = resolveManualSerialTarget()
+            if (device == null) {
                 updateConnection { it.copy(devicePresence = DevicePresence.NotFound) }
                 return@launch
             }
-            targetDevice = device
-
-            ensureForeground()
-            val client = SppClient(adapter, ButtonParser())
-            sppClient = client
-
-            sppStateJob?.cancel()
-            sppStateJob = serviceScope.launch {
-                client.state.collect { state ->
-                    updateConnection {
-                        it.copy(
-                            spp = state,
-                            sppError = if (state == SppState.Failed) "Serial connection failed" else null,
-                        )
-                    }
-                    refreshReadiness()
-                }
-            }
-
-            serialJob = serviceScope.launch {
-                client.events(device).collect { event -> handleRawButtonEvent(event) }
-                echo.cancelAndRelease("SPP disconnected")
-                stopForegroundIfNeeded()
-                stopSelf()
-                refreshReadiness()
-            }
+            startSerialSession(adapter, device, automatic = false)
         }
     }
 
     fun disconnectSerial() {
+        reconnectPolicy.clearMonitoring()
+        reconnectJob?.cancel()
         serialJob?.cancel()
         sppStateJob?.cancel()
         sppClient?.disconnect()
+        sppClient = null
         updateConnection { it.copy(spp = SppState.Disconnected) }
         echo.cancelAndRelease()
         stopForegroundIfNeeded()
@@ -279,6 +263,152 @@ class PttForegroundService : Service() {
             RawButtonEvent.VolumeDownClicked,
             -> scheduleVolumeExpiry()
             else -> Unit
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun resolveManualSerialTarget(): BluetoothDevice? {
+        val device = findBondedTarget() ?: targetDevice
+        if (device?.bondState != BluetoothDevice.BOND_BONDED) return null
+        targetDevice = device
+        return device
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun findBondedTarget(): BluetoothDevice? {
+        if (!RequiredPermissions.hasBluetoothConnect(this)) return null
+        if (bluetoothAdapter?.isEnabled != true) return null
+        return runCatching { scanner.bondedTarget() }.getOrNull()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun reconnectPrerequisites(
+        bondedTarget: BluetoothDevice? = findBondedTarget(),
+    ): ReconnectPrerequisites = ReconnectPrerequisites(
+        permissionsGranted = _appState.value.connection.permissions == PermissionState.Granted,
+        bluetoothEnabled = _appState.value.connection.bluetoothEnabled,
+        bondedTargetAvailable = bondedTarget?.bondState == BluetoothDevice.BOND_BONDED,
+    )
+
+    private fun startSerialSession(
+        adapter: BluetoothAdapter,
+        device: BluetoothDevice,
+        automatic: Boolean,
+    ): Boolean {
+        if (serialJob?.isActive == true) return false
+
+        ensureForeground()
+        sppStateJob?.cancel()
+        sppClient?.disconnect()
+
+        var connected = false
+        val client = SppClient(adapter, ButtonParser())
+        sppClient = client
+
+        sppStateJob = serviceScope.launch {
+            client.state.collect { state ->
+                if (state == SppState.Connected) {
+                    connected = true
+                    if (automatic) {
+                        reconnectPolicy.finishAttempt(
+                            success = true,
+                            nowMillis = SystemClock.elapsedRealtime(),
+                            prerequisites = reconnectPrerequisites(device),
+                        )
+                    }
+                }
+                updateConnection {
+                    it.copy(
+                        spp = state,
+                        sppError = if (state == SppState.Failed) "Serial connection failed" else null,
+                    )
+                }
+                refreshReadiness()
+            }
+        }
+
+        serialJob = serviceScope.launch {
+            client.events(device).collect { event -> handleRawButtonEvent(event) }
+            handleSerialSessionEnded(automatic = automatic, connected = connected)
+        }
+        return true
+    }
+
+    private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
+        echo.cancelAndRelease("SPP disconnected")
+        refreshReadiness()
+
+        if (!reconnectPolicy.monitoringRequested) {
+            stopForegroundIfNeeded()
+            stopSelf()
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val prerequisites = reconnectPrerequisites()
+        val decision = if (automatic && !connected) {
+            reconnectPolicy.finishAttempt(success = false, nowMillis = now, prerequisites = prerequisites)
+        } else {
+            reconnectPolicy.cancelAttempt()
+            reconnectPolicy.scheduleAfterUnexpectedLoss(nowMillis = now, prerequisites = prerequisites)
+        }
+        handleReconnectDecision(decision)
+    }
+
+    private fun handleReconnectDecision(decision: ReconnectDecision) {
+        when (decision) {
+            ReconnectDecision.AlreadyInProgress,
+            ReconnectDecision.NoAction,
+            ReconnectDecision.StartAttempt,
+            -> Unit
+
+            is ReconnectDecision.Schedule -> scheduleReconnectAt(decision.attemptAtMillis)
+            is ReconnectDecision.Wait -> scheduleReconnectAt(decision.attemptAtMillis)
+            is ReconnectDecision.Blocked -> {
+                if (decision.reason == ReconnectBlockReason.TargetUnavailable) {
+                    updateConnection { it.copy(devicePresence = DevicePresence.NotFound) }
+                }
+                refreshReadiness()
+                stopForegroundIfNeeded()
+                stopSelf()
+            }
+        }
+    }
+
+    private fun scheduleReconnectAt(attemptAtMillis: Long) {
+        reconnectJob?.cancel()
+        reconnectJob = serviceScope.launch {
+            val waitMs = (attemptAtMillis - SystemClock.elapsedRealtime()).coerceAtLeast(0)
+            if (waitMs > 0) delay(waitMs)
+            beginAutomaticReconnectAttempt()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginAutomaticReconnectAttempt() {
+        refreshReadiness()
+        val adapter = bluetoothAdapter ?: return
+        val device = findBondedTarget()
+        if (device != null) targetDevice = device
+
+        when (val decision = reconnectPolicy.beginAttempt(SystemClock.elapsedRealtime(), reconnectPrerequisites(device))) {
+            ReconnectDecision.StartAttempt -> {
+                if (device == null) {
+                    handleReconnectDecision(ReconnectDecision.Blocked(ReconnectBlockReason.TargetUnavailable))
+                    return
+                }
+                if (!startSerialSession(adapter, device, automatic = true)) {
+                    reconnectPolicy.cancelAttempt()
+                }
+            }
+
+            ReconnectDecision.AlreadyInProgress,
+            ReconnectDecision.NoAction,
+            -> Unit
+
+            is ReconnectDecision.Schedule -> scheduleReconnectAt(decision.attemptAtMillis)
+            is ReconnectDecision.Wait -> scheduleReconnectAt(decision.attemptAtMillis)
+            is ReconnectDecision.Blocked -> handleReconnectDecision(decision)
         }
     }
 
