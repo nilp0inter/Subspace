@@ -16,6 +16,8 @@ class ScoAudioController(
 ) : ScoRoute {
     private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
     override val state: StateFlow<ScoState> = _state.asStateFlow()
+    private var _coldStart: Boolean = false
+    override val coldStart: Boolean get() = _coldStart
 
     @SuppressLint("MissingPermission")
     override fun hasAvailableScoDevice(): Boolean = findScoDevice() != null
@@ -24,20 +26,24 @@ class ScoAudioController(
     override suspend fun acquire(): Boolean {
         if (isActive()) {
             _state.value = ScoState.Active
+            _coldStart = false
             return true
         }
 
+        _coldStart = true
         _state.value = ScoState.Starting
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
 
         val device = findScoDevice()
         if (device == null) {
+            _coldStart = false
             _state.value = ScoState.Failed("Bluetooth SCO headset not available")
             return false
         }
 
         val accepted = audioManager.setCommunicationDevice(device)
         if (!accepted) {
+            _coldStart = false
             _state.value = ScoState.Failed("Android rejected Bluetooth SCO route")
             return false
         }
@@ -47,6 +53,7 @@ class ScoAudioController(
             true
         } == true
 
+        if (!active) _coldStart = false
         _state.value = if (active) {
             ScoState.Active
         } else {

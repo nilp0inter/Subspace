@@ -22,7 +22,6 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
@@ -127,10 +126,6 @@ class MainActivity : ComponentActivity() {
 
                     override fun setEchoEnabled(enabled: Boolean) {
                         currentServiceState?.setEchoEnabled(enabled)
-                    }
-
-                    override fun setEchoTimingMode(mode: EchoTimingMode) {
-                        currentServiceState?.setEchoTimingMode(mode)
                     }
 
                     override fun setSttEnabled(enabled: Boolean) {

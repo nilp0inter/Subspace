@@ -1,7 +1,6 @@
 package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.EchoStatus
-import dev.nilp0inter.subspace.model.EchoTimingMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -22,9 +21,6 @@ class EchoController(
     var enabled: Boolean = false
         private set
 
-    var timingMode: EchoTimingMode = EchoTimingMode.RecordAfterBeep
-        private set
-
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
     private var maxDurationJob: Job? = null
@@ -36,10 +32,6 @@ class EchoController(
         if (!value && !recorder.isActive && setupJob?.isActive != true) {
             _status.value = EchoStatus.Idle
         }
-    }
-
-    fun setTimingMode(value: EchoTimingMode) {
-        timingMode = value
     }
 
     fun onPttPressed() {
@@ -76,25 +68,22 @@ class EchoController(
             }
 
             if (!pttDown) {
-                cancelBeforeRecording()
+                cancelSession()
                 return
             }
 
-            when (timingMode) {
-                EchoTimingMode.RecordAfterBeep -> startAfterBeepMode()
-                EchoTimingMode.RecordWhileBeepPlays -> startDuringBeepMode()
-            }
+            startRecording()
         }.onFailure { error ->
             _status.value = EchoStatus.Error(error.message ?: "Echo failed")
             recorder.stopIfActiveOrEmpty()
         }
     }
 
-    private suspend fun startAfterBeepMode() {
+    private suspend fun startRecording() {
         _status.value = EchoStatus.Beeping
-        output.playReadyBeep()
+        output.playReadyBeep(sco.coldStart)
         if (!pttDown) {
-            cancelBeforeRecording()
+            cancelSession()
             return
         }
 
@@ -106,17 +95,6 @@ class EchoController(
         scheduleMaxDurationStop()
     }
 
-    private suspend fun startDuringBeepMode() {
-        if (!recorder.start()) {
-            _status.value = EchoStatus.Error("Recording failed")
-            return
-        }
-        _status.value = EchoStatus.Beeping
-        output.playReadyBeep()
-        if (pttDown) _status.value = EchoStatus.Recording
-        scheduleMaxDurationStop()
-    }
-
     private suspend fun finishEchoSessionIfNeeded() {
         val retained = retainedAfterMaxDuration
         retainedAfterMaxDuration = null
@@ -125,7 +103,7 @@ class EchoController(
 
         val recording = retained ?: recorder.stopIfActiveOrEmpty()
         if (recording.isEmpty) {
-            if (enabled || _status.value != EchoStatus.Idle) cancelBeforeRecording()
+            if (enabled || _status.value != EchoStatus.Idle) cancelSession()
             return
         }
 
@@ -133,11 +111,7 @@ class EchoController(
             _status.value = EchoStatus.Playback
             output.play(recording)
             _status.value = EchoStatus.Warm
-            closeScoJob = scope.launch {
-                delay(30_000)
-                sco.release()
-                _status.value = EchoStatus.Idle
-            }
+            releaseScoAfterWarmup(EchoStatus.Idle)
         }.onFailure { error ->
             _status.value = EchoStatus.Error(error.message ?: "Playback failed")
         }
@@ -154,12 +128,20 @@ class EchoController(
         }
     }
 
-    private fun cancelBeforeRecording() {
+    private fun cancelSession() {
         maxDurationJob?.cancel()
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        sco.release()
+        releaseScoAfterWarmup(EchoStatus.Idle)
         _status.value = EchoStatus.Cancelled
+    }
+
+    private fun releaseScoAfterWarmup(warmEndStatus: EchoStatus) {
+        closeScoJob = scope.launch {
+            delay(30_000)
+            sco.release()
+            _status.value = warmEndStatus
+        }
     }
 }

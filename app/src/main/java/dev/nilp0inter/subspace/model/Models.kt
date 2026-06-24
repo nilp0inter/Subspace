@@ -40,7 +40,6 @@ data class MonitorState(
     val hardwareMode: HardwareMode = HardwareMode.Active,
     val buttons: ButtonStates = ButtonStates(),
     val echoEnabled: Boolean = false,
-    val echoTimingMode: EchoTimingMode = EchoTimingMode.RecordAfterBeep,
     val scoState: ScoState = ScoState.Inactive,
     val echoStatus: EchoStatus = EchoStatus.Idle,
     val sttEnabled: Boolean = false,
@@ -72,7 +71,7 @@ enum class HardwareMode { Active, Control }
 enum class TwoStateButton { Released, Pressed }
 enum class SosButtonState { Released, Pressed, LongPressed }
 enum class ClickButtonState { Idle, Clicked }
-enum class EchoTimingMode { RecordAfterBeep, RecordWhileBeepPlays }
+enum class EchoTimingMode { RecordAfterBeep }
 
 sealed interface ScoState {
     data object Inactive : ScoState

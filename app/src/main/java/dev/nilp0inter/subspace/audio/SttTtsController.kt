@@ -98,14 +98,14 @@ class SttTtsController(
             }
 
             if (!pttDown) {
-                cancelBeforeRecording()
+                cancelSession()
                 return
             }
 
             _status.value = SttTtsStatus.Beeping
-            output.playReadyBeep()
+            output.playReadyBeep(sco.coldStart)
             if (!pttDown) {
-                cancelBeforeRecording()
+                cancelSession()
                 return
             }
 
@@ -147,7 +147,7 @@ class SttTtsController(
         val recording = retained ?: recorder.stopIfActiveOrEmpty()
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttTtsStatus.Idle) cancelBeforeRecording()
+            if (enabled || _status.value != SttTtsStatus.Idle) cancelSession()
             _status.value = SttTtsStatus.EmptyAudio
             return
         }
@@ -161,7 +161,7 @@ class SttTtsController(
                     val transcript = transcriptOutcome.text
                     if (transcript.isBlank()) {
                         _status.value = SttTtsStatus.EmptyTranscript
-                        sco.release()
+                        releaseScoAfterWarmup()
                         return@launch
                     }
                     _status.value = SttTtsStatus.Transcript(transcript)
@@ -178,7 +178,7 @@ class SttTtsController(
                         is SynthesisOutcome.Success -> {
                             if (synthOutcome.samples.isEmpty()) {
                                 _status.value = SttTtsStatus.Error("Synthesis produced no audio")
-                                sco.release()
+                                releaseScoAfterWarmup()
                             } else {
                                 _status.value = SttTtsStatus.Playing
                                 val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
@@ -189,29 +189,29 @@ class SttTtsController(
                         }
                         is SynthesisOutcome.ModelNotReady -> {
                             _status.value = SttTtsStatus.Error("TTS model not ready")
-                            sco.release()
+                            releaseScoAfterWarmup()
                         }
                         is SynthesisOutcome.Failure -> {
                             _status.value = SttTtsStatus.Error(synthOutcome.reason)
-                            sco.release()
+                            releaseScoAfterWarmup()
                         }
                         SynthesisOutcome.EmptyText -> {
                             _status.value = SttTtsStatus.EmptyTranscript
-                            sco.release()
+                            releaseScoAfterWarmup()
                         }
                     }
                 }
                 is TranscriptionOutcome.Failure -> {
                     _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
-                    sco.release()
+                    releaseScoAfterWarmup()
                 }
                 TranscriptionOutcome.ModelNotReady -> {
                     _status.value = SttTtsStatus.Error("STT model not ready")
-                    sco.release()
+                    releaseScoAfterWarmup()
                 }
                 TranscriptionOutcome.EmptyInput -> {
                     _status.value = SttTtsStatus.EmptyAudio
-                    sco.release()
+                    releaseScoAfterWarmup()
                 }
             }
         }
@@ -224,12 +224,12 @@ class SttTtsController(
         }
     }
 
-    private fun cancelBeforeRecording() {
+    private fun cancelSession() {
         maxDurationJob?.cancel()
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        sco.release()
+        releaseScoAfterWarmup()
         _status.value = SttTtsStatus.Cancelled
     }
 

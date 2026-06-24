@@ -37,7 +37,6 @@ import androidx.compose.ui.unit.dp
 import dev.nilp0inter.subspace.model.ButtonStates
 import dev.nilp0inter.subspace.model.ClickButtonState
 import dev.nilp0inter.subspace.model.EchoStatus
-import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.SttStatus
 import dev.nilp0inter.subspace.model.SttTtsStatus
@@ -148,21 +147,6 @@ private fun EchoControls(state: MonitorState, actions: PttUiActions) {
                 Switch(checked = state.echoEnabled, onCheckedChange = actions::setEchoEnabled)
             }
 
-            Text("Timing", style = MaterialTheme.typography.titleMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TimingButton(
-                    selected = state.echoTimingMode == EchoTimingMode.RecordAfterBeep,
-                    label = "After beep",
-                    onClick = { actions.setEchoTimingMode(EchoTimingMode.RecordAfterBeep) },
-                    modifier = Modifier.weight(1f),
-                )
-                TimingButton(
-                    selected = state.echoTimingMode == EchoTimingMode.RecordWhileBeepPlays,
-                    label = "During beep",
-                    onClick = { actions.setEchoTimingMode(EchoTimingMode.RecordWhileBeepPlays) },
-                    modifier = Modifier.weight(1f),
-                )
-            }
         }
     }
 }

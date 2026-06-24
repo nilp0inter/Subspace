@@ -86,14 +86,14 @@ class SttController(
             }
 
             if (!pttDown) {
-                cancelBeforeRecording()
+                cancelSession()
                 return
             }
 
             _status.value = SttStatus.Beeping
-            output.playReadyBeep()
+            output.playReadyBeep(sco.coldStart)
             if (!pttDown) {
-                cancelBeforeRecording()
+                cancelSession()
                 return
             }
 
@@ -129,7 +129,7 @@ class SttController(
         val recording = retained ?: recorder.stopIfActiveOrEmpty()
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttStatus.Idle) cancelBeforeRecording()
+            if (enabled || _status.value != SttStatus.Idle) cancelSession()
             _status.value = SttStatus.EmptyAudio
             return
         }
@@ -149,7 +149,7 @@ class SttController(
                         TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
                         else -> SttStatus.Error(error.message ?: "Transcription failed")
                     }
-                    if (_status.value !is SttStatus.Transcribed) sco.release()
+                    if (_status.value !is SttStatus.Transcribed) releaseScoAfterWarmup()
                 }
         }
     }
@@ -161,12 +161,12 @@ class SttController(
         }
     }
 
-    private fun cancelBeforeRecording() {
+    private fun cancelSession() {
         maxDurationJob?.cancel()
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        sco.release()
+        releaseScoAfterWarmup()
         _status.value = SttStatus.Cancelled
     }
 

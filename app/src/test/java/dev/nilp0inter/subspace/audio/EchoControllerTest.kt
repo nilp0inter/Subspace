@@ -1,7 +1,6 @@
 package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.EchoStatus
-import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.ScoState
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -29,11 +28,15 @@ class EchoControllerTest {
         controller.onPttPressed()
         advanceTimeBy(100)
         controller.onPttReleased()
-        advanceUntilIdle()
+        runCurrent()
 
         assertFalse(recorder.started)
         assertEquals(0, output.playbackCount)
         assertEquals(EchoStatus.Cancelled, controller.status.value)
+
+        advanceTimeBy(30_000)
+        runCurrent()
+        assertEquals(EchoStatus.Idle, controller.status.value)
     }
 
     @Test
@@ -65,22 +68,6 @@ class EchoControllerTest {
     }
 
     @Test
-    fun alternateModeStartsRecordingBeforeBeep() = runTest {
-        val events = mutableListOf<String>()
-        val sco = FakeScoRoute()
-        val recorder = FakeRecorder(onStart = { events += "record" })
-        val output = FakeOutput(onBeep = { events += "beep" })
-        val controller = EchoController(this, sco, recorder, output)
-        controller.setEnabled(true)
-        controller.setTimingMode(EchoTimingMode.RecordWhileBeepPlays)
-
-        controller.onPttPressed()
-        runCurrent()
-
-        assertEquals(listOf("record", "beep"), events)
-    }
-
-    @Test
     fun maxDurationStopsRecordingAndWaitsForRelease() = runTest {
         val sco = FakeScoRoute()
         val recorder = FakeRecorder()
@@ -107,6 +94,7 @@ class EchoControllerTest {
     ) : ScoRoute {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
         override val state: StateFlow<ScoState> = _state
+        override val coldStart: Boolean = false
         var releaseCount = 0
 
         override fun hasAvailableScoDevice(): Boolean = true
@@ -153,7 +141,7 @@ class EchoControllerTest {
         var beepCount = 0
         var playbackCount = 0
 
-        override suspend fun playReadyBeep() {
+        override suspend fun playReadyBeep(coldStart: Boolean) {
             onBeep()
             beepCount += 1
         }

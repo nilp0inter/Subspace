@@ -1,7 +1,5 @@
 package dev.nilp0inter.subspace.ui
 
-import dev.nilp0inter.subspace.model.EchoTimingMode
-
 interface PttUiActions {
     fun requestPermissions()
     fun requestManageExternalStorage()
@@ -13,7 +11,6 @@ interface PttUiActions {
     fun retry()
     fun disconnectSerial()
     fun setEchoEnabled(enabled: Boolean)
-    fun setEchoTimingMode(mode: EchoTimingMode)
     fun setSttEnabled(enabled: Boolean)
     fun setTtsEnabled(enabled: Boolean)
     fun setSttTtsEnabled(enabled: Boolean)

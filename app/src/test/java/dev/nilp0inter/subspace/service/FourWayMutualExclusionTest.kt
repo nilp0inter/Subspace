@@ -163,7 +163,7 @@ class FourWayMutualExclusionTest {
     }
 
     private class FakeOutput : PcmOutput {
-        override suspend fun playReadyBeep() {}
+        override suspend fun playReadyBeep(coldStart: Boolean) {}
         override suspend fun play(recording: RecordedPcm) {}
     }
 }

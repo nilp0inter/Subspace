@@ -13,6 +13,8 @@ data class RecordedPcm(
 
 interface ScoRoute {
     val state: StateFlow<ScoState>
+    val coldStart: Boolean
+        get() = false
     fun hasAvailableScoDevice(): Boolean
     suspend fun acquire(): Boolean
     fun isActive(): Boolean
@@ -26,6 +28,6 @@ interface AudioRecorder {
 }
 
 interface PcmOutput {
-    suspend fun playReadyBeep()
+    suspend fun playReadyBeep(coldStart: Boolean = false)
     suspend fun play(recording: RecordedPcm)
 }

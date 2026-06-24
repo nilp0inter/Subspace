@@ -21,19 +21,25 @@ import kotlin.math.sin
 class AndroidPcmOutput(
     private val audioManager: AudioManager,
 ) : PcmOutput {
-    override suspend fun playReadyBeep() {
+    override suspend fun playReadyBeep(coldStart: Boolean) {
         ensureScoActive()
         val sampleRate = 16_000
-        val samples = generateSinePcm16(
+        var samples = generateSinePcm16(
             frequencyHz = 880.0,
             durationMs = 150,
             sampleRate = sampleRate,
             amplitude = 0.35,
         )
+        if (coldStart) {
+            val silenceCount = sampleRate * 100 / 1_000
+            val silence = ShortArray(silenceCount)
+            samples = silence + samples
+        }
         playStaticPcm(
             samples = samples,
             sampleRate = sampleRate,
             contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+            preferredDevice = audioManager.communicationDevice,
         )
     }
 
@@ -57,6 +63,7 @@ class AndroidPcmOutput(
         samples: ShortArray,
         sampleRate: Int,
         contentType: Int,
+        preferredDevice: AudioDeviceInfo? = null,
     ) = withContext(Dispatchers.IO) {
         val track = AudioTrack.Builder()
             .setAudioAttributes(
@@ -75,6 +82,10 @@ class AndroidPcmOutput(
             .setBufferSizeInBytes(samples.size * Short.SIZE_BYTES)
             .setTransferMode(AudioTrack.MODE_STATIC)
             .build()
+
+        if (preferredDevice != null) {
+            track.setPreferredDevice(preferredDevice)
+        }
 
         try {
             track.write(samples, 0, samples.size)

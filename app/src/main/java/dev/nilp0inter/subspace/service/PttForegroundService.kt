@@ -45,7 +45,6 @@ import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DevicePresence
 import dev.nilp0inter.subspace.model.EchoStatus
-import dev.nilp0inter.subspace.model.EchoTimingMode
 import dev.nilp0inter.subspace.model.HeadsetAudioState
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.PermissionState
@@ -545,11 +544,6 @@ class PttForegroundService : Service() {
 
     fun setSttTtsEnabled(enabled: Boolean) {
         audioRouter.setTestModeEnabled(AudioTestMode.SttTts, enabled)
-    }
-
-    fun setEchoTimingMode(mode: EchoTimingMode) {
-        echo.setTimingMode(mode)
-        updateMonitor { it.copy(echoTimingMode = mode) }
     }
 
     fun setCaptainsLogDirectory(path: String) {
