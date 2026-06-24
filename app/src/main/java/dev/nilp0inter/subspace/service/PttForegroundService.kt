@@ -31,6 +31,7 @@ import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.SupertonicAssetExtractor
 import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
+import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
@@ -47,6 +48,7 @@ import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.DevicePresence
 import dev.nilp0inter.subspace.model.EchoStatus
+import dev.nilp0inter.subspace.model.HardwareMode
 import dev.nilp0inter.subspace.model.HeadsetAudioState
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.PermissionState
@@ -87,6 +89,7 @@ class PttForegroundService : Service() {
     private var sttModelStatusJob: Job? = null
     private var ttsController: TtsController? = null
     private var ttsSynthesizer: TtsSynthesizer? = null
+    private var announcer: SystemAnnouncer? = null
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
     private var journalPttController: JournalPttController? = null
@@ -205,6 +208,19 @@ class PttForegroundService : Service() {
         }
         ttsSynthesizer = synth
         if (synth != null) {
+            announcer = SystemAnnouncer(synth)
+            val vocabulary = mapOf(
+                "sys.menu.channels" to "Channels",
+                "chan.${JournalChannel.ID}.name" to "Journal Channel",
+                "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
+                "chan.${DebugChannel.ID}.name" to "Debug Channel",
+                "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected"
+            )
+            val voiceStylePath = voiceStyleFile(_appState.value.monitor.ttsVoiceStyle).absolutePath
+            serviceScope.launch {
+                announcer?.precompute(vocabulary, voiceStylePath, SCO_RATE)
+            }
+
             ttsController = TtsController(
                 scope = serviceScope,
                 sco = sco,
@@ -549,7 +565,22 @@ class PttForegroundService : Service() {
         return java.io.File(modelDir, "$style.json")
     }
 
+    private fun cycleActiveChannel(next: Boolean) {
+        val channels = listOf(JournalChannel.ID, DebugChannel.ID)
+        val currentIndex = channels.indexOf(_appState.value.activeChannelId).takeIf { it >= 0 } ?: 0
+        val offset = if (next) 1 else -1
+        val newIndex = (currentIndex + offset).let {
+            if (it < 0) channels.size - 1 else it % channels.size
+        }
+        val newId = channels[newIndex]
+        setActiveChannelId(newId)
+        serviceScope.launch {
+            announcer?.announce("chan.$newId.name", sco, pcmOutput)
+        }
+    }
+
     private fun handleRawButtonEvent(event: RawButtonEvent) {
+        val previousMode = _appState.value.monitor.hardwareMode
         val snapshot = buttonStateMachine.apply(event, SystemClock.elapsedRealtime())
         updateMonitor {
             it.copy(
@@ -559,11 +590,35 @@ class PttForegroundService : Service() {
         }
 
         when (event) {
-            RawButtonEvent.PttPressed -> dispatchPttPressed()
+            RawButtonEvent.GroupPressed -> {
+                if (previousMode != HardwareMode.Control && snapshot.hardwareMode == HardwareMode.Control) {
+                    serviceScope.launch {
+                        announcer?.announce("sys.menu.channels", sco, pcmOutput)
+                    }
+                }
+            }
+            RawButtonEvent.VolumeUpClicked -> {
+                if (snapshot.hardwareMode == HardwareMode.Control) {
+                    cycleActiveChannel(next = true)
+                }
+                scheduleVolumeExpiry()
+            }
+            RawButtonEvent.VolumeDownClicked -> {
+                if (snapshot.hardwareMode == HardwareMode.Control) {
+                    cycleActiveChannel(next = false)
+                }
+                scheduleVolumeExpiry()
+            }
+            RawButtonEvent.PttPressed -> {
+                if (previousMode == HardwareMode.Control) {
+                    serviceScope.launch {
+                        announcer?.announce("chan.${_appState.value.activeChannelId}.selected", sco, pcmOutput)
+                    }
+                } else {
+                    dispatchPttPressed()
+                }
+            }
             RawButtonEvent.PttReleased -> dispatchPttReleased()
-            RawButtonEvent.VolumeUpClicked,
-            RawButtonEvent.VolumeDownClicked,
-            -> scheduleVolumeExpiry()
             else -> Unit
         }
     }
