@@ -8,9 +8,9 @@ val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
 data class AppState(
     val connection: ConnectionState = ConnectionState(),
     val monitor: MonitorState = MonitorState(),
-    val captainsLog: CaptainsLogChannel = CaptainsLogChannel(),
+    val journal: JournalChannel = JournalChannel(),
     val debugChannel: DebugChannel = DebugChannel(),
-    val activeChannelId: String = CaptainsLogChannel.ID,
+    val activeChannelId: String = JournalChannel.ID,
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor

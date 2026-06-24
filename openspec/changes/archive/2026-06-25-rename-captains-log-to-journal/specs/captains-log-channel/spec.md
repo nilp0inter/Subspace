@@ -1,8 +1,4 @@
-## Purpose
-
-TBD. Defines the Captain's Log channel behavior for PTT capture persistence, transcription, and output files.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Captain's Log channel type
 The system SHALL provide a built-in channel type named "Journal" that records PTT captures as OGG audio files and/or appends transcriptions to a daily markdown journal file in a user-selected directory.
@@ -44,24 +40,6 @@ The system SHALL provide a "Save in journal file" toggle on the dedicated config
 - **WHEN** the Journal channel receives a PTT capture and "Save in journal file" is disabled
 - **THEN** the system SHALL NOT transcribe the capture or write to the markdown journal
 
-### Requirement: At least one toggle must be enabled
-The system SHALL enforce that at least one of "Save voice" or "Save in log file" is enabled at all times. Both toggles disabled is an illegal state.
-
-#### Scenario: User disables the last active toggle
-- **WHEN** one toggle is enabled and the user attempts to disable it
-- **THEN** the system SHALL prevent the action and keep the toggle enabled
-
-### Requirement: Date-structured directory output
-The system SHALL create a hierarchical date-based directory structure under the user-selected base directory for all output files.
-
-#### Scenario: First capture on a new date
-- **WHEN** a PTT capture occurs on a date with no existing output directory
-- **THEN** the system SHALL create the directory structure `YYYY/YYYY-MM/YYYY-MM-DD/` and a `recordings/` subdirectory within it
-
-#### Scenario: Subsequent capture on same date
-- **WHEN** a PTT capture occurs on a date with an existing output directory
-- **THEN** the system SHALL use the existing directory structure without creating duplicates
-
 ### Requirement: Audio file naming
 The system SHALL name audio recording files using the pattern `journal-YYYY-MM-DD_HH-MM-SS.ogg` where the timestamp reflects the moment PTT was released (capture end).
 
@@ -87,14 +65,3 @@ The system SHALL maintain a daily markdown journal file named `journal-YYYY-MM-D
 #### Scenario: Subsequent entry appended
 - **WHEN** a PTT capture completes and the daily journal file already exists
 - **THEN** the system SHALL append the new H2 entry at the end of the file without modifying existing content
-
-### Requirement: STT transcription via on-device model
-The system SHALL use the existing on-device Parakeet STT model for transcription. Transcription SHALL NOT require network access.
-
-#### Scenario: Transcription succeeds
-- **WHEN** a PTT capture is transcribed
-- **THEN** the transcription SHALL use the Parakeet model already loaded in the service and SHALL NOT perform any network I/O
-
-#### Scenario: Transcription fails
-- **WHEN** the STT model fails to produce a transcript
-- **THEN** the system SHALL write the entry with an error placeholder text and SHALL NOT discard the audio recording if "Save voice" is enabled

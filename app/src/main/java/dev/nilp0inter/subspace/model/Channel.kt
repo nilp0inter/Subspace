@@ -6,7 +6,7 @@ sealed interface Channel {
     val isReady: Boolean
 }
 
-data class CaptainsLogChannel(
+data class JournalChannel(
     override val id: String = ID,
     override val name: String = NAME,
     val baseDirectory: String? = null,
@@ -17,12 +17,12 @@ data class CaptainsLogChannel(
         get() = baseDirectory != null && (saveVoice || saveText)
 
     init {
-        require(saveVoice || saveText) { "Captain's Log must save voice, text, or both" }
+        require(saveVoice || saveText) { "Journal must save voice, text, or both" }
     }
 
     companion object {
         const val ID = "captains-log"
-        const val NAME = "Captain's Log"
+        const val NAME = "Journal"
     }
 }
 

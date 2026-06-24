@@ -10,13 +10,13 @@ class ChannelRepository(
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
     )
 
-    fun loadCaptainsLog(): CaptainsLogChannel = CaptainsLogChannel(
+    fun loadJournal(): JournalChannel = JournalChannel(
         baseDirectory = prefs.getString(KEY_BASE_DIRECTORY, null),
         saveVoice = prefs.getBoolean(KEY_SAVE_VOICE, true),
         saveText = prefs.getBoolean(KEY_SAVE_TEXT, true),
     )
 
-    fun saveCaptainsLog(channel: CaptainsLogChannel) {
+    fun saveJournal(channel: JournalChannel) {
         prefs.edit()
             .putString(KEY_BASE_DIRECTORY, channel.baseDirectory)
             .putBoolean(KEY_SAVE_VOICE, channel.saveVoice)
@@ -35,7 +35,7 @@ class ChannelRepository(
     }
 
     fun loadActiveChannelId(): String =
-        prefs.getString(KEY_ACTIVE_CHANNEL, CaptainsLogChannel.ID) ?: CaptainsLogChannel.ID
+        prefs.getString(KEY_ACTIVE_CHANNEL, JournalChannel.ID) ?: JournalChannel.ID
 
     fun saveActiveChannelId(id: String) {
         prefs.edit().putString(KEY_ACTIVE_CHANNEL, id).apply()
@@ -43,9 +43,9 @@ class ChannelRepository(
 
     companion object {
         private const val PREFS_NAME = "channels"
-        private const val KEY_BASE_DIRECTORY = "captains_log_base_directory"
-        private const val KEY_SAVE_VOICE = "captains_log_save_voice"
-        private const val KEY_SAVE_TEXT = "captains_log_save_text"
+        private const val KEY_BASE_DIRECTORY = "journal_base_directory"
+        private const val KEY_SAVE_VOICE = "journal_save_voice"
+        private const val KEY_SAVE_TEXT = "journal_save_text"
         private const val KEY_DEBUG_MODE = "debug_channel_mode"
         private const val KEY_ACTIVE_CHANNEL = "active_channel_id"
     }

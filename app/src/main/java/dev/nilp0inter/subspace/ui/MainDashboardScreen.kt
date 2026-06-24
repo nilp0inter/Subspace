@@ -32,7 +32,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 
@@ -129,7 +129,7 @@ private fun ChannelPanel(
             color = MaterialTheme.colorScheme.primary,
         )
 
-        CaptainsLogCard(appState, actions)
+        JournalCard(appState, actions)
         DebugChannelCard(appState, actions)
 
         previewChannels.forEach { channel ->
@@ -139,12 +139,12 @@ private fun ChannelPanel(
 }
 
 @Composable
-private fun CaptainsLogCard(
+private fun JournalCard(
     appState: AppState,
     actions: PttUiActions,
 ) {
-    val channel = appState.captainsLog
-    val isActive = appState.activeChannelId == CaptainsLogChannel.ID
+    val channel = appState.journal
+    val isActive = appState.activeChannelId == JournalChannel.ID
     val isReady = channel.isReady
     val accent = when {
         isActive -> MaterialTheme.colorScheme.primary
@@ -152,7 +152,7 @@ private fun CaptainsLogCard(
         else -> MaterialTheme.colorScheme.outline
     }
     Card(
-        onClick = { actions.setActiveChannel(CaptainsLogChannel.ID) },
+        onClick = { actions.setActiveChannel(JournalChannel.ID) },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
         modifier = Modifier.fillMaxWidth(),
@@ -179,7 +179,7 @@ private fun CaptainsLogCard(
                         },
                         accent = accent,
                     )
-                    IconButton(onClick = actions::navigateToCaptainsLogConfig) {
+                    IconButton(onClick = actions::navigateToJournalConfig) {
                         Icon(Icons.Filled.Settings, contentDescription = "Config")
                     }
                 }

@@ -37,10 +37,10 @@ import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
-import dev.nilp0inter.subspace.channel.CaptainsLogController
-import dev.nilp0inter.subspace.channel.CaptainsLogPttController
+import dev.nilp0inter.subspace.channel.JournalController
+import dev.nilp0inter.subspace.channel.JournalPttController
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DebugChannel
@@ -89,7 +89,7 @@ class PttForegroundService : Service() {
     private var ttsSynthesizer: TtsSynthesizer? = null
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
-    private var captainsLogPttController: CaptainsLogPttController? = null
+    private var journalPttController: JournalPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private var targetDevice: BluetoothDevice? = null
@@ -110,7 +110,7 @@ class PttForegroundService : Service() {
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         channelRepository = ChannelRepository(applicationContext)
         _appState.value = _appState.value.copy(
-            captainsLog = channelRepository.loadCaptainsLog(),
+            journal = channelRepository.loadJournal(),
             debugChannel = channelRepository.loadDebugChannel(),
             activeChannelId = channelRepository.loadActiveChannelId(),
         )
@@ -127,7 +127,7 @@ class PttForegroundService : Service() {
 
         initializeStt(audioManager)
         initializeTts(audioManager)
-        initializeCaptainsLog(audioManager)
+        initializeJournal(audioManager)
         
         updateActiveControllers()
 
@@ -266,28 +266,28 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        captainsLogPttController?.cancelAndRelease()
+        journalPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         super.onDestroy()
     }
 
-    private fun initializeCaptainsLog(audioManager: AudioManager) {
+    private fun initializeJournal(audioManager: AudioManager) {
         val transcriber = transcriptionService ?: object : PcmTranscriber {
             override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
                 throw IllegalStateException("STT transcriber unavailable")
             }
         }
-        captainsLogPttController = CaptainsLogPttController(
+        journalPttController = JournalPttController(
             scope = serviceScope,
             sco = sco,
             recorder = InMemoryRecorder(serviceScope),
             output = AndroidPcmOutput(audioManager),
-            captainsLog = CaptainsLogController(
+            journal = JournalController(
                 scope = serviceScope,
                 encoder = OggEncoder(),
                 transcriber = transcriber,
             ),
-            channelProvider = { _appState.value.captainsLog },
+            channelProvider = { _appState.value.journal },
         )
     }
 
@@ -322,8 +322,8 @@ class PttForegroundService : Service() {
             updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
         }
         
-        if (activeChannelId != CaptainsLogChannel.ID) {
-            captainsLogPttController?.cancelAndRelease()
+        if (activeChannelId != JournalChannel.ID) {
+            journalPttController?.cancelAndRelease()
         }
     }
 
@@ -446,27 +446,27 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        captainsLogPttController?.cancelAndRelease()
+        journalPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
     }
 
-    fun setCaptainsLogDirectory(path: String) {
-        val channel = channelRepository.loadCaptainsLog().copy(baseDirectory = path)
-        saveCaptainsLog(channel)
+    fun setJournalDirectory(path: String) {
+        val channel = channelRepository.loadJournal().copy(baseDirectory = path)
+        saveJournal(channel)
     }
 
-    fun setCaptainsLogSaveVoice(enabled: Boolean) {
-        val current = _appState.value.captainsLog
+    fun setJournalSaveVoice(enabled: Boolean) {
+        val current = _appState.value.journal
         if (!enabled && !current.saveText) return
-        saveCaptainsLog(current.copy(saveVoice = enabled))
+        saveJournal(current.copy(saveVoice = enabled))
     }
 
-    fun setCaptainsLogSaveText(enabled: Boolean) {
-        val current = _appState.value.captainsLog
+    fun setJournalSaveText(enabled: Boolean) {
+        val current = _appState.value.journal
         if (!enabled && !current.saveVoice) return
-        saveCaptainsLog(current.copy(saveText = enabled))
+        saveJournal(current.copy(saveText = enabled))
     }
 
     fun setActiveChannelId(id: String) {
@@ -483,9 +483,9 @@ class PttForegroundService : Service() {
         updateActiveControllers()
     }
 
-    private fun saveCaptainsLog(channel: CaptainsLogChannel) {
-        channelRepository.saveCaptainsLog(channel)
-        _appState.value = _appState.value.copy(captainsLog = channel)
+    private fun saveJournal(channel: JournalChannel) {
+        channelRepository.saveJournal(channel)
+        _appState.value = _appState.value.copy(journal = channel)
     }
 
     private fun saveDebugChannel(channel: DebugChannel) {
@@ -573,7 +573,7 @@ class PttForegroundService : Service() {
         val activeChannelId = appState.activeChannelId
 
         val activeChannel = when (activeChannelId) {
-            CaptainsLogChannel.ID -> appState.captainsLog
+            JournalChannel.ID -> appState.journal
             DebugChannel.ID -> appState.debugChannel
             else -> return
         }
@@ -588,7 +588,7 @@ class PttForegroundService : Service() {
         }
 
         when (activeChannelId) {
-            CaptainsLogChannel.ID -> captainsLogPttController?.onPttPressed()
+            JournalChannel.ID -> journalPttController?.onPttPressed()
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttPressed()
@@ -615,7 +615,7 @@ class PttForegroundService : Service() {
         val activeChannelId = appState.activeChannelId
 
         val activeChannel = when (activeChannelId) {
-            CaptainsLogChannel.ID -> appState.captainsLog
+            JournalChannel.ID -> appState.journal
             DebugChannel.ID -> appState.debugChannel
             else -> return
         }
@@ -623,7 +623,7 @@ class PttForegroundService : Service() {
         if (!activeChannel.isReady) return
 
         when (activeChannelId) {
-            CaptainsLogChannel.ID -> captainsLogPttController?.onPttReleased()
+            JournalChannel.ID -> journalPttController?.onPttReleased()
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttReleased()
@@ -717,7 +717,7 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        captainsLogPttController?.cancelAndRelease()
+        journalPttController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {

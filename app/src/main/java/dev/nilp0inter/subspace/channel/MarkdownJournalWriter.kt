@@ -2,7 +2,7 @@ package dev.nilp0inter.subspace.channel
 
 import java.io.File
 
-class MarkdownLogWriter {
+class MarkdownJournalWriter {
     fun appendEntry(
         markdownFile: File,
         dateLabel: String,
@@ -13,7 +13,7 @@ class MarkdownLogWriter {
         markdownFile.parentFile?.mkdirs()
         val isNewFile = !markdownFile.exists()
         markdownFile.appendText(buildString {
-            if (isNewFile) append("# Log $dateLabel\n\n")
+            if (isNewFile) append("# Journal $dateLabel\n\n")
             append("## Entry $timeLabel\n\n")
             append(bodyText)
             append("\n\n")

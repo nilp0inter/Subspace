@@ -4,19 +4,19 @@ import dev.nilp0inter.subspace.audio.AudioRecorder
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ScoRoute
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-class CaptainsLogPttController(
+class JournalPttController(
     private val scope: CoroutineScope,
     private val sco: ScoRoute,
     private val recorder: AudioRecorder,
     private val output: PcmOutput,
-    private val captainsLog: CaptainsLogController,
-    private val channelProvider: () -> CaptainsLogChannel,
+    private val journal: JournalController,
+    private val channelProvider: () -> JournalChannel,
 ) {
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
@@ -83,7 +83,7 @@ class CaptainsLogPttController(
         val recording = retained ?: recorder.stopIfActiveOrEmpty()
         releaseScoAfterWarmup()
         if (!recording.isEmpty) {
-            captainsLog.handleCapture(channelProvider(), recording.samples, recording.sampleRate)
+            journal.handleCapture(channelProvider(), recording.samples, recording.sampleRate)
         }
     }
 

@@ -5,7 +5,7 @@ import java.time.Clock
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
-class LogDirectoryManager(
+class JournalDirectoryManager(
     private val clock: Clock = Clock.systemDefaultZone(),
 ) {
     fun pathsFor(baseDirectory: File, timestamp: LocalDateTime = LocalDateTime.now(clock)): LogPaths {
@@ -13,12 +13,12 @@ class LogDirectoryManager(
         val time = timestamp.format(TIME)
         val dayDirectory = File(baseDirectory, "${timestamp.format(YEAR)}/${timestamp.format(MONTH)}/$day")
         val recordingsDirectory = File(dayDirectory, "recordings")
-        val recordingName = "log-${day}_$time.ogg"
+        val recordingName = "journal-${day}_$time.ogg"
         return LogPaths(
             dayDirectory = dayDirectory,
             recordingsDirectory = recordingsDirectory,
             recordingFile = File(recordingsDirectory, recordingName),
-            markdownFile = File(dayDirectory, "log-$day.md"),
+            markdownFile = File(dayDirectory, "journal-$day.md"),
             relativeRecordingLink = "recordings/$recordingName",
             dateLabel = day,
             timeLabel = time,

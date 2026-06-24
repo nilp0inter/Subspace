@@ -2,7 +2,7 @@ package dev.nilp0inter.subspace.channel
 
 import dev.nilp0inter.subspace.audio.AudioEncoder
 import dev.nilp0inter.subspace.audio.PcmTranscriber
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 import java.io.File
 import java.time.Clock
 import java.time.Instant
@@ -14,37 +14,37 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class CaptainsLogControllerTest {
+class JournalControllerTest {
     @Test
     fun bothOutputsEncodeTranscribeAndWriteMarkdownLink() = runTest {
-        val base = createTempDirectory(prefix = "captains-log-").toFile()
+        val base = createTempDirectory(prefix = "journal-").toFile()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("hello log")
         val controller = controller(encoder, transcriber)
 
-        controller.processCapture(CaptainsLogChannel(saveVoice = true, saveText = true), base, shortArrayOf(1, 2), 16_000)
+        controller.processCapture(JournalChannel(saveVoice = true, saveText = true), base, shortArrayOf(1, 2), 16_000)
 
         assertEquals(1, encoder.callCount)
         assertEquals(1, transcriber.callCount)
-        val log = File(base, "2026/2026-06/2026-06-24/log-2026-06-24.md")
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/log-2026-06-24_14-30-00.ogg").isFile)
+        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md")
+        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
         assertEquals(
-            "# Log 2026-06-24\n\n" +
+            "# Journal 2026-06-24\n\n" +
                 "## Entry 14-30-00\n\n" +
                 "hello log\n\n" +
-                "[Source recording](recordings/log-2026-06-24_14-30-00.ogg)\n\n",
+                "[Source recording](recordings/journal-2026-06-24_14-30-00.ogg)\n\n",
             log.readText(),
         )
     }
 
     @Test
     fun textOnlyDoesNotEncodeOrWriteRecordingLink() = runTest {
-        val base = createTempDirectory(prefix = "captains-log-").toFile()
+        val base = createTempDirectory(prefix = "journal-").toFile()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("text only")
 
         controller(encoder, transcriber).processCapture(
-            CaptainsLogChannel(saveVoice = false, saveText = true),
+            JournalChannel(saveVoice = false, saveText = true),
             base,
             shortArrayOf(1, 2),
             16_000,
@@ -52,19 +52,19 @@ class CaptainsLogControllerTest {
 
         assertEquals(0, encoder.callCount)
         assertEquals(1, transcriber.callCount)
-        val log = File(base, "2026/2026-06/2026-06-24/log-2026-06-24.md")
-        assertFalse(File(base, "2026/2026-06/2026-06-24/recordings/log-2026-06-24_14-30-00.ogg").exists())
+        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md")
+        assertFalse(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").exists())
         assertFalse(log.readText().contains("Source recording"))
     }
 
     @Test
     fun voiceOnlyDoesNotTranscribeOrWriteMarkdown() = runTest {
-        val base = createTempDirectory(prefix = "captains-log-").toFile()
+        val base = createTempDirectory(prefix = "journal-").toFile()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("ignored")
 
         controller(encoder, transcriber).processCapture(
-            CaptainsLogChannel(saveVoice = true, saveText = false),
+            JournalChannel(saveVoice = true, saveText = false),
             base,
             shortArrayOf(1, 2),
             16_000,
@@ -72,49 +72,49 @@ class CaptainsLogControllerTest {
 
         assertEquals(1, encoder.callCount)
         assertEquals(0, transcriber.callCount)
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/log-2026-06-24_14-30-00.ogg").isFile)
-        assertFalse(File(base, "2026/2026-06/2026-06-24/log-2026-06-24.md").exists())
+        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
+        assertFalse(File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").exists())
     }
 
     @Test
     fun transcriptionFailureWritesPlaceholderAndKeepsAudio() = runTest {
-        val base = createTempDirectory(prefix = "captains-log-").toFile()
+        val base = createTempDirectory(prefix = "journal-").toFile()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber(error = IllegalStateException("stt failed"))
 
         controller(encoder, transcriber).processCapture(
-            CaptainsLogChannel(saveVoice = true, saveText = true),
+            JournalChannel(saveVoice = true, saveText = true),
             base,
             shortArrayOf(1, 2),
             16_000,
         )
 
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/log-2026-06-24_14-30-00.ogg").isFile)
-        val log = File(base, "2026/2026-06/2026-06-24/log-2026-06-24.md").readText()
+        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
+        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").readText()
         assertTrue(log.contains("[Transcription failed: stt failed]"))
-        assertTrue(log.contains("[Source recording](recordings/log-2026-06-24_14-30-00.ogg)"))
+        assertTrue(log.contains("[Source recording](recordings/journal-2026-06-24_14-30-00.ogg)"))
     }
 
     @Test
     fun encodingFailureStillWritesMarkdownNote() = runTest {
-        val base = createTempDirectory(prefix = "captains-log-").toFile()
+        val base = createTempDirectory(prefix = "journal-").toFile()
         val encoder = FakeEncoder(error = IllegalStateException("codec failed"))
         val transcriber = FakeTranscriber("hello")
 
         controller(encoder, transcriber).processCapture(
-            CaptainsLogChannel(saveVoice = true, saveText = true),
+            JournalChannel(saveVoice = true, saveText = true),
             base,
             shortArrayOf(1, 2),
             16_000,
         )
 
-        val log = File(base, "2026/2026-06/2026-06-24/log-2026-06-24.md").readText()
+        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").readText()
         assertTrue(log.contains("hello"))
         assertTrue(log.contains("Recording failed."))
     }
 
-    private fun controller(encoder: AudioEncoder, transcriber: PcmTranscriber): CaptainsLogController =
-        CaptainsLogController(
+    private fun controller(encoder: AudioEncoder, transcriber: PcmTranscriber): JournalController =
+        JournalController(
             scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
             encoder = encoder,
             transcriber = transcriber,

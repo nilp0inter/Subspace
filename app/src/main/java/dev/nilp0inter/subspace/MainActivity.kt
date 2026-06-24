@@ -34,14 +34,14 @@ import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<PttForegroundService?>(null)
     private var bound = false
-    private var pendingCaptainsLogDirectory: String? = null
+    private var pendingJournalDirectory: String? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
-                pendingCaptainsLogDirectory?.let { path ->
-                    connectedService.setCaptainsLogDirectory(path)
-                    pendingCaptainsLogDirectory = null
+                pendingJournalDirectory?.let { path ->
+                    connectedService.setJournalDirectory(path)
+                    pendingJournalDirectory = null
                 }
                 connectedService.refreshReadiness()
             }
@@ -75,9 +75,9 @@ class MainActivity : ComponentActivity() {
                 if (path != null) {
                     val connectedService = currentServiceState
                     if (connectedService == null) {
-                        pendingCaptainsLogDirectory = path
+                        pendingJournalDirectory = path
                     } else {
-                        connectedService.setCaptainsLogDirectory(path)
+                        connectedService.setJournalDirectory(path)
                     }
                 }
             }
@@ -92,7 +92,7 @@ class MainActivity : ComponentActivity() {
                         startActivity(RequiredPermissions.manageExternalStorageIntent(this@MainActivity))
                     }
 
-                    override fun pickCaptainsLogDirectory() {
+                    override fun pickJournalDirectory() {
                         directoryLauncher.launch(null)
                     }
 
@@ -125,12 +125,12 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.disconnectSerial()
                     }
 
-                    override fun setCaptainsLogSaveVoice(enabled: Boolean) {
-                        currentServiceState?.setCaptainsLogSaveVoice(enabled)
+                    override fun setJournalSaveVoice(enabled: Boolean) {
+                        currentServiceState?.setJournalSaveVoice(enabled)
                     }
 
-                    override fun setCaptainsLogSaveText(enabled: Boolean) {
-                        currentServiceState?.setCaptainsLogSaveText(enabled)
+                    override fun setJournalSaveText(enabled: Boolean) {
+                        currentServiceState?.setJournalSaveText(enabled)
                     }
 
                     override fun setActiveChannel(id: String) {
@@ -141,8 +141,8 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setDebugChannelMode(mode)
                     }
 
-                    override fun navigateToCaptainsLogConfig() {
-                        route = MainRoute.CaptainsLogConfig
+                    override fun navigateToJournalConfig() {
+                        route = MainRoute.JournalConfig
                     }
 
                     override fun navigateToDebugConfig() {
@@ -213,8 +213,8 @@ class MainActivity : ComponentActivity() {
 
                         MainRoute.Connection -> ConnectionScreen(state.connection, actions)
                         MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                        MainRoute.CaptainsLogConfig -> dev.nilp0inter.subspace.ui.CaptainsLogConfigScreen(
-                            channel = state.captainsLog,
+                        MainRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
+                            channel = state.journal,
                             actions = actions,
                             onBack = { route = MainRoute.Dashboard },
                         )
@@ -253,5 +253,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, CaptainsLogConfig, DebugChannelConfig }
+    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig }
 }

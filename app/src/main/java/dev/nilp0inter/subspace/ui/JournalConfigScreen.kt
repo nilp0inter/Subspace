@@ -23,12 +23,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CaptainsLogConfigScreen(
-    channel: CaptainsLogChannel,
+fun JournalConfigScreen(
+    channel: JournalChannel,
     actions: PttUiActions,
     onBack: () -> Unit,
 ) {
@@ -73,7 +73,7 @@ fun CaptainsLogConfigScreen(
                 OutlinedButton(onClick = actions::requestManageExternalStorage, modifier = Modifier.fillMaxWidth()) {
                     Text("Grant all-files access")
                 }
-                OutlinedButton(onClick = actions::pickCaptainsLogDirectory, modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(onClick = actions::pickJournalDirectory, modifier = Modifier.fillMaxWidth()) {
                     Text(if (configured) "Change directory" else "Select directory")
                 }
             }
@@ -88,7 +88,7 @@ fun CaptainsLogConfigScreen(
                     Switch(
                         checked = channel.saveVoice,
                         onCheckedChange = { enabled ->
-                            if (enabled || channel.saveText) actions.setCaptainsLogSaveVoice(enabled)
+                            if (enabled || channel.saveText) actions.setJournalSaveVoice(enabled)
                         },
                     )
                 }
@@ -98,11 +98,11 @@ fun CaptainsLogConfigScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("Save in log file", style = MaterialTheme.typography.bodyLarge)
+                    Text("Save in journal file", style = MaterialTheme.typography.bodyLarge)
                     Switch(
                         checked = channel.saveText,
                         onCheckedChange = { enabled ->
-                            if (enabled || channel.saveVoice) actions.setCaptainsLogSaveText(enabled)
+                            if (enabled || channel.saveVoice) actions.setJournalSaveText(enabled)
                         },
                     )
                 }

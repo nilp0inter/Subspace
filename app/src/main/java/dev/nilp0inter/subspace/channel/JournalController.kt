@@ -3,7 +3,7 @@ package dev.nilp0inter.subspace.channel
 import android.util.Log
 import dev.nilp0inter.subspace.audio.AudioEncoder
 import dev.nilp0inter.subspace.audio.PcmTranscriber
-import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.JournalChannel
 import java.io.File
 import java.time.Clock
 import java.time.LocalDateTime
@@ -11,15 +11,15 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-class CaptainsLogController(
+class JournalController(
     private val scope: CoroutineScope,
     private val encoder: AudioEncoder,
     private val transcriber: PcmTranscriber,
-    private val directoryManager: LogDirectoryManager = LogDirectoryManager(),
-    private val logWriter: MarkdownLogWriter = MarkdownLogWriter(),
+    private val directoryManager: JournalDirectoryManager = JournalDirectoryManager(),
+    private val journalWriter: MarkdownJournalWriter = MarkdownJournalWriter(),
     private val clock: Clock = Clock.systemDefaultZone(),
 ) {
-    fun handleCapture(channel: CaptainsLogChannel, pcm: ShortArray, sampleRate: Int) {
+    fun handleCapture(channel: JournalChannel, pcm: ShortArray, sampleRate: Int) {
         val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() } ?: return
         if (!channel.isReady) return
         scope.launch(Dispatchers.Default) {
@@ -27,7 +27,7 @@ class CaptainsLogController(
         }
     }
 
-    suspend fun processCapture(channel: CaptainsLogChannel, baseDirectory: File, pcm: ShortArray, sampleRate: Int) {
+    suspend fun processCapture(channel: JournalChannel, baseDirectory: File, pcm: ShortArray, sampleRate: Int) {
         val paths = directoryManager.preparePaths(baseDirectory, LocalDateTime.now(clock))
         val recording = if (channel.saveVoice) {
             encoder.encode(pcm, paths.recordingFile, sampleRate)
@@ -38,7 +38,7 @@ class CaptainsLogController(
         if (channel.saveText) {
             val transcript = runCatching { transcriber.transcribe(pcm, sampleRate) }
                 .getOrElse { error ->
-                    runCatching { Log.e(TAG, "Captain's Log transcription failed", error) }
+                    runCatching { Log.e(TAG, "Journal transcription failed", error) }
                     "[Transcription failed: ${error.message ?: "unknown error"}]"
                 }
             val recordingLink = when {
@@ -46,7 +46,7 @@ class CaptainsLogController(
                 recording?.isFailure == true -> "Recording failed."
                 else -> null
             }
-            logWriter.appendEntry(
+            journalWriter.appendEntry(
                 markdownFile = paths.markdownFile,
                 dateLabel = paths.dateLabel,
                 timeLabel = paths.timeLabel,
@@ -60,6 +60,6 @@ class CaptainsLogController(
     }
 
     companion object {
-        private const val TAG = "SubspaceCaptainsLog"
+        private const val TAG = "SubspaceJournal"
     }
 }

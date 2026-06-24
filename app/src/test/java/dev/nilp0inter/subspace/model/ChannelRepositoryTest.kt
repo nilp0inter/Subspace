@@ -8,23 +8,23 @@ import org.junit.Test
 
 class ChannelRepositoryTest {
     @Test
-    fun captainsLogRoundTripPersistsConfiguration() {
+    fun journalRoundTripPersistsConfiguration() {
         val repository = ChannelRepository(FakeSharedPreferences())
-        val channel = CaptainsLogChannel(
+        val channel = JournalChannel(
             baseDirectory = "/storage/emulated/0/Subspace",
             saveVoice = false,
             saveText = true,
         )
 
-        repository.saveCaptainsLog(channel)
+        repository.saveJournal(channel)
 
-        assertEquals(channel, repository.loadCaptainsLog())
+        assertEquals(channel, repository.loadJournal())
     }
 
     @Test
-    fun captainsLogRejectsBothOutputsDisabled() {
+    fun journalRejectsBothOutputsDisabled() {
         assertThrows(IllegalArgumentException::class.java) {
-            CaptainsLogChannel(saveVoice = false, saveText = false)
+            JournalChannel(saveVoice = false, saveText = false)
         }
     }
 
