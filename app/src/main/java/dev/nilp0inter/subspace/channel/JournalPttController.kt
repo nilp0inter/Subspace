@@ -21,13 +21,11 @@ class JournalPttController(
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
     private var maxDurationJob: Job? = null
-    private var closeScoJob: Job? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
 
     fun onPttPressed() {
         pttDown = true
         if (setupJob?.isActive == true || recorder.isActive) return
-        closeScoJob?.cancel()
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession() }
     }
@@ -40,28 +38,28 @@ class JournalPttController(
     fun cancelAndRelease() {
         setupJob?.cancel()
         maxDurationJob?.cancel()
-        closeScoJob?.cancel()
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
+        sco.release()
     }
 
     private suspend fun startSession() {
         runCatching {
             if (!sco.acquire()) return
             if (!pttDown) {
-                releaseScoAfterWarmup()
+                sco.release()
                 return
             }
             output.playReadyBeep(sco.coldStart)
             if (!pttDown) {
-                releaseScoAfterWarmup()
+                sco.release()
                 return
             }
             if (!recorder.start()) return
             scheduleMaxDurationStop()
         }.onFailure {
             recorder.stopIfActiveOrEmpty()
-            releaseScoAfterWarmup()
+            sco.release()
         }
     }
 
@@ -81,21 +79,13 @@ class JournalPttController(
         val retained = retainedAfterMaxDuration
         retainedAfterMaxDuration = null
         val recording = retained ?: recorder.stopIfActiveOrEmpty()
-        releaseScoAfterWarmup()
+        sco.release()
         if (!recording.isEmpty) {
             journal.handleCapture(channelProvider(), recording.samples, recording.sampleRate)
         }
     }
 
-    private fun releaseScoAfterWarmup() {
-        closeScoJob = scope.launch {
-            delay(SCO_WARMUP_MS)
-            sco.release()
-        }
-    }
-
     companion object {
         private const val MAX_DURATION_MS = 60_000L
-        private const val SCO_WARMUP_MS = 30_000L
     }
 }

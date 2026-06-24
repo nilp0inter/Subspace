@@ -24,7 +24,6 @@ class EchoController(
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
     private var maxDurationJob: Job? = null
-    private var closeScoJob: Job? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
 
     fun setEnabled(value: Boolean) {
@@ -39,7 +38,6 @@ class EchoController(
         if (!enabled) return
         if (setupJob?.isActive == true || recorder.isActive) return
 
-        closeScoJob?.cancel()
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startEchoSession() }
     }
@@ -52,7 +50,6 @@ class EchoController(
     fun cancelAndRelease(reason: String? = null) {
         setupJob?.cancel()
         maxDurationJob?.cancel()
-        closeScoJob?.cancel()
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
         sco.release()
@@ -110,10 +107,11 @@ class EchoController(
         runCatching {
             _status.value = EchoStatus.Playback
             output.play(recording)
-            _status.value = EchoStatus.Warm
-            releaseScoAfterWarmup(EchoStatus.Idle)
+            sco.release()
+            _status.value = EchoStatus.Idle
         }.onFailure { error ->
             _status.value = EchoStatus.Error(error.message ?: "Playback failed")
+            sco.release()
         }
     }
 
@@ -133,15 +131,7 @@ class EchoController(
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        releaseScoAfterWarmup(EchoStatus.Idle)
+        sco.release()
         _status.value = EchoStatus.Cancelled
-    }
-
-    private fun releaseScoAfterWarmup(warmEndStatus: EchoStatus) {
-        closeScoJob = scope.launch {
-            delay(30_000)
-            sco.release()
-            _status.value = warmEndStatus
-        }
     }
 }

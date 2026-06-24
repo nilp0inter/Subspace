@@ -7,7 +7,6 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,7 +23,7 @@ import kotlinx.coroutines.withContext
  *
  * On synthesis request while enabled: acquire SCO, synthesize off the main
  * thread with the current text/parameters, resample 44.1 kHz → SCO rate, play
- * through [PcmOutput], release SCO after a keep-warm window, and report status
+ * through [PcmOutput], release SCO, and report status
  * at each stage. Handles empty text, model-not-ready, synthesis failure,
  * playback completion, and cancellation.
  */
@@ -42,7 +41,6 @@ class TtsController(
         private set
 
     private var synthesisJob: Job? = null
-    private var closeScoJob: Job? = null
 
     fun setEnabled(value: Boolean) {
         enabled = value
@@ -69,7 +67,6 @@ class TtsController(
             return
         }
         synthesisJob?.cancel()
-        closeScoJob?.cancel()
         synthesisJob = scope.launch {
             runSynthesis(text, voiceStylePath, lang, totalSteps, speed, scoRate)
         }
@@ -95,7 +92,6 @@ class TtsController(
     /** Cancel any active or pending TTS work and release resources. */
     fun cancelAndRelease() {
         synthesisJob?.cancel()
-        closeScoJob?.cancel()
         sco.release()
         _status.value = TtsStatus.Idle
     }
@@ -136,12 +132,12 @@ class TtsController(
                     val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
                     if (playback.isEmpty) {
                         _status.value = TtsStatus.Idle
-                        releaseScoAfterWarmup()
+                        sco.release()
                         return
                     }
                     output.play(playback)
                     _status.value = TtsStatus.Idle
-                    releaseScoAfterWarmup()
+                    sco.release()
                 }
                 is SynthesisOutcome.ModelNotReady -> {
                     _status.value = TtsStatus.Error("TTS model not ready")
@@ -160,16 +156,5 @@ class TtsController(
             _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
             sco.release()
         }
-    }
-
-    private fun releaseScoAfterWarmup() {
-        closeScoJob = scope.launch {
-            delay(SCO_WARMUP_MS)
-            sco.release()
-        }
-    }
-
-    companion object {
-        private const val SCO_WARMUP_MS = 30_000L
     }
 }

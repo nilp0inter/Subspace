@@ -49,7 +49,6 @@ class SttTtsController(
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
     private var maxDurationJob: Job? = null
-    private var closeScoJob: Job? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
     private var transcribeJob: Job? = null
 
@@ -67,7 +66,6 @@ class SttTtsController(
 
         transcribeJob?.cancel()
         transcribeJob = null
-        closeScoJob?.cancel()
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession() }
     }
@@ -81,7 +79,6 @@ class SttTtsController(
     fun cancelAndRelease() {
         setupJob?.cancel()
         maxDurationJob?.cancel()
-        closeScoJob?.cancel()
         transcribeJob?.cancel()
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
@@ -161,7 +158,7 @@ class SttTtsController(
                     val transcript = transcriptOutcome.text
                     if (transcript.isBlank()) {
                         _status.value = SttTtsStatus.EmptyTranscript
-                        releaseScoAfterWarmup()
+                        sco.release()
                         return@launch
                     }
                     _status.value = SttTtsStatus.Transcript(transcript)
@@ -178,49 +175,42 @@ class SttTtsController(
                         is SynthesisOutcome.Success -> {
                             if (synthOutcome.samples.isEmpty()) {
                                 _status.value = SttTtsStatus.Error("Synthesis produced no audio")
-                                releaseScoAfterWarmup()
+                                sco.release()
                             } else {
                                 _status.value = SttTtsStatus.Playing
                                 val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
                                 if (!playback.isEmpty) output.play(playback)
                                 _status.value = SttTtsStatus.Idle
-                                releaseScoAfterWarmup()
+                                sco.release()
                             }
                         }
                         is SynthesisOutcome.ModelNotReady -> {
                             _status.value = SttTtsStatus.Error("TTS model not ready")
-                            releaseScoAfterWarmup()
+                            sco.release()
                         }
                         is SynthesisOutcome.Failure -> {
                             _status.value = SttTtsStatus.Error(synthOutcome.reason)
-                            releaseScoAfterWarmup()
+                            sco.release()
                         }
                         SynthesisOutcome.EmptyText -> {
                             _status.value = SttTtsStatus.EmptyTranscript
-                            releaseScoAfterWarmup()
+                            sco.release()
                         }
                     }
                 }
                 is TranscriptionOutcome.Failure -> {
                     _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
-                    releaseScoAfterWarmup()
+                    sco.release()
                 }
                 TranscriptionOutcome.ModelNotReady -> {
                     _status.value = SttTtsStatus.Error("STT model not ready")
-                    releaseScoAfterWarmup()
+                    sco.release()
                 }
                 TranscriptionOutcome.EmptyInput -> {
                     _status.value = SttTtsStatus.EmptyAudio
-                    releaseScoAfterWarmup()
+                    sco.release()
                 }
             }
-        }
-    }
-
-    private fun releaseScoAfterWarmup() {
-        closeScoJob = scope.launch {
-            delay(SCO_WARMUP_MS)
-            sco.release()
         }
     }
 
@@ -229,12 +219,11 @@ class SttTtsController(
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        releaseScoAfterWarmup()
+        sco.release()
         _status.value = SttTtsStatus.Cancelled
     }
 
     companion object {
         private const val MAX_DURATION_MS = 60_000L
-        private const val SCO_WARMUP_MS = 30_000L
     }
 }

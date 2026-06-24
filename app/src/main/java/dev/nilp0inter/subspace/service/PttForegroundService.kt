@@ -119,7 +119,7 @@ class PttForegroundService : Service() {
         )
 
         val audioManager = getSystemService(AudioManager::class.java)
-        sco = ScoAudioController(audioManager)
+        sco = ScoAudioController(serviceScope, audioManager)
         pcmOutput = AndroidPcmOutput(audioManager)
         echo = EchoController(
             scope = serviceScope,

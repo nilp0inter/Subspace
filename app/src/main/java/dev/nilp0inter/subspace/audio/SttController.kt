@@ -37,7 +37,6 @@ class SttController(
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
     private var maxDurationJob: Job? = null
-    private var closeScoJob: Job? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
     private var transcribeJob: Job? = null
 
@@ -55,7 +54,6 @@ class SttController(
 
         transcribeJob?.cancel()
         transcribeJob = null
-        closeScoJob?.cancel()
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession() }
     }
@@ -69,7 +67,6 @@ class SttController(
     fun cancelAndRelease() {
         setupJob?.cancel()
         maxDurationJob?.cancel()
-        closeScoJob?.cancel()
         transcribeJob?.cancel()
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
@@ -139,7 +136,7 @@ class SttController(
             runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
                 .onSuccess { text ->
                     _status.value = SttStatus.Transcribed(text)
-                    releaseScoAfterWarmup()
+                    sco.release()
                 }
                 .onFailure { error ->
                     if (error is CancellationException) throw error
@@ -149,15 +146,8 @@ class SttController(
                         TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
                         else -> SttStatus.Error(error.message ?: "Transcription failed")
                     }
-                    if (_status.value !is SttStatus.Transcribed) releaseScoAfterWarmup()
+                    if (_status.value !is SttStatus.Transcribed) sco.release()
                 }
-        }
-    }
-
-    private fun releaseScoAfterWarmup() {
-        closeScoJob = scope.launch {
-            delay(SCO_WARMUP_MS)
-            sco.release()
         }
     }
 
@@ -166,12 +156,11 @@ class SttController(
         maxDurationJob = null
         recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        releaseScoAfterWarmup()
+        sco.release()
         _status.value = SttStatus.Cancelled
     }
 
     companion object {
         private const val MAX_DURATION_MS = 60_000L
-        private const val SCO_WARMUP_MS = 30_000L
     }
 }
