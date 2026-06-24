@@ -4,35 +4,17 @@ Defines a push-to-talk speech-to-text-to-speech round-trip test mode on the conn
 
 ## Requirements
 
-### Requirement: STT↔TTS test control is available beside the other test controls
-The system SHALL show a speech-to-text-to-speech round-trip test toggle on the connected monitor/test surface that contains the echo, STT, and TTS test toggles. The STT↔TTS test toggle SHALL NOT show a text box; the input text comes from the user's voice.
+### Requirement: STT↔TTS test control is available in Debug Channel configuration
+The system SHALL show the speech-to-text-to-speech round-trip test mode option in the Debug Channel configuration screen.
 
-#### Scenario: Connected test surface is displayed
-- **WHEN** the user opens the connected monitor/test surface
-- **THEN** the system shows an STT↔TTS test toggle alongside the echo, STT, and TTS test toggles
-- **AND** below the STT↔TTS test toggle the system shows a status/transcript area and no text input box
+#### Scenario: Debug Channel config surface is displayed
+- **WHEN** the user opens the Debug Channel configuration screen
+- **THEN** the system shows the STT↔TTS test mode as a selectable option among the debug modes
+- **AND** if STT↔TTS mode is selected, below the selection the system shows a status/transcript area and no text input box
 
 #### Scenario: Round-trip test is not yet run
-- **WHEN** the connected test surface is displayed before any STT↔TTS result exists
-- **THEN** the status/transcript area below the STT↔TTS toggle shows an idle state
-
-### Requirement: Echo, STT, TTS, and STT↔TTS test modes are mutually exclusive
-The system SHALL allow at most one of echo test mode, STT test mode, TTS test mode, and STT↔TTS test mode to be enabled at a time.
-
-#### Scenario: STT↔TTS is enabled while another mode is enabled
-- **WHEN** exactly one of echo, STT, or TTS test mode is enabled and the user enables STT↔TTS test mode
-- **THEN** the system enables STT↔TTS test mode
-- **AND** the system disables and cancels the previously enabled mode
-
-#### Scenario: Another mode is enabled while STT↔TTS is enabled
-- **WHEN** STT↔TTS test mode is enabled and the user enables echo, STT, or TTS test mode
-- **THEN** the system enables the newly selected mode
-- **AND** the system disables and cancels STT↔TTS test mode
-
-#### Scenario: STT↔TTS mode is disabled
-- **WHEN** STT↔TTS test mode is enabled and the user disables it
-- **THEN** the system leaves all four test modes disabled
-- **AND** the system cancels any active STT↔TTS work
+- **WHEN** the Debug Channel configuration screen is displayed before any STT↔TTS result exists and STT↔TTS is the active mode
+- **THEN** the status/transcript area shows an idle state
 
 ### Requirement: STT↔TTS test records audio from PTT activity
 The system SHALL record audio for the STT↔TTS round-trip using the same PTT-controlled Bluetooth SCO recording path as the STT test.

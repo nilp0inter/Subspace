@@ -23,3 +23,19 @@ data class CaptainsLogChannel(
         const val NAME = "Captain's Log"
     }
 }
+
+enum class DebugMode {
+    ECHO, STT, TTS, STT_TTS
+}
+
+data class DebugChannel(
+    override val id: String = ID,
+    override val name: String = NAME,
+    override val enabled: Boolean = false,
+    val mode: DebugMode = DebugMode.ECHO,
+) : Channel {
+    companion object {
+        const val ID = "debug-channel"
+        const val NAME = "Debug Channel"
+    }
+}

@@ -28,15 +28,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 
 @Composable
 fun MainDashboardScreen(
     connected: Boolean,
     captainsLog: CaptainsLogChannel,
-    testModeActive: Boolean,
+    debugChannel: DebugChannel,
     actions: PttUiActions,
     onConnectionClick: () -> Unit,
+    onDebugChannelClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -56,7 +58,7 @@ fun MainDashboardScreen(
             onClick = onConnectionClick,
         )
 
-        ChannelPanel(captainsLog, testModeActive, actions)
+        ChannelPanel(captainsLog, debugChannel, actions, onDebugChannelClick)
     }
 }
 
@@ -115,8 +117,9 @@ private fun ConnectionIndicator(
 @Composable
 private fun ChannelPanel(
     captainsLog: CaptainsLogChannel,
-    testModeActive: Boolean,
+    debugChannel: DebugChannel,
     actions: PttUiActions,
+    onDebugChannelClick: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
@@ -125,7 +128,8 @@ private fun ChannelPanel(
             color = MaterialTheme.colorScheme.primary,
         )
 
-        CaptainsLogCard(captainsLog, testModeActive, actions)
+        CaptainsLogCard(captainsLog, actions)
+        DebugChannelCard(debugChannel, onDebugChannelClick)
 
         previewChannels.forEach { channel ->
             ChannelCard(channel)
@@ -136,11 +140,10 @@ private fun ChannelPanel(
 @Composable
 private fun CaptainsLogCard(
     channel: CaptainsLogChannel,
-    testModeActive: Boolean,
     actions: PttUiActions,
 ) {
     val configured = !channel.baseDirectory.isNullOrBlank()
-    val active = channel.enabled && !testModeActive
+    val active = channel.enabled
     val accent = when {
         active -> MaterialTheme.colorScheme.primary
         configured -> MaterialTheme.colorScheme.secondary
@@ -167,7 +170,6 @@ private fun CaptainsLogCard(
                 StatusPill(
                     label = when {
                         active -> "ACTIVE"
-                        testModeActive && channel.enabled -> "INACTIVE"
                         configured -> "READY"
                         else -> "CONFIGURE"
                     },
@@ -222,6 +224,48 @@ private fun CaptainsLogCard(
             ) {
                 Text(if (channel.enabled) "Deactivate Captain's Log" else "Activate Captain's Log")
             }
+        }
+    }
+}
+
+@Composable
+private fun DebugChannelCard(
+    channel: DebugChannel,
+    onClick: () -> Unit,
+) {
+    val active = channel.enabled
+    val accent = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+
+    Card(
+        onClick = onClick,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(1.dp, accent),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                }
+                StatusPill(
+                    label = if (active) "ACTIVE" else "READY",
+                    accent = accent,
+                )
+            }
+
+            Text(
+                text = "Mode: ${channel.mode.name}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -297,10 +341,5 @@ private val previewChannels = listOf(
         name = "Command Uplink",
         route = "CH-02 / REMOTE",
         description = "Placeholder for a future network-backed channel.",
-    ),
-    MockChannel(
-        name = "Diagnostics",
-        route = "CH-03 / TEST",
-        description = "Placeholder for future hardware and audio health checks.",
-    ),
+    )
 )

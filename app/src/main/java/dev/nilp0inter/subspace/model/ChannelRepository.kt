@@ -26,11 +26,25 @@ class ChannelRepository(
             .apply()
     }
 
+    fun loadDebugChannel(): DebugChannel = DebugChannel(
+        enabled = prefs.getBoolean(KEY_DEBUG_ENABLED, false),
+        mode = DebugMode.valueOf(prefs.getString(KEY_DEBUG_MODE, DebugMode.ECHO.name) ?: DebugMode.ECHO.name)
+    )
+
+    fun saveDebugChannel(channel: DebugChannel) {
+        prefs.edit()
+            .putBoolean(KEY_DEBUG_ENABLED, channel.enabled)
+            .putString(KEY_DEBUG_MODE, channel.mode.name)
+            .apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "channels"
         private const val KEY_ENABLED = "captains_log_enabled"
         private const val KEY_BASE_DIRECTORY = "captains_log_base_directory"
         private const val KEY_SAVE_VOICE = "captains_log_save_voice"
         private const val KEY_SAVE_TEXT = "captains_log_save_text"
+        private const val KEY_DEBUG_ENABLED = "debug_channel_enabled"
+        private const val KEY_DEBUG_MODE = "debug_channel_mode"
     }
 }

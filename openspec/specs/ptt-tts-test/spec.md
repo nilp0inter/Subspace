@@ -22,43 +22,18 @@ The system SHALL start loading the Supertonic 3 text-to-speech model after app s
 - **THEN** the system marks TTS model readiness as failed
 - **AND** the connected monitor/test surface shows the model load error instead of silently ignoring TTS requests
 
-### Requirement: TTS test control is available beside the other test controls
-The system SHALL show a text-to-speech test toggle on the connected monitor/test surface that contains the echo, STT, and STT↔TTS test toggles.
+### Requirement: TTS test control is available in Debug Channel configuration
+The system SHALL show the text-to-speech test mode option in the Debug Channel configuration screen.
 
-#### Scenario: Connected test surface is displayed
-- **WHEN** the user opens the connected monitor/test surface
-- **THEN** the system shows the echo test toggle
-- **AND** the system shows the STT test toggle
-- **AND** the system shows a TTS test toggle
-- **AND** the system shows an STT↔TTS test toggle
-- **AND** below the TTS test toggle the system shows an editable text box prefilled with a short default phrase
-- **AND** below the TTS test toggle the system shows the Supertonic controls the integration exposes (voice style, language, quality/total steps, and speed)
+#### Scenario: Debug Channel config surface is displayed
+- **WHEN** the user opens the Debug Channel configuration screen
+- **THEN** the system shows the TTS test mode as a selectable option among the debug modes
+- **AND** if TTS mode is selected, below the selection the system shows an editable text box prefilled with a short default phrase
+- **AND** below the TTS selection the system shows the Supertonic controls the integration exposes (voice style, language, quality/total steps, and speed)
 
 #### Scenario: TTS test is not yet run
-- **WHEN** the connected test surface is displayed before any TTS result exists
-- **THEN** the TTS status area below the TTS toggle shows an idle TTS state
-
-### Requirement: Echo, STT, TTS, and STT↔TTS test modes are mutually exclusive
-The system SHALL allow at most one of echo test mode, STT test mode, TTS test mode, and STT↔TTS test mode to be enabled at a time.
-
-#### Scenario: TTS is enabled while another mode is enabled
-- **WHEN** exactly one of echo, STT, or STT↔TTS test mode is enabled and the user enables TTS test mode
-- **THEN** the system enables TTS test mode
-- **AND** the system disables and cancels the previously enabled mode
-
-#### Scenario: Another mode is enabled while TTS is enabled
-- **WHEN** TTS test mode is enabled and the user enables echo, STT, or STT↔TTS test mode
-- **THEN** the system enables the newly selected mode
-- **AND** the system disables and cancels TTS test mode
-
-#### Scenario: Active mode is disabled
-- **WHEN** exactly one test mode is enabled and the user disables that mode
-- **THEN** the system leaves all four test modes disabled
-
-#### Scenario: PTT event is received while all modes are disabled
-- **WHEN** all four test modes are disabled and a PTT press or release event is received
-- **THEN** the system updates normal button state
-- **AND** the system does not start echo, STT, TTS, or STT↔TTS work
+- **WHEN** the Debug Channel configuration screen is displayed before any TTS result exists and TTS is the active mode
+- **THEN** the TTS status area shows an idle TTS state
 
 ### Requirement: TTS test synthesizes and plays text on demand
 The system SHALL synthesize speech from the text in the TTS test text box using Supertonic with the user-selected parameters and play the resulting audio through the connected Bluetooth SCO route.

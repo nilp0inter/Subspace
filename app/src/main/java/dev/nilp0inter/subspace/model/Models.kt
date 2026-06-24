@@ -9,6 +9,7 @@ data class AppState(
     val connection: ConnectionState = ConnectionState(),
     val monitor: MonitorState = MonitorState(),
     val captainsLog: CaptainsLogChannel = CaptainsLogChannel(),
+    val debugChannel: DebugChannel = DebugChannel(),
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor
@@ -57,6 +58,10 @@ data class MonitorState(
     val sttTtsEnabled: Boolean = false,
     val sttTtsStatus: SttTtsStatus = SttTtsStatus.Idle,
     val sttTtsTranscript: String = "",
+    val sttTtsVoiceStyle: String = DEFAULT_TTS_VOICE_STYLE,
+    val sttTtsLang: String = DEFAULT_TTS_LANG,
+    val sttTtsTotalSteps: Int = DEFAULT_TTS_TOTAL_STEPS,
+    val sttTtsSpeed: Float = DEFAULT_TTS_SPEED,
 )
 
 data class ButtonStates(

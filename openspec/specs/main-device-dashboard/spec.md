@@ -51,25 +51,25 @@ The system SHALL keep the dashboard as the home surface and treat the legacy con
 - **WHEN** the user is viewing a legacy connection or monitor screen opened from the dashboard and requests back navigation
 - **THEN** the system returns to the dashboard instead of switching directly between legacy screens
 
-### Requirement: Dashboard shows mock channels
-The system SHALL show a channel panel on the dashboard. When the Captain's Log channel is configured, it SHALL appear as a real channel card with its configuration state. Remaining mock channels SHALL continue to display as non-functional previews.
+### Requirement: Dashboard shows channels
+The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards with their configuration states. Mock channels SHALL continue to display as non-functional previews.
 
 #### Scenario: Captain's Log not configured
 - **WHEN** the dashboard is visible and the Captain's Log has no directory selected
 - **THEN** the system SHALL show the Captain's Log channel card with a prompt to configure it
 
-#### Scenario: Captain's Log configured and active
-- **WHEN** the dashboard is visible and the Captain's Log is configured and active
-- **THEN** the system SHALL show the Captain's Log channel card with its current toggle states (save voice, save text) and the selected directory
+#### Scenario: Channel configured and active
+- **WHEN** the dashboard is visible and a channel (e.g. Captain's Log or Debug Channel) is configured and active
+- **THEN** the system SHALL show the channel card as active with its current configuration state
 
-#### Scenario: Captain's Log configured but inactive (test mode active)
-- **WHEN** the dashboard is visible and the Captain's Log is configured but a test mode is active
-- **THEN** the system SHALL show the Captain's Log channel card as inactive
+#### Scenario: Channel configured but inactive
+- **WHEN** the dashboard is visible and a channel is configured but another channel is active
+- **THEN** the system SHALL show the channel card as inactive
 
 #### Scenario: Mock channels still shown
 - **WHEN** the dashboard is visible
-- **THEN** the system SHALL continue to show non-functional mock channel entries for Command Uplink and Diagnostics
+- **THEN** the system SHALL continue to show non-functional mock channel entries for Command Uplink
 
 #### Scenario: Channel card opens configuration
-- **WHEN** the user taps the Captain's Log channel card
-- **THEN** the system SHALL show the channel configuration surface (directory picker, toggle controls, activate/deactivate)
+- **WHEN** the user taps a functional channel card
+- **THEN** the system SHALL show the respective channel configuration surface

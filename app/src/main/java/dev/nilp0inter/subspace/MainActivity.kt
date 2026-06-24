@@ -25,6 +25,7 @@ import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
+import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
@@ -124,22 +125,6 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.disconnectSerial()
                     }
 
-                    override fun setEchoEnabled(enabled: Boolean) {
-                        currentServiceState?.setEchoEnabled(enabled)
-                    }
-
-                    override fun setSttEnabled(enabled: Boolean) {
-                        currentServiceState?.setSttEnabled(enabled)
-                    }
-
-                    override fun setTtsEnabled(enabled: Boolean) {
-                        currentServiceState?.setTtsEnabled(enabled)
-                    }
-
-                    override fun setSttTtsEnabled(enabled: Boolean) {
-                        currentServiceState?.setSttTtsEnabled(enabled)
-                    }
-
                     override fun setCaptainsLogSaveVoice(enabled: Boolean) {
                         currentServiceState?.setCaptainsLogSaveVoice(enabled)
                     }
@@ -150,6 +135,14 @@ class MainActivity : ComponentActivity() {
 
                     override fun setCaptainsLogEnabled(enabled: Boolean) {
                         currentServiceState?.setCaptainsLogEnabled(enabled)
+                    }
+
+                    override fun setDebugChannelEnabled(enabled: Boolean) {
+                        currentServiceState?.setDebugChannelEnabled(enabled)
+                    }
+
+                    override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {
+                        currentServiceState?.setDebugChannelMode(mode)
                     }
 
                     override fun setTtsText(text: String) {
@@ -175,6 +168,22 @@ class MainActivity : ComponentActivity() {
                     override fun requestTtsSynthesis() {
                         currentServiceState?.requestTtsSynthesis()
                     }
+
+                    override fun setSttTtsVoiceStyle(style: String) {
+                        currentServiceState?.setSttTtsVoiceStyle(style)
+                    }
+
+                    override fun setSttTtsLang(lang: String) {
+                        currentServiceState?.setSttTtsLang(lang)
+                    }
+
+                    override fun setSttTtsTotalSteps(steps: Int) {
+                        currentServiceState?.setSttTtsTotalSteps(steps)
+                    }
+
+                    override fun setSttTtsSpeed(speed: Float) {
+                        currentServiceState?.setSttTtsSpeed(speed)
+                    }
                 }
             }
 
@@ -188,16 +197,24 @@ class MainActivity : ComponentActivity() {
                         MainRoute.Dashboard -> MainDashboardScreen(
                             connected = state.readyForMonitor,
                             captainsLog = state.captainsLog,
-                            testModeActive = state.monitor.echoEnabled || state.monitor.sttEnabled ||
-                                state.monitor.ttsEnabled || state.monitor.sttTtsEnabled,
+                            debugChannel = state.debugChannel,
                             actions = actions,
                             onConnectionClick = {
                                 route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
+                            },
+                            onDebugChannelClick = {
+                                route = MainRoute.DebugChannelConfig
                             },
                         )
 
                         MainRoute.Connection -> ConnectionScreen(state.connection, actions)
                         MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
+                        MainRoute.DebugChannelConfig -> DebugChannelConfigScreen(
+                            channel = state.debugChannel,
+                            monitorState = state.monitor,
+                            actions = actions,
+                            onBack = { route = MainRoute.Dashboard },
+                        )
                     }
                 }
             }
@@ -227,5 +244,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor }
+    private enum class MainRoute { Dashboard, Connection, Monitor, DebugChannelConfig }
 }

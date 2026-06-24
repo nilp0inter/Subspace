@@ -20,18 +20,15 @@ The system SHALL maintain at most one active channel at any time. The active cha
 
 #### Scenario: No channel is active
 - **WHEN** no channel is configured or all channels are disabled
-- **THEN** PTT captures SHALL be dispatched to the legacy test controller if one is active
+- **THEN** PTT captures SHALL NOT be dispatched to any channel
 
-### Requirement: PTT routing mutual exclusion
-The system SHALL ensure that the active channel and the legacy test mode (echo, STT test, TTS test, STT+TTS test) are mutually exclusive. Only one dispatch path SHALL be active at any time.
+### Requirement: Channel activation mutual exclusion
+The system SHALL ensure that activating a channel immediately deactivates all other channels.
 
-#### Scenario: Channel activated while test mode is running
-- **WHEN** a test mode is active and the user activates a channel
-- **THEN** the system SHALL deactivate the test mode and route PTT to the channel
-
-#### Scenario: Test mode activated while channel is active
-- **WHEN** a channel is active and the user starts a test mode
-- **THEN** the system SHALL deactivate the channel routing and route PTT to the test controller
+#### Scenario: Channel activated while another is active
+- **WHEN** Channel A is active and the user activates Channel B
+- **THEN** the system SHALL deactivate Channel A and set Channel B as the only active channel
+- **AND** PTT captures SHALL be routed to Channel B
 
 ### Requirement: Channel configuration persistence
 The system SHALL persist channel configuration across app restarts. Configuration changes SHALL take effect immediately without requiring a service restart.
