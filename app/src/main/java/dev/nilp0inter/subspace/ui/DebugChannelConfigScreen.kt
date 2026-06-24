@@ -78,32 +78,6 @@ fun DebugChannelConfigScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Enable Debug Channel", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            "Mutually exclusive with Captain's Log",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Switch(
-                        checked = channel.enabled,
-                        onCheckedChange = actions::setDebugChannelEnabled
-                    )
-                }
-            }
-
             Text("Diagnostic Mode", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
 
             Column(Modifier.selectableGroup()) {

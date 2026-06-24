@@ -10,6 +10,7 @@ data class AppState(
     val monitor: MonitorState = MonitorState(),
     val captainsLog: CaptainsLogChannel = CaptainsLogChannel(),
     val debugChannel: DebugChannel = DebugChannel(),
+    val activeChannelId: String = CaptainsLogChannel.ID,
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor

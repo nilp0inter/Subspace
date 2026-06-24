@@ -27,6 +27,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.CaptainsLogChannel
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
@@ -34,11 +39,9 @@ import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 @Composable
 fun MainDashboardScreen(
     connected: Boolean,
-    captainsLog: CaptainsLogChannel,
-    debugChannel: DebugChannel,
+    appState: AppState,
     actions: PttUiActions,
     onConnectionClick: () -> Unit,
-    onDebugChannelClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -58,7 +61,7 @@ fun MainDashboardScreen(
             onClick = onConnectionClick,
         )
 
-        ChannelPanel(captainsLog, debugChannel, actions, onDebugChannelClick)
+        ChannelPanel(appState, actions)
     }
 }
 
@@ -116,10 +119,8 @@ private fun ConnectionIndicator(
 
 @Composable
 private fun ChannelPanel(
-    captainsLog: CaptainsLogChannel,
-    debugChannel: DebugChannel,
+    appState: AppState,
     actions: PttUiActions,
-    onDebugChannelClick: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
@@ -128,8 +129,8 @@ private fun ChannelPanel(
             color = MaterialTheme.colorScheme.primary,
         )
 
-        CaptainsLogCard(captainsLog, actions)
-        DebugChannelCard(debugChannel, onDebugChannelClick)
+        CaptainsLogCard(appState, actions)
+        DebugChannelCard(appState, actions)
 
         previewChannels.forEach { channel ->
             ChannelCard(channel)
@@ -139,17 +140,19 @@ private fun ChannelPanel(
 
 @Composable
 private fun CaptainsLogCard(
-    channel: CaptainsLogChannel,
+    appState: AppState,
     actions: PttUiActions,
 ) {
-    val configured = !channel.baseDirectory.isNullOrBlank()
-    val active = channel.enabled
+    val channel = appState.captainsLog
+    val isActive = appState.activeChannelId == CaptainsLogChannel.ID
+    val isReady = channel.isReady
     val accent = when {
-        active -> MaterialTheme.colorScheme.primary
-        configured -> MaterialTheme.colorScheme.secondary
+        isActive -> MaterialTheme.colorScheme.primary
+        isReady -> MaterialTheme.colorScheme.secondary
         else -> MaterialTheme.colorScheme.outline
     }
     Card(
+        onClick = { actions.setActiveChannel(CaptainsLogChannel.ID) },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
         modifier = Modifier.fillMaxWidth(),
@@ -167,62 +170,26 @@ private fun CaptainsLogCard(
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                 }
-                StatusPill(
-                    label = when {
-                        active -> "ACTIVE"
-                        configured -> "READY"
-                        else -> "CONFIGURE"
-                    },
-                    accent = accent,
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    StatusPill(
+                        label = when {
+                            isActive -> "ACTIVE"
+                            isReady -> "READY"
+                            else -> "STANDBY"
+                        },
+                        accent = accent,
+                    )
+                    IconButton(onClick = actions::navigateToCaptainsLogConfig) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Config")
+                    }
+                }
+            }
+            if (!isReady) {
+                Text(
+                    text = "Requires configuration to broadcast.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
                 )
-            }
-
-            Text(
-                text = channel.baseDirectory ?: "Select a base directory before activation.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Save voice", style = MaterialTheme.typography.bodyLarge)
-                Switch(
-                    checked = channel.saveVoice,
-                    onCheckedChange = { enabled ->
-                        if (enabled || channel.saveText) actions.setCaptainsLogSaveVoice(enabled)
-                    },
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Save in log file", style = MaterialTheme.typography.bodyLarge)
-                Switch(
-                    checked = channel.saveText,
-                    onCheckedChange = { enabled ->
-                        if (enabled || channel.saveVoice) actions.setCaptainsLogSaveText(enabled)
-                    },
-                )
-            }
-
-            OutlinedButton(onClick = actions::requestManageExternalStorage, modifier = Modifier.fillMaxWidth()) {
-                Text("Grant all-files access")
-            }
-            OutlinedButton(onClick = actions::pickCaptainsLogDirectory, modifier = Modifier.fillMaxWidth()) {
-                Text(if (configured) "Change directory" else "Select directory")
-            }
-            Button(
-                onClick = { actions.setCaptainsLogEnabled(!channel.enabled) },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = configured,
-            ) {
-                Text(if (channel.enabled) "Deactivate Captain's Log" else "Activate Captain's Log")
             }
         }
     }
@@ -230,14 +197,16 @@ private fun CaptainsLogCard(
 
 @Composable
 private fun DebugChannelCard(
-    channel: DebugChannel,
-    onClick: () -> Unit,
+    appState: AppState,
+    actions: PttUiActions,
 ) {
-    val active = channel.enabled
-    val accent = if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+    val channel = appState.debugChannel
+    val isActive = appState.activeChannelId == DebugChannel.ID
+    val isReady = channel.isReady
+    val accent = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
 
     Card(
-        onClick = onClick,
+        onClick = { actions.setActiveChannel(DebugChannel.ID) },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
         modifier = Modifier.fillMaxWidth(),
@@ -255,10 +224,15 @@ private fun DebugChannelCard(
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                 }
-                StatusPill(
-                    label = if (active) "ACTIVE" else "READY",
-                    accent = accent,
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    StatusPill(
+                        label = if (isActive) "ACTIVE" else "READY",
+                        accent = accent,
+                    )
+                    IconButton(onClick = actions::navigateToDebugConfig) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Config")
+                    }
+                }
             }
 
             Text(

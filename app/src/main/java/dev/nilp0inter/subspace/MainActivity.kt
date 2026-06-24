@@ -133,16 +133,24 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setCaptainsLogSaveText(enabled)
                     }
 
-                    override fun setCaptainsLogEnabled(enabled: Boolean) {
-                        currentServiceState?.setCaptainsLogEnabled(enabled)
-                    }
-
-                    override fun setDebugChannelEnabled(enabled: Boolean) {
-                        currentServiceState?.setDebugChannelEnabled(enabled)
+                    override fun setActiveChannel(id: String) {
+                        currentServiceState?.setActiveChannelId(id)
                     }
 
                     override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {
                         currentServiceState?.setDebugChannelMode(mode)
+                    }
+
+                    override fun navigateToCaptainsLogConfig() {
+                        route = MainRoute.CaptainsLogConfig
+                    }
+
+                    override fun navigateToDebugConfig() {
+                        route = MainRoute.DebugChannelConfig
+                    }
+
+                    override fun navigateBack() {
+                        route = MainRoute.Dashboard
                     }
 
                     override fun setTtsText(text: String) {
@@ -196,20 +204,21 @@ class MainActivity : ComponentActivity() {
                     when (route) {
                         MainRoute.Dashboard -> MainDashboardScreen(
                             connected = state.readyForMonitor,
-                            captainsLog = state.captainsLog,
-                            debugChannel = state.debugChannel,
+                            appState = state,
                             actions = actions,
                             onConnectionClick = {
                                 route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
-                            },
-                            onDebugChannelClick = {
-                                route = MainRoute.DebugChannelConfig
                             },
                         )
 
                         MainRoute.Connection -> ConnectionScreen(state.connection, actions)
                         MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                        MainRoute.DebugChannelConfig -> DebugChannelConfigScreen(
+                        MainRoute.CaptainsLogConfig -> dev.nilp0inter.subspace.ui.CaptainsLogConfigScreen(
+                            channel = state.captainsLog,
+                            actions = actions,
+                            onBack = { route = MainRoute.Dashboard },
+                        )
+                        MainRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
                             channel = state.debugChannel,
                             monitorState = state.monitor,
                             actions = actions,
@@ -244,5 +253,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, DebugChannelConfig }
+    private enum class MainRoute { Dashboard, Connection, Monitor, CaptainsLogConfig, DebugChannelConfig }
 }

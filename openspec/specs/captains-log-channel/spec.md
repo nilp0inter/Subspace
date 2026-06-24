@@ -11,19 +11,19 @@ The system SHALL provide a built-in channel type named "Captain's Log" that reco
 - **WHEN** the app is launched
 - **THEN** the Captain's Log channel SHALL appear as an available channel
 
-### Requirement: Directory selection before activation
-The system SHALL require the user to select a base output directory before the Captain's Log channel can be activated. The channel SHALL NOT accept PTT captures until a valid directory is configured.
+### Requirement: Directory selection before readiness
+The system SHALL require the user to select a base output directory before the Captain's Log channel is considered ready. The channel MAY be set as the active channel without a directory, but it SHALL NOT accept PTT captures and SHALL emit an error beep if PTT is pressed while not ready.
 
 #### Scenario: No directory selected
-- **WHEN** the user attempts to activate the Captain's Log channel without a configured directory
-- **THEN** the system SHALL prompt the user to select a directory and SHALL NOT activate the channel
+- **WHEN** the user attempts to use PTT on an active Captain's Log channel without a configured directory
+- **THEN** the system SHALL emit a two-tone error beep over the headset and SHALL NOT process the capture
 
 #### Scenario: Directory selected
-- **WHEN** the user selects a valid directory via the system directory picker
-- **THEN** the system SHALL persist the directory path and allow channel activation
+- **WHEN** the user selects a valid directory via the dedicated configuration screen
+- **THEN** the channel's readiness state SHALL become true, allowing PTT captures
 
 ### Requirement: Save voice toggle
-The system SHALL provide a "Save voice" toggle that controls whether PTT captures are encoded and saved as OGG audio files.
+The system SHALL provide a "Save voice" toggle on the dedicated configuration screen that controls whether PTT captures are encoded and saved as OGG audio files.
 
 #### Scenario: Save voice enabled
 - **WHEN** the Captain's Log channel receives a PTT capture and "Save voice" is enabled
@@ -34,7 +34,7 @@ The system SHALL provide a "Save voice" toggle that controls whether PTT capture
 - **THEN** the system SHALL NOT write an audio file for that capture
 
 ### Requirement: Save in log file toggle
-The system SHALL provide a "Save in log file" toggle that controls whether PTT captures are transcribed and appended to the daily markdown log.
+The system SHALL provide a "Save in log file" toggle on the dedicated configuration screen that controls whether PTT captures are transcribed and appended to the daily markdown log.
 
 #### Scenario: Save text enabled
 - **WHEN** the Captain's Log channel receives a PTT capture and "Save in log file" is enabled

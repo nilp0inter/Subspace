@@ -43,6 +43,35 @@ class AndroidPcmOutput(
         )
     }
 
+    override suspend fun playErrorBeep(coldStart: Boolean) {
+        ensureScoActive()
+        val sampleRate = 16_000
+        val tone1 = generateSinePcm16(
+            frequencyHz = 400.0,
+            durationMs = 150,
+            sampleRate = sampleRate,
+            amplitude = 0.35,
+        )
+        val tone2 = generateSinePcm16(
+            frequencyHz = 300.0,
+            durationMs = 150,
+            sampleRate = sampleRate,
+            amplitude = 0.35,
+        )
+        var samples = tone1 + tone2
+        if (coldStart) {
+            val silenceCount = sampleRate * 100 / 1_000
+            val silence = ShortArray(silenceCount)
+            samples = silence + samples
+        }
+        playStaticPcm(
+            samples = samples,
+            sampleRate = sampleRate,
+            contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
+            preferredDevice = audioManager.communicationDevice,
+        )
+    }
+
     override suspend fun play(recording: RecordedPcm) {
         ensureScoActive()
         if (recording.isEmpty) return

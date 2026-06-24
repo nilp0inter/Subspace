@@ -3,17 +3,19 @@ package dev.nilp0inter.subspace.model
 sealed interface Channel {
     val id: String
     val name: String
-    val enabled: Boolean
+    val isReady: Boolean
 }
 
 data class CaptainsLogChannel(
     override val id: String = ID,
     override val name: String = NAME,
-    override val enabled: Boolean = false,
     val baseDirectory: String? = null,
     val saveVoice: Boolean = true,
     val saveText: Boolean = true,
 ) : Channel {
+    override val isReady: Boolean
+        get() = baseDirectory != null && (saveVoice || saveText)
+
     init {
         require(saveVoice || saveText) { "Captain's Log must save voice, text, or both" }
     }
@@ -31,9 +33,10 @@ enum class DebugMode {
 data class DebugChannel(
     override val id: String = ID,
     override val name: String = NAME,
-    override val enabled: Boolean = false,
     val mode: DebugMode = DebugMode.ECHO,
 ) : Channel {
+    override val isReady: Boolean = true
+
     companion object {
         const val ID = "debug-channel"
         const val NAME = "Debug Channel"

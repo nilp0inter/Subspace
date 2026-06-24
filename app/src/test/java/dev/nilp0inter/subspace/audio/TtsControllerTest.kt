@@ -171,6 +171,7 @@ class TtsControllerTest {
         var beepCount = 0
         var playbackCount = 0
 
+        override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun playReadyBeep(coldStart: Boolean) {
             beepCount += 1
         }

@@ -66,6 +66,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 class PttForegroundService : Service() {
@@ -78,6 +79,7 @@ class PttForegroundService : Service() {
     private lateinit var scanner: DeviceScanner
     private lateinit var channelRepository: ChannelRepository
     private lateinit var sco: ScoAudioController
+    private lateinit var pcmOutput: AndroidPcmOutput
     private lateinit var echo: EchoController
     private var sttController: SttController? = null
     private var sttTranscriber: SttTranscriber? = null
@@ -109,11 +111,13 @@ class PttForegroundService : Service() {
         channelRepository = ChannelRepository(applicationContext)
         _appState.value = _appState.value.copy(
             captainsLog = channelRepository.loadCaptainsLog(),
-            debugChannel = channelRepository.loadDebugChannel()
+            debugChannel = channelRepository.loadDebugChannel(),
+            activeChannelId = channelRepository.loadActiveChannelId(),
         )
 
         val audioManager = getSystemService(AudioManager::class.java)
         sco = ScoAudioController(audioManager)
+        pcmOutput = AndroidPcmOutput(audioManager)
         echo = EchoController(
             scope = serviceScope,
             sco = sco,
@@ -289,35 +293,36 @@ class PttForegroundService : Service() {
 
     private fun updateActiveControllers() {
         val state = _appState.value
-        val capLog = state.captainsLog.enabled
-        val debug = state.debugChannel.enabled
+        val activeChannelId = state.activeChannelId
         val mode = state.debugChannel.mode
 
-        echo.setEnabled(debug && mode == DebugMode.ECHO)
-        if (!(debug && mode == DebugMode.ECHO)) {
+        val isDebugActive = activeChannelId == DebugChannel.ID
+
+        echo.setEnabled(isDebugActive && mode == DebugMode.ECHO)
+        if (!(isDebugActive && mode == DebugMode.ECHO)) {
             echo.cancelAndRelease()
             updateMonitor { it.copy(echoStatus = EchoStatus.Idle) }
         }
 
-        sttController?.setEnabled(debug && mode == DebugMode.STT)
-        if (!(debug && mode == DebugMode.STT)) {
+        sttController?.setEnabled(isDebugActive && mode == DebugMode.STT)
+        if (!(isDebugActive && mode == DebugMode.STT)) {
             sttController?.cancelAndRelease()
             updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
         }
 
-        ttsController?.setEnabled(debug && mode == DebugMode.TTS)
-        if (!(debug && mode == DebugMode.TTS)) {
+        ttsController?.setEnabled(isDebugActive && mode == DebugMode.TTS)
+        if (!(isDebugActive && mode == DebugMode.TTS)) {
             ttsController?.cancelAndRelease()
             updateMonitor { it.copy(ttsStatus = TtsStatus.Idle) }
         }
 
-        sttTtsController?.setEnabled(debug && mode == DebugMode.STT_TTS)
-        if (!(debug && mode == DebugMode.STT_TTS)) {
+        sttTtsController?.setEnabled(isDebugActive && mode == DebugMode.STT_TTS)
+        if (!(isDebugActive && mode == DebugMode.STT_TTS)) {
             sttTtsController?.cancelAndRelease()
             updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
         }
         
-        if (!capLog) {
+        if (activeChannelId != CaptainsLogChannel.ID) {
             captainsLogPttController?.cancelAndRelease()
         }
     }
@@ -464,22 +469,12 @@ class PttForegroundService : Service() {
         saveCaptainsLog(current.copy(saveText = enabled))
     }
 
-    fun setCaptainsLogEnabled(enabled: Boolean) {
-        val currentCapLog = _appState.value.captainsLog
-        if (enabled && currentCapLog.baseDirectory.isNullOrBlank()) return
-        
-        saveCaptainsLog(currentCapLog.copy(enabled = enabled))
-        if (enabled) {
-            saveDebugChannel(_appState.value.debugChannel.copy(enabled = false))
-        }
-        updateActiveControllers()
-    }
+    fun setActiveChannelId(id: String) {
+        val current = _appState.value
+        if (current.activeChannelId == id) return
 
-    fun setDebugChannelEnabled(enabled: Boolean) {
-        saveDebugChannel(_appState.value.debugChannel.copy(enabled = enabled))
-        if (enabled) {
-            saveCaptainsLog(_appState.value.captainsLog.copy(enabled = false))
-        }
+        channelRepository.saveActiveChannelId(id)
+        _appState.update { it.copy(activeChannelId = id) }
         updateActiveControllers()
     }
 
@@ -575,46 +570,75 @@ class PttForegroundService : Service() {
 
     private fun dispatchPttPressed() {
         val appState = _appState.value
-        if (appState.captainsLog.enabled) {
-            captainsLogPttController?.onPttPressed()
-        } else if (appState.debugChannel.enabled) {
-            when (appState.debugChannel.mode) {
-                DebugMode.ECHO -> echo.onPttPressed()
-                DebugMode.STT -> sttController?.onPttPressed()
-                DebugMode.TTS -> {
-                    val monitor = appState.monitor
-                    ttsController?.onPttPressed(
-                        text = monitor.ttsText,
-                        voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
-                        lang = monitor.ttsLang,
-                        totalSteps = monitor.ttsTotalSteps,
-                        speed = monitor.ttsSpeed,
-                        scoRate = SCO_RATE,
-                    )
+        val activeChannelId = appState.activeChannelId
+
+        val activeChannel = when (activeChannelId) {
+            CaptainsLogChannel.ID -> appState.captainsLog
+            DebugChannel.ID -> appState.debugChannel
+            else -> return
+        }
+
+        if (!activeChannel.isReady) {
+            serviceScope.launch {
+                sco.acquire()
+                pcmOutput.playErrorBeep(sco.coldStart)
+                sco.release()
+            }
+            return
+        }
+
+        when (activeChannelId) {
+            CaptainsLogChannel.ID -> captainsLogPttController?.onPttPressed()
+            DebugChannel.ID -> {
+                when (appState.debugChannel.mode) {
+                    DebugMode.ECHO -> echo.onPttPressed()
+                    DebugMode.STT -> sttController?.onPttPressed()
+                    DebugMode.TTS -> {
+                        val monitor = appState.monitor
+                        ttsController?.onPttPressed(
+                            text = monitor.ttsText,
+                            voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
+                            lang = monitor.ttsLang,
+                            totalSteps = monitor.ttsTotalSteps,
+                            speed = monitor.ttsSpeed,
+                            scoRate = SCO_RATE,
+                        )
+                    }
+                    DebugMode.STT_TTS -> sttTtsController?.onPttPressed()
                 }
-                DebugMode.STT_TTS -> sttTtsController?.onPttPressed()
             }
         }
     }
 
     private fun dispatchPttReleased() {
         val appState = _appState.value
-        if (appState.captainsLog.enabled) {
-            captainsLogPttController?.onPttReleased()
-        } else if (appState.debugChannel.enabled) {
-            when (appState.debugChannel.mode) {
-                DebugMode.ECHO -> echo.onPttReleased()
-                DebugMode.STT -> sttController?.onPttReleased()
-                DebugMode.TTS -> ttsController?.onPttReleased()
-                DebugMode.STT_TTS -> {
-                    val monitor = appState.monitor
-                    sttTtsController?.onPttReleased(
-                        voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle).absolutePath,
-                        lang = monitor.sttTtsLang,
-                        totalSteps = monitor.sttTtsTotalSteps,
-                        speed = monitor.sttTtsSpeed,
-                        scoRate = SCO_RATE,
-                    )
+        val activeChannelId = appState.activeChannelId
+
+        val activeChannel = when (activeChannelId) {
+            CaptainsLogChannel.ID -> appState.captainsLog
+            DebugChannel.ID -> appState.debugChannel
+            else -> return
+        }
+
+        if (!activeChannel.isReady) return
+
+        when (activeChannelId) {
+            CaptainsLogChannel.ID -> captainsLogPttController?.onPttReleased()
+            DebugChannel.ID -> {
+                when (appState.debugChannel.mode) {
+                    DebugMode.ECHO -> echo.onPttReleased()
+                    DebugMode.STT -> sttController?.onPttReleased()
+                    DebugMode.TTS -> ttsController?.onPttReleased()
+                    DebugMode.STT_TTS -> {
+                        val monitor = appState.monitor
+                        sttTtsController?.onPttReleased(
+                            voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle).absolutePath,
+                            lang = monitor.sttTtsLang,
+                            totalSteps = monitor.sttTtsTotalSteps,
+                            speed = monitor.sttTtsSpeed,
+                            scoRate = SCO_RATE,
+                        )
+                    }
                 }
             }
         }

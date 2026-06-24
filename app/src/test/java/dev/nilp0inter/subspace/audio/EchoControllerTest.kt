@@ -141,6 +141,7 @@ class EchoControllerTest {
         var beepCount = 0
         var playbackCount = 0
 
+        override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun playReadyBeep(coldStart: Boolean) {
             onBeep()
             beepCount += 1

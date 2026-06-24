@@ -11,7 +11,6 @@ class ChannelRepositoryTest {
     fun captainsLogRoundTripPersistsConfiguration() {
         val repository = ChannelRepository(FakeSharedPreferences())
         val channel = CaptainsLogChannel(
-            enabled = true,
             baseDirectory = "/storage/emulated/0/Subspace",
             saveVoice = false,
             saveText = true,

@@ -21,7 +21,7 @@ class CaptainsLogController(
 ) {
     fun handleCapture(channel: CaptainsLogChannel, pcm: ShortArray, sampleRate: Int) {
         val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() } ?: return
-        if (!channel.enabled) return
+        if (!channel.isReady) return
         scope.launch(Dispatchers.Default) {
             processCapture(channel, File(baseDirectory), pcm, sampleRate)
         }

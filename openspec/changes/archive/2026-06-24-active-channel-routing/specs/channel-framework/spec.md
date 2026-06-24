@@ -1,8 +1,10 @@
-## Purpose
+## REMOVED Requirements
 
-TBD. Defines channel identity, selection, routing, and persisted configuration.
+### Requirement: Channel data model
+**Reason**: The enabled state is replaced by a single global active channel.
+**Migration**: Use the `isReady` property and the `activeChannelId` in `AppState`.
 
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Active channel selection
 The system SHALL maintain exactly one active channel at any time, identified by a unique ID. The active channel is the intended destination for PTT audio captures, subject to readiness evaluation.
@@ -18,14 +20,3 @@ The system SHALL ensure that activating a channel inherently establishes it as t
 - **WHEN** Channel A is active and the user activates Channel B
 - **THEN** the system SHALL set Channel B as the active channel
 - **AND** PTT captures SHALL be routed to Channel B, provided it is ready
-
-### Requirement: Channel configuration persistence
-The system SHALL persist channel configuration across app restarts. Configuration changes SHALL take effect immediately without requiring a service restart.
-
-#### Scenario: App restarted after channel configuration
-- **WHEN** the user configures a channel and the app is killed and restarted
-- **THEN** the channel configuration SHALL be restored to the previously saved state
-
-#### Scenario: Configuration changed at runtime
-- **WHEN** the user changes a channel configuration while the service is running
-- **THEN** the new configuration SHALL take effect for the next PTT capture without restarting the service
