@@ -1,91 +1,179 @@
 package dev.nilp0inter.subspace.channel
 
-import dev.nilp0inter.subspace.audio.AudioRecorder
+import dev.nilp0inter.subspace.audio.FileWavRecorder
 import dev.nilp0inter.subspace.audio.PcmOutput
-import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ScoRoute
+import dev.nilp0inter.subspace.audio.WavPcmReader
 import dev.nilp0inter.subspace.model.JournalChannel
+import java.io.File
+import java.time.ZonedDateTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class JournalPttController(
     private val scope: CoroutineScope,
     private val sco: ScoRoute,
-    private val recorder: AudioRecorder,
     private val output: PcmOutput,
     private val journal: JournalController,
     private val channelProvider: () -> JournalChannel,
+    private val pathGenerator: JournalEntryPaths = JournalEntryPaths(),
+    private val metadataStore: JournalMetadataStore = JournalMetadataStore(),
 ) {
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
-    private var maxDurationJob: Job? = null
-    private var retainedAfterMaxDuration: RecordedPcm? = null
+    private var activeRecorder: FileWavRecorder? = null
+    private var activeEntryPaths: JournalEntryPaths.EntryPaths? = null
+    private var activeChannel: JournalChannel? = null
 
     fun onPttPressed() {
         pttDown = true
-        if (setupJob?.isActive == true || recorder.isActive) return
-        retainedAfterMaxDuration = null
+        if (setupJob?.isActive == true || activeRecorder?.isActive == true) return
         setupJob = scope.launch { startSession() }
     }
 
     fun onPttReleased() {
         pttDown = false
-        scope.launch { finishSessionIfNeeded() }
+        finishSession()
     }
 
     fun cancelAndRelease() {
         setupJob?.cancel()
-        maxDurationJob?.cancel()
-        recorder.stopIfActiveOrEmpty()
-        retainedAfterMaxDuration = null
+        activeRecorder?.stop()
+        activeRecorder = null
+        activeEntryPaths = null
+        activeChannel = null
         sco.release()
     }
 
     private suspend fun startSession() {
         runCatching {
-            if (!sco.acquire()) return
+            val channel = channelProvider()
+            if (!channel.isReady) return@runCatching
+            val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() }
+                ?: return@runCatching
+
+            if (!sco.acquire()) return@runCatching
             if (!pttDown) {
                 sco.release()
-                return
+                return@runCatching
             }
+
+            val startedAt = ZonedDateTime.now()
+            val paths = pathGenerator.preparePaths(File(baseDirectory), startedAt)
+            if (!pttDown) {
+                sco.release()
+                return@runCatching
+            }
+
             output.playReadyBeep(sco.coldStart)
             if (!pttDown) {
                 sco.release()
-                return
+                return@runCatching
             }
-            if (!recorder.start()) return
-            scheduleMaxDurationStop()
+
+            val metadata = JournalEntryMetadata(
+                entryId = paths.stem,
+                startedAt = startedAt.toString(),
+                timezoneOffset = paths.timezoneOffset,
+                channel = MetadataChannelSnapshot(
+                    id = channel.id,
+                    saveVoice = channel.saveVoice,
+                    saveText = channel.saveText,
+                ),
+                capture = CaptureState(state = CaptureTaskState.recording),
+            )
+            metadataStore.write(metadata, paths.metadataFile)
+
+            val recorder = FileWavRecorder(scope, paths.captureFile)
+            if (!recorder.start()) {
+                sco.release()
+                return@runCatching
+            }
+
+            activeRecorder = recorder
+            activeEntryPaths = paths
+            activeChannel = channel
         }.onFailure {
-            recorder.stopIfActiveOrEmpty()
+            activeRecorder?.stop()
+            activeRecorder = null
+            activeEntryPaths = null
+            activeChannel = null
             sco.release()
         }
     }
 
-    private fun scheduleMaxDurationStop() {
-        maxDurationJob?.cancel()
-        maxDurationJob = scope.launch {
-            delay(MAX_DURATION_MS)
-            if (pttDown && recorder.isActive) {
-                retainedAfterMaxDuration = recorder.stopIfActiveOrEmpty()
+    private fun finishSession() {
+        val paths = activeEntryPaths ?: return
+        val channel = activeChannel ?: return
+        val recorder = activeRecorder ?: return
+        activeRecorder = null
+        activeEntryPaths = null
+        activeChannel = null
+
+        scope.launch {
+            recorder.stop()
+            val captureFile = recorder.captureFile
+            val wavInfo = WavPcmReader.read(captureFile)
+            if (wavInfo != null && wavInfo.samples.isNotEmpty()) {
+                metadataStore.write(
+                    JournalEntryMetadata(
+                        entryId = paths.stem,
+                        startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                        endedAt = ZonedDateTime.now().toString(),
+                        timezoneOffset = paths.timezoneOffset,
+                        channel = MetadataChannelSnapshot(
+                            id = channel.id,
+                            saveVoice = channel.saveVoice,
+                            saveText = channel.saveText,
+                        ),
+                        capture = CaptureState(
+                            state = CaptureTaskState.finished,
+                            path = captureFile.name,
+                            sampleRate = wavInfo.sampleRate,
+                            channels = wavInfo.channelCount,
+                            encoding = "pcm_s16le",
+                            durationMs = wavInfo.durationMs,
+                            bytes = wavInfo.dataSize,
+                        ),
+                        encoding = if (channel.saveVoice)
+                            DerivedTaskState(state = DerivedTaskStatus.pending)
+                        else
+                            DerivedTaskState(state = DerivedTaskStatus.skipped),
+                        transcription = if (channel.saveText)
+                            DerivedTaskState(state = DerivedTaskStatus.pending)
+                        else
+                            DerivedTaskState(state = DerivedTaskStatus.skipped),
+                    ),
+                    paths.metadataFile,
+                )
+            } else {
+                metadataStore.write(
+                    JournalEntryMetadata(
+                        entryId = paths.stem,
+                        startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                        endedAt = ZonedDateTime.now().toString(),
+                        timezoneOffset = paths.timezoneOffset,
+                        channel = MetadataChannelSnapshot(
+                            id = channel.id,
+                            saveVoice = channel.saveVoice,
+                            saveText = channel.saveText,
+                        ),
+                        capture = CaptureState(
+                            state = CaptureTaskState.failed,
+                            error = if (wavInfo == null) "WAV read failed" else "Empty capture",
+                        ),
+                        encoding = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                        transcription = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                    ),
+                    paths.metadataFile,
+                )
             }
+            sco.release()
+            journal.processCaptureFile(paths)
         }
     }
 
-    private suspend fun finishSessionIfNeeded() {
-        maxDurationJob?.cancel()
-        maxDurationJob = null
-        val retained = retainedAfterMaxDuration
-        retainedAfterMaxDuration = null
-        val recording = retained ?: recorder.stopIfActiveOrEmpty()
-        sco.release()
-        if (!recording.isEmpty) {
-            journal.handleCapture(channelProvider(), recording.samples, recording.sampleRate)
-        }
-    }
-
-    companion object {
-        private const val MAX_DURATION_MS = 60_000L
-    }
+    private fun readStartedAt(store: JournalMetadataStore, file: File): String? =
+        store.read(file)?.startedAt
 }

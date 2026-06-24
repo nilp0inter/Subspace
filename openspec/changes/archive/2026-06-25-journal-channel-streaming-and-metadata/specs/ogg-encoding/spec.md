@@ -1,8 +1,4 @@
-## Purpose
-
-TBD. Defines PCM-to-OGG/Vorbis encoding behavior for channel recording outputs.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: PCM to OGG/Vorbis encoding
 The system SHALL encode finalized PCM/WAV capture files containing raw PCM audio (16-bit, 16kHz, mono) to OGG/Vorbis format using a bundled Rust native encoder that does not depend on the target device exposing a platform Vorbis `MediaCodec` encoder.

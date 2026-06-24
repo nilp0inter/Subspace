@@ -39,6 +39,9 @@ import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
 import dev.nilp0inter.subspace.channel.JournalController
+import dev.nilp0inter.subspace.channel.JournalEntryDiscovery
+import dev.nilp0inter.subspace.channel.JournalEntryPaths
+import dev.nilp0inter.subspace.channel.JournalMetadataStore
 import dev.nilp0inter.subspace.channel.JournalPttController
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.JournalChannel
@@ -293,18 +296,35 @@ class PttForegroundService : Service() {
                 throw IllegalStateException("STT transcriber unavailable")
             }
         }
+        val journalController = JournalController(
+            scope = serviceScope,
+            encoder = OggEncoder(),
+            transcriber = transcriber,
+        )
         journalPttController = JournalPttController(
             scope = serviceScope,
             sco = sco,
-            recorder = InMemoryRecorder(serviceScope),
             output = AndroidPcmOutput(audioManager),
-            journal = JournalController(
-                scope = serviceScope,
-                encoder = OggEncoder(),
-                transcriber = transcriber,
-            ),
+            journal = journalController,
             channelProvider = { _appState.value.journal },
         )
+
+        val journal = _appState.value.journal
+        val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
+        if (baseDir != null) {
+            journalController.runRecovery(java.io.File(baseDir))
+        }
+
+        serviceScope.launch {
+            var lastBaseDir: String? = null
+            _appState.collect { state ->
+                val currentDir = state.journal.baseDirectory?.takeIf { it.isNotBlank() }
+                if (currentDir != null && currentDir != lastBaseDir) {
+                    lastBaseDir = currentDir
+                    journalController.runRecovery(java.io.File(currentDir))
+                }
+            }
+        }
     }
 
     private fun updateActiveControllers() {

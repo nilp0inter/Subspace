@@ -79,31 +79,45 @@ fun JournalConfigScreen(
             }
 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Save voice", style = MaterialTheme.typography.bodyLarge)
-                    Switch(
-                        checked = channel.saveVoice,
-                        onCheckedChange = { enabled ->
-                            if (enabled || channel.saveText) actions.setJournalSaveVoice(enabled)
-                        },
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Save voice", style = MaterialTheme.typography.bodyLarge)
+                        Switch(
+                            checked = channel.saveVoice,
+                            onCheckedChange = { enabled ->
+                                if (enabled || channel.saveText) actions.setJournalSaveVoice(enabled)
+                            },
+                        )
+                    }
+                    Text(
+                        text = "Derives a compressed OGG recording. The original WAV capture is always retained.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Save in journal file", style = MaterialTheme.typography.bodyLarge)
-                    Switch(
-                        checked = channel.saveText,
-                        onCheckedChange = { enabled ->
-                            if (enabled || channel.saveVoice) actions.setJournalSaveText(enabled)
-                        },
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Save in journal file", style = MaterialTheme.typography.bodyLarge)
+                        Switch(
+                            checked = channel.saveText,
+                            onCheckedChange = { enabled ->
+                                if (enabled || channel.saveVoice) actions.setJournalSaveText(enabled)
+                            },
+                        )
+                    }
+                    Text(
+                        text = "Transcribes captures and includes them in the daily markdown journal.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }

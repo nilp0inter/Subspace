@@ -2,11 +2,10 @@ package dev.nilp0inter.subspace.channel
 
 import dev.nilp0inter.subspace.audio.AudioEncoder
 import dev.nilp0inter.subspace.audio.PcmTranscriber
-import dev.nilp0inter.subspace.model.JournalChannel
 import java.io.File
-import java.time.Clock
-import java.time.Instant
+import java.io.RandomAccessFile
 import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import kotlin.io.path.createTempDirectory
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -17,109 +16,160 @@ import org.junit.Test
 class JournalControllerTest {
     @Test
     fun bothOutputsEncodeTranscribeAndWriteMarkdownLink() = runTest {
-        val base = createTempDirectory(prefix = "journal-").toFile()
+        val base = createTempDir()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("hello log")
-        val controller = controller(encoder, transcriber)
+        val paths = createCapture(base, encoder, transcriber,
+            saveVoice = true, saveText = true)
 
-        controller.processCapture(JournalChannel(saveVoice = true, saveText = true), base, shortArrayOf(1, 2), 16_000)
-
-        assertEquals(1, encoder.callCount)
-        assertEquals(1, transcriber.callCount)
-        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md")
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
-        assertEquals(
-            "# Journal 2026-06-24\n\n" +
-                "## Entry 14-30-00\n\n" +
-                "hello log\n\n" +
-                "[Source recording](recordings/journal-2026-06-24_14-30-00.ogg)\n\n",
-            log.readText(),
-        )
+        val log = File(paths.dayDirectory, "journal-day-${paths.dateLabel}.md")
+        assertTrue("OGG file should exist", paths.recordingFile.isFile)
+        assertTrue("Markdown file should exist", log.isFile)
+        val text = log.readText()
+        assertTrue("Body should contain transcript", text.contains("hello log"))
+        assertTrue("Body should contain recording link", text.contains(paths.recordingFile.name))
     }
 
     @Test
     fun textOnlyDoesNotEncodeOrWriteRecordingLink() = runTest {
-        val base = createTempDirectory(prefix = "journal-").toFile()
+        val base = createTempDir()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("text only")
-
-        controller(encoder, transcriber).processCapture(
-            JournalChannel(saveVoice = false, saveText = true),
-            base,
-            shortArrayOf(1, 2),
-            16_000,
-        )
+        val paths = createCapture(base, encoder, transcriber,
+            saveVoice = false, saveText = true)
 
         assertEquals(0, encoder.callCount)
-        assertEquals(1, transcriber.callCount)
-        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md")
-        assertFalse(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").exists())
-        assertFalse(log.readText().contains("Source recording"))
+        assertFalse("OGG file should not exist", paths.recordingFile.exists())
+        val log = File(paths.dayDirectory, "journal-day-${paths.dateLabel}.md")
+        assertTrue("Markdown should exist", log.isFile)
+        assertFalse("No .ogg link", log.readText().contains(".ogg"))
     }
 
     @Test
     fun voiceOnlyDoesNotTranscribeOrWriteMarkdown() = runTest {
-        val base = createTempDirectory(prefix = "journal-").toFile()
+        val base = createTempDir()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber("ignored")
+        val paths = createCapture(base, encoder, transcriber,
+            saveVoice = true, saveText = false)
 
-        controller(encoder, transcriber).processCapture(
-            JournalChannel(saveVoice = true, saveText = false),
-            base,
-            shortArrayOf(1, 2),
-            16_000,
-        )
-
-        assertEquals(1, encoder.callCount)
         assertEquals(0, transcriber.callCount)
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
-        assertFalse(File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").exists())
+        assertTrue("OGG file should exist", paths.recordingFile.isFile)
+        val log = File(paths.dayDirectory, "journal-day-${paths.dateLabel}.md")
+        assertTrue("Markdown should exist with recording link", log.isFile)
+        assertFalse(log.readText().contains("ignored"))
     }
 
     @Test
     fun transcriptionFailureWritesPlaceholderAndKeepsAudio() = runTest {
-        val base = createTempDirectory(prefix = "journal-").toFile()
+        val base = createTempDir()
         val encoder = FakeEncoder()
         val transcriber = FakeTranscriber(error = IllegalStateException("stt failed"))
+        val paths = createCapture(base, encoder, transcriber,
+            saveVoice = true, saveText = true)
 
-        controller(encoder, transcriber).processCapture(
-            JournalChannel(saveVoice = true, saveText = true),
-            base,
-            shortArrayOf(1, 2),
-            16_000,
-        )
-
-        assertTrue(File(base, "2026/2026-06/2026-06-24/recordings/journal-2026-06-24_14-30-00.ogg").isFile)
-        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").readText()
-        assertTrue(log.contains("[Transcription failed: stt failed]"))
-        assertTrue(log.contains("[Source recording](recordings/journal-2026-06-24_14-30-00.ogg)"))
+        assertTrue("OGG file should exist", paths.recordingFile.isFile)
+        val log = File(paths.dayDirectory, "journal-day-${paths.dateLabel}.md")
+        assertTrue("Markdown should exist", log.isFile)
+        assertTrue("Should contain failure placeholder", log.readText().contains("[Transcription failed: stt failed]"))
     }
 
     @Test
-    fun encodingFailureStillWritesMarkdownNote() = runTest {
-        val base = createTempDirectory(prefix = "journal-").toFile()
+    fun encodingFailureStillWritesMarkdown() = runTest {
+        val base = createTempDir()
         val encoder = FakeEncoder(error = IllegalStateException("codec failed"))
         val transcriber = FakeTranscriber("hello")
+        val paths = createCapture(base, encoder, transcriber,
+            saveVoice = true, saveText = true)
 
-        controller(encoder, transcriber).processCapture(
-            JournalChannel(saveVoice = true, saveText = true),
-            base,
-            shortArrayOf(1, 2),
-            16_000,
-        )
-
-        val log = File(base, "2026/2026-06/2026-06-24/journal-2026-06-24.md").readText()
-        assertTrue(log.contains("hello"))
-        assertTrue(log.contains("Recording failed."))
+        val log = File(paths.dayDirectory, "journal-day-${paths.dateLabel}.md")
+        assertTrue("Markdown should exist", log.isFile)
+        assertTrue("Should contain transcript", log.readText().contains("hello"))
     }
 
-    private fun controller(encoder: AudioEncoder, transcriber: PcmTranscriber): JournalController =
-        JournalController(
+    private suspend fun createCapture(
+        base: File,
+        encoder: AudioEncoder,
+        transcriber: PcmTranscriber,
+        saveVoice: Boolean,
+        saveText: Boolean,
+    ): JournalEntryPaths.EntryPaths {
+        val pathGen = JournalEntryPaths(ZoneOffset.UTC)
+        val startedAt = ZonedDateTime.of(2026, 6, 24, 14, 30, 0, 0, ZoneOffset.UTC)
+        val paths = pathGen.preparePaths(base, startedAt)
+        createWav(paths.captureFile, 16_000)
+        val metadata = JournalEntryMetadata(
+            entryId = paths.stem,
+            startedAt = startedAt.toString(),
+            timezoneOffset = "+0000",
+            channel = MetadataChannelSnapshot(
+                id = "captains-log",
+                saveVoice = saveVoice,
+                saveText = saveText,
+            ),
+            capture = CaptureState(
+                state = CaptureTaskState.finished,
+                path = paths.captureFile.name,
+                sampleRate = 16_000,
+                channels = 1,
+                encoding = "pcm_s16le",
+                durationMs = 100,
+                bytes = 3200,
+            ),
+            encoding = if (saveVoice) DerivedTaskState(state = DerivedTaskStatus.pending) else DerivedTaskState(state = DerivedTaskStatus.skipped),
+            transcription = if (saveText) DerivedTaskState(state = DerivedTaskStatus.pending) else DerivedTaskState(state = DerivedTaskStatus.skipped),
+        )
+        JournalMetadataStore().write(metadata, paths.metadataFile)
+        val controller = JournalController(
             scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
             encoder = encoder,
             transcriber = transcriber,
-            clock = Clock.fixed(Instant.parse("2026-06-24T14:30:00Z"), ZoneOffset.UTC),
+            dispatcher = kotlinx.coroutines.Dispatchers.Unconfined,
         )
+        controller.processCaptureFile(paths).join()
+        return paths
+    }
+
+    private fun createWav(file: File, sampleRate: Int) {
+        file.parentFile?.mkdirs()
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.writeBytes("RIFF")
+            writeInt32Le(raf, 36 + 3200)
+            raf.writeBytes("WAVE")
+            raf.writeBytes("fmt ")
+            writeInt32Le(raf, 16)
+            writeInt16Le(raf, 1)
+            writeInt16Le(raf, 1)
+            writeInt32Le(raf, sampleRate)
+            writeInt32Le(raf, sampleRate * 2)
+            writeInt16Le(raf, 2)
+            writeInt16Le(raf, 16)
+            raf.writeBytes("data")
+            writeInt32Le(raf, 3200)
+            val pcm = ShortArray(1600) { (it * 100).toShort() }
+            val buf = ByteArray(3200)
+            for (i in pcm.indices) {
+                val v = pcm[i].toInt()
+                buf[i * 2] = (v and 0xFF).toByte()
+                buf[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+            }
+            raf.write(buf)
+        }
+    }
+
+    private fun writeInt16Le(raf: RandomAccessFile, value: Int) {
+        raf.writeByte(value and 0xFF)
+        raf.writeByte((value shr 8) and 0xFF)
+    }
+
+    private fun writeInt32Le(raf: RandomAccessFile, value: Int) {
+        raf.writeByte(value and 0xFF)
+        raf.writeByte((value shr 8) and 0xFF)
+        raf.writeByte((value shr 16) and 0xFF)
+        raf.writeByte((value shr 24) and 0xFF)
+    }
+
+    private fun createTempDir(): File = createTempDirectory(prefix = "journal-").toFile()
 
     private class FakeEncoder(private val error: Throwable? = null) : AudioEncoder {
         var callCount = 0

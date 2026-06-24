@@ -1,8 +1,4 @@
-## Purpose
-
-TBD. Defines the Captain's Log channel behavior for PTT capture persistence, transcription, and output files.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Captain's Log channel type
 The system SHALL provide a built-in channel type named "Journal" that streams accepted PTT captures to durable WAV/PCM capture files, records canonical entry state in JSON metadata, and derives OGG audio files and/or daily markdown journal output in a user-selected directory.
@@ -10,17 +6,6 @@ The system SHALL provide a built-in channel type named "Journal" that streams ac
 #### Scenario: Channel exists in channel list
 - **WHEN** the app is launched
 - **THEN** the Journal channel SHALL appear as an available channel
-
-### Requirement: Directory selection before readiness
-The system SHALL require the user to select a base output directory before the Journal channel is considered ready. The channel MAY be set as the active channel without a directory, but it SHALL NOT accept PTT captures and SHALL emit an error beep if PTT is pressed while not ready.
-
-#### Scenario: No directory selected
-- **WHEN** the user attempts to use PTT on an active Journal channel without a configured directory
-- **THEN** the system SHALL emit a two-tone error beep over the headset and SHALL NOT process the capture
-
-#### Scenario: Directory selected
-- **WHEN** the user selects a valid directory via the dedicated configuration screen
-- **THEN** the channel's readiness state SHALL become true, allowing PTT captures
 
 ### Requirement: Save voice toggle
 The system SHALL provide a "Save voice" toggle on the dedicated configuration screen that controls whether finalized Journal capture files are encoded and saved as derived OGG audio files. The toggle SHALL NOT control whether the canonical WAV/PCM capture file is retained for an accepted Journal entry.
@@ -34,7 +19,7 @@ The system SHALL provide a "Save voice" toggle on the dedicated configuration sc
 - **THEN** the system SHALL NOT write a derived OGG file for that capture
 - **AND** the system SHALL retain the canonical WAV/PCM capture file for that entry
 
-### Requirement: Save in journal file toggle
+### Requirement: Save in log file toggle
 The system SHALL provide a "Save in journal file" toggle on the dedicated configuration screen that controls whether PTT captures are transcribed and included in the generated daily markdown journal.
 
 #### Scenario: Save text enabled
@@ -114,6 +99,8 @@ The system SHALL use the existing on-device Parakeet STT model for transcription
 - **THEN** the system SHALL mark transcription as failed in entry metadata
 - **AND** the system SHALL NOT discard the canonical capture file
 - **AND** the generated markdown entry SHALL include an error placeholder if "Save in journal file" is enabled
+
+## ADDED Requirements
 
 ### Requirement: Journal entry metadata source of truth
 The system SHALL create a JSON metadata sidecar for every accepted Journal capture and SHALL treat that metadata as the canonical source of truth for entry identity, capture state, derived task state, transcript text, artifact paths, and deletion state.
