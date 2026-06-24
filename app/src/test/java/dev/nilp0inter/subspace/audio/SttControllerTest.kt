@@ -34,8 +34,7 @@ class SttControllerTest {
         sco = sco,
         recorder = recorder,
         output = output,
-        transcriber = transcriber,
-        transcriptionDispatcher = dispatcher,
+        transcriptionService = TranscriptionService(transcriber, dispatcher),
     )
 
     @Test

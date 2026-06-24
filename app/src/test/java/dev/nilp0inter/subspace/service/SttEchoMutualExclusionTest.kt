@@ -7,7 +7,7 @@ import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.SttController
-import dev.nilp0inter.subspace.audio.TranscriptionOutcome
+import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.ScoState
 import dev.nilp0inter.subspace.model.SttStatus
@@ -37,7 +37,7 @@ class SttEchoMutualExclusionTest {
             FakeSco(),
             FakeRecorder(),
             FakeOutput(),
-            FakeSttTranscriber(),
+            TranscriptionService(FakeSttTranscriber()),
         )
         echo.setEnabled(true)
         assertTrue(echo.enabled)
@@ -62,7 +62,7 @@ class SttEchoMutualExclusionTest {
             FakeSco(),
             FakeRecorder(),
             FakeOutput(),
-            FakeSttTranscriber(),
+            TranscriptionService(FakeSttTranscriber()),
         )
         stt.setEnabled(true)
         assertTrue(stt.enabled)
@@ -87,7 +87,7 @@ class SttEchoMutualExclusionTest {
             FakeSco(),
             FakeRecorder(),
             FakeOutput(),
-            FakeSttTranscriber(),
+            TranscriptionService(FakeSttTranscriber()),
         )
         stt.setEnabled(true)
         stt.setEnabled(false)

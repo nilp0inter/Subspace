@@ -4,6 +4,8 @@ import dev.nilp0inter.subspace.model.EchoTimingMode
 
 interface PttUiActions {
     fun requestPermissions()
+    fun requestManageExternalStorage()
+    fun pickCaptainsLogDirectory()
     fun openBluetoothSettings()
     fun scanForDevice()
     fun pairTarget()
@@ -15,6 +17,9 @@ interface PttUiActions {
     fun setSttEnabled(enabled: Boolean)
     fun setTtsEnabled(enabled: Boolean)
     fun setSttTtsEnabled(enabled: Boolean)
+    fun setCaptainsLogSaveVoice(enabled: Boolean)
+    fun setCaptainsLogSaveText(enabled: Boolean)
+    fun setCaptainsLogEnabled(enabled: Boolean)
     fun setTtsText(text: String)
     fun setTtsVoiceStyle(style: String)
     fun setTtsLang(lang: String)

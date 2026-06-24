@@ -2,23 +2,21 @@ package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.SttStatus
-import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * STT test controller.
  *
  * Mirrors [EchoController] lifecycle (SCO acquisition, ready beep, recording,
  * max-duration retention, cancellation) but transcribes the captured audio
- * with [SttTranscriber] instead of playing it back.
+ * with [TranscriptionService] instead of playing it back.
  *
  * Like [EchoController], this controller assumes a single PTT press at a time
  * and must be serialized by the owning service.
@@ -28,8 +26,7 @@ class SttController(
     private val sco: ScoRoute,
     private val recorder: AudioRecorder,
     private val output: PcmOutput,
-    private val transcriber: SttTranscriber,
-    private val transcriptionDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val transcriptionService: TranscriptionService,
 ) {
     private val _status = MutableStateFlow<SttStatus>(SttStatus.Idle)
     val status: StateFlow<SttStatus> = _status.asStateFlow()
@@ -139,26 +136,21 @@ class SttController(
 
         _status.value = SttStatus.Transcribing
         transcribeJob = scope.launch {
-            val samples = SttAudio.toParakeetInput(recording)
-            val outcome = withContext(transcriptionDispatcher) { transcriber.transcribe(samples) }
-            when (outcome) {
-                is TranscriptionOutcome.Success -> {
-                    _status.value = SttStatus.Transcribed(outcome.text)
+            runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
+                .onSuccess { text ->
+                    _status.value = SttStatus.Transcribed(text)
                     releaseScoAfterWarmup()
                 }
-                is TranscriptionOutcome.Failure -> {
-                    _status.value = SttStatus.Error(outcome.reason)
-                    sco.release()
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _status.value = when (error) {
+                        TranscriptionException.EmptyInput -> SttStatus.EmptyAudio
+                        is TranscriptionException.Failed -> SttStatus.Error(error.reason)
+                        TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
+                        else -> SttStatus.Error(error.message ?: "Transcription failed")
+                    }
+                    if (_status.value !is SttStatus.Transcribed) sco.release()
                 }
-                TranscriptionOutcome.ModelNotReady -> {
-                    _status.value = SttStatus.Error("STT model not ready")
-                    sco.release()
-                }
-                TranscriptionOutcome.EmptyInput -> {
-                    _status.value = SttStatus.EmptyAudio
-                    sco.release()
-                }
-            }
         }
     }
 

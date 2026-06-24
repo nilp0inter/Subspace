@@ -22,8 +22,10 @@ import dev.nilp0inter.subspace.R
 import dev.nilp0inter.subspace.audio.AndroidPcmOutput
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.InMemoryRecorder
+import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
+import dev.nilp0inter.subspace.audio.PcmTranscriber
 import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
@@ -32,10 +34,14 @@ import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
-import dev.nilp0inter.subspace.audio.TranscriptionOutcome
+import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
+import dev.nilp0inter.subspace.channel.CaptainsLogController
+import dev.nilp0inter.subspace.channel.CaptainsLogPttController
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.CaptainsLogChannel
+import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DevicePresence
 import dev.nilp0inter.subspace.model.EchoStatus
@@ -74,15 +80,19 @@ class PttForegroundService : Service() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private lateinit var scanner: DeviceScanner
+    private lateinit var channelRepository: ChannelRepository
     private lateinit var sco: ScoAudioController
     private lateinit var echo: EchoController
     private var sttController: SttController? = null
     private var sttTranscriber: SttTranscriber? = null
+    private var transcriptionService: TranscriptionService? = null
     private var sttModelStatusJob: Job? = null
     private var ttsController: TtsController? = null
     private var ttsSynthesizer: TtsSynthesizer? = null
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
+    private var captainsLogPttController: CaptainsLogPttController? = null
+    private lateinit var audioRouter: AudioRouter
     private val buttonStateMachine = ButtonStateMachine()
 
     private var targetDevice: BluetoothDevice? = null
@@ -101,6 +111,8 @@ class PttForegroundService : Service() {
         super.onCreate()
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
+        channelRepository = ChannelRepository(applicationContext)
+        _appState.value = _appState.value.copy(captainsLog = channelRepository.loadCaptainsLog())
 
         val audioManager = getSystemService(AudioManager::class.java)
         sco = ScoAudioController(audioManager)
@@ -121,6 +133,8 @@ class PttForegroundService : Service() {
         // reasons as STT. If the native library is not available, TTS stays
         // disabled and the rest of the service works unchanged.
         initializeTts(audioManager)
+        initializeCaptainsLog(audioManager)
+        initializeAudioRouter()
 
         serviceScope.launch {
             sco.state.collect { state ->
@@ -152,12 +166,14 @@ class PttForegroundService : Service() {
         }
         sttTranscriber = transcriber
         if (transcriber != null) {
+            val transcription = TranscriptionService(transcriber)
+            transcriptionService = transcription
             sttController = SttController(
                 scope = serviceScope,
                 sco = sco,
                 recorder = InMemoryRecorder(serviceScope),
                 output = AndroidPcmOutput(audioManager),
-                transcriber = transcriber,
+                transcriptionService = transcription,
             )
             sttModelStatusJob = serviceScope.launch {
                 var lastStatus: SttModelStatus? = null
@@ -257,9 +273,138 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
+        captainsLogPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         super.onDestroy()
     }
+
+    private fun initializeCaptainsLog(audioManager: AudioManager) {
+        val transcriber = transcriptionService ?: object : PcmTranscriber {
+            override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
+                throw IllegalStateException("STT transcriber unavailable")
+            }
+        }
+        captainsLogPttController = CaptainsLogPttController(
+            scope = serviceScope,
+            sco = sco,
+            recorder = InMemoryRecorder(serviceScope),
+            output = AndroidPcmOutput(audioManager),
+            captainsLog = CaptainsLogController(
+                scope = serviceScope,
+                encoder = OggEncoder(),
+                transcriber = transcriber,
+            ),
+            channelProvider = { _appState.value.captainsLog },
+        )
+    }
+
+    private fun initializeAudioRouter() {
+        audioRouter = AudioRouter(
+            channelRoute = AudioRoute(
+                enabled = { _appState.value.captainsLog.enabled },
+                setEnabled = ::setCaptainsLogEnabledInternal,
+                cancel = { captainsLogPttController?.cancelAndRelease() },
+                onPttPressed = { captainsLogPttController?.onPttPressed() },
+                onPttReleased = { captainsLogPttController?.onPttReleased() },
+            ),
+            testRoutes = mapOf(
+                AudioTestMode.Echo to echoRoute(),
+                AudioTestMode.Stt to sttRoute(),
+                AudioTestMode.Tts to ttsRoute(),
+                AudioTestMode.SttTts to sttTtsRoute(),
+            ),
+        )
+    }
+
+    private fun echoRoute(): AudioRoute = AudioRoute(
+        enabled = { echo.enabled },
+        setEnabled = { enabled ->
+            echo.setEnabled(enabled)
+            updateMonitor { it.copy(echoEnabled = enabled) }
+        },
+        cancel = {
+            echo.cancelAndRelease()
+            updateMonitor { it.copy(echoStatus = EchoStatus.Idle) }
+        },
+        onPttPressed = { echo.onPttPressed() },
+        onPttReleased = { echo.onPttReleased() },
+    )
+
+    private fun sttRoute(): AudioRoute = AudioRoute(
+        enabled = { sttController?.enabled == true },
+        setEnabled = { enabled ->
+            val stt = sttController
+            if (stt == null) {
+                updateMonitor { it.copy(sttEnabled = false) }
+            } else {
+                stt.setEnabled(enabled)
+                updateMonitor { it.copy(sttEnabled = enabled) }
+            }
+        },
+        cancel = {
+            sttController?.cancelAndRelease()
+            updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
+        },
+        onPttPressed = { sttController?.onPttPressed() },
+        onPttReleased = { sttController?.onPttReleased() },
+    )
+
+    private fun ttsRoute(): AudioRoute = AudioRoute(
+        enabled = { ttsController?.enabled == true },
+        setEnabled = { enabled ->
+            val tts = ttsController
+            if (tts == null) {
+                updateMonitor { it.copy(ttsEnabled = false) }
+            } else {
+                tts.setEnabled(enabled)
+                updateMonitor { it.copy(ttsEnabled = enabled) }
+            }
+        },
+        cancel = {
+            ttsController?.cancelAndRelease()
+            updateMonitor { it.copy(ttsStatus = TtsStatus.Idle) }
+        },
+        onPttPressed = {
+            val monitor = _appState.value.monitor
+            ttsController?.onPttPressed(
+                text = monitor.ttsText,
+                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
+                lang = monitor.ttsLang,
+                totalSteps = monitor.ttsTotalSteps,
+                speed = monitor.ttsSpeed,
+                scoRate = SCO_RATE,
+            )
+        },
+        onPttReleased = { ttsController?.onPttReleased() },
+    )
+
+    private fun sttTtsRoute(): AudioRoute = AudioRoute(
+        enabled = { sttTtsController?.enabled == true },
+        setEnabled = { enabled ->
+            val sttTts = sttTtsController
+            if (sttTts == null) {
+                updateMonitor { it.copy(sttTtsEnabled = false) }
+            } else {
+                sttTts.setEnabled(enabled)
+                updateMonitor { it.copy(sttTtsEnabled = enabled) }
+            }
+        },
+        cancel = {
+            sttTtsController?.cancelAndRelease()
+            updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
+        },
+        onPttPressed = { sttTtsController?.onPttPressed() },
+        onPttReleased = {
+            val monitor = _appState.value.monitor
+            sttTtsController?.onPttReleased(
+                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
+                lang = monitor.ttsLang,
+                totalSteps = monitor.ttsTotalSteps,
+                speed = monitor.ttsSpeed,
+                scoRate = SCO_RATE,
+            )
+        },
+    )
 
     @SuppressLint("MissingPermission")
     fun refreshReadiness() {
@@ -380,116 +525,63 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
+        captainsLogPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
     }
 
     fun setEchoEnabled(enabled: Boolean) {
-        if (enabled) {
-            disableStt()
-            disableTts()
-            disableSttTts()
-        }
-        echo.setEnabled(enabled)
-        updateMonitor { it.copy(echoEnabled = enabled) }
+        audioRouter.setTestModeEnabled(AudioTestMode.Echo, enabled)
     }
 
     fun setSttEnabled(enabled: Boolean) {
-        val stt = sttController
-        if (stt == null) {
-            updateMonitor { it.copy(sttEnabled = false) }
-            return
-        }
-        if (enabled) {
-            disableEcho()
-            disableTts()
-            disableSttTts()
-        } else {
-            stt.cancelAndRelease()
-            updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
-        }
-        stt.setEnabled(enabled)
-        updateMonitor { it.copy(sttEnabled = enabled) }
+        audioRouter.setTestModeEnabled(AudioTestMode.Stt, enabled)
     }
 
     fun setTtsEnabled(enabled: Boolean) {
-        val tts = ttsController
-        if (tts == null) {
-            updateMonitor { it.copy(ttsEnabled = false) }
-            return
-        }
-        if (enabled) {
-            disableEcho()
-            disableStt()
-            disableSttTts()
-        } else {
-            tts.cancelAndRelease()
-            updateMonitor { it.copy(ttsStatus = TtsStatus.Idle) }
-        }
-        tts.setEnabled(enabled)
-        updateMonitor { it.copy(ttsEnabled = enabled) }
+        audioRouter.setTestModeEnabled(AudioTestMode.Tts, enabled)
     }
 
     fun setSttTtsEnabled(enabled: Boolean) {
-        val sttTts = sttTtsController
-        if (sttTts == null) {
-            updateMonitor { it.copy(sttTtsEnabled = false) }
-            return
-        }
-        if (enabled) {
-            disableEcho()
-            disableStt()
-            disableTts()
-        } else {
-            sttTts.cancelAndRelease()
-            updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
-        }
-        sttTts.setEnabled(enabled)
-        updateMonitor { it.copy(sttTtsEnabled = enabled) }
-    }
-
-    private fun disableEcho() {
-        if (echo.enabled) {
-            echo.setEnabled(false)
-            echo.cancelAndRelease()
-            updateMonitor { it.copy(echoEnabled = false, echoStatus = EchoStatus.Idle) }
-        }
-    }
-
-    private fun disableStt() {
-        sttController?.let { stt ->
-            if (stt.enabled) {
-                stt.setEnabled(false)
-                stt.cancelAndRelease()
-                updateMonitor { it.copy(sttEnabled = false, sttStatus = SttStatus.Idle) }
-            }
-        }
-    }
-
-    private fun disableTts() {
-        ttsController?.let { tts ->
-            if (tts.enabled) {
-                tts.setEnabled(false)
-                tts.cancelAndRelease()
-                updateMonitor { it.copy(ttsEnabled = false, ttsStatus = TtsStatus.Idle) }
-            }
-        }
-    }
-
-    private fun disableSttTts() {
-        sttTtsController?.let { sttTts ->
-            if (sttTts.enabled) {
-                sttTts.setEnabled(false)
-                sttTts.cancelAndRelease()
-                updateMonitor { it.copy(sttTtsEnabled = false, sttTtsStatus = SttTtsStatus.Idle) }
-            }
-        }
+        audioRouter.setTestModeEnabled(AudioTestMode.SttTts, enabled)
     }
 
     fun setEchoTimingMode(mode: EchoTimingMode) {
         echo.setTimingMode(mode)
         updateMonitor { it.copy(echoTimingMode = mode) }
+    }
+
+    fun setCaptainsLogDirectory(path: String) {
+        val channel = channelRepository.loadCaptainsLog().copy(baseDirectory = path)
+        saveCaptainsLog(channel)
+    }
+
+    fun setCaptainsLogSaveVoice(enabled: Boolean) {
+        val current = _appState.value.captainsLog
+        if (!enabled && !current.saveText) return
+        saveCaptainsLog(current.copy(saveVoice = enabled))
+    }
+
+    fun setCaptainsLogSaveText(enabled: Boolean) {
+        val current = _appState.value.captainsLog
+        if (!enabled && !current.saveVoice) return
+        saveCaptainsLog(current.copy(saveText = enabled))
+    }
+
+    fun setCaptainsLogEnabled(enabled: Boolean) {
+        audioRouter.setChannelEnabled(enabled)
+    }
+
+    private fun setCaptainsLogEnabledInternal(enabled: Boolean) {
+        val current = _appState.value.captainsLog
+        if (enabled && current.baseDirectory.isNullOrBlank()) return
+        saveCaptainsLog(current.copy(enabled = enabled))
+    }
+
+    private fun saveCaptainsLog(channel: CaptainsLogChannel) {
+        channelRepository.saveCaptainsLog(channel)
+        _appState.value = _appState.value.copy(captainsLog = channel)
     }
 
     fun setTtsText(text: String) {
@@ -552,39 +644,11 @@ class PttForegroundService : Service() {
     }
 
     private fun dispatchPttPressed() {
-        val monitor = _appState.value.monitor
-        when {
-            sttTtsController?.enabled == true -> sttTtsController?.onPttPressed()
-            ttsController?.enabled == true -> {
-                val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath
-                ttsController?.onPttPressed(
-                    text = monitor.ttsText,
-                    voiceStylePath = voiceStylePath,
-                    lang = monitor.ttsLang,
-                    totalSteps = monitor.ttsTotalSteps,
-                    speed = monitor.ttsSpeed,
-                    scoRate = SCO_RATE,
-                )
-            }
-            sttController?.enabled == true -> sttController?.onPttPressed()
-            echo.enabled -> echo.onPttPressed()
-        }
+        audioRouter.onPttPressed()
     }
 
     private fun dispatchPttReleased() {
-        val monitor = _appState.value.monitor
-        when {
-            sttTtsController?.enabled == true -> sttTtsController?.onPttReleased(
-                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
-                lang = monitor.ttsLang,
-                totalSteps = monitor.ttsTotalSteps,
-                speed = monitor.ttsSpeed,
-                scoRate = SCO_RATE,
-            )
-            ttsController?.enabled == true -> ttsController?.onPttReleased()
-            sttController?.enabled == true -> sttController?.onPttReleased()
-            echo.enabled -> echo.onPttReleased()
-        }
+        audioRouter.onPttReleased()
     }
 
     @SuppressLint("MissingPermission")
@@ -660,6 +724,7 @@ class PttForegroundService : Service() {
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
+        captainsLogPttController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {

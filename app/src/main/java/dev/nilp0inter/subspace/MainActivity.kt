@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.Settings
+import dev.nilp0inter.subspace.channel.StoragePathResolver
 import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -33,10 +34,17 @@ import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<PttForegroundService?>(null)
     private var bound = false
+    private var pendingCaptainsLogDirectory: String? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            service = (binder as PttForegroundService.LocalBinder).service().also { it.refreshReadiness() }
+            service = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
+                pendingCaptainsLogDirectory?.let { path ->
+                    connectedService.setCaptainsLogDirectory(path)
+                    pendingCaptainsLogDirectory = null
+                }
+                connectedService.refreshReadiness()
+            }
             bound = true
         }
 
@@ -60,11 +68,32 @@ class MainActivity : ComponentActivity() {
             ) {
                 currentServiceState?.refreshReadiness()
             }
+            val directoryLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocumentTree(),
+            ) { uri ->
+                val path = uri?.let(StoragePathResolver::resolveTreeUri)
+                if (path != null) {
+                    val connectedService = currentServiceState
+                    if (connectedService == null) {
+                        pendingCaptainsLogDirectory = path
+                    } else {
+                        connectedService.setCaptainsLogDirectory(path)
+                    }
+                }
+            }
 
-            val actions = remember(currentService, permissionLauncher) {
+            val actions = remember(currentService, permissionLauncher, directoryLauncher) {
                 object : PttUiActions {
                     override fun requestPermissions() {
                         permissionLauncher.launch(RequiredPermissions.runtimePermissions())
+                    }
+
+                    override fun requestManageExternalStorage() {
+                        startActivity(RequiredPermissions.manageExternalStorageIntent(this@MainActivity))
+                    }
+
+                    override fun pickCaptainsLogDirectory() {
+                        directoryLauncher.launch(null)
                     }
 
                     override fun openBluetoothSettings() {
@@ -116,6 +145,18 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setSttTtsEnabled(enabled)
                     }
 
+                    override fun setCaptainsLogSaveVoice(enabled: Boolean) {
+                        currentServiceState?.setCaptainsLogSaveVoice(enabled)
+                    }
+
+                    override fun setCaptainsLogSaveText(enabled: Boolean) {
+                        currentServiceState?.setCaptainsLogSaveText(enabled)
+                    }
+
+                    override fun setCaptainsLogEnabled(enabled: Boolean) {
+                        currentServiceState?.setCaptainsLogEnabled(enabled)
+                    }
+
                     override fun setTtsText(text: String) {
                         currentServiceState?.setTtsText(text)
                     }
@@ -151,6 +192,10 @@ class MainActivity : ComponentActivity() {
                     when (route) {
                         MainRoute.Dashboard -> MainDashboardScreen(
                             connected = state.readyForMonitor,
+                            captainsLog = state.captainsLog,
+                            testModeActive = state.monitor.echoEnabled || state.monitor.sttEnabled ||
+                                state.monitor.ttsEnabled || state.monitor.sttTtsEnabled,
+                            actions = actions,
                             onConnectionClick = {
                                 route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
                             },

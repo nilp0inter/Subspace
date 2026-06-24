@@ -107,6 +107,10 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+
+    androidTestImplementation("androidx.test:core:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +188,12 @@ val buildParakeetNative = registerNativeBuildTask(
     "libsubspace_parakeet.so",
 )
 
+val buildOggNative = registerNativeBuildTask(
+    "buildOggNative",
+    "subspace-ogg",
+    "libsubspace_ogg.so",
+)
+
 val buildSupertonicNative = registerNativeBuildTask(
     "buildSupertonicNative",
     "subspace-supertonic",
@@ -191,6 +201,7 @@ val buildSupertonicNative = registerNativeBuildTask(
 )
 
 tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(buildOggNative)
     dependsOn(buildParakeetNative)
     dependsOn(buildSupertonicNative)
 }

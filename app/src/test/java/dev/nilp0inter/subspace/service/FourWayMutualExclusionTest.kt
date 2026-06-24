@@ -9,8 +9,8 @@ import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTtsController
+import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.audio.TtsController
-import dev.nilp0inter.subspace.audio.TranscriptionOutcome
 import dev.nilp0inter.subspace.audio.SynthesisOutcome
 import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.ScoState
@@ -37,7 +37,7 @@ class FourWayMutualExclusionTest {
     @Test
     fun enablingTtsDisablesEchoSttAndSttTts() = runTest {
         val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber())
+        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), TranscriptionService(FakeSttTranscriber()))
         val tts = TtsController(this, FakeSco(), FakeOutput(), FakeTtsSynthesizer())
         val sttTts = SttTtsController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber(), FakeTtsSynthesizer())
 
@@ -66,7 +66,7 @@ class FourWayMutualExclusionTest {
     @Test
     fun enablingSttTtsDisablesEchoSttAndTts() = runTest {
         val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber())
+        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), TranscriptionService(FakeSttTranscriber()))
         val tts = TtsController(this, FakeSco(), FakeOutput(), FakeTtsSynthesizer())
         val sttTts = SttTtsController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber(), FakeTtsSynthesizer())
 
@@ -88,7 +88,7 @@ class FourWayMutualExclusionTest {
     @Test
     fun enablingEchoDisablesSttTtsAndSttTts() = runTest {
         val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber())
+        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), TranscriptionService(FakeSttTranscriber()))
         val tts = TtsController(this, FakeSco(), FakeOutput(), FakeTtsSynthesizer())
         val sttTts = SttTtsController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber(), FakeTtsSynthesizer())
 
@@ -110,7 +110,7 @@ class FourWayMutualExclusionTest {
     @Test
     fun enablingSttDisablesEchoTtsAndSttTts() = runTest {
         val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber())
+        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), TranscriptionService(FakeSttTranscriber()))
         val tts = TtsController(this, FakeSco(), FakeOutput(), FakeTtsSynthesizer())
         val sttTts = SttTtsController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber(), FakeTtsSynthesizer())
 
@@ -132,7 +132,7 @@ class FourWayMutualExclusionTest {
     @Test
     fun disablingAllLeavesAllOff() = runTest {
         val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber())
+        val stt = SttController(this, FakeSco(), FakeRecorder(), FakeOutput(), TranscriptionService(FakeSttTranscriber()))
         val tts = TtsController(this, FakeSco(), FakeOutput(), FakeTtsSynthesizer())
         val sttTts = SttTtsController(this, FakeSco(), FakeRecorder(), FakeOutput(), FakeSttTranscriber(), FakeTtsSynthesizer())
 

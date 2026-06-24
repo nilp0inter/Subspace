@@ -15,7 +15,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -24,11 +27,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.nilp0inter.subspace.model.CaptainsLogChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 
 @Composable
 fun MainDashboardScreen(
     connected: Boolean,
+    captainsLog: CaptainsLogChannel,
+    testModeActive: Boolean,
+    actions: PttUiActions,
     onConnectionClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -49,7 +56,7 @@ fun MainDashboardScreen(
             onClick = onConnectionClick,
         )
 
-        ChannelPanel()
+        ChannelPanel(captainsLog, testModeActive, actions)
     }
 }
 
@@ -106,7 +113,11 @@ private fun ConnectionIndicator(
 }
 
 @Composable
-private fun ChannelPanel() {
+private fun ChannelPanel(
+    captainsLog: CaptainsLogChannel,
+    testModeActive: Boolean,
+    actions: PttUiActions,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
             text = "CHANNELS",
@@ -114,8 +125,103 @@ private fun ChannelPanel() {
             color = MaterialTheme.colorScheme.primary,
         )
 
-        mockChannels.forEach { channel ->
+        CaptainsLogCard(captainsLog, testModeActive, actions)
+
+        previewChannels.forEach { channel ->
             ChannelCard(channel)
+        }
+    }
+}
+
+@Composable
+private fun CaptainsLogCard(
+    channel: CaptainsLogChannel,
+    testModeActive: Boolean,
+    actions: PttUiActions,
+) {
+    val configured = !channel.baseDirectory.isNullOrBlank()
+    val active = channel.enabled && !testModeActive
+    val accent = when {
+        active -> MaterialTheme.colorScheme.primary
+        configured -> MaterialTheme.colorScheme.secondary
+        else -> MaterialTheme.colorScheme.outline
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(1.dp, accent),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                }
+                StatusPill(
+                    label = when {
+                        active -> "ACTIVE"
+                        testModeActive && channel.enabled -> "INACTIVE"
+                        configured -> "READY"
+                        else -> "CONFIGURE"
+                    },
+                    accent = accent,
+                )
+            }
+
+            Text(
+                text = channel.baseDirectory ?: "Select a base directory before activation.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Save voice", style = MaterialTheme.typography.bodyLarge)
+                Switch(
+                    checked = channel.saveVoice,
+                    onCheckedChange = { enabled ->
+                        if (enabled || channel.saveText) actions.setCaptainsLogSaveVoice(enabled)
+                    },
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Save in log file", style = MaterialTheme.typography.bodyLarge)
+                Switch(
+                    checked = channel.saveText,
+                    onCheckedChange = { enabled ->
+                        if (enabled || channel.saveVoice) actions.setCaptainsLogSaveText(enabled)
+                    },
+                )
+            }
+
+            OutlinedButton(onClick = actions::requestManageExternalStorage, modifier = Modifier.fillMaxWidth()) {
+                Text("Grant all-files access")
+            }
+            OutlinedButton(onClick = actions::pickCaptainsLogDirectory, modifier = Modifier.fillMaxWidth()) {
+                Text(if (configured) "Change directory" else "Select directory")
+            }
+            Button(
+                onClick = { actions.setCaptainsLogEnabled(!channel.enabled) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = configured,
+            ) {
+                Text(if (channel.enabled) "Deactivate Captain's Log" else "Activate Captain's Log")
+            }
         }
     }
 }
@@ -186,12 +292,7 @@ private data class MockChannel(
     val description: String,
 )
 
-private val mockChannels = listOf(
-    MockChannel(
-        name = "Local Relay",
-        route = "CH-01 / LOCAL",
-        description = "Placeholder for an on-device assistant route.",
-    ),
+private val previewChannels = listOf(
     MockChannel(
         name = "Command Uplink",
         route = "CH-02 / REMOTE",
