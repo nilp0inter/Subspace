@@ -192,6 +192,14 @@ class MainActivity : ComponentActivity() {
                     override fun setSttTtsSpeed(speed: Float) {
                         currentServiceState?.setSttTtsSpeed(speed)
                     }
+
+                    override fun phonePttPressed(channelId: String) {
+                        currentServiceState?.phonePttPressed(channelId)
+                    }
+
+                    override fun phonePttReleased(channelId: String) {
+                        currentServiceState?.phonePttReleased(channelId)
+                    }
                 }
             }
 

@@ -1,6 +1,10 @@
 package dev.nilp0inter.subspace.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
@@ -166,7 +171,16 @@ private fun JournalCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .phonePttInput(
+                            channelId = JournalChannel.ID,
+                            onPttPressed = actions::phonePttPressed,
+                            onPttReleased = actions::phonePttReleased,
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                 }
@@ -189,6 +203,11 @@ private fun JournalCard(
                     text = "Requires configuration to broadcast.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.phonePttInput(
+                        channelId = JournalChannel.ID,
+                        onPttPressed = actions::phonePttPressed,
+                        onPttReleased = actions::phonePttReleased,
+                    ),
                 )
             }
         }
@@ -220,7 +239,16 @@ private fun DebugChannelCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .phonePttInput(
+                            channelId = DebugChannel.ID,
+                            onPttPressed = actions::phonePttPressed,
+                            onPttReleased = actions::phonePttReleased,
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                 }
@@ -239,6 +267,11 @@ private fun DebugChannelCard(
                 text = "Mode: ${channel.mode.name}",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.phonePttInput(
+                    channelId = DebugChannel.ID,
+                    onPttPressed = actions::phonePttPressed,
+                    onPttReleased = actions::phonePttReleased,
+                ),
             )
         }
     }
@@ -284,6 +317,21 @@ private fun ChannelCard(channel: MockChannel) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+private fun Modifier.phonePttInput(
+    channelId: String,
+    onPttPressed: (String) -> Unit,
+    onPttReleased: (String) -> Unit,
+): Modifier = pointerInput(channelId, onPttPressed, onPttReleased) {
+    awaitEachGesture {
+        val down = awaitFirstDown()
+        val longPress = awaitLongPressOrCancellation(down.id) ?: return@awaitEachGesture
+        longPress.consume()
+        onPttPressed(channelId)
+        waitForUpOrCancellation()
+        onPttReleased(channelId)
     }
 }
 

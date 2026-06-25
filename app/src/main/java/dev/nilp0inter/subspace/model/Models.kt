@@ -74,6 +74,7 @@ data class ButtonStates(
 )
 
 enum class HardwareMode { Active, Control }
+enum class PttSource { Rsm, Phone }
 enum class TwoStateButton { Released, Pressed }
 enum class SosButtonState { Released, Pressed, LongPressed }
 enum class ClickButtonState { Idle, Clicked }

@@ -1,26 +1,4 @@
-## Purpose
-
-TBD. Defines the active channel routing, mutual exclusivity, and readiness evaluation before dispatching PTT audio.
-
-## Requirements
-
-### Requirement: Active channel mutual exclusivity
-The system SHALL maintain a single `activeChannelId` to represent the selected communication channel, replacing independent channel enablement states.
-
-#### Scenario: Switching active channel
-- **WHEN** the user taps a channel card on the main dashboard
-- **THEN** that channel SHALL become the active channel and all others SHALL become inactive
-
-### Requirement: Channel readiness state
-The system SHALL require channels to provide a computed `isReady` state indicating if they have all necessary configuration to handle PTT broadcasts.
-
-#### Scenario: Fully configured channel
-- **WHEN** the Captain's Log channel has a valid output directory and at least one save toggle enabled
-- **THEN** its `isReady` state SHALL evaluate to true
-
-#### Scenario: Incompletely configured channel
-- **WHEN** the Captain's Log channel has no output directory selected
-- **THEN** its `isReady` state SHALL evaluate to false
+## MODIFIED Requirements
 
 ### Requirement: PTT routing respects readiness
 The system SHALL evaluate the target channel's readiness state before dispatching a PTT capture, regardless of whether PTT was started by the RSM or by phone channel-card long-press.

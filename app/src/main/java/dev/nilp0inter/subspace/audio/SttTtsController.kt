@@ -60,6 +60,10 @@ class SttTtsController(
     }
 
     fun onPttPressed() {
+        onPttPressed(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
         if (!enabled) return
         if (setupJob?.isActive == true || recorder.isActive) return
@@ -67,12 +71,16 @@ class SttTtsController(
         transcribeJob?.cancel()
         transcribeJob = null
         retainedAfterMaxDuration = null
-        setupJob = scope.launch { startSession() }
+        setupJob = scope.launch { startSession(route) }
     }
 
     fun onPttReleased(voiceStylePath: String, lang: String, totalSteps: Int, speed: Float, scoRate: Int) {
+        onPttReleased(ResolvedAudioRoute(sco, output, recorder), voiceStylePath, lang, totalSteps, speed, scoRate)
+    }
+
+    fun onPttReleased(route: ResolvedAudioRoute, voiceStylePath: String, lang: String, totalSteps: Int, speed: Float, scoRate: Int) {
         pttDown = false
-        scope.launch { finishSessionIfNeeded(voiceStylePath, lang, totalSteps, speed, scoRate) }
+        scope.launch { finishSessionIfNeeded(route, voiceStylePath, lang, totalSteps, speed, scoRate) }
     }
 
     /** Cancel any active or pending STT↔TTS work and release resources. */
@@ -87,26 +95,30 @@ class SttTtsController(
     }
 
     private suspend fun startSession() {
+        startSession(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    private suspend fun startSession(route: ResolvedAudioRoute) {
         runCatching {
             _status.value = SttTtsStatus.WaitingForAudio
-            if (!sco.acquire()) {
+            if (!route.sco.acquire()) {
                 _status.value = SttTtsStatus.Error("SCO unavailable")
                 return
             }
 
             if (!pttDown) {
-                cancelSession()
+                cancelSession(route)
                 return
             }
 
             _status.value = SttTtsStatus.Beeping
-            output.playReadyBeep(sco.coldStart)
+            route.output.playReadyBeep(route.sco.coldStart)
             if (!pttDown) {
-                cancelSession()
+                cancelSession(route)
                 return
             }
 
-            if (!recorder.start()) {
+            if (!route.recorder.start()) {
                 _status.value = SttTtsStatus.Error("Recording failed")
                 return
             }
@@ -136,15 +148,26 @@ class SttTtsController(
         speed: Float,
         scoRate: Int,
     ) {
+        finishSessionIfNeeded(ResolvedAudioRoute(sco, output, recorder), voiceStylePath, lang, totalSteps, speed, scoRate)
+    }
+
+    private suspend fun finishSessionIfNeeded(
+        route: ResolvedAudioRoute,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
         maxDurationJob?.cancel()
         maxDurationJob = null
 
         val retained = retainedAfterMaxDuration
         retainedAfterMaxDuration = null
-        val recording = retained ?: recorder.stopIfActiveOrEmpty()
+        val recording = retained ?: route.recorder.stopIfActiveOrEmpty()
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttTtsStatus.Idle) cancelSession()
+            if (enabled || _status.value != SttTtsStatus.Idle) cancelSession(route)
             _status.value = SttTtsStatus.EmptyAudio
             return
         }
@@ -158,7 +181,7 @@ class SttTtsController(
                     val transcript = transcriptOutcome.text
                     if (transcript.isBlank()) {
                         _status.value = SttTtsStatus.EmptyTranscript
-                        sco.release()
+                        route.sco.release()
                         return@launch
                     }
                     _status.value = SttTtsStatus.Transcript(transcript)
@@ -175,51 +198,55 @@ class SttTtsController(
                         is SynthesisOutcome.Success -> {
                             if (synthOutcome.samples.isEmpty()) {
                                 _status.value = SttTtsStatus.Error("Synthesis produced no audio")
-                                sco.release()
+                                route.sco.release()
                             } else {
                                 _status.value = SttTtsStatus.Playing
                                 val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
-                                if (!playback.isEmpty) output.play(playback)
+                                if (!playback.isEmpty) route.output.play(playback)
                                 _status.value = SttTtsStatus.Idle
-                                sco.release()
+                                route.sco.release()
                             }
                         }
                         is SynthesisOutcome.ModelNotReady -> {
                             _status.value = SttTtsStatus.Error("TTS model not ready")
-                            sco.release()
+                            route.sco.release()
                         }
                         is SynthesisOutcome.Failure -> {
                             _status.value = SttTtsStatus.Error(synthOutcome.reason)
-                            sco.release()
+                            route.sco.release()
                         }
                         SynthesisOutcome.EmptyText -> {
                             _status.value = SttTtsStatus.EmptyTranscript
-                            sco.release()
+                            route.sco.release()
                         }
                     }
                 }
                 is TranscriptionOutcome.Failure -> {
                     _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
-                    sco.release()
+                    route.sco.release()
                 }
                 TranscriptionOutcome.ModelNotReady -> {
                     _status.value = SttTtsStatus.Error("STT model not ready")
-                    sco.release()
+                    route.sco.release()
                 }
                 TranscriptionOutcome.EmptyInput -> {
                     _status.value = SttTtsStatus.EmptyAudio
-                    sco.release()
+                    route.sco.release()
                 }
             }
         }
     }
 
     private fun cancelSession() {
+        cancelSession(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    private fun cancelSession(route: ResolvedAudioRoute) {
         maxDurationJob?.cancel()
         maxDurationJob = null
-        recorder.stopIfActiveOrEmpty()
+        route.recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        sco.release()
+        route.sco.release()
         _status.value = SttTtsStatus.Cancelled
     }
 

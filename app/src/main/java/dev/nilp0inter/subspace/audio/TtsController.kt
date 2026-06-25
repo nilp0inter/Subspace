@@ -84,6 +84,26 @@ class TtsController(
         synthesize(text, voiceStylePath, lang, totalSteps, speed, scoRate)
     }
 
+    fun onPttPressed(
+        route: ResolvedAudioRoute,
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
+        if (!enabled) return
+        if (text.isBlank()) {
+            _status.value = TtsStatus.EmptyText
+            return
+        }
+        synthesisJob?.cancel()
+        synthesisJob = scope.launch {
+            runSynthesis(route, text, voiceStylePath, lang, totalSteps, speed, scoRate)
+        }
+    }
+
     /** PTT release is a no-op for the TTS controller. */
     fun onPttReleased() {
         // No-op: playback runs to completion unless cancelled.
@@ -91,8 +111,11 @@ class TtsController(
 
     /** Cancel any active or pending TTS work and release resources. */
     fun cancelAndRelease() {
-        synthesisJob?.cancel()
-        sco.release()
+        val activeJob = synthesisJob?.takeIf { it.isActive }
+        activeJob?.cancel()
+        if (activeJob != null) {
+            sco.release()
+        }
         _status.value = TtsStatus.Idle
     }
 
@@ -104,9 +127,21 @@ class TtsController(
         speed: Float,
         scoRate: Int,
     ) {
+        runSynthesis(ResolvedAudioRoute(sco, output, NoopRecorder()), text, voiceStylePath, lang, totalSteps, speed, scoRate)
+    }
+
+    private suspend fun runSynthesis(
+        route: ResolvedAudioRoute,
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ) {
         runCatching {
             _status.value = TtsStatus.WaitingForModel
-            if (!sco.acquire()) {
+            if (!route.sco.acquire()) {
                 _status.value = TtsStatus.Error("SCO unavailable")
                 return
             }
@@ -125,36 +160,36 @@ class TtsController(
                 is SynthesisOutcome.Success -> {
                     if (outcome.samples.isEmpty()) {
                         _status.value = TtsStatus.Error("Synthesis produced no audio")
-                        sco.release()
+                        route.sco.release()
                         return
                     }
                     _status.value = TtsStatus.Playing
                     val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
                     if (playback.isEmpty) {
                         _status.value = TtsStatus.Idle
-                        sco.release()
+                        route.sco.release()
                         return
                     }
-                    output.play(playback)
+                    route.output.play(playback)
                     _status.value = TtsStatus.Idle
-                    sco.release()
+                    route.sco.release()
                 }
                 is SynthesisOutcome.ModelNotReady -> {
                     _status.value = TtsStatus.Error("TTS model not ready")
-                    sco.release()
+                    route.sco.release()
                 }
                 is SynthesisOutcome.Failure -> {
                     _status.value = TtsStatus.Error(outcome.reason)
-                    sco.release()
+                    route.sco.release()
                 }
                 SynthesisOutcome.EmptyText -> {
                     _status.value = TtsStatus.EmptyText
-                    sco.release()
+                    route.sco.release()
                 }
             }
         }.onFailure { error ->
             _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
-            sco.release()
+            route.sco.release()
         }
     }
 }

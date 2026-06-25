@@ -22,10 +22,13 @@ import dev.nilp0inter.subspace.R
 import dev.nilp0inter.subspace.audio.AndroidPcmOutput
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.InMemoryRecorder
+import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.PcmTranscriber
+import dev.nilp0inter.subspace.audio.PhoneMicRecorder
+import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
@@ -36,6 +39,7 @@ import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TranscriptionService
+import dev.nilp0inter.subspace.audio.resolveAudioRoute
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
 import dev.nilp0inter.subspace.channel.JournalController
@@ -55,6 +59,7 @@ import dev.nilp0inter.subspace.model.HardwareMode
 import dev.nilp0inter.subspace.model.HeadsetAudioState
 import dev.nilp0inter.subspace.model.MonitorState
 import dev.nilp0inter.subspace.model.PermissionState
+import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.model.RawButtonEvent
 import dev.nilp0inter.subspace.model.SppState
 import dev.nilp0inter.subspace.model.SttModelStatus
@@ -98,6 +103,10 @@ class PttForegroundService : Service() {
     private var journalPttController: JournalPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
+    private lateinit var localOutput: LocalPcmOutput
+    private lateinit var localRecorder: PhoneMicRecorder
+    private var activePttSession: PttSession? = null
+
     private var targetDevice: BluetoothDevice? = null
     private var sppClient: SppClient? = null
     private var serialJob: Job? = null
@@ -105,6 +114,12 @@ class PttForegroundService : Service() {
     private val reconnectPolicy = ReconnectPolicy()
     private var reconnectJob: Job? = null
     private var foreground = false
+
+    private data class PttSession(
+        val source: PttSource,
+        val channelId: String,
+        val route: ResolvedAudioRoute,
+    )
 
     inner class LocalBinder : Binder() {
         fun service(): PttForegroundService = this@PttForegroundService
@@ -124,6 +139,8 @@ class PttForegroundService : Service() {
         val audioManager = getSystemService(AudioManager::class.java)
         sco = ScoAudioController(serviceScope, audioManager)
         pcmOutput = AndroidPcmOutput(audioManager)
+        localOutput = LocalPcmOutput()
+        localRecorder = PhoneMicRecorder(serviceScope)
         echo = EchoController(
             scope = serviceScope,
             sco = sco,
@@ -514,6 +531,15 @@ class PttForegroundService : Service() {
         updateActiveControllers()
     }
 
+    fun phonePttPressed(channelId: String) {
+        setActiveChannelId(channelId)
+        dispatchPttPressed(PttSource.Phone)
+    }
+
+    fun phonePttReleased(channelId: String) {
+        dispatchPttReleased(PttSource.Phone)
+    }
+
     fun setDebugChannelMode(mode: DebugMode) {
         saveDebugChannel(_appState.value.debugChannel.copy(mode = mode))
         updateActiveControllers()
@@ -644,33 +670,49 @@ class PttForegroundService : Service() {
     }
 
     private fun dispatchPttPressed() {
+        dispatchPttPressed(PttSource.Rsm)
+    }
+
+    private fun dispatchPttPressed(source: PttSource) {
+        if (activePttSession != null) return
+
         val appState = _appState.value
-        val activeChannelId = appState.activeChannelId
+        val decision = decidePttDispatch(appState) ?: return
+        val activeChannelId = decision.channelId
 
-        val activeChannel = when (activeChannelId) {
-            JournalChannel.ID -> appState.journal
-            DebugChannel.ID -> appState.debugChannel
-            else -> return
-        }
+        val route = resolveAudioRoute(
+            scoRoute = sco,
+            scoOutput = pcmOutput,
+            scoRecorder = InMemoryRecorder(serviceScope),
+            localOutput = localOutput,
+            localRecorder = localRecorder,
+        )
 
-        if (!activeChannel.isReady) {
+        if (decision is PttDispatchDecision.ErrorBeep) {
             serviceScope.launch {
-                sco.acquire()
-                pcmOutput.playErrorBeep(sco.coldStart)
-                sco.release()
+                route.sco.acquire()
+                route.output.playErrorBeep(route.sco.coldStart)
+                route.sco.release()
             }
             return
         }
 
+        activePttSession = PttSession(
+            source = source,
+            channelId = activeChannelId,
+            route = route,
+        )
+
         when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttPressed()
+            JournalChannel.ID -> journalPttController?.onPttPressed(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttPressed()
-                    DebugMode.STT -> sttController?.onPttPressed()
+                    DebugMode.ECHO -> echo.onPttPressed(route)
+                    DebugMode.STT -> sttController?.onPttPressed(route)
                     DebugMode.TTS -> {
                         val monitor = appState.monitor
                         ttsController?.onPttPressed(
+                            route = route,
                             text = monitor.ttsText,
                             voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
                             lang = monitor.ttsLang,
@@ -679,34 +721,35 @@ class PttForegroundService : Service() {
                             scoRate = SCO_RATE,
                         )
                     }
-                    DebugMode.STT_TTS -> sttTtsController?.onPttPressed()
+                    DebugMode.STT_TTS -> sttTtsController?.onPttPressed(route)
                 }
             }
         }
     }
 
     private fun dispatchPttReleased() {
+        dispatchPttReleased(PttSource.Rsm)
+    }
+
+    private fun dispatchPttReleased(source: PttSource) {
+        val session = activePttSession?.takeIf { it.source == source } ?: return
+        activePttSession = null
         val appState = _appState.value
-        val activeChannelId = appState.activeChannelId
+        val activeChannelId = session.channelId
 
-        val activeChannel = when (activeChannelId) {
-            JournalChannel.ID -> appState.journal
-            DebugChannel.ID -> appState.debugChannel
-            else -> return
-        }
-
-        if (!activeChannel.isReady) return
+        val route = session.route
 
         when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttReleased()
+            JournalChannel.ID -> journalPttController?.onPttReleased(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttReleased()
-                    DebugMode.STT -> sttController?.onPttReleased()
+                    DebugMode.ECHO -> echo.onPttReleased(route)
+                    DebugMode.STT -> sttController?.onPttReleased(route)
                     DebugMode.TTS -> ttsController?.onPttReleased()
                     DebugMode.STT_TTS -> {
                         val monitor = appState.monitor
                         sttTtsController?.onPttReleased(
+                            route,
                             voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle).absolutePath,
                             lang = monitor.sttTtsLang,
                             totalSteps = monitor.sttTtsTotalSteps,

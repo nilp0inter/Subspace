@@ -27,4 +27,6 @@ interface PttUiActions {
     fun setSttTtsLang(lang: String)
     fun setSttTtsTotalSteps(steps: Int)
     fun setSttTtsSpeed(speed: Float)
+    fun phonePttPressed(channelId: String)
+    fun phonePttReleased(channelId: String)
 }

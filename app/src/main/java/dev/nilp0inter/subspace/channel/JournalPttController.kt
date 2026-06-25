@@ -1,7 +1,9 @@
 package dev.nilp0inter.subspace.channel
 
 import dev.nilp0inter.subspace.audio.FileWavRecorder
+import dev.nilp0inter.subspace.audio.NoopRecorder
 import dev.nilp0inter.subspace.audio.PcmOutput
+import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.WavPcmReader
 import dev.nilp0inter.subspace.model.JournalChannel
@@ -27,14 +29,22 @@ class JournalPttController(
     private var activeChannel: JournalChannel? = null
 
     fun onPttPressed() {
+        onPttPressed(ResolvedAudioRoute(sco, output, NoopRecorder()))
+    }
+
+    fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
         if (setupJob?.isActive == true || activeRecorder?.isActive == true) return
-        setupJob = scope.launch { startSession() }
+        setupJob = scope.launch { startSession(route) }
     }
 
     fun onPttReleased() {
+        onPttReleased(ResolvedAudioRoute(sco, output, NoopRecorder()))
+    }
+
+    fun onPttReleased(route: ResolvedAudioRoute) {
         pttDown = false
-        finishSession()
+        finishSession(route)
     }
 
     fun cancelAndRelease() {
@@ -47,28 +57,32 @@ class JournalPttController(
     }
 
     private suspend fun startSession() {
+        startSession(ResolvedAudioRoute(sco, output, NoopRecorder()))
+    }
+
+    private suspend fun startSession(route: ResolvedAudioRoute) {
         runCatching {
             val channel = channelProvider()
             if (!channel.isReady) return@runCatching
             val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() }
                 ?: return@runCatching
 
-            if (!sco.acquire()) return@runCatching
+            if (!route.sco.acquire()) return@runCatching
             if (!pttDown) {
-                sco.release()
+                route.sco.release()
                 return@runCatching
             }
 
             val startedAt = ZonedDateTime.now()
             val paths = pathGenerator.preparePaths(File(baseDirectory), startedAt)
             if (!pttDown) {
-                sco.release()
+                route.sco.release()
                 return@runCatching
             }
 
-            output.playReadyBeep(sco.coldStart)
+            route.output.playReadyBeep(route.sco.coldStart)
             if (!pttDown) {
-                sco.release()
+                route.sco.release()
                 return@runCatching
             }
 
@@ -87,7 +101,7 @@ class JournalPttController(
 
             val recorder = FileWavRecorder(scope, paths.captureFile)
             if (!recorder.start()) {
-                sco.release()
+                route.sco.release()
                 return@runCatching
             }
 
@@ -99,11 +113,15 @@ class JournalPttController(
             activeRecorder = null
             activeEntryPaths = null
             activeChannel = null
-            sco.release()
+            route.sco.release()
         }
     }
 
     private fun finishSession() {
+        finishSession(ResolvedAudioRoute(sco, output, NoopRecorder()))
+    }
+
+    private fun finishSession(route: ResolvedAudioRoute) {
         val paths = activeEntryPaths ?: return
         val channel = activeChannel ?: return
         val recorder = activeRecorder ?: return
@@ -169,7 +187,7 @@ class JournalPttController(
                     paths.metadataFile,
                 )
             }
-            sco.release()
+            route.sco.release()
             journal.processCaptureFile(paths)
         }
     }

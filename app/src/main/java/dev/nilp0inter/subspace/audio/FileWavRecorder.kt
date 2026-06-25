@@ -1,5 +1,6 @@
 package dev.nilp0inter.subspace.audio
 
+import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -27,6 +28,7 @@ class FileWavRecorder(
     val captureFile: File
         get() = targetFile
 
+    @SuppressLint("MissingPermission")
     suspend fun start(): Boolean = withContext(Dispatchers.IO) {
         if (audioRecord != null) return@withContext true
 

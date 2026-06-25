@@ -48,6 +48,10 @@ class SttController(
     }
 
     fun onPttPressed() {
+        onPttPressed(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
         if (!enabled) return
         if (setupJob?.isActive == true || recorder.isActive) return
@@ -55,12 +59,16 @@ class SttController(
         transcribeJob?.cancel()
         transcribeJob = null
         retainedAfterMaxDuration = null
-        setupJob = scope.launch { startSession() }
+        setupJob = scope.launch { startSession(route) }
     }
 
     fun onPttReleased() {
+        onPttReleased(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    fun onPttReleased(route: ResolvedAudioRoute) {
         pttDown = false
-        scope.launch { finishSessionIfNeeded() }
+        scope.launch { finishSessionIfNeeded(route) }
     }
 
     /** Cancel any active or pending STT work and release resources. */
@@ -75,26 +83,30 @@ class SttController(
     }
 
     private suspend fun startSession() {
+        startSession(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    private suspend fun startSession(route: ResolvedAudioRoute) {
         runCatching {
             _status.value = SttStatus.WaitingForAudio
-            if (!sco.acquire()) {
+            if (!route.sco.acquire()) {
                 _status.value = SttStatus.Error("SCO unavailable")
                 return
             }
 
             if (!pttDown) {
-                cancelSession()
+                cancelSession(route)
                 return
             }
 
             _status.value = SttStatus.Beeping
-            output.playReadyBeep(sco.coldStart)
+            route.output.playReadyBeep(route.sco.coldStart)
             if (!pttDown) {
-                cancelSession()
+                cancelSession(route)
                 return
             }
 
-            if (!recorder.start()) {
+            if (!route.recorder.start()) {
                 _status.value = SttStatus.Error("Recording failed")
                 return
             }
@@ -118,15 +130,19 @@ class SttController(
     }
 
     private suspend fun finishSessionIfNeeded() {
+        finishSessionIfNeeded(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    private suspend fun finishSessionIfNeeded(route: ResolvedAudioRoute) {
         maxDurationJob?.cancel()
         maxDurationJob = null
 
         val retained = retainedAfterMaxDuration
         retainedAfterMaxDuration = null
-        val recording = retained ?: recorder.stopIfActiveOrEmpty()
+        val recording = retained ?: route.recorder.stopIfActiveOrEmpty()
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttStatus.Idle) cancelSession()
+            if (enabled || _status.value != SttStatus.Idle) cancelSession(route)
             _status.value = SttStatus.EmptyAudio
             return
         }
@@ -136,7 +152,7 @@ class SttController(
             runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
                 .onSuccess { text ->
                     _status.value = SttStatus.Transcribed(text)
-                    sco.release()
+                    route.sco.release()
                 }
                 .onFailure { error ->
                     if (error is CancellationException) throw error
@@ -146,17 +162,21 @@ class SttController(
                         TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
                         else -> SttStatus.Error(error.message ?: "Transcription failed")
                     }
-                    if (_status.value !is SttStatus.Transcribed) sco.release()
+                    if (_status.value !is SttStatus.Transcribed) route.sco.release()
                 }
         }
     }
 
     private fun cancelSession() {
+        cancelSession(ResolvedAudioRoute(sco, output, recorder))
+    }
+
+    private fun cancelSession(route: ResolvedAudioRoute) {
         maxDurationJob?.cancel()
         maxDurationJob = null
-        recorder.stopIfActiveOrEmpty()
+        route.recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        sco.release()
+        route.sco.release()
         _status.value = SttStatus.Cancelled
     }
 

@@ -52,11 +52,16 @@ The system SHALL keep the dashboard as the home surface and treat the legacy con
 - **THEN** the system returns to the dashboard instead of switching directly between legacy screens
 
 ### Requirement: Dashboard shows channels
-The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones. The cards SHALL display their current readiness state.
+The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones and phone-side PTT zones. The cards SHALL display their current readiness state.
 
 #### Scenario: Channel selected for activation
 - **WHEN** the user taps the main surface area of a functional channel card
 - **THEN** the system SHALL set that channel as the single active channel
+
+#### Scenario: Channel long-pressed for PTT
+- **WHEN** the user long-presses the main surface area of a functional channel card
+- **THEN** the system SHALL set that channel as the single active channel
+- **AND** start a phone-originated PTT session for that channel
 
 #### Scenario: Captain's Log not configured
 - **WHEN** the dashboard is visible and the Captain's Log has no directory selected
