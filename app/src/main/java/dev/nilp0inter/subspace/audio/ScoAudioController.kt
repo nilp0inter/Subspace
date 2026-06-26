@@ -104,6 +104,18 @@ class ScoAudioController(
         }
     }
 
+    suspend fun releaseImmediately() {
+        mutex.withLock {
+            activeClients = 0
+            keepWarmJob?.cancel()
+            keepWarmJob = null
+            _state.value = ScoState.Closing
+            audioManager.clearCommunicationDevice()
+            audioManager.mode = AudioManager.MODE_NORMAL
+            _state.value = ScoState.Inactive
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun findScoDevice(): AudioDeviceInfo? {
         val devices = audioManager.availableCommunicationDevices

@@ -4,4 +4,10 @@
     <string name="notification_channel_name">Subspace device link</string>
     <string name="notification_title">Subspace connected</string>
     <string name="notification_text">Monitoring B02PTT-FF01 serial and headset audio readiness.</string>
+    <string name="car_media_subtitle">Virtual push-to-talk</string>
+    <string name="car_media_ready_title">Subspace ready</string>
+    <string name="car_media_recording_title">Subspace recording</string>
+    <string name="car_media_finalizing_title">Subspace finalizing</string>
+    <string name="car_media_not_ready_title">Subspace not ready</string>
+    <string name="telecom_phone_account_description">Subspace car push-to-talk</string>
 </resources>

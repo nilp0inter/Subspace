@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
+import android.os.Bundle
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -23,6 +24,7 @@ import dev.nilp0inter.subspace.audio.AndroidPcmOutput
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.InMemoryRecorder
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
+import dev.nilp0inter.subspace.audio.MediaResponsePlayer
 import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
@@ -37,6 +39,7 @@ import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
+import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TranscriptionService
 import dev.nilp0inter.subspace.audio.resolveAudioRoute
@@ -68,7 +71,10 @@ import dev.nilp0inter.subspace.model.SttTtsStatus
 import dev.nilp0inter.subspace.model.TtsStatus
 import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
+import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
+import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -78,8 +84,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
-class PttForegroundService : Service() {
+class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _appState = MutableStateFlow(AppState())
@@ -105,7 +112,12 @@ class PttForegroundService : Service() {
 
     private lateinit var localOutput: LocalPcmOutput
     private lateinit var localRecorder: PhoneMicRecorder
+    private lateinit var telecomRegistrar: SubspacePhoneAccountRegistrar
+    private lateinit var mediaResponsePlayer: MediaResponsePlayer
+    private var telecomDisconnected = CompletableDeferred<Unit>().apply { complete(Unit) }
+    private var suppressCarMediaStartUntilMs: Long = 0L
     private var activePttSession: PttSession? = null
+    private lateinit var carPttAdapter: VirtualPttAdapter
 
     private var targetDevice: BluetoothDevice? = null
     private var sppClient: SppClient? = null
@@ -141,6 +153,16 @@ class PttForegroundService : Service() {
         pcmOutput = AndroidPcmOutput(audioManager)
         localOutput = LocalPcmOutput()
         localRecorder = PhoneMicRecorder(serviceScope)
+        telecomRegistrar = SubspacePhoneAccountRegistrar(this)
+        telecomRegistrar.register()
+        mediaResponsePlayer = MediaResponsePlayer(audioManager, localOutput)
+        carPttAdapter = VirtualPttAdapter(
+            press = { dispatchPttPressed(PttSource.CarMedia) },
+            release = { dispatchPttReleased(PttSource.CarMedia) },
+            onStateChanged = { updateCarMediaState() },
+        )
+        CarPttCommandBus.setListener(this)
+        TelecomCarPttCoordinator.setListener(this)
         echo = EchoController(
             scope = serviceScope,
             sco = sco,
@@ -161,11 +183,13 @@ class PttForegroundService : Service() {
         }
         serviceScope.launch {
             echo.status.collect { status ->
+                if (isTerminalCarStatus(status)) carPttAdapter.forceRelease()
                 updateMonitor { it.copy(echoStatus = status) }
             }
         }
 
         refreshReadiness()
+        updateCarMediaState()
     }
 
     private fun initializeStt(audioManager: AudioManager) {
@@ -204,6 +228,7 @@ class PttForegroundService : Service() {
             }
             serviceScope.launch {
                 sttController?.status?.collect { status ->
+                    if (isTerminalCarStatus(status)) carPttAdapter.forceRelease()
                     updateMonitor {
                         val newTranscript = (status as? SttStatus.Transcribed)?.text
                             ?: it.sttTranscript
@@ -273,6 +298,7 @@ class PttForegroundService : Service() {
             }
             serviceScope.launch {
                 sttTtsController?.status?.collect { status ->
+                    if (isTerminalCarStatus(status)) carPttAdapter.forceRelease()
                     val transcript = (status as? SttTtsStatus.Transcript)?.text
                         ?: _appState.value.monitor.sttTtsTranscript
                     updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
@@ -291,6 +317,10 @@ class PttForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        carPttAdapter.forceRelease()
+        CarPttCommandBus.setListener(null)
+        TelecomCarPttCoordinator.setListener(null)
+        TelecomCarPttCoordinator.forceAbort()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
         serialJob?.cancel()
@@ -488,6 +518,7 @@ class PttForegroundService : Service() {
     }
 
     fun disconnectSerial() {
+        carPttAdapter.forceRelease()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
         serialJob?.cancel()
@@ -538,6 +569,36 @@ class PttForegroundService : Service() {
 
     fun phonePttReleased(channelId: String) {
         dispatchPttReleased(PttSource.Phone)
+    }
+
+    override fun onCarPttStart() {
+        startTelecomCarPtt()
+    }
+
+    override fun onCarPttRelease() {
+        TelecomCarPttCoordinator.forceAbort()
+    }
+
+    override fun onTelecomCaptureStart() {
+        dispatchPttPressed(PttSource.CarTelecom)
+        updateCarMediaState()
+    }
+
+    override fun onTelecomCaptureStop() {
+        suppressCarMediaStartUntilMs = SystemClock.elapsedRealtime() + POST_TELECOM_MEDIA_START_SUPPRESS_MS
+        dispatchPttReleased(PttSource.CarTelecom)
+        updateCarMediaState()
+    }
+
+    override fun onTelecomRouteTimeout() {
+        playCarErrorBeep()
+        updateCarMediaState()
+    }
+
+    override fun onTelecomConnectionEnded() {
+        if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
+        suppressCarMediaStartUntilMs = SystemClock.elapsedRealtime() + POST_TELECOM_MEDIA_START_SUPPRESS_MS
+        updateCarMediaState()
     }
 
     fun setDebugChannelMode(mode: DebugMode) {
@@ -625,6 +686,49 @@ class PttForegroundService : Service() {
         }
     }
 
+    private fun startTelecomCarPtt() {
+        if (SystemClock.elapsedRealtime() < suppressCarMediaStartUntilMs) return
+        if (!telecomDisconnected.isCompleted) return
+        if (activePttSession != null) return
+        val decision = decidePttDispatch(_appState.value) ?: return
+        if (decision is PttDispatchDecision.ErrorBeep) {
+            playCarErrorBeep()
+            return
+        }
+        telecomRegistrar.register()
+        if (!telecomRegistrar.isEnabled()) {
+            startActivity(telecomRegistrar.setupIntent())
+            return
+        }
+
+        val telecom = getSystemService(android.telecom.TelecomManager::class.java) ?: return
+        val extras = Bundle().apply {
+            putParcelable(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, telecomRegistrar.handle)
+        }
+        runCatching {
+            telecomDisconnected = CompletableDeferred()
+            telecom.placeCall(telecomRegistrar.callAddress(), extras)
+        }.onFailure {
+            if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
+            playCarErrorBeep()
+        }
+    }
+
+    private fun playCarErrorBeep() {
+        val route = resolveAudioRoute(
+            scoRoute = sco,
+            scoOutput = pcmOutput,
+            scoRecorder = InMemoryRecorder(serviceScope),
+            localOutput = localOutput,
+            localRecorder = localRecorder,
+        )
+        serviceScope.launch {
+            route.sco.acquire()
+            route.output.playErrorBeep(route.sco.coldStart)
+            route.sco.release()
+        }
+    }
+
     private fun handleRawButtonEvent(event: RawButtonEvent) {
         val previousMode = _appState.value.monitor.hardwareMode
         val snapshot = buttonStateMachine.apply(event, SystemClock.elapsedRealtime())
@@ -673,20 +777,14 @@ class PttForegroundService : Service() {
         dispatchPttPressed(PttSource.Rsm)
     }
 
-    private fun dispatchPttPressed(source: PttSource) {
-        if (activePttSession != null) return
+    private fun dispatchPttPressed(source: PttSource): Boolean {
+        if (activePttSession != null) return false
 
         val appState = _appState.value
-        val decision = decidePttDispatch(appState) ?: return
+        val decision = decidePttDispatch(appState) ?: return false
         val activeChannelId = decision.channelId
 
-        val route = resolveAudioRoute(
-            scoRoute = sco,
-            scoOutput = pcmOutput,
-            scoRecorder = InMemoryRecorder(serviceScope),
-            localOutput = localOutput,
-            localRecorder = localRecorder,
-        )
+        val route = resolvePttAudioRoute(source)
 
         if (decision is PttDispatchDecision.ErrorBeep) {
             serviceScope.launch {
@@ -694,7 +792,7 @@ class PttForegroundService : Service() {
                 route.output.playErrorBeep(route.sco.coldStart)
                 route.sco.release()
             }
-            return
+            return false
         }
 
         activePttSession = PttSession(
@@ -725,6 +823,30 @@ class PttForegroundService : Service() {
                 }
             }
         }
+        updateCarMediaState()
+        return true
+    }
+
+    private fun resolvePttAudioRoute(source: PttSource): ResolvedAudioRoute {
+        if (source == PttSource.CarTelecom) {
+            return ResolvedAudioRoute(
+                sco = sco,
+                output = TelecomCapturePcmOutput(
+                    captureOutput = pcmOutput,
+                    mediaResponsePlayer = mediaResponsePlayer,
+                    releaseCaptureRoute = { sco.releaseImmediately() },
+                    awaitTelecomDisconnected = { withTimeoutOrNull(POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS) { telecomDisconnected.await() } },
+                ),
+                recorder = InMemoryRecorder(serviceScope),
+            )
+        }
+        return resolveAudioRoute(
+            scoRoute = sco,
+            scoOutput = pcmOutput,
+            scoRecorder = InMemoryRecorder(serviceScope),
+            localOutput = localOutput,
+            localRecorder = localRecorder,
+        )
     }
 
     private fun dispatchPttReleased() {
@@ -732,7 +854,7 @@ class PttForegroundService : Service() {
     }
 
     private fun dispatchPttReleased(source: PttSource) {
-        val session = activePttSession?.takeIf { it.source == source } ?: return
+        val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
         activePttSession = null
         val appState = _appState.value
         val activeChannelId = session.channelId
@@ -760,7 +882,31 @@ class PttForegroundService : Service() {
                 }
             }
         }
+        updateCarMediaState()
     }
+
+    private fun updateCarMediaState() {
+        val activeReady = decidePttDispatch(_appState.value) is PttDispatchDecision.Dispatch
+        val state = when {
+            activePttSession?.source == PttSource.CarTelecom -> CarMediaPttState.Recording
+            carPttAdapter.state == VirtualPttState.Pressed -> CarMediaPttState.Recording
+            carPttAdapter.state == VirtualPttState.Finalizing -> CarMediaPttState.Finalizing
+            activeReady -> CarMediaPttState.Ready
+            else -> CarMediaPttState.NotReady
+        }
+        CarMediaStateBus.update(state)
+    }
+
+    private fun isTerminalCarStatus(status: EchoStatus): Boolean = isTerminalCarSource() &&
+        (status is EchoStatus.Error || status == EchoStatus.MaxDurationReached)
+
+    private fun isTerminalCarStatus(status: SttStatus): Boolean = isTerminalCarSource() &&
+        (status is SttStatus.Error || status == SttStatus.MaxDurationReached)
+
+    private fun isTerminalCarStatus(status: SttTtsStatus): Boolean = isTerminalCarSource() &&
+        (status is SttTtsStatus.Error || status == SttTtsStatus.MaxDurationReached)
+
+    private fun isTerminalCarSource(): Boolean = activePttSession?.source in setOf(PttSource.CarMedia, PttSource.CarTelecom)
 
     @SuppressLint("MissingPermission")
     private fun resolveManualSerialTarget(): BluetoothDevice? {
@@ -831,6 +977,7 @@ class PttForegroundService : Service() {
     }
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
+        carPttAdapter.forceRelease()
         echo.cancelAndRelease("SPP disconnected")
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
@@ -927,6 +1074,7 @@ class PttForegroundService : Service() {
 
     private fun updateConnection(transform: (ConnectionState) -> ConnectionState) {
         _appState.value = _appState.value.copy(connection = transform(_appState.value.connection))
+        updateCarMediaState()
     }
 
     private fun updateMonitor(transform: (MonitorState) -> MonitorState) {
@@ -1002,5 +1150,7 @@ class PttForegroundService : Service() {
         private const val STT_MODEL_POLL_MS = 500L
         private const val TTS_MODEL_POLL_MS = 500L
         private const val SCO_RATE = 16_000
+        private const val POST_TELECOM_MEDIA_START_SUPPRESS_MS = 10_000L
+        private const val POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS = 3_000L
     }
 }

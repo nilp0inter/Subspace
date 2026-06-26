@@ -27,4 +27,25 @@ class PttDispatchDecisionTest {
 
         assertEquals(PttDispatchDecision.ErrorBeep(JournalChannel.ID), decision)
     }
+
+    @Test
+    fun readyActiveCarTargetDispatchesToSelectedChannel() {
+        val state = AppState(activeChannelId = DebugChannel.ID)
+
+        val decision = decidePttDispatch(state)
+
+        assertEquals(PttDispatchDecision.Dispatch(DebugChannel.ID), decision)
+    }
+
+    @Test
+    fun notReadyActiveCarTargetPlaysErrorBeepInsteadOfDispatching() {
+        val state = AppState(
+            journal = JournalChannel(baseDirectory = null),
+            activeChannelId = JournalChannel.ID,
+        )
+
+        val decision = decidePttDispatch(state)
+
+        assertEquals(PttDispatchDecision.ErrorBeep(JournalChannel.ID), decision)
+    }
 }
