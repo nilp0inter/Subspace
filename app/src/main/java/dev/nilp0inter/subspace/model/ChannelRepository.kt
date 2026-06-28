@@ -34,6 +34,16 @@ class ChannelRepository(
             .apply()
     }
 
+    /**
+     * The single source of truth for channel ordering across both surfaces
+     * (phone dashboard + Android Auto browse tree). Order emanates solely from
+     * this repository per `car-media-channel-browse` spec "Channel ordering is
+     * stable across surfaces"; the ordering is [Channel.orderIndex] ascending
+     * (JournalChannel at index 0, DebugChannel at index 1 today).
+     */
+    fun loadChannels(): List<Channel> =
+        listOf(loadJournal(), loadDebugChannel()).sortedBy { it.orderIndex }
+
     fun loadActiveChannelId(): String =
         prefs.getString(KEY_ACTIVE_CHANNEL, JournalChannel.ID) ?: JournalChannel.ID
 

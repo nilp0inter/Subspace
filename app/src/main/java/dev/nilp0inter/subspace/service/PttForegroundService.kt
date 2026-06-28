@@ -52,8 +52,10 @@ import dev.nilp0inter.subspace.channel.JournalEntryPaths
 import dev.nilp0inter.subspace.channel.JournalMetadataStore
 import dev.nilp0inter.subspace.channel.JournalPttController
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.ChannelBrowseEntry
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.InputModeAvailability
+import dev.nilp0inter.subspace.model.InputModeSelection
 import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
@@ -72,6 +74,9 @@ import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.SttStatus
 import dev.nilp0inter.subspace.model.SttTtsStatus
 import dev.nilp0inter.subspace.model.TtsStatus
+import dev.nilp0inter.subspace.model.projectChannelBrowseEntries
+import dev.nilp0inter.subspace.model.orderedChannelIds
+import dev.nilp0inter.subspace.model.selectChannelByOffset
 import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
@@ -82,9 +87,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -94,6 +102,22 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _appState = MutableStateFlow(AppState())
     val appState: StateFlow<AppState> = _appState.asStateFlow()
+
+    /**
+     * Car-browse projection of the channel list. Derived purely from
+     * [appState] via [projectChannelBrowseEntries]; the Android Auto Media
+     * service collects this to populate `onLoadChildren` and drive
+     * `notifyChildrenChanged` (see design D3).
+     *
+     * Pending counts are always 0 today (per `STATUS.md` "Not implemented yet";
+     * see design non-goal "Pending unheard backlog accuracy on the first
+     * cut"). A future inbound-backlog tracker can supply the second argument
+     * to [projectChannelBrowseEntries] without changing this flow's shape.
+     */
+    val channelBrowseEntries: Flow<List<ChannelBrowseEntry>>
+        get() = _appState
+            .map { projectChannelBrowseEntries(it) }
+            .distinctUntilChanged()
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private lateinit var scanner: DeviceScanner
@@ -566,6 +590,49 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         channelRepository.saveActiveChannelId(id)
         _appState.update { it.copy(activeChannelId = id) }
         updateActiveControllers()
+        updateCarMediaState()
+    }
+
+    /**
+     * Advance the active channel by [offset] positions in the stable channel
+     * ordering (`Channel.orderIndex`), saturating at the bounds — no
+     * wraparound (design D5 / spec `car-contextual-skip-controls` "Previous
+     * saturates at the first channel rather than wrap"). Powered by
+     * [selectChannelByOffset] so the phone hardware control mode and the car
+     * steering wheel share the exact same selection path.
+     */
+    fun setActiveChannelOffset(offset: Int) {
+        val orderedIds = orderedChannelIds(_appState.value)
+        val newId = selectChannelByOffset(orderedIds, _appState.value.activeChannelId, offset)
+            ?: return
+        if (newId == _appState.value.activeChannelId) return
+        channelRepository.saveActiveChannelId(newId)
+        _appState.update { it.copy(activeChannelId = newId) }
+        updateActiveControllers()
+    }
+
+    /**
+     * **Future wiring**: skip the currently-playing inbound message on the
+     * active channel and advance to the queued one (spec
+     * `car-contextual-skip-controls` "Next skips the current inbound message
+     * while Finalizing"). No inbound backlog tracking exists today (per
+     * `STATUS.md` "Not implemented yet" `pending unheard message state`), so
+     * this method no-ops safely pending the message-backlog capability. When
+     * that capability ships, this method should: mark the current inbound
+     * message Heard, advance the active-channel inbox pointer, and (if no
+     * queued message) fall back to `Ready`. The car [CarMediaStateBus] will
+     * emit the resulting state and the now-playing card will reflect it.
+     */
+    fun skipCurrentMessage() {
+    }
+
+    /**
+     * **Future wiring**: replay the last heard inbound message on the active
+     * channel (spec `car-contextual-skip-controls` "Previous replays the last
+     * heard message while Finalizing"). No `last-heard message state` exists
+     * today; this method no-ops safely until that capability ships.
+     */
+    fun replayLastHeard() {
     }
 
     fun phonePttPressed(channelId: String) {
@@ -577,8 +644,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         dispatchPttReleased(PttSource.Phone)
     }
 
-    fun setInputMode(mode: InputMode): Boolean {
-        val changed = inputModeController.setInputMode(mode)
+    fun setInputMode(mode: InputMode): Boolean = setInputMode(mode, InputModeSelection.User)
+
+    fun setInputMode(mode: InputMode, by: InputModeSelection): Boolean {
+        val changed = inputModeController.setInputMode(mode, by)
         if (changed) publishInputMode()
         return changed
     }
@@ -593,6 +662,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun publishInputMode() {
         _appState.value = _appState.value.copy(
             inputMode = inputModeController.mode,
+            inputModeSelectedBy = inputModeController.selectedBy,
             inputModeAvailability = inputModeController.availability,
         )
         updateCarMediaState()
@@ -735,17 +805,31 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun cycleActiveChannel(next: Boolean) {
-        val channels = listOf(JournalChannel.ID, DebugChannel.ID)
-        val currentIndex = channels.indexOf(_appState.value.activeChannelId).takeIf { it >= 0 } ?: 0
         val offset = if (next) 1 else -1
-        val newIndex = (currentIndex + offset).let {
-            if (it < 0) channels.size - 1 else it % channels.size
+        val previousId = _appState.value.activeChannelId
+        setActiveChannelOffset(offset)
+        val newId = _appState.value.activeChannelId
+        if (newId != previousId) {
+            serviceScope.launch {
+                announcer?.announce("chan.$newId.name", sco, pcmOutput)
+            }
         }
-        val newId = channels[newIndex]
-        setActiveChannelId(newId)
-        serviceScope.launch {
-            announcer?.announce("chan.$newId.name", sco, pcmOutput)
-        }
+    }
+
+    override fun onCarSetActiveChannel(id: String) {
+        setActiveChannelId(id)
+    }
+
+    override fun onCarSetActiveChannelOffset(offset: Int) {
+        setActiveChannelOffset(offset)
+    }
+
+    override fun onCarSkipMessage() {
+        skipCurrentMessage()
+    }
+
+    override fun onCarReplayMessage() {
+        replayLastHeard()
     }
 
     private fun startTelecomCarPtt() {

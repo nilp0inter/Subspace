@@ -12,11 +12,21 @@ data class AppState(
     val debugChannel: DebugChannel = DebugChannel(),
     val activeChannelId: String = JournalChannel.ID,
     val inputMode: InputMode = InputMode.OnAPinch,
+    val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
     val inputModeAvailability: InputModeAvailability = InputModeAvailability(),
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor
 }
+
+/**
+ * Records whether the current [InputMode] was chosen by the user or
+ * auto-switched by the system (Android Auto connect/disconnect per
+ * `car-input-mode-auto-switch`). Defaulting to [InputModeSelection.User] keeps
+ * the existing manual-selection behavior observable-unchanged; the new
+ * auto-switch consults this flag before overriding the user's choice.
+ */
+enum class InputModeSelection { User, System }
 
 data class ConnectionState(
     val permissions: PermissionState = PermissionState.Missing,
