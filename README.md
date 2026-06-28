@@ -32,7 +32,6 @@ channel/history navigation are not implemented yet.
 ## Repository Docs
 
 - `PRODUCT_VISION.md`: long-term product model and interaction behavior.
-- `STATUS.md`: current implementation state, verified behavior, and next work.
 - `VISUAL_IDENTITY.md`: visual language, typography, palette, and UI principles.
 - `AGENTS.md`: development environment, tooling, and manual device-test instructions.
 

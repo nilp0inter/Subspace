@@ -39,8 +39,8 @@ internal object CarPttCommandBus {
 
     /**
      * Skip the currently-playing inbound message on the active channel.
-     * **Future wiring**: until inbound backlog tracking lands per
-     * `STATUS.md` "Not implemented yet" / `pending unheard message state`,
+     * **Future wiring**: until inbound backlog tracking lands
+     * (`pending unheard message state` is not yet implemented),
      * the service implementation no-ops safely (design D9).
      */
     fun skipCurrentMessage() {

@@ -9,9 +9,8 @@ package dev.nilp0inter.subspace.model
  * count is omitted from the subtitle when zero).
  *
  * The projection is produced by [projectChannelBrowseEntries] from an [AppState]
- * plus a per-channel pending-unheard count map (today always empty; pending
- * backlog tracking per `STATUS.md` "Not implemented yet" will feed the map
- * without changing this data class).
+ * plus a per-channel pending-unheard count map (today always empty; a future
+ * inbound-backlog tracker will feed the map without changing this data class).
  */
 data class ChannelBrowseEntry(
     val id: String,

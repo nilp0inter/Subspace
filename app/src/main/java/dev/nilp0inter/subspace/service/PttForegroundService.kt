@@ -109,8 +109,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
      * service collects this to populate `onLoadChildren` and drive
      * `notifyChildrenChanged` (see design D3).
      *
-     * Pending counts are always 0 today (per `STATUS.md` "Not implemented yet";
-     * see design non-goal "Pending unheard backlog accuracy on the first
+     * Pending counts are always 0 today (inbound backlog tracking is not yet
+     * implemented; see design non-goal "Pending unheard backlog accuracy on the first
      * cut"). A future inbound-backlog tracker can supply the second argument
      * to [projectChannelBrowseEntries] without changing this flow's shape.
      */
@@ -615,8 +615,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
      * **Future wiring**: skip the currently-playing inbound message on the
      * active channel and advance to the queued one (spec
      * `car-contextual-skip-controls` "Next skips the current inbound message
-     * while Finalizing"). No inbound backlog tracking exists today (per
-     * `STATUS.md` "Not implemented yet" `pending unheard message state`), so
+     * while Finalizing"). No inbound backlog tracking exists today
+     * (`pending unheard message state` is not yet implemented), so
      * this method no-ops safely pending the message-backlog capability. When
      * that capability ships, this method should: mark the current inbound
      * message Heard, advance the active-channel inbox pointer, and (if no

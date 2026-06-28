@@ -37,8 +37,8 @@ internal enum class CarSkipAction {
  * scenario "Next skips the current inbound message while Finalizing" / "Previous
  * replays the last heard message while Finalizing" — this is the case the
  * steering wheel user actually experiences during the on-the-road playback
- * window. The future inbound-backlog tracker (per `STATUS.md` "Not implemented
- * yet" `pending unheard message state`) can disambiguate the two rows when it
+ * window. The future inbound-backlog tracker (`pending unheard message
+ * state` is not yet implemented) can disambiguate the two rows when it
  * ships, mapping idle Finalizing to channel-skip; the message-skip/replay
  * stubs on [PttForegroundService] currently no-op safely (see design D9).
  */
