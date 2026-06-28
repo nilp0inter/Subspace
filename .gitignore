@@ -6,3 +6,4 @@ local.properties
 .android/
 .opencode
 rust/target/
+.omo
