@@ -45,7 +45,9 @@ class SppClient(
                     val read = input.read(buffer)
                     if (read < 0) break
                     val events = parser.push(buffer.copyOf(read))
-                    for (event in events) send(event)
+                    for (event in events) {
+                        send(event)
+                    }
                 }
             } catch (error: IOException) {
                 if (isActive) _state.value = SppState.Failed

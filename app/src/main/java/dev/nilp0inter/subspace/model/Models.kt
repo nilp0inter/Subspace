@@ -11,6 +11,8 @@ data class AppState(
     val journal: JournalChannel = JournalChannel(),
     val debugChannel: DebugChannel = DebugChannel(),
     val activeChannelId: String = JournalChannel.ID,
+    val inputMode: InputMode = InputMode.OnAPinch,
+    val inputModeAvailability: InputModeAvailability = InputModeAvailability(),
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor
@@ -74,7 +76,20 @@ data class ButtonStates(
 )
 
 enum class HardwareMode { Active, Control }
-enum class PttSource { Rsm, Phone, CarMedia, CarTelecom }
+enum class PttSource { Rsm, Phone, CarTelecom }
+enum class InputMode { Work, OnTheRoad, OnAPinch }
+
+data class InputModeAvailability(
+    val work: Boolean = false,
+    val onTheRoad: Boolean = false,
+    val onAPinch: Boolean = true,
+) {
+    fun isAvailable(mode: InputMode): Boolean = when (mode) {
+        InputMode.Work -> work
+        InputMode.OnTheRoad -> onTheRoad
+        InputMode.OnAPinch -> onAPinch
+    }
+}
 enum class TwoStateButton { Released, Pressed }
 enum class SosButtonState { Released, Pressed, LongPressed }
 enum class ClickButtonState { Idle, Clicked }

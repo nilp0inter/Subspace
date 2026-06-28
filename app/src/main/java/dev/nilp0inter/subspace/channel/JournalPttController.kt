@@ -3,15 +3,19 @@ package dev.nilp0inter.subspace.channel
 import dev.nilp0inter.subspace.audio.FileWavRecorder
 import dev.nilp0inter.subspace.audio.NoopRecorder
 import dev.nilp0inter.subspace.audio.PcmOutput
+import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoRoute
+import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.WavPcmReader
 import dev.nilp0inter.subspace.model.JournalChannel
 import java.io.File
 import java.time.ZonedDateTime
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class JournalPttController(
     private val scope: CoroutineScope,
@@ -130,65 +134,73 @@ class JournalPttController(
         activeChannel = null
 
         scope.launch {
-            recorder.stop()
-            val captureFile = recorder.captureFile
-            val wavInfo = WavPcmReader.read(captureFile)
-            if (wavInfo != null && wavInfo.samples.isNotEmpty()) {
-                metadataStore.write(
-                    JournalEntryMetadata(
-                        entryId = paths.stem,
-                        startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
-                        endedAt = ZonedDateTime.now().toString(),
-                        timezoneOffset = paths.timezoneOffset,
-                        channel = MetadataChannelSnapshot(
-                            id = channel.id,
-                            saveVoice = channel.saveVoice,
-                            saveText = channel.saveText,
-                        ),
-                        capture = CaptureState(
-                            state = CaptureTaskState.finished,
-                            path = captureFile.name,
-                            sampleRate = wavInfo.sampleRate,
-                            channels = wavInfo.channelCount,
-                            encoding = "pcm_s16le",
-                            durationMs = wavInfo.durationMs,
-                            bytes = wavInfo.dataSize,
-                        ),
-                        encoding = if (channel.saveVoice)
-                            DerivedTaskState(state = DerivedTaskStatus.pending)
-                        else
-                            DerivedTaskState(state = DerivedTaskStatus.skipped),
-                        transcription = if (channel.saveText)
-                            DerivedTaskState(state = DerivedTaskStatus.pending)
-                        else
-                            DerivedTaskState(state = DerivedTaskStatus.skipped),
-                    ),
-                    paths.metadataFile,
-                )
+            val telecomOutput = route.output as? TelecomCapturePcmOutput
+            if (telecomOutput != null) {
+                telecomOutput.releaseRoute()
             } else {
-                metadataStore.write(
-                    JournalEntryMetadata(
-                        entryId = paths.stem,
-                        startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
-                        endedAt = ZonedDateTime.now().toString(),
-                        timezoneOffset = paths.timezoneOffset,
-                        channel = MetadataChannelSnapshot(
-                            id = channel.id,
-                            saveVoice = channel.saveVoice,
-                            saveText = channel.saveText,
-                        ),
-                        capture = CaptureState(
-                            state = CaptureTaskState.failed,
-                            error = if (wavInfo == null) "WAV read failed" else "Empty capture",
-                        ),
-                        encoding = DerivedTaskState(state = DerivedTaskStatus.skipped),
-                        transcription = DerivedTaskState(state = DerivedTaskStatus.skipped),
-                    ),
-                    paths.metadataFile,
-                )
+                route.output.play(RecordedPcm(shortArrayOf(), 16_000))
             }
-            route.sco.release()
-            journal.processCaptureFile(paths)
+
+            withContext(Dispatchers.IO) {
+                recorder.stop()
+                val captureFile = recorder.captureFile
+                val wavInfo = WavPcmReader.read(captureFile)
+                if (wavInfo != null && wavInfo.samples.isNotEmpty()) {
+                    metadataStore.write(
+                        JournalEntryMetadata(
+                            entryId = paths.stem,
+                            startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                            endedAt = ZonedDateTime.now().toString(),
+                            timezoneOffset = paths.timezoneOffset,
+                            channel = MetadataChannelSnapshot(
+                                id = channel.id,
+                                saveVoice = channel.saveVoice,
+                                saveText = channel.saveText,
+                            ),
+                            capture = CaptureState(
+                                state = CaptureTaskState.finished,
+                                path = captureFile.name,
+                                sampleRate = wavInfo.sampleRate,
+                                channels = wavInfo.channelCount,
+                                encoding = "pcm_s16le",
+                                durationMs = wavInfo.durationMs,
+                                bytes = wavInfo.dataSize,
+                            ),
+                            encoding = if (channel.saveVoice)
+                                DerivedTaskState(state = DerivedTaskStatus.pending)
+                            else
+                                DerivedTaskState(state = DerivedTaskStatus.skipped),
+                            transcription = if (channel.saveText)
+                                DerivedTaskState(state = DerivedTaskStatus.pending)
+                            else
+                                DerivedTaskState(state = DerivedTaskStatus.skipped),
+                        ),
+                        paths.metadataFile,
+                    )
+                } else {
+                    metadataStore.write(
+                        JournalEntryMetadata(
+                            entryId = paths.stem,
+                            startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                            endedAt = ZonedDateTime.now().toString(),
+                            timezoneOffset = paths.timezoneOffset,
+                            channel = MetadataChannelSnapshot(
+                                id = channel.id,
+                                saveVoice = channel.saveVoice,
+                                saveText = channel.saveText,
+                            ),
+                            capture = CaptureState(
+                                state = CaptureTaskState.failed,
+                                error = if (wavInfo == null) "WAV read failed" else "Empty capture",
+                            ),
+                            encoding = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                            transcription = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                        ),
+                        paths.metadataFile,
+                    )
+                }
+                journal.processCaptureFile(paths)
+            }
         }
     }
 

@@ -22,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
@@ -135,6 +136,10 @@ class MainActivity : ComponentActivity() {
 
                     override fun setActiveChannel(id: String) {
                         currentServiceState?.setActiveChannelId(id)
+                    }
+
+                    override fun setInputMode(mode: InputMode) {
+                        currentServiceState?.setInputMode(mode)
                     }
 
                     override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {

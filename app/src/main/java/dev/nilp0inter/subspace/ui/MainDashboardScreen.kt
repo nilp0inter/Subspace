@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
@@ -65,6 +66,8 @@ fun MainDashboardScreen(
             connected = connected,
             onClick = onConnectionClick,
         )
+
+        InputModeSelector(appState, actions)
 
         ChannelPanel(appState, actions)
     }
@@ -117,6 +120,90 @@ private fun ConnectionIndicator(
                 text = guidance,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun InputModeSelector(
+    appState: AppState,
+    actions: PttUiActions,
+) {
+    val availability = appState.inputModeAvailability
+    val activeMode = appState.inputMode
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "INPUT MODE",
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ModeSegment(
+                label = "Work",
+                subtitle = "RSM headset",
+                isActive = activeMode == InputMode.Work,
+                isAvailable = availability.work,
+                onClick = { actions.setInputMode(InputMode.Work) },
+                modifier = Modifier.weight(1f),
+            )
+            ModeSegment(
+                label = "On-the-road",
+                subtitle = "Steering wheel",
+                isActive = activeMode == InputMode.OnTheRoad,
+                isAvailable = availability.onTheRoad,
+                onClick = { actions.setInputMode(InputMode.OnTheRoad) },
+                modifier = Modifier.weight(1f),
+            )
+            ModeSegment(
+                label = "On-a-pinch",
+                subtitle = "Phone alone",
+                isActive = activeMode == InputMode.OnAPinch,
+                isAvailable = availability.onAPinch,
+                onClick = { actions.setInputMode(InputMode.OnAPinch) },
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModeSegment(
+    label: String,
+    subtitle: String,
+    isActive: Boolean,
+    isAvailable: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val accent = if (isActive) MaterialTheme.colorScheme.primary
+    else if (isAvailable) MaterialTheme.colorScheme.secondary
+    else MaterialTheme.colorScheme.outline
+    val contentColor = if (isAvailable) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline
+    Card(
+        onClick = onClick.takeIf { isAvailable } ?: {},
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(if (isActive) 2.dp else 1.dp, accent),
+        modifier = modifier,
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.titleSmall,
+                color = contentColor,
+                fontWeight = if (isActive) FontWeight.Bold else FontWeight.SemiBold,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (isAvailable) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.outline,
             )
         }
     }

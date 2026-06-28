@@ -181,6 +181,7 @@ class SttTtsController(
                     val transcript = transcriptOutcome.text
                     if (transcript.isBlank()) {
                         _status.value = SttTtsStatus.EmptyTranscript
+                        route.output.releaseRoute()
                         route.sco.release()
                         return@launch
                     }
@@ -198,6 +199,7 @@ class SttTtsController(
                         is SynthesisOutcome.Success -> {
                             if (synthOutcome.samples.isEmpty()) {
                                 _status.value = SttTtsStatus.Error("Synthesis produced no audio")
+                                route.output.releaseRoute()
                                 route.sco.release()
                             } else {
                                 _status.value = SttTtsStatus.Playing
@@ -209,28 +211,34 @@ class SttTtsController(
                         }
                         is SynthesisOutcome.ModelNotReady -> {
                             _status.value = SttTtsStatus.Error("TTS model not ready")
+                            route.output.releaseRoute()
                             route.sco.release()
                         }
                         is SynthesisOutcome.Failure -> {
                             _status.value = SttTtsStatus.Error(synthOutcome.reason)
+                            route.output.releaseRoute()
                             route.sco.release()
                         }
                         SynthesisOutcome.EmptyText -> {
                             _status.value = SttTtsStatus.EmptyTranscript
+                            route.output.releaseRoute()
                             route.sco.release()
                         }
                     }
                 }
                 is TranscriptionOutcome.Failure -> {
                     _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
                 TranscriptionOutcome.ModelNotReady -> {
                     _status.value = SttTtsStatus.Error("STT model not ready")
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
                 TranscriptionOutcome.EmptyInput -> {
                     _status.value = SttTtsStatus.EmptyAudio
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
             }
@@ -246,7 +254,10 @@ class SttTtsController(
         maxDurationJob = null
         route.recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        route.sco.release()
+        scope.launch {
+            route.output.releaseRoute()
+            route.sco.release()
+        }
         _status.value = SttTtsStatus.Cancelled
     }
 

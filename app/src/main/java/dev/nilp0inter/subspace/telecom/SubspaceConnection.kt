@@ -31,8 +31,38 @@ internal class SubspaceConnection : Connection() {
         }
     }
 
-    override fun onAbort() = abortFromTelecom()
-    override fun onReject() = abortFromTelecom()
+    override fun onAbort() {
+        abortFromTelecom()
+    }
+
+    override fun onReject() {
+        abortFromTelecom()
+    }
+
+    override fun onPlayDtmfTone(c: Char) {
+        super.onPlayDtmfTone(c)
+    }
+
+    override fun onHold() {
+        super.onHold()
+    }
+
+    override fun onUnhold() {
+        super.onUnhold()
+    }
+
+    override fun onAnswer() {
+        super.onAnswer()
+    }
+
+    override fun onAnswer(videoState: Int) {
+        super.onAnswer(videoState)
+    }
+
+    override fun onSilence() {
+        super.onSilence()
+    }
+
     fun disconnectFromCoordinator() {
         coordinatorDisconnect = true
         handler.removeCallbacks(timeout)

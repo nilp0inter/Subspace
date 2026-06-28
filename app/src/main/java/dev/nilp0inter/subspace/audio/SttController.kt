@@ -152,6 +152,7 @@ class SttController(
             runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
                 .onSuccess { text ->
                     _status.value = SttStatus.Transcribed(text)
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
                 .onFailure { error ->
@@ -162,7 +163,10 @@ class SttController(
                         TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
                         else -> SttStatus.Error(error.message ?: "Transcription failed")
                     }
-                    if (_status.value !is SttStatus.Transcribed) route.sco.release()
+                    if (_status.value !is SttStatus.Transcribed) {
+                        route.output.releaseRoute()
+                        route.sco.release()
+                    }
                 }
         }
     }
@@ -176,7 +180,10 @@ class SttController(
         maxDurationJob = null
         route.recorder.stopIfActiveOrEmpty()
         retainedAfterMaxDuration = null
-        route.sco.release()
+        scope.launch {
+            route.output.releaseRoute()
+            route.sco.release()
+        }
         _status.value = SttStatus.Cancelled
     }
 

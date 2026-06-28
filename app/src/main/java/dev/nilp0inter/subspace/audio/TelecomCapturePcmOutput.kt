@@ -19,4 +19,9 @@ class TelecomCapturePcmOutput(
         awaitTelecomDisconnected()
         mediaResponsePlayer.play(recording)
     }
+
+    override suspend fun releaseRoute() {
+        releaseCaptureRoute()
+        awaitTelecomDisconnected()
+    }
 }

@@ -15,6 +15,7 @@ import dev.nilp0inter.subspace.R
 
 class CarMediaSessionService : MediaBrowserService() {
     private lateinit var session: MediaSession
+    private var browserClientCount = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -39,6 +40,10 @@ class CarMediaSessionService : MediaBrowserService() {
 
     override fun onDestroy() {
         CarPttCommandBus.release()
+        if (browserClientCount > 0) {
+            browserClientCount = 0
+            AndroidAutoPresenceBus.update(false)
+        }
         CarMediaStateBus.setListener(null)
         session.isActive = false
         session.release()
@@ -46,6 +51,8 @@ class CarMediaSessionService : MediaBrowserService() {
     }
 
     override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+        browserClientCount += 1
+        AndroidAutoPresenceBus.update(browserClientCount > 0)
         return BrowserRoot(ROOT_ID, null)
     }
 
@@ -93,9 +100,10 @@ class CarMediaSessionService : MediaBrowserService() {
         .build()
 
     private val callback = object : MediaSession.Callback() {
-        override fun onPlay() = CarPttCommandBus.startTelecomCapture()
-        override fun onPause() = Unit
-        override fun onStop() = Unit
+        override fun onPlay() {
+            CarPttCommandBus.startTelecomCapture()
+        }
+
         override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
             val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
             if (event?.action != KeyEvent.ACTION_DOWN) return true
@@ -130,3 +138,21 @@ internal object CarMediaStateBus {
 }
 
 internal enum class CarMediaPttState { NotReady, Ready, Recording, Finalizing }
+
+internal object AndroidAutoPresenceBus {
+    private var listener: ((Boolean) -> Unit)? = null
+    private var connected: Boolean = false
+
+    fun setListener(listener: ((Boolean) -> Unit)?) {
+        this.listener = listener
+        listener?.invoke(connected)
+    }
+
+    fun update(connected: Boolean) {
+        if (this.connected == connected) return
+        this.connected = connected
+        listener?.invoke(connected)
+    }
+
+    fun isConnected(): Boolean = connected
+}

@@ -160,6 +160,7 @@ class TtsController(
                 is SynthesisOutcome.Success -> {
                     if (outcome.samples.isEmpty()) {
                         _status.value = TtsStatus.Error("Synthesis produced no audio")
+                        route.output.releaseRoute()
                         route.sco.release()
                         return
                     }
@@ -167,6 +168,7 @@ class TtsController(
                     val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
                     if (playback.isEmpty) {
                         _status.value = TtsStatus.Idle
+                        route.output.releaseRoute()
                         route.sco.release()
                         return
                     }
@@ -176,19 +178,23 @@ class TtsController(
                 }
                 is SynthesisOutcome.ModelNotReady -> {
                     _status.value = TtsStatus.Error("TTS model not ready")
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
                 is SynthesisOutcome.Failure -> {
                     _status.value = TtsStatus.Error(outcome.reason)
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
                 SynthesisOutcome.EmptyText -> {
                     _status.value = TtsStatus.EmptyText
+                    route.output.releaseRoute()
                     route.sco.release()
                 }
             }
         }.onFailure { error ->
             _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
+            route.output.releaseRoute()
             route.sco.release()
         }
     }

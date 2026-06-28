@@ -25,7 +25,12 @@ class SubspaceConnectionService : ConnectionService() {
         return connection
     }
 
-    override fun onCreateOutgoingConnectionFailed(
+    override fun onCreateIncomingConnection(
+        connectionManagerPhoneAccount: android.telecom.PhoneAccountHandle?,
+        request: ConnectionRequest?,
+    ): Connection? = super.onCreateIncomingConnection(connectionManagerPhoneAccount, request)
+
+    override fun onCreateIncomingConnectionFailed(
         connectionManagerPhoneAccount: android.telecom.PhoneAccountHandle?,
         request: ConnectionRequest?,
     ) {

@@ -1,8 +1,4 @@
-## Purpose
-
-TBD. Defines self-managed Telecom VoIP-based car PTT capture through Subspace's PhoneAccount, with Telecom callbacks as the authoritative stop signal.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Telecom-backed car PTT capture session
 The system SHALL represent each in-car PTT capture interval as a self-managed Telecom VoIP call owned by Subspace. Each PTT cycle SHALL be a complete call lifecycle: place call, acquire SCO, capture, release on hang-up, and perform a mandatory route switch.
@@ -83,3 +79,13 @@ The system SHALL start a 30-second idle timer after the route switch completes. 
 #### Scenario: Idle timer cancelled by new PTT
 - **WHEN** the user presses play/pause before the 30-second idle timer fires
 - **THEN** the system SHALL cancel the idle timer and start a new PTT cycle
+
+## REMOVED Requirements
+
+### Requirement: Previous media-session PTT stop path is not used
+**Reason**: The media-toggle approach (`VirtualPttAdapter`, `CarMedia` source) was discarded after in-car testing. The media session remains as a feedback surface and browser client tracker, but is not a PTT input or stop path.
+**Migration**: The `onPlay` callback in `CarMediaSessionService` now calls the on-the-road PTT start path directly (Telecom self-call). The `VirtualPttAdapter`, `CarMedia` `PttSource`, and `CarPttCommandBus` start/release paths are removed. The `suppressCarMediaStartUntilMs` blackout window is removed because the mandatory route switch makes it unnecessary.
+
+### Requirement: Response playback uses media audio
+**Reason**: This requirement is superseded by the `on-the-road-ptt-session` capability which provides a more complete specification of the response playback behavior including the mandatory route switch.
+**Migration**: See `on-the-road-ptt-session` spec for the response playback requirements.

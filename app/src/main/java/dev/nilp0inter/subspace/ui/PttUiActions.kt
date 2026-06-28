@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.ui
 
+import dev.nilp0inter.subspace.model.InputMode
+
 interface PttUiActions {
     fun requestPermissions()
     fun requestManageExternalStorage()
@@ -13,6 +15,7 @@ interface PttUiActions {
     fun setJournalSaveVoice(enabled: Boolean)
     fun setJournalSaveText(enabled: Boolean)
     fun setActiveChannel(id: String)
+    fun setInputMode(mode: InputMode)
     fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode)
     fun navigateToJournalConfig()
     fun navigateToDebugConfig()

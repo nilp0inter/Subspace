@@ -31,6 +31,7 @@ interface PcmOutput {
     suspend fun playReadyBeep(coldStart: Boolean = false)
     suspend fun playErrorBeep(coldStart: Boolean = false)
     suspend fun play(recording: RecordedPcm)
+    suspend fun releaseRoute() {}
 }
 
 data class ResolvedAudioRoute(
