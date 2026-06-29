@@ -171,8 +171,85 @@ class SttControllerTest {
         runCurrent()
 
         assertEquals(SttStatus.Idle, controller.status.value)
-        assertEquals(1, sco.releaseCount)
+        assertEquals(1, output.releaseRouteCount)
         assertFalse(captureService.isCapturing.value)
+    }
+
+    @Test
+    fun normalTranscriptionReleasesRouteViaFinally() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
+        val output = FakeOutput()
+        val transcriber = FakeSttTranscriber().apply {
+            setOutcome(TranscriptionOutcome.Success("hello"))
+        }
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.onPttReleased()
+        runCurrent()
+        advanceUntilIdle()
+
+        assertEquals(SttStatus.Transcribed("hello"), controller.status.value)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun transcribeFailureReleasesRouteViaFinally() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
+        val output = FakeOutput()
+        val transcriber = FakeSttTranscriber().apply {
+            setOutcome(TranscriptionOutcome.Failure("blew up"))
+        }
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.onPttReleased()
+        runCurrent()
+        advanceUntilIdle()
+
+        assertTrue(controller.status.value is SttStatus.Error)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun newPressCancelsInFlightTranscriptionAndReleasesRouteExactlyOnce() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val sourceA = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
+        val sourceB = CaptureServiceFakes.singleShotSource(shortArrayOf(5, 6, 7, 8))
+        val output = FakeOutput()
+        val transcriber = FakeSttTranscriber().apply {
+            setOutcome(TranscriptionOutcome.Success("first"))
+        }
+        val controller = makeController(this, sco, captureService, sourceA, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.onPttReleased()
+        runCurrent()
+        // Transcription is now in flight. Press PTT again before it completes.
+        controller.onPttPressed(ResolvedAudioRoute(sco, output, sourceB))
+        runCurrent()
+        advanceUntilIdle()
+
+        // The first session's transcription was cancelled by the new press;
+        // its `finally` block must release the route exactly once. The new
+        // session will release again on its own post-capture path.
+        assertEquals(
+            "old session must release route exactly once via finally on cancellation",
+            1,
+            output.releaseRouteCount,
+        )
+        assertEquals(2, sco.acquireCount)
     }
 
     private class FakeScoRoute(
@@ -181,10 +258,12 @@ class SttControllerTest {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
         override val state: StateFlow<ScoState> = _state
         var releaseCount = 0
+        var acquireCount = 0; private set
 
         override fun hasAvailableScoDevice(): Boolean = true
 
         override suspend fun acquire(): Boolean {
+            acquireCount += 1
             delay(acquireDelayMs)
             _state.value = ScoState.Active
             return true
@@ -201,6 +280,7 @@ class SttControllerTest {
     private class FakeOutput : PcmOutput {
         var beepCount = 0
         var playbackCount = 0
+        var releaseRouteCount = 0
 
         override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun playReadyBeep(coldStart: Boolean) {
@@ -209,6 +289,10 @@ class SttControllerTest {
 
         override suspend fun play(recording: RecordedPcm) {
             playbackCount += 1
+        }
+
+        override suspend fun releaseRoute() {
+            releaseRouteCount += 1
         }
     }
 }

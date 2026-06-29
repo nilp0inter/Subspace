@@ -202,8 +202,61 @@ class SttTtsControllerTest {
         runCurrent()
 
         assertEquals(SttTtsStatus.Idle, controller.status.value)
-        assertEquals(1, sco.releaseCount)
+        assertEquals(1, output.releaseRouteCount)
         assertFalse(captureService.isCapturing.value)
+    }
+
+    @Test
+    fun roundTripSuccessReleasesRouteViaFinally() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
+        val output = FakeOutput()
+        val transcriber = FakeSttTranscriber().apply {
+            setOutcome(TranscriptionOutcome.Success("hello world"))
+        }
+        val synth = FakeTtsSynthesizer().apply {
+            setOutcome(SynthesisOutcome.Success(FloatArray(100) { 0.5f }))
+        }
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.onPttReleased("/tmp/M1.json", "en", 8, 1.0f, 16_000)
+        runCurrent()
+        advanceUntilIdle()
+
+        assertEquals(SttTtsStatus.Idle, controller.status.value)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun newPressCancelsInFlightTranscriptionAndReleasesRouteExactlyOnce() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val sourceA = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
+        val sourceB = CaptureServiceFakes.singleShotSource(shortArrayOf(5, 6, 7, 8))
+        val output = FakeOutput()
+        val transcriber = FakeSttTranscriber().apply {
+            setOutcome(TranscriptionOutcome.Success("first"))
+        }
+        val synth = FakeTtsSynthesizer()
+        val controller = makeController(this, sco, captureService, sourceA, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.onPttReleased("/tmp/M1.json", "en", 8, 1.0f, 16_000)
+        runCurrent()
+        // Transcription in flight; press PTT again to cancel it.
+        controller.onPttPressed(ResolvedAudioRoute(sco, output, sourceB))
+        runCurrent()
+        advanceUntilIdle()
+
+        // The old session's `finally` must release exactly once on cancellation.
+        assertEquals(1, output.releaseRouteCount)
+        assertEquals(2, sco.acquireCount)
     }
 
     private class FakeScoRoute(
@@ -212,10 +265,12 @@ class SttTtsControllerTest {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
         override val state: StateFlow<ScoState> = _state
         var releaseCount = 0
+        var acquireCount = 0; private set
 
         override fun hasAvailableScoDevice(): Boolean = true
 
         override suspend fun acquire(): Boolean {
+            acquireCount += 1
             delay(acquireDelayMs)
             _state.value = ScoState.Active
             return true
@@ -232,6 +287,7 @@ class SttTtsControllerTest {
     private class FakeOutput : PcmOutput {
         var beepCount = 0
         var playbackCount = 0
+        var releaseRouteCount = 0
 
         override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun playReadyBeep(coldStart: Boolean) {
@@ -240,6 +296,10 @@ class SttTtsControllerTest {
 
         override suspend fun play(recording: RecordedPcm) {
             playbackCount += 1
+        }
+
+        override suspend fun releaseRoute() {
+            releaseRouteCount += 1
         }
     }
 }

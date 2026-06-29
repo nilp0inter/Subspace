@@ -33,6 +33,10 @@ class EchoControllerTest {
         assertEquals(0, source.openCount)
         assertEquals(0, output.playbackCount)
         assertEquals(EchoStatus.Cancelled, controller.status.value)
+        // The controller must not release the route on this branch — the
+        // service owns SCO release on Cancelled. The controller's
+        // output.releaseRoute() must NOT be called here.
+        assertEquals(0, output.releaseRouteCount)
 
         advanceTimeBy(30_000)
         runCurrent()
@@ -64,8 +68,28 @@ class EchoControllerTest {
         advanceTimeBy(30_000)
         runCurrent()
 
-        assertEquals(1, sco.releaseCount)
+        assertEquals(1, output.releaseRouteCount)
+        assertEquals(0, sco.releaseCount)
         assertEquals(EchoStatus.Idle, controller.status.value)
+    }
+
+    @Test
+    fun recordingFailedDoesNotReleaseScoViaController() = runTest {
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.failingSource()
+        val sco = FakeScoRoute()
+        val output = FakeOutput()
+        val controller = EchoController(this, sco, captureService, source, output)
+        controller.setEnabled(true)
+
+        controller.onPttPressed()
+        runCurrent()
+
+        // The service releases SCO on RecordingFailed; the controller must
+        // not double-release via output.releaseRoute() on this branch.
+        assertEquals(0, output.releaseRouteCount)
+        assertEquals(1, sco.releaseCount)
+        assertEquals(EchoStatus.Error("Recording failed"), controller.status.value)
     }
 
     @Test
@@ -118,6 +142,7 @@ class EchoControllerTest {
     private class FakeOutput : PcmOutput {
         var readyBeepCount = 0
         var playbackCount = 0
+        var releaseRouteCount = 0
 
         override suspend fun playReadyBeep(coldStart: Boolean) {
             readyBeepCount += 1
@@ -127,6 +152,10 @@ class EchoControllerTest {
 
         override suspend fun play(recording: RecordedPcm) {
             playbackCount += 1
+        }
+
+        override suspend fun releaseRoute() {
+            releaseRouteCount += 1
         }
     }
 

@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.SttTtsStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -90,7 +91,7 @@ class SttTtsController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        sco.release()
+        scope.launch { output.releaseRoute() }
         _status.value = SttTtsStatus.Idle
     }
 
@@ -111,9 +112,11 @@ class SttTtsController(
                     _status.value = SttTtsStatus.Error("SCO unavailable")
                 }
                 CaptureStartResult.Cancelled -> {
-                    cancelSession(route)
+                    // Service already released SCO on this branch.
+                    _status.value = SttTtsStatus.Cancelled
                 }
                 CaptureStartResult.RecordingFailed -> {
+                    // Service already released SCO on this branch.
                     _status.value = SttTtsStatus.Error("Recording failed")
                 }
                 is CaptureStartResult.Started -> {
@@ -123,6 +126,7 @@ class SttTtsController(
                 }
             }
         }.onFailure { error ->
+            if (error is CancellationException) throw error
             _status.value = SttTtsStatus.Error(error.message ?: "STT↔TTS session failed")
             val session = activeSession
             activeSession = null
@@ -164,80 +168,75 @@ class SttTtsController(
         retainedAfterMaxDuration = null
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttTtsStatus.Idle) cancelSession(route)
-            _status.value = SttTtsStatus.EmptyAudio
+            if (session == null) {
+                if (_status.value != SttTtsStatus.Idle && _status.value !is SttTtsStatus.Error) {
+                    _status.value = SttTtsStatus.Cancelled
+                }
+                setupJob?.cancel()
+                setupJob = null
+            } else {
+                if (enabled || _status.value != SttTtsStatus.Idle) cancelSession(route)
+                _status.value = SttTtsStatus.EmptyAudio
+            }
             return
         }
 
         _status.value = SttTtsStatus.Transcribing
         transcribeJob = scope.launch {
-            val samples = SttAudio.toParakeetInput(recording)
-            val transcriptOutcome = withContext(transcriptionDispatcher) { transcriber.transcribe(samples) }
-            when (transcriptOutcome) {
-                is TranscriptionOutcome.Success -> {
-                    val transcript = transcriptOutcome.text
-                    if (transcript.isBlank()) {
-                        _status.value = SttTtsStatus.EmptyTranscript
-                        route.output.releaseRoute()
-                        route.sco.release()
-                        return@launch
-                    }
-                    _status.value = SttTtsStatus.Transcript(transcript)
-                    _status.value = SttTtsStatus.Synthesizing
-                    val synthRequest = SynthesisRequest(
-                        text = transcript,
-                        voiceStylePath = voiceStylePath,
-                        lang = lang,
-                        totalSteps = totalSteps,
-                        speed = speed,
-                    )
-                    val synthOutcome = withContext(synthesisDispatcher) { synthesizer.synthesize(synthRequest) }
-                    when (synthOutcome) {
-                        is SynthesisOutcome.Success -> {
-                            if (synthOutcome.samples.isEmpty()) {
-                                _status.value = SttTtsStatus.Error("Synthesis produced no audio")
-                                route.output.releaseRoute()
-                                route.sco.release()
-                            } else {
-                                _status.value = SttTtsStatus.Playing
-                                val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
-                                if (!playback.isEmpty) route.output.play(playback)
-                                _status.value = SttTtsStatus.Idle
-                                route.sco.release()
+            try {
+                val samples = SttAudio.toParakeetInput(recording)
+                val transcriptOutcome = withContext(transcriptionDispatcher) { transcriber.transcribe(samples) }
+                when (transcriptOutcome) {
+                    is TranscriptionOutcome.Success -> {
+                        val transcript = transcriptOutcome.text
+                        if (transcript.isBlank()) {
+                            _status.value = SttTtsStatus.EmptyTranscript
+                            return@launch
+                        }
+                        _status.value = SttTtsStatus.Transcript(transcript)
+                        _status.value = SttTtsStatus.Synthesizing
+                        val synthRequest = SynthesisRequest(
+                            text = transcript,
+                            voiceStylePath = voiceStylePath,
+                            lang = lang,
+                            totalSteps = totalSteps,
+                            speed = speed,
+                        )
+                        val synthOutcome = withContext(synthesisDispatcher) { synthesizer.synthesize(synthRequest) }
+                        when (synthOutcome) {
+                            is SynthesisOutcome.Success -> {
+                                if (synthOutcome.samples.isEmpty()) {
+                                    _status.value = SttTtsStatus.Error("Synthesis produced no audio")
+                                } else {
+                                    _status.value = SttTtsStatus.Playing
+                                    val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
+                                    if (!playback.isEmpty) route.output.play(playback)
+                                    _status.value = SttTtsStatus.Idle
+                                }
+                            }
+                            is SynthesisOutcome.ModelNotReady -> {
+                                _status.value = SttTtsStatus.Error("TTS model not ready")
+                            }
+                            is SynthesisOutcome.Failure -> {
+                                _status.value = SttTtsStatus.Error(synthOutcome.reason)
+                            }
+                            SynthesisOutcome.EmptyText -> {
+                                _status.value = SttTtsStatus.EmptyTranscript
                             }
                         }
-                        is SynthesisOutcome.ModelNotReady -> {
-                            _status.value = SttTtsStatus.Error("TTS model not ready")
-                            route.output.releaseRoute()
-                            route.sco.release()
-                        }
-                        is SynthesisOutcome.Failure -> {
-                            _status.value = SttTtsStatus.Error(synthOutcome.reason)
-                            route.output.releaseRoute()
-                            route.sco.release()
-                        }
-                        SynthesisOutcome.EmptyText -> {
-                            _status.value = SttTtsStatus.EmptyTranscript
-                            route.output.releaseRoute()
-                            route.sco.release()
-                        }
+                    }
+                    is TranscriptionOutcome.Failure -> {
+                        _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
+                    }
+                    TranscriptionOutcome.ModelNotReady -> {
+                        _status.value = SttTtsStatus.Error("STT model not ready")
+                    }
+                    TranscriptionOutcome.EmptyInput -> {
+                        _status.value = SttTtsStatus.EmptyAudio
                     }
                 }
-                is TranscriptionOutcome.Failure -> {
-                    _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
-                    route.output.releaseRoute()
-                    route.sco.release()
-                }
-                TranscriptionOutcome.ModelNotReady -> {
-                    _status.value = SttTtsStatus.Error("STT model not ready")
-                    route.output.releaseRoute()
-                    route.sco.release()
-                }
-                TranscriptionOutcome.EmptyInput -> {
-                    _status.value = SttTtsStatus.EmptyAudio
-                    route.output.releaseRoute()
-                    route.sco.release()
-                }
+            } finally {
+                route.output.releaseRoute()
             }
         }
     }
@@ -251,10 +250,7 @@ class SttTtsController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        scope.launch {
-            route.output.releaseRoute()
-            route.sco.release()
-        }
+        scope.launch { route.output.releaseRoute() }
         _status.value = SttTtsStatus.Cancelled
     }
 

@@ -44,15 +44,12 @@ class CaptureServiceTest {
         assertTrue(first is CaptureStartResult.Started)
         (first as CaptureStartResult.Started).session.stop()
 
-        // The active reference must be cleared by stop() so the next PTT
-        // press can start a new session. Regression test for "Capture session
-        // already active" after a normal press→release→press cycle.
-        advanceTimeBy(SMALL_TICK_MS)
-        runCurrent()
-
+        // The active reference must be cleared synchronously inside stop() so
+        // a rapid PTT re-press — with no coroutine pump between release and
+        // the next press — is accepted instead of rejected as SessionActive.
         val second = service.startSession(FakeSource(continuous = true), FakeScoRoute(), FakeOutput()) { true }
         assertTrue(
-            "expected second start to be accepted after stop, got $second",
+            "expected second start to be accepted immediately after stop, got $second",
             second is CaptureStartResult.Started,
         )
         (second as CaptureStartResult.Started).session.stop()
@@ -284,6 +281,11 @@ class CaptureServiceTest {
         assertEquals(0, output.readyBeepCount)
         assertEquals(0, source.openCount)
         assertEquals(1, sco.acquireCount)
+        assertEquals(
+            "service must release SCO on Cancelled after SCO acquire (PTT released during acquire)",
+            1,
+            sco.releaseCount,
+        )
     }
 
     @Test
@@ -304,6 +306,11 @@ class CaptureServiceTest {
         assertEquals(CaptureStartResult.Cancelled, result)
         assertEquals(1, output.readyBeepCount)
         assertEquals(0, source.openCount)
+        assertEquals(
+            "service must release SCO on Cancelled after beep (PTT released during beep)",
+            1,
+            sco.releaseCount,
+        )
     }
 
     @Test
@@ -318,6 +325,37 @@ class CaptureServiceTest {
         assertEquals(CaptureStartResult.RecordingFailed, result)
         assertEquals(1, output.readyBeepCount)
         assertFalse(service.isCapturing.value)
+        assertEquals(
+            "service must release SCO on RecordingFailed (source open returned null after beep)",
+            1,
+            sco.releaseCount,
+        )
+    }
+
+    @Test
+    fun rapidRePressAfterCancelSessionIsAccepted() = runTest {
+        val service = captureService()
+        val source = FakeSource(continuous = true)
+
+        val first = service.startSession(source, FakeScoRoute(), FakeOutput()) { true }
+        assertTrue(first is CaptureStartResult.Started)
+        val firstSession = (first as CaptureStartResult.Started).session
+
+        service.cancelSession(firstSession)
+
+        // No advanceTimeBy / runCurrent between cancel and re-press — the
+        // service must have cleared `active` synchronously inside
+        // `cancelSession()` → `ActiveSession.cancel()` → `finalize()`.
+        val second = service.startSession(
+            FakeSource(continuous = true),
+            FakeScoRoute(),
+            FakeOutput(),
+        ) { true }
+        assertTrue(
+            "expected rapid re-press after cancelSession to be accepted, got $second",
+            second is CaptureStartResult.Started,
+        )
+        (second as CaptureStartResult.Started).session.stop()
     }
 
     @Test
@@ -341,6 +379,34 @@ class CaptureServiceTest {
         val pcm = session.stop()
 
         assertEquals(capSamples, pcm.samples.size)
+    }
+
+    @Test
+    fun sessionExposesNegotiated16kHzSampleRate() = runTest {
+        val service = captureService()
+        val source = FakeSource(
+            sampleRate = 16_000,
+            continuous = true,
+        )
+
+        val session = startedSession(service, source)
+
+        assertEquals(16_000, session.sampleRate)
+        session.stop()
+    }
+
+    @Test
+    fun sessionExposesNegotiated8kHzSampleRate() = runTest {
+        val service = captureService()
+        val source = FakeSource(
+            sampleRate = 8_000,
+            continuous = true,
+        )
+
+        val session = startedSession(service, source)
+
+        assertEquals(8_000, session.sampleRate)
+        session.stop()
     }
 
     // -- helpers -------------------------------------------------------------
@@ -424,6 +490,7 @@ class CaptureServiceTest {
         override val state: StateFlow<ScoState> = _state.asStateFlow()
         override val coldStart: Boolean = false
         var acquireCount: Int = 0; private set
+        var releaseCount: Int = 0; private set
 
         override fun hasAvailableScoDevice(): Boolean = scoAvailable
 
@@ -437,6 +504,7 @@ class CaptureServiceTest {
         override fun isActive(): Boolean = _state.value == ScoState.Active
 
         override fun release() {
+            releaseCount += 1
             _state.value = ScoState.Inactive
         }
     }

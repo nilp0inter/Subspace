@@ -39,6 +39,28 @@ object NoopCaptureSource : CaptureSource {
     override suspend fun open(): OpenedCaptureSource? = null
 }
 
+/**
+ * Delegation-only [PcmOutput] that owns its route's release semantics.
+ *
+ * `releaseRoute()` invokes [release] — a lambda captured at route
+ * resolution time that performs the correct release for the selected route
+ * (warm 30-second retention for SCO, immediate release for telecom, no-op
+ * for local fallback). All other [PcmOutput] operations delegate to
+ * [delegate]. This completes the `PcmOutput.releaseRoute()` pattern
+ * introduced for [TelecomCapturePcmOutput]: controllers call
+ * `route.output.releaseRoute()` and never reach for `ScoRoute` directly in
+ * the PTT flow.
+ */
+class ScopedPcmOutput(
+    private val delegate: PcmOutput,
+    private val release: suspend () -> Unit,
+) : PcmOutput {
+    override suspend fun playReadyBeep(coldStart: Boolean) = delegate.playReadyBeep(coldStart)
+    override suspend fun playErrorBeep(coldStart: Boolean) = delegate.playErrorBeep(coldStart)
+    override suspend fun play(recording: RecordedPcm) = delegate.play(recording)
+    override suspend fun releaseRoute() = release()
+}
+
 fun resolveAudioRoute(
     scoRoute: ScoRoute,
     scoOutput: PcmOutput,
@@ -48,8 +70,16 @@ fun resolveAudioRoute(
 ): ResolvedAudioRoute {
     val scoUsable = scoRoute.hasAvailableScoDevice() || scoRoute.isActive()
     return if (scoUsable) {
-        ResolvedAudioRoute(sco = scoRoute, output = scoOutput, source = scoSource)
+        ResolvedAudioRoute(
+            sco = scoRoute,
+            output = ScopedPcmOutput(scoOutput) { scoRoute.release() },
+            source = scoSource,
+        )
     } else {
-        ResolvedAudioRoute(sco = NoopScoRoute(), output = localOutput, source = localSource)
+        ResolvedAudioRoute(
+            sco = NoopScoRoute(),
+            output = ScopedPcmOutput(localOutput) { },
+            source = localSource,
+        )
     }
 }

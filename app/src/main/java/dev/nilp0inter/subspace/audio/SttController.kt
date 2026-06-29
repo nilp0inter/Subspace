@@ -72,7 +72,7 @@ class SttController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        sco.release()
+        scope.launch { output.releaseRoute() }
         _status.value = SttStatus.Idle
     }
 
@@ -93,9 +93,11 @@ class SttController(
                     _status.value = SttStatus.Error("SCO unavailable")
                 }
                 CaptureStartResult.Cancelled -> {
-                    cancelSession(route)
+                    // Service already released SCO on this branch.
+                    _status.value = SttStatus.Cancelled
                 }
                 CaptureStartResult.RecordingFailed -> {
+                    // Service already released SCO on this branch.
                     _status.value = SttStatus.Error("Recording failed")
                 }
                 is CaptureStartResult.Started -> {
@@ -105,6 +107,7 @@ class SttController(
                 }
             }
         }.onFailure { error ->
+            if (error is CancellationException) throw error
             _status.value = SttStatus.Error(error.message ?: "STT session failed")
             val session = activeSession
             activeSession = null
@@ -139,32 +142,41 @@ class SttController(
         retainedAfterMaxDuration = null
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != SttStatus.Idle) cancelSession(route)
-            _status.value = SttStatus.EmptyAudio
+            if (session == null) {
+                // Setup still in flight or already failed; the service owns
+                // SCO release on Cancelled / RecordingFailed. Do not release
+                // the route here.
+                if (_status.value != SttStatus.Idle && _status.value !is SttStatus.Error) {
+                    _status.value = SttStatus.Cancelled
+                }
+                setupJob?.cancel()
+                setupJob = null
+            } else {
+                if (enabled || _status.value != SttStatus.Idle) cancelSession(route)
+                _status.value = SttStatus.EmptyAudio
+            }
             return
         }
 
         _status.value = SttStatus.Transcribing
         transcribeJob = scope.launch {
-            runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
-                .onSuccess { text ->
-                    _status.value = SttStatus.Transcribed(text)
-                    route.output.releaseRoute()
-                    route.sco.release()
-                }
-                .onFailure { error ->
-                    if (error is CancellationException) throw error
-                    _status.value = when (error) {
-                        TranscriptionException.EmptyInput -> SttStatus.EmptyAudio
-                        is TranscriptionException.Failed -> SttStatus.Error(error.reason)
-                        TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
-                        else -> SttStatus.Error(error.message ?: "Transcription failed")
+            try {
+                runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
+                    .onSuccess { text ->
+                        _status.value = SttStatus.Transcribed(text)
                     }
-                    if (_status.value !is SttStatus.Transcribed) {
-                        route.output.releaseRoute()
-                        route.sco.release()
+                    .onFailure { error ->
+                        if (error is CancellationException) throw error
+                        _status.value = when (error) {
+                            TranscriptionException.EmptyInput -> SttStatus.EmptyAudio
+                            is TranscriptionException.Failed -> SttStatus.Error(error.reason)
+                            TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
+                            else -> SttStatus.Error(error.message ?: "Transcription failed")
+                        }
                     }
-                }
+            } finally {
+                route.output.releaseRoute()
+            }
         }
     }
 
@@ -177,10 +189,7 @@ class SttController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        scope.launch {
-            route.output.releaseRoute()
-            route.sco.release()
-        }
+        scope.launch { route.output.releaseRoute() }
         _status.value = SttStatus.Cancelled
     }
 

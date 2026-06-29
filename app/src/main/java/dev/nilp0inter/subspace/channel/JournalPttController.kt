@@ -9,7 +9,6 @@ import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoRoute
-import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.WavPcmReader
 import dev.nilp0inter.subspace.model.JournalChannel
 import java.io.File
@@ -17,6 +16,7 @@ import java.time.ZonedDateTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -61,6 +61,9 @@ class JournalPttController(
 
     fun cancelAndRelease() {
         setupJob?.cancel()
+        // framesJob is joined inside finishSession on the normal path; for
+        // the cancel-and-release teardown path we cancel it here and let
+        // the writer's thread-safe finalize be the safety net.
         framesJob?.cancel()
         framesJob = null
         val session = activeSession
@@ -72,7 +75,7 @@ class JournalPttController(
         activeWavWriter = null
         activeEntryPaths = null
         activeChannel = null
-        sco.release()
+        scope.launch { output.releaseRoute() }
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -93,20 +96,20 @@ class JournalPttController(
             )
             when (result) {
                 CaptureStartResult.SessionActive -> {
-                    route.sco.release()
+                    // No SCO acquired by this start; nothing to release here.
                 }
                 CaptureStartResult.ScoUnavailable -> {
-                    route.sco.release()
+                    // No SCO acquired; nothing to release.
                 }
                 CaptureStartResult.Cancelled -> {
-                    route.sco.release()
+                    // Service already released SCO on this branch.
                 }
                 CaptureStartResult.RecordingFailed -> {
-                    route.sco.release()
+                    // Service already released SCO on this branch.
                 }
                 is CaptureStartResult.Started -> {
                     val session = result.session
-                    val writer = JournalWavWriter(paths.captureFile, SAMPLE_RATE)
+                    val writer = JournalWavWriter(paths.captureFile, session.sampleRate)
                     framesJob = scope.launch {
                         session.frames.collect { chunk ->
                             writer.writeChunk(chunk)
@@ -143,7 +146,7 @@ class JournalPttController(
             activeWavWriter = null
             activeEntryPaths = null
             activeChannel = null
-            route.sco.release()
+            scope.launch { route.output.releaseRoute() }
         }
     }
 
@@ -162,15 +165,17 @@ class JournalPttController(
         activeChannel = null
 
         scope.launch {
-            val telecomOutput = route.output as? TelecomCapturePcmOutput
-            if (telecomOutput != null) {
-                telecomOutput.releaseRoute()
-            } else {
-                route.output.play(RecordedPcm(shortArrayOf(), 16_000))
-            }
+            // Preserve current behavior: a no-op play call for the non-telecom
+            // path before releasing the route. Telecom's releaseRoute() already
+            // does the right thing (await disconnect), so both paths now go
+            // through route.output.releaseRoute().
+            route.output.play(RecordedPcm(shortArrayOf(), session.sampleRate))
 
             withContext(Dispatchers.IO) {
-                framesJob?.cancel()
+                // Join the frames collector before finalizing so the
+                // collector has fully unwound before the file is closed
+                // (D6 layer 2). The thread-safe writer is the safety net.
+                framesJob?.cancelAndJoin()
                 framesJob = null
                 session.stop()
                 writer.finalize()
@@ -232,13 +237,10 @@ class JournalPttController(
                 }
                 journal.processCaptureFile(paths)
             }
+            route.output.releaseRoute()
         }
     }
 
     private fun readStartedAt(store: JournalMetadataStore, file: File): String? =
         store.read(file)?.startedAt
-
-    private companion object {
-        const val SAMPLE_RATE = 16_000
-    }
 }

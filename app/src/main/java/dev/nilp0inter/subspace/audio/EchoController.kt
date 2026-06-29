@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.EchoStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -67,7 +68,7 @@ class EchoController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        sco.release()
+        scope.launch { output.releaseRoute() }
         _status.value = if (reason == null) EchoStatus.Idle else EchoStatus.Error(reason)
     }
 
@@ -88,9 +89,17 @@ class EchoController(
                     _status.value = EchoStatus.Error("SCO unavailable")
                 }
                 CaptureStartResult.Cancelled -> {
-                    cancelSession(route)
+                    // Service already released SCO on this branch; just transition status.
+                    _status.value = EchoStatus.Cancelled
+                    scope.launch {
+                        delay(COOLDOWN_MS)
+                        if (_status.value == EchoStatus.Cancelled) {
+                            _status.value = EchoStatus.Idle
+                        }
+                    }
                 }
                 CaptureStartResult.RecordingFailed -> {
+                    // Service already released SCO on this branch.
                     _status.value = EchoStatus.Error("Recording failed")
                 }
                 is CaptureStartResult.Started -> {
@@ -100,6 +109,7 @@ class EchoController(
                 }
             }
         }.onFailure { error ->
+            if (error is CancellationException) throw error
             _status.value = EchoStatus.Error(error.message ?: "Echo failed")
             val session = activeSession
             activeSession = null
@@ -134,7 +144,29 @@ class EchoController(
         retainedAfterMaxDuration = null
 
         if (recording.isEmpty) {
-            if (enabled || _status.value != EchoStatus.Idle) cancelSession(route)
+            // No active session and no retained PCM means the setup job is
+            // still in flight (SCO acquire / beep) or already failed. The
+            // service owns SCO release on the Cancelled / RecordingFailed
+            // branches, so we must NOT release the route here — doing so
+            // would double-release against the service's own release.
+            // Transition to Cancelled first, then cancel the in-flight setup
+            // so the service observes `shouldProceed() == false` and releases
+            // SCO itself.
+            if (session == null) {
+                if (_status.value != EchoStatus.Idle && _status.value !is EchoStatus.Error) {
+                    _status.value = EchoStatus.Cancelled
+                    scope.launch {
+                        delay(COOLDOWN_MS)
+                        if (_status.value == EchoStatus.Cancelled) {
+                            _status.value = EchoStatus.Idle
+                        }
+                    }
+                }
+                setupJob?.cancel()
+                setupJob = null
+            } else if (enabled || _status.value != EchoStatus.Idle) {
+                cancelSession(route)
+            }
             return
         }
 
@@ -143,13 +175,13 @@ class EchoController(
             route.output.play(recording)
             _status.value = EchoStatus.Warm
             delay(COOLDOWN_MS)
-            route.sco.release()
+            route.output.releaseRoute()
             if (_status.value == EchoStatus.Warm) {
                 _status.value = EchoStatus.Idle
             }
         }.onFailure { error ->
             _status.value = EchoStatus.Error(error.message ?: "Playback failed")
-            route.sco.release()
+            route.output.releaseRoute()
         }
     }
 
@@ -162,7 +194,7 @@ class EchoController(
             scope.launch { captureService.cancelSession(session) }
         }
         retainedAfterMaxDuration = null
-        route.sco.release()
+        scope.launch { route.output.releaseRoute() }
         _status.value = EchoStatus.Cancelled
         scope.launch {
             delay(COOLDOWN_MS)

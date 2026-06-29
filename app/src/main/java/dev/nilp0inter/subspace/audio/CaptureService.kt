@@ -137,6 +137,15 @@ interface CaptureSession {
     val completion: Deferred<CaptureCompletion>
 
     /**
+     * The sample rate negotiated by the opened capture source for this
+     * session. Consumers that write capture-derived artifacts (WAV headers,
+     * metadata) MUST read this value rather than assuming a hardcoded rate,
+     * because [AndroidCaptureSource.selectSampleRate] may negotiate 8 kHz or
+     * 16 kHz depending on the route.
+     */
+    val sampleRate: Int
+
+    /**
      * Stop the session (if still running) and return the captured PCM.
      * Idempotent: subsequent calls return the same captured samples.
      */
@@ -196,14 +205,27 @@ class CaptureService(
             if (!sco.acquire()) return@withLock CaptureStartResult.ScoUnavailable
 
             // PTT released during SCO acquisition: keep SCO warm, no beep, no record.
-            if (!shouldProceed()) return@withLock CaptureStartResult.Cancelled
+            // The service owns the SCO release on this failure branch — controllers
+            // MUST NOT also release SCO here (capture-service / sco-audio specs).
+            if (!shouldProceed()) {
+                sco.release()
+                return@withLock CaptureStartResult.Cancelled
+            }
 
             output.playReadyBeep(sco.coldStart)
 
             // PTT released during the ready beep: no record, retain warm SCO.
-            if (!shouldProceed()) return@withLock CaptureStartResult.Cancelled
+            // Service-owned release; controllers MUST NOT release SCO here.
+            if (!shouldProceed()) {
+                sco.release()
+                return@withLock CaptureStartResult.Cancelled
+            }
 
             opened = source.open() ?: run {
+                // Source open failed after the beep — service releases the SCO
+                // reference it acquired above so the warmup window starts and
+                // the route is not leaked for the rest of the session.
+                sco.release()
                 return@withLock CaptureStartResult.RecordingFailed
             }
 
@@ -222,10 +244,14 @@ class CaptureService(
                     _isCapturing.value = capturing
                 },
                 onLevelUpdate = { rms -> _level.value = rms },
-                onFinalized = { finalizedSession ->
-                    scope.launch {
-                        mutex.withLock { if (active === finalizedSession) active = null }
-                    }
+                // Synchronous finalize hook: clears the service's `active`
+                // reference inside `finalizeLock` so a rapid re-press after
+                // `stop()` / `cancelSession()` is never rejected as
+                // `SessionActive`. The identity check (`active === session`)
+                // is performed inside `finalize()` so this lambda is safe to
+                // call even after a new session has taken `active`.
+                onFinalize = { finalizedSession ->
+                    if (active === finalizedSession) active = null
                 },
             )
             opened = null // ownership transferred
@@ -275,10 +301,11 @@ class CaptureService(
         private val clock: () -> Long,
         private val onCaptureSignalChange: (Boolean) -> Unit,
         private val onLevelUpdate: (Float) -> Unit,
-        private val onFinalized: (ActiveSession) -> Unit,
+        private val onFinalize: (ActiveSession) -> Unit,
     ) : CaptureSession {
         override val frames: SharedFlow<ShortArray>
         override val completion: Deferred<CaptureCompletion>
+        override val sampleRate: Int = opened.sampleRate
 
         private val buffer = mutableListOf<Short>()
         private val bufferLock = Any()
@@ -365,9 +392,9 @@ class CaptureService(
             synchronized(finalizeLock) {
                 if (finalized != null) return finalized!!
                 finalized = pcm
+                onFinalize(this)
                 onCaptureSignalChange(false)
                 _completion.complete(reason)
-                onFinalized(this)
             }
             readJob.cancel()
             return pcm
