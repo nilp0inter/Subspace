@@ -1,6 +1,6 @@
 package dev.nilp0inter.subspace.service
 
-import dev.nilp0inter.subspace.audio.AudioRecorder
+import dev.nilp0inter.subspace.audio.CaptureServiceFakes
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.FakeSttTranscriber
 import dev.nilp0inter.subspace.audio.PcmOutput
@@ -31,14 +31,8 @@ import org.junit.Test
 class SttEchoMutualExclusionTest {
     @Test
     fun enablingSttDisablesAndCancelsEcho() = runTest {
-        val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(
-            this,
-            FakeSco(),
-            FakeRecorder(),
-            FakeOutput(),
-            TranscriptionService(FakeSttTranscriber()),
-        )
+        val echo = newEcho()
+        val stt = newStt()
         echo.setEnabled(true)
         assertTrue(echo.enabled)
 
@@ -56,14 +50,8 @@ class SttEchoMutualExclusionTest {
 
     @Test
     fun enablingEchoDisablesAndCancelsStt() = runTest {
-        val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(
-            this,
-            FakeSco(),
-            FakeRecorder(),
-            FakeOutput(),
-            TranscriptionService(FakeSttTranscriber()),
-        )
+        val echo = newEcho()
+        val stt = newStt()
         stt.setEnabled(true)
         assertTrue(stt.enabled)
 
@@ -81,14 +69,8 @@ class SttEchoMutualExclusionTest {
 
     @Test
     fun disablingBothLeavesBothOff() = runTest {
-        val echo = EchoController(this, FakeSco(), FakeRecorder(), FakeOutput())
-        val stt = SttController(
-            this,
-            FakeSco(),
-            FakeRecorder(),
-            FakeOutput(),
-            TranscriptionService(FakeSttTranscriber()),
-        )
+        val echo = newEcho()
+        val stt = newStt()
         stt.setEnabled(true)
         stt.setEnabled(false)
         echo.setEnabled(false)
@@ -97,18 +79,24 @@ class SttEchoMutualExclusionTest {
         assertFalse(echo.enabled)
     }
 
+    private fun kotlinx.coroutines.test.TestScope.newEcho(): EchoController {
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3))
+        return EchoController(this, FakeSco(), captureService, source, FakeOutput())
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.newStt(): SttController {
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3))
+        return SttController(this, FakeSco(), captureService, source, FakeOutput(), TranscriptionService(FakeSttTranscriber()))
+    }
+
     private class FakeSco : ScoRoute {
         override val state: StateFlow<ScoState> = MutableStateFlow(ScoState.Inactive)
         override fun hasAvailableScoDevice(): Boolean = true
         override suspend fun acquire(): Boolean = true
         override fun isActive(): Boolean = false
         override fun release() {}
-    }
-
-    private class FakeRecorder : AudioRecorder {
-        override val isActive: Boolean = false
-        override suspend fun start(): Boolean = true
-        override fun stopIfActiveOrEmpty(): RecordedPcm = RecordedPcm(shortArrayOf(), 16_000)
     }
 
     private class FakeOutput : PcmOutput {

@@ -15,45 +15,45 @@ class AudioRouteResolverTest {
     fun selectsScoRouteWhenScoDeviceIsAvailable() {
         val scoRoute = FakeScoRoute(hasDevice = true, isActive = false)
         val scoOutput = FakeOutput()
-        val scoRecorder = FakeRecorder()
+        val scoSource = CaptureServiceFakes.singleShotSource(shortArrayOf(1), sourceId = CaptureSourceId.VoiceCommunication)
         val localOutput = FakeOutput()
-        val localRecorder = FakeRecorder()
+        val localSource = CaptureServiceFakes.singleShotSource(shortArrayOf(2), sourceId = CaptureSourceId.Mic)
 
-        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoRecorder, localOutput, localRecorder)
+        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoSource, localOutput, localSource)
 
         assertEquals(scoRoute, resolved.sco)
         assertEquals(scoOutput, resolved.output)
-        assertEquals(scoRecorder, resolved.recorder)
+        assertEquals(scoSource, resolved.source)
     }
 
     @Test
     fun selectsScoRouteWhenScoIsAlreadyActive() {
         val scoRoute = FakeScoRoute(hasDevice = false, isActive = true)
         val scoOutput = FakeOutput()
-        val scoRecorder = FakeRecorder()
+        val scoSource = CaptureServiceFakes.singleShotSource(shortArrayOf(1), sourceId = CaptureSourceId.VoiceCommunication)
         val localOutput = FakeOutput()
-        val localRecorder = FakeRecorder()
+        val localSource = CaptureServiceFakes.singleShotSource(shortArrayOf(2), sourceId = CaptureSourceId.Mic)
 
-        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoRecorder, localOutput, localRecorder)
+        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoSource, localOutput, localSource)
 
         assertEquals(scoRoute, resolved.sco)
         assertEquals(scoOutput, resolved.output)
-        assertEquals(scoRecorder, resolved.recorder)
+        assertEquals(scoSource, resolved.source)
     }
 
     @Test
     fun selectsLocalRouteWhenScoIsUnavailable() {
         val scoRoute = FakeScoRoute(hasDevice = false, isActive = false)
         val scoOutput = FakeOutput()
-        val scoRecorder = FakeRecorder()
+        val scoSource = CaptureServiceFakes.singleShotSource(shortArrayOf(1), sourceId = CaptureSourceId.VoiceCommunication)
         val localOutput = FakeOutput()
-        val localRecorder = FakeRecorder()
+        val localSource = CaptureServiceFakes.singleShotSource(shortArrayOf(2), sourceId = CaptureSourceId.Mic)
 
-        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoRecorder, localOutput, localRecorder)
+        val resolved = resolveAudioRoute(scoRoute, scoOutput, scoSource, localOutput, localSource)
 
         assertTrue(resolved.sco is NoopScoRoute)
         assertEquals(localOutput, resolved.output)
-        assertEquals(localRecorder, resolved.recorder)
+        assertEquals(localSource, resolved.source)
     }
 
     @Test
@@ -62,9 +62,9 @@ class AudioRouteResolverTest {
         val resolved = resolveAudioRoute(
             scoRoute,
             FakeOutput(),
-            FakeRecorder(),
+            CaptureServiceFakes.singleShotSource(shortArrayOf(1)),
             FakeOutput(),
-            FakeRecorder(),
+            CaptureServiceFakes.singleShotSource(shortArrayOf(2), sourceId = CaptureSourceId.Mic),
         )
 
         assertTrue(resolved.sco.acquire())
@@ -92,11 +92,5 @@ class AudioRouteResolverTest {
         override suspend fun playReadyBeep(coldStart: Boolean) {}
         override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun play(recording: RecordedPcm) {}
-    }
-
-    private class FakeRecorder : AudioRecorder {
-        override var isActive: Boolean = false
-        override suspend fun start(): Boolean = true
-        override fun stopIfActiveOrEmpty(): RecordedPcm = RecordedPcm(shortArrayOf(), 16_000)
     }
 }

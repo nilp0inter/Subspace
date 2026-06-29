@@ -1,21 +1,14 @@
 package dev.nilp0inter.subspace.audio
 
-import android.annotation.SuppressLint
 import android.media.AudioAttributes
 import android.media.AudioFormat
-import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaRecorder
 import dev.nilp0inter.subspace.model.ScoState
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.sin
@@ -136,98 +129,4 @@ class LocalPcmOutput : PcmOutput {
     }
 }
 
-class PhoneMicRecorder(
-    private val scope: CoroutineScope,
-) : AudioRecorder {
-    private val lock = Any()
-    private val pcm = mutableListOf<Short>()
-    private var audioRecord: AudioRecord? = null
-    private var readJob: Job? = null
-    private var sampleRate: Int = 16_000
 
-    override val isActive: Boolean
-        get() = audioRecord != null
-
-    @SuppressLint("MissingPermission")
-    override suspend fun start(): Boolean = withContext(Dispatchers.IO) {
-        if (audioRecord != null) return@withContext true
-
-        val selectedRate = selectSampleRate() ?: return@withContext false
-        val minBuffer = AudioRecord.getMinBufferSize(
-            selectedRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        if (minBuffer <= 0) return@withContext false
-
-        val format = AudioFormat.Builder()
-            .setSampleRate(selectedRate)
-            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-            .build()
-
-        val record = runCatching {
-            AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(format)
-                .setBufferSizeInBytes(minBuffer * 2)
-                .build()
-        }.getOrNull() ?: return@withContext false
-
-        if (record.state != AudioRecord.STATE_INITIALIZED) {
-            record.release()
-            return@withContext false
-        }
-
-        synchronized(lock) { pcm.clear() }
-        sampleRate = selectedRate
-        runCatching { record.startRecording() }.getOrElse {
-            record.release()
-            return@withContext false
-        }
-
-        audioRecord = record
-        readJob = scope.launch(Dispatchers.IO) { readLoop(record, minBuffer / Short.SIZE_BYTES) }
-        true
-    }
-
-    override fun stopIfActiveOrEmpty(): RecordedPcm {
-        val record = audioRecord ?: return RecordedPcm(shortArrayOf(), sampleRate)
-        audioRecord = null
-        runCatching { record.stop() }
-        readJob?.cancel()
-        readJob = null
-        record.release()
-
-        val captured = synchronized(lock) { pcm.toShortArray() }
-        return RecordedPcm(captured, sampleRate)
-    }
-
-    private fun selectSampleRate(): Int? = listOf(16_000, 8_000).firstOrNull { rate ->
-        AudioRecord.getMinBufferSize(
-            rate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        ) > 0
-    }
-
-    private fun readLoop(record: AudioRecord, bufferSizeShorts: Int) {
-        val buffer = ShortArray(bufferSizeShorts.coerceAtLeast(1))
-        val maxSamples = sampleRate * 60
-        while (scope.isActive && audioRecord === record) {
-            val read = record.read(buffer, 0, buffer.size)
-            if (read <= 0) continue
-            synchronized(lock) {
-                val remaining = maxSamples - pcm.size
-            val toCopy = minOf(read, remaining)
-            for (index in 0 until toCopy) pcm += buffer[index]
-        }
-    }
-}
-}
-
-class NoopRecorder : AudioRecorder {
-    override val isActive: Boolean = false
-    override suspend fun start(): Boolean = true
-    override fun stopIfActiveOrEmpty(): RecordedPcm = RecordedPcm(shortArrayOf(), 16_000)
-}

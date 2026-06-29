@@ -12,7 +12,8 @@ import kotlinx.coroutines.launch
 class EchoController(
     private val scope: CoroutineScope,
     private val sco: ScoRoute,
-    private val recorder: AudioRecorder,
+    private val captureService: CaptureService,
+    private val source: CaptureSource,
     private val output: PcmOutput,
 ) {
     private val _status = MutableStateFlow<EchoStatus>(EchoStatus.Idle)
@@ -23,31 +24,32 @@ class EchoController(
 
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
-    private var maxDurationJob: Job? = null
+    private var completionJob: Job? = null
+    private var activeSession: CaptureSession? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
 
     fun setEnabled(value: Boolean) {
         enabled = value
-        if (!value && !recorder.isActive && setupJob?.isActive != true) {
+        if (!value && activeSession == null && setupJob?.isActive != true) {
             _status.value = EchoStatus.Idle
         }
     }
 
     fun onPttPressed() {
-        onPttPressed(ResolvedAudioRoute(sco, output, recorder))
+        onPttPressed(ResolvedAudioRoute(sco, output, source))
     }
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
         if (!enabled) return
-        if (setupJob?.isActive == true || recorder.isActive) return
+        if (setupJob?.isActive == true || activeSession != null) return
 
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startEchoSession(route) }
     }
 
     fun onPttReleased() {
-        onPttReleased(ResolvedAudioRoute(sco, output, recorder))
+        onPttReleased(ResolvedAudioRoute(sco, output, source))
     }
 
     fun onPttReleased(route: ResolvedAudioRoute) {
@@ -57,64 +59,80 @@ class EchoController(
 
     fun cancelAndRelease(reason: String? = null) {
         setupJob?.cancel()
-        maxDurationJob?.cancel()
-        recorder.stopIfActiveOrEmpty()
+        completionJob?.cancel()
+        completionJob = null
+        val session = activeSession
+        activeSession = null
+        if (session != null) {
+            scope.launch { captureService.cancelSession(session) }
+        }
         retainedAfterMaxDuration = null
         sco.release()
         _status.value = if (reason == null) EchoStatus.Idle else EchoStatus.Error(reason)
     }
 
-    private suspend fun startEchoSession() {
-        startEchoSession(ResolvedAudioRoute(sco, output, recorder))
-    }
-
     private suspend fun startEchoSession(route: ResolvedAudioRoute) {
         runCatching {
             _status.value = EchoStatus.WaitingForAudio
-            if (!route.sco.acquire()) {
-                _status.value = EchoStatus.Error("SCO unavailable")
-                return
+            val result = captureService.startSession(
+                source = route.source,
+                sco = route.sco,
+                output = route.output,
+                shouldProceed = { pttDown },
+            )
+            when (result) {
+                CaptureStartResult.SessionActive -> {
+                    _status.value = EchoStatus.Error("Capture session already active")
+                }
+                CaptureStartResult.ScoUnavailable -> {
+                    _status.value = EchoStatus.Error("SCO unavailable")
+                }
+                CaptureStartResult.Cancelled -> {
+                    cancelSession(route)
+                }
+                CaptureStartResult.RecordingFailed -> {
+                    _status.value = EchoStatus.Error("Recording failed")
+                }
+                is CaptureStartResult.Started -> {
+                    activeSession = result.session
+                    _status.value = EchoStatus.Recording
+                    observeCompletion(result.session)
+                }
             }
-
-            if (!pttDown) {
-                cancelSession(route)
-                return
-            }
-
-            startRecording(route)
         }.onFailure { error ->
             _status.value = EchoStatus.Error(error.message ?: "Echo failed")
-            recorder.stopIfActiveOrEmpty()
+            val session = activeSession
+            activeSession = null
+            if (session != null) captureService.cancelSession(session)
         }
     }
 
-    private suspend fun startRecording(route: ResolvedAudioRoute) {
-        _status.value = EchoStatus.Beeping
-        route.output.playReadyBeep(route.sco.coldStart)
-        if (!pttDown) {
-            cancelSession(route)
-            return
+    private fun observeCompletion(session: CaptureSession) {
+        completionJob = scope.launch {
+            val completion = session.completion.await()
+            if (completion is CaptureCompletion.MaxDuration &&
+                pttDown &&
+                activeSession === session
+            ) {
+                retainedAfterMaxDuration = completion.recordedPcm
+                _status.value = EchoStatus.MaxDurationReached
+            }
         }
-
-        if (!route.recorder.start()) {
-            _status.value = EchoStatus.Error("Recording failed")
-            return
-        }
-        _status.value = EchoStatus.Recording
-        scheduleMaxDurationStop()
-    }
-
-    private suspend fun finishEchoSessionIfNeeded() {
-        finishEchoSessionIfNeeded(ResolvedAudioRoute(sco, output, recorder))
     }
 
     private suspend fun finishEchoSessionIfNeeded(route: ResolvedAudioRoute) {
-        val retained = retainedAfterMaxDuration
-        retainedAfterMaxDuration = null
-        maxDurationJob?.cancel()
-        maxDurationJob = null
+        completionJob?.cancel()
+        completionJob = null
 
-        val recording = retained ?: route.recorder.stopIfActiveOrEmpty()
+        val session = activeSession
+        val recording = if (session != null) {
+            activeSession = null
+            session.stop()
+        } else {
+            retainedAfterMaxDuration ?: RecordedPcm(shortArrayOf(), DEFAULT_RATE)
+        }
+        retainedAfterMaxDuration = null
+
         if (recording.isEmpty) {
             if (enabled || _status.value != EchoStatus.Idle) cancelSession(route)
             return
@@ -135,25 +153,14 @@ class EchoController(
         }
     }
 
-    private fun scheduleMaxDurationStop() {
-        maxDurationJob?.cancel()
-        maxDurationJob = scope.launch {
-            delay(60_000)
-            if (pttDown && recorder.isActive) {
-                retainedAfterMaxDuration = recorder.stopIfActiveOrEmpty()
-                _status.value = EchoStatus.MaxDurationReached
-            }
-        }
-    }
-
-    private fun cancelSession() {
-        cancelSession(ResolvedAudioRoute(sco, output, recorder))
-    }
-
     private fun cancelSession(route: ResolvedAudioRoute) {
-        maxDurationJob?.cancel()
-        maxDurationJob = null
-        route.recorder.stopIfActiveOrEmpty()
+        completionJob?.cancel()
+        completionJob = null
+        val session = activeSession
+        activeSession = null
+        if (session != null) {
+            scope.launch { captureService.cancelSession(session) }
+        }
         retainedAfterMaxDuration = null
         route.sco.release()
         _status.value = EchoStatus.Cancelled
@@ -167,5 +174,6 @@ class EchoController(
 
     private companion object {
         const val COOLDOWN_MS = 30_000L
+        const val DEFAULT_RATE = 16_000
     }
 }

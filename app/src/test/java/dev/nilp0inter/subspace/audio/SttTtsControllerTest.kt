@@ -22,7 +22,8 @@ class SttTtsControllerTest {
     private fun makeController(
         scope: kotlinx.coroutines.CoroutineScope,
         sco: ScoRoute,
-        recorder: AudioRecorder,
+        captureService: CaptureService,
+        source: CaptureSource,
         output: PcmOutput,
         transcriber: FakeSttTranscriber,
         synthesizer: FakeTtsSynthesizer,
@@ -30,7 +31,8 @@ class SttTtsControllerTest {
     ): SttTtsController = SttTtsController(
         scope = scope,
         sco = sco,
-        recorder = recorder,
+        captureService = captureService,
+        source = source,
         output = output,
         transcriber = transcriber,
         synthesizer = synthesizer,
@@ -41,7 +43,8 @@ class SttTtsControllerTest {
     @Test
     fun roundTripSuccessTranscribesThenSynthesizesThenPlays() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Success("hello world"))
@@ -49,7 +52,7 @@ class SttTtsControllerTest {
         val synth = FakeTtsSynthesizer().apply {
             setOutcome(SynthesisOutcome.Success(FloatArray(100) { 0.5f }))
         }
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -70,11 +73,12 @@ class SttTtsControllerTest {
     @Test
     fun earlyReleaseBeforeRecordingCancels() = runTest {
         val sco = FakeScoRoute(acquireDelayMs = 1_000)
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
         val synth = FakeTtsSynthesizer()
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -82,7 +86,7 @@ class SttTtsControllerTest {
         controller.onPttReleased("/tmp/M1.json", "en", 8, 1.0f, 16_000)
         advanceUntilIdle()
 
-        assertFalse(recorder.started)
+        assertEquals(0, source.openCount)
         assertEquals(0, transcriber.callCount)
         assertEquals(0, synth.callCount)
     }
@@ -90,11 +94,12 @@ class SttTtsControllerTest {
     @Test
     fun emptyAudioReportsEmptyAudioWithoutCallingParakeet() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder(returnEmpty = true)
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.emptySource()
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
         val synth = FakeTtsSynthesizer()
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -111,13 +116,14 @@ class SttTtsControllerTest {
     @Test
     fun emptyTranscriptReportsEmptyTranscriptWithoutCallingSupertonic() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Success(""))
         }
         val synth = FakeTtsSynthesizer()
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -134,13 +140,14 @@ class SttTtsControllerTest {
     @Test
     fun transcriptionFailureSurfacesErrorStatus() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Failure("stt blew up"))
         }
         val synth = FakeTtsSynthesizer()
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -156,7 +163,8 @@ class SttTtsControllerTest {
     @Test
     fun synthesisFailureSurfacesErrorStatus() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Success("hello"))
@@ -164,7 +172,7 @@ class SttTtsControllerTest {
         val synth = FakeTtsSynthesizer().apply {
             setOutcome(SynthesisOutcome.Failure("tts blew up"))
         }
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -180,20 +188,22 @@ class SttTtsControllerTest {
     @Test
     fun cancellationReleasesScoAndReturnsToIdle() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
         val synth = FakeTtsSynthesizer()
-        val controller = makeController(this, sco, recorder, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, synth, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
         runCurrent()
         controller.cancelAndRelease()
+        runCurrent()
 
         assertEquals(SttTtsStatus.Idle, controller.status.value)
         assertEquals(1, sco.releaseCount)
-        assertFalse(recorder.isActive)
+        assertFalse(captureService.isCapturing.value)
     }
 
     private class FakeScoRoute(
@@ -216,30 +226,6 @@ class SttTtsControllerTest {
         override fun release() {
             releaseCount += 1
             _state.value = ScoState.Inactive
-        }
-    }
-
-    private class FakeRecorder(
-        private val returnEmpty: Boolean = false,
-    ) : AudioRecorder {
-        var started = false
-        override var isActive: Boolean = false
-            private set
-
-        override suspend fun start(): Boolean {
-            started = true
-            isActive = true
-            return true
-        }
-
-        override fun stopIfActiveOrEmpty(): RecordedPcm {
-            if (!isActive) return RecordedPcm(shortArrayOf(), 16_000)
-            isActive = false
-            return if (returnEmpty) {
-                RecordedPcm(shortArrayOf(), 16_000)
-            } else {
-                RecordedPcm(shortArrayOf(1, 2, 3, 4), 16_000)
-            }
         }
     }
 

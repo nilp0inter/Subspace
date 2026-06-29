@@ -1,7 +1,10 @@
 package dev.nilp0inter.subspace.channel
 
-import dev.nilp0inter.subspace.audio.FileWavRecorder
-import dev.nilp0inter.subspace.audio.NoopRecorder
+import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.audio.CaptureSession
+import dev.nilp0inter.subspace.audio.CaptureSource
+import dev.nilp0inter.subspace.audio.CaptureStartResult
+import dev.nilp0inter.subspace.audio.JournalWavWriter
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
@@ -14,6 +17,7 @@ import java.time.ZonedDateTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -21,6 +25,8 @@ class JournalPttController(
     private val scope: CoroutineScope,
     private val sco: ScoRoute,
     private val output: PcmOutput,
+    private val captureService: CaptureService,
+    private val source: CaptureSource,
     private val journal: JournalController,
     private val channelProvider: () -> JournalChannel,
     private val pathGenerator: JournalEntryPaths = JournalEntryPaths(),
@@ -28,22 +34,24 @@ class JournalPttController(
 ) {
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
-    private var activeRecorder: FileWavRecorder? = null
+    private var framesJob: Job? = null
+    private var activeSession: CaptureSession? = null
+    private var activeWavWriter: JournalWavWriter? = null
     private var activeEntryPaths: JournalEntryPaths.EntryPaths? = null
     private var activeChannel: JournalChannel? = null
 
     fun onPttPressed() {
-        onPttPressed(ResolvedAudioRoute(sco, output, NoopRecorder()))
+        onPttPressed(ResolvedAudioRoute(sco, output, source))
     }
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
-        if (setupJob?.isActive == true || activeRecorder?.isActive == true) return
+        if (setupJob?.isActive == true || activeSession != null) return
         setupJob = scope.launch { startSession(route) }
     }
 
     fun onPttReleased() {
-        onPttReleased(ResolvedAudioRoute(sco, output, NoopRecorder()))
+        onPttReleased(ResolvedAudioRoute(sco, output, source))
     }
 
     fun onPttReleased(route: ResolvedAudioRoute) {
@@ -53,15 +61,18 @@ class JournalPttController(
 
     fun cancelAndRelease() {
         setupJob?.cancel()
-        activeRecorder?.stop()
-        activeRecorder = null
+        framesJob?.cancel()
+        framesJob = null
+        val session = activeSession
+        activeSession = null
+        if (session != null) {
+            scope.launch { captureService.cancelSession(session) }
+        }
+        activeWavWriter?.finalize()
+        activeWavWriter = null
         activeEntryPaths = null
         activeChannel = null
         sco.release()
-    }
-
-    private suspend fun startSession() {
-        startSession(ResolvedAudioRoute(sco, output, NoopRecorder()))
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -71,50 +82,65 @@ class JournalPttController(
             val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() }
                 ?: return@runCatching
 
-            if (!route.sco.acquire()) return@runCatching
-            if (!pttDown) {
-                route.sco.release()
-                return@runCatching
-            }
-
             val startedAt = ZonedDateTime.now()
             val paths = pathGenerator.preparePaths(File(baseDirectory), startedAt)
-            if (!pttDown) {
-                route.sco.release()
-                return@runCatching
-            }
 
-            route.output.playReadyBeep(route.sco.coldStart)
-            if (!pttDown) {
-                route.sco.release()
-                return@runCatching
-            }
-
-            val metadata = JournalEntryMetadata(
-                entryId = paths.stem,
-                startedAt = startedAt.toString(),
-                timezoneOffset = paths.timezoneOffset,
-                channel = MetadataChannelSnapshot(
-                    id = channel.id,
-                    saveVoice = channel.saveVoice,
-                    saveText = channel.saveText,
-                ),
-                capture = CaptureState(state = CaptureTaskState.recording),
+            val result = captureService.startSession(
+                source = route.source,
+                sco = route.sco,
+                output = route.output,
+                shouldProceed = { pttDown },
             )
-            metadataStore.write(metadata, paths.metadataFile)
+            when (result) {
+                CaptureStartResult.SessionActive -> {
+                    route.sco.release()
+                }
+                CaptureStartResult.ScoUnavailable -> {
+                    route.sco.release()
+                }
+                CaptureStartResult.Cancelled -> {
+                    route.sco.release()
+                }
+                CaptureStartResult.RecordingFailed -> {
+                    route.sco.release()
+                }
+                is CaptureStartResult.Started -> {
+                    val session = result.session
+                    val writer = JournalWavWriter(paths.captureFile, SAMPLE_RATE)
+                    framesJob = scope.launch {
+                        session.frames.collect { chunk ->
+                            writer.writeChunk(chunk)
+                        }
+                    }
+                    activeSession = session
+                    activeWavWriter = writer
+                    activeEntryPaths = paths
+                    activeChannel = channel
 
-            val recorder = FileWavRecorder(scope, paths.captureFile)
-            if (!recorder.start()) {
-                route.sco.release()
-                return@runCatching
+                    val metadata = JournalEntryMetadata(
+                        entryId = paths.stem,
+                        startedAt = startedAt.toString(),
+                        timezoneOffset = paths.timezoneOffset,
+                        channel = MetadataChannelSnapshot(
+                            id = channel.id,
+                            saveVoice = channel.saveVoice,
+                            saveText = channel.saveText,
+                        ),
+                        capture = CaptureState(state = CaptureTaskState.recording),
+                    )
+                    metadataStore.write(metadata, paths.metadataFile)
+                }
             }
-
-            activeRecorder = recorder
-            activeEntryPaths = paths
-            activeChannel = channel
         }.onFailure {
-            activeRecorder?.stop()
-            activeRecorder = null
+            framesJob?.cancel()
+            framesJob = null
+            val session = activeSession
+            activeSession = null
+            if (session != null) {
+                scope.launch { captureService.cancelSession(session) }
+            }
+            activeWavWriter?.finalize()
+            activeWavWriter = null
             activeEntryPaths = null
             activeChannel = null
             route.sco.release()
@@ -122,14 +148,16 @@ class JournalPttController(
     }
 
     private fun finishSession() {
-        finishSession(ResolvedAudioRoute(sco, output, NoopRecorder()))
+        finishSession(ResolvedAudioRoute(sco, output, source))
     }
 
     private fun finishSession(route: ResolvedAudioRoute) {
         val paths = activeEntryPaths ?: return
         val channel = activeChannel ?: return
-        val recorder = activeRecorder ?: return
-        activeRecorder = null
+        val session = activeSession ?: return
+        val writer = activeWavWriter ?: return
+        activeSession = null
+        activeWavWriter = null
         activeEntryPaths = null
         activeChannel = null
 
@@ -142,8 +170,11 @@ class JournalPttController(
             }
 
             withContext(Dispatchers.IO) {
-                recorder.stop()
-                val captureFile = recorder.captureFile
+                framesJob?.cancel()
+                framesJob = null
+                session.stop()
+                writer.finalize()
+                val captureFile = paths.captureFile
                 val wavInfo = WavPcmReader.read(captureFile)
                 if (wavInfo != null && wavInfo.samples.isNotEmpty()) {
                     metadataStore.write(
@@ -206,4 +237,8 @@ class JournalPttController(
 
     private fun readStartedAt(store: JournalMetadataStore, file: File): String? =
         store.read(file)?.startedAt
+
+    private companion object {
+        const val SAMPLE_RATE = 16_000
+    }
 }

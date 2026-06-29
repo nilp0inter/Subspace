@@ -1,39 +1,21 @@
 package dev.nilp0inter.subspace.audio
 
 import dev.nilp0inter.subspace.model.SttTtsStatus
-import dev.nilp0inter.subspace.model.TtsModelStatus
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/**
- * STT↔TTS round-trip test controller.
- *
- * Composes the existing STT capture flow ([ScoRoute], [AudioRecorder], ready
- * beep, max-duration retention) with transcription ([SttTranscriber]) then
- * synthesis ([TtsSynthesizer]) then resample+playback.
- *
- * On PTT press while enabled: acquire SCO, ready beep, start recording (same
- * timing as STT). On PTT release: stop recording, normalize samples,
- * transcribe via [SttTranscriber] off the main thread; on success, synthesize
- * via [TtsSynthesizer] off the main thread using the transcript as text; on
- * success, resample and play through the headset; report status at each stage.
- *
- * Handles early release, empty audio, empty transcript, transcription failure,
- * synthesis failure, model-not-ready at either stage, playback completion, and
- * cancellation.
- */
 class SttTtsController(
     private val scope: CoroutineScope,
     private val sco: ScoRoute,
-    private val recorder: AudioRecorder,
+    private val captureService: CaptureService,
+    private val source: CaptureSource,
     private val output: PcmOutput,
     private val transcriber: SttTranscriber,
     private val synthesizer: TtsSynthesizer,
@@ -48,25 +30,26 @@ class SttTtsController(
 
     private var pttDown: Boolean = false
     private var setupJob: Job? = null
-    private var maxDurationJob: Job? = null
+    private var completionJob: Job? = null
+    private var activeSession: CaptureSession? = null
     private var retainedAfterMaxDuration: RecordedPcm? = null
     private var transcribeJob: Job? = null
 
     fun setEnabled(value: Boolean) {
         enabled = value
-        if (!value && !recorder.isActive && setupJob?.isActive != true) {
+        if (!value && activeSession == null && setupJob?.isActive != true) {
             _status.value = SttTtsStatus.Idle
         }
     }
 
     fun onPttPressed() {
-        onPttPressed(ResolvedAudioRoute(sco, output, recorder))
+        onPttPressed(ResolvedAudioRoute(sco, output, source))
     }
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
         if (!enabled) return
-        if (setupJob?.isActive == true || recorder.isActive) return
+        if (setupJob?.isActive == true || activeSession != null) return
 
         transcribeJob?.cancel()
         transcribeJob = null
@@ -74,81 +57,90 @@ class SttTtsController(
         setupJob = scope.launch { startSession(route) }
     }
 
-    fun onPttReleased(voiceStylePath: String, lang: String, totalSteps: Int, speed: Float, scoRate: Int) {
-        onPttReleased(ResolvedAudioRoute(sco, output, recorder), voiceStylePath, lang, totalSteps, speed, scoRate)
+    fun onPttReleased(
+        voiceStylePath: String = "",
+        lang: String = "",
+        totalSteps: Int = 0,
+        speed: Float = 1.0f,
+        scoRate: Int = 16_000,
+    ) {
+        onPttReleased(ResolvedAudioRoute(sco, output, source), voiceStylePath, lang, totalSteps, speed, scoRate)
     }
 
-    fun onPttReleased(route: ResolvedAudioRoute, voiceStylePath: String, lang: String, totalSteps: Int, speed: Float, scoRate: Int) {
-        pttDown = false
-        scope.launch { finishSessionIfNeeded(route, voiceStylePath, lang, totalSteps, speed, scoRate) }
-    }
-
-    /** Cancel any active or pending STT↔TTS work and release resources. */
-    fun cancelAndRelease() {
-        setupJob?.cancel()
-        maxDurationJob?.cancel()
-        transcribeJob?.cancel()
-        recorder.stopIfActiveOrEmpty()
-        retainedAfterMaxDuration = null
-        sco.release()
-        _status.value = SttTtsStatus.Idle
-    }
-
-    private suspend fun startSession() {
-        startSession(ResolvedAudioRoute(sco, output, recorder))
-    }
-
-    private suspend fun startSession(route: ResolvedAudioRoute) {
-        runCatching {
-            _status.value = SttTtsStatus.WaitingForAudio
-            if (!route.sco.acquire()) {
-                _status.value = SttTtsStatus.Error("SCO unavailable")
-                return
-            }
-
-            if (!pttDown) {
-                cancelSession(route)
-                return
-            }
-
-            _status.value = SttTtsStatus.Beeping
-            route.output.playReadyBeep(route.sco.coldStart)
-            if (!pttDown) {
-                cancelSession(route)
-                return
-            }
-
-            if (!route.recorder.start()) {
-                _status.value = SttTtsStatus.Error("Recording failed")
-                return
-            }
-            _status.value = SttTtsStatus.Recording
-            scheduleMaxDurationStop()
-        }.onFailure { error ->
-            _status.value = SttTtsStatus.Error(error.message ?: "STT↔TTS session failed")
-            recorder.stopIfActiveOrEmpty()
-        }
-    }
-
-    private fun scheduleMaxDurationStop() {
-        maxDurationJob?.cancel()
-        maxDurationJob = scope.launch {
-            delay(MAX_DURATION_MS)
-            if (pttDown && recorder.isActive) {
-                retainedAfterMaxDuration = recorder.stopIfActiveOrEmpty()
-                _status.value = SttTtsStatus.MaxDurationReached
-            }
-        }
-    }
-
-    private suspend fun finishSessionIfNeeded(
+    fun onPttReleased(
+        route: ResolvedAudioRoute,
         voiceStylePath: String,
         lang: String,
         totalSteps: Int,
         speed: Float,
         scoRate: Int,
     ) {
-        finishSessionIfNeeded(ResolvedAudioRoute(sco, output, recorder), voiceStylePath, lang, totalSteps, speed, scoRate)
+        pttDown = false
+        scope.launch { finishSessionIfNeeded(route, voiceStylePath, lang, totalSteps, speed, scoRate) }
+    }
+
+    fun cancelAndRelease() {
+        setupJob?.cancel()
+        completionJob?.cancel()
+        completionJob = null
+        transcribeJob?.cancel()
+        val session = activeSession
+        activeSession = null
+        if (session != null) {
+            scope.launch { captureService.cancelSession(session) }
+        }
+        retainedAfterMaxDuration = null
+        sco.release()
+        _status.value = SttTtsStatus.Idle
+    }
+
+    private suspend fun startSession(route: ResolvedAudioRoute) {
+        runCatching {
+            _status.value = SttTtsStatus.WaitingForAudio
+            val result = captureService.startSession(
+                source = route.source,
+                sco = route.sco,
+                output = route.output,
+                shouldProceed = { pttDown },
+            )
+            when (result) {
+                CaptureStartResult.SessionActive -> {
+                    _status.value = SttTtsStatus.Error("Capture session already active")
+                }
+                CaptureStartResult.ScoUnavailable -> {
+                    _status.value = SttTtsStatus.Error("SCO unavailable")
+                }
+                CaptureStartResult.Cancelled -> {
+                    cancelSession(route)
+                }
+                CaptureStartResult.RecordingFailed -> {
+                    _status.value = SttTtsStatus.Error("Recording failed")
+                }
+                is CaptureStartResult.Started -> {
+                    activeSession = result.session
+                    _status.value = SttTtsStatus.Recording
+                    observeCompletion(result.session)
+                }
+            }
+        }.onFailure { error ->
+            _status.value = SttTtsStatus.Error(error.message ?: "STT↔TTS session failed")
+            val session = activeSession
+            activeSession = null
+            if (session != null) captureService.cancelSession(session)
+        }
+    }
+
+    private fun observeCompletion(session: CaptureSession) {
+        completionJob = scope.launch {
+            val completion = session.completion.await()
+            if (completion is CaptureCompletion.MaxDuration &&
+                pttDown &&
+                activeSession === session
+            ) {
+                retainedAfterMaxDuration = completion.recordedPcm
+                _status.value = SttTtsStatus.MaxDurationReached
+            }
+        }
     }
 
     private suspend fun finishSessionIfNeeded(
@@ -159,12 +151,17 @@ class SttTtsController(
         speed: Float,
         scoRate: Int,
     ) {
-        maxDurationJob?.cancel()
-        maxDurationJob = null
+        completionJob?.cancel()
+        completionJob = null
 
-        val retained = retainedAfterMaxDuration
+        val session = activeSession
+        val recording = if (session != null) {
+            activeSession = null
+            session.stop()
+        } else {
+            retainedAfterMaxDuration ?: RecordedPcm(shortArrayOf(), DEFAULT_RATE)
+        }
         retainedAfterMaxDuration = null
-        val recording = retained ?: route.recorder.stopIfActiveOrEmpty()
 
         if (recording.isEmpty) {
             if (enabled || _status.value != SttTtsStatus.Idle) cancelSession(route)
@@ -245,14 +242,14 @@ class SttTtsController(
         }
     }
 
-    private fun cancelSession() {
-        cancelSession(ResolvedAudioRoute(sco, output, recorder))
-    }
-
     private fun cancelSession(route: ResolvedAudioRoute) {
-        maxDurationJob?.cancel()
-        maxDurationJob = null
-        route.recorder.stopIfActiveOrEmpty()
+        completionJob?.cancel()
+        completionJob = null
+        val session = activeSession
+        activeSession = null
+        if (session != null) {
+            scope.launch { captureService.cancelSession(session) }
+        }
         retainedAfterMaxDuration = null
         scope.launch {
             route.output.releaseRoute()
@@ -261,7 +258,7 @@ class SttTtsController(
         _status.value = SttTtsStatus.Cancelled
     }
 
-    companion object {
-        private const val MAX_DURATION_MS = 60_000L
+    private companion object {
+        const val DEFAULT_RATE = 16_000
     }
 }

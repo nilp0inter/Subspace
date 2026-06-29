@@ -21,12 +21,6 @@ interface ScoRoute {
     fun release()
 }
 
-interface AudioRecorder {
-    val isActive: Boolean
-    suspend fun start(): Boolean
-    fun stopIfActiveOrEmpty(): RecordedPcm
-}
-
 interface PcmOutput {
     suspend fun playReadyBeep(coldStart: Boolean = false)
     suspend fun playErrorBeep(coldStart: Boolean = false)
@@ -37,20 +31,25 @@ interface PcmOutput {
 data class ResolvedAudioRoute(
     val sco: ScoRoute,
     val output: PcmOutput,
-    val recorder: AudioRecorder,
+    val source: CaptureSource,
 )
+
+object NoopCaptureSource : CaptureSource {
+    override val sourceId: CaptureSourceId = CaptureSourceId.Mic
+    override suspend fun open(): OpenedCaptureSource? = null
+}
 
 fun resolveAudioRoute(
     scoRoute: ScoRoute,
     scoOutput: PcmOutput,
-    scoRecorder: AudioRecorder,
+    scoSource: CaptureSource,
     localOutput: PcmOutput,
-    localRecorder: AudioRecorder,
+    localSource: CaptureSource,
 ): ResolvedAudioRoute {
     val scoUsable = scoRoute.hasAvailableScoDevice() || scoRoute.isActive()
     return if (scoUsable) {
-        ResolvedAudioRoute(sco = scoRoute, output = scoOutput, recorder = scoRecorder)
+        ResolvedAudioRoute(sco = scoRoute, output = scoOutput, source = scoSource)
     } else {
-        ResolvedAudioRoute(sco = NoopScoRoute(), output = localOutput, recorder = localRecorder)
+        ResolvedAudioRoute(sco = NoopScoRoute(), output = localOutput, source = localSource)
     }
 }

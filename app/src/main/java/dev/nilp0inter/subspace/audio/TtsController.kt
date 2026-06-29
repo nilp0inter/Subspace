@@ -127,7 +127,8 @@ class TtsController(
         speed: Float,
         scoRate: Int,
     ) {
-        runSynthesis(ResolvedAudioRoute(sco, output, NoopRecorder()), text, voiceStylePath, lang, totalSteps, speed, scoRate)
+        val route = ResolvedAudioRoute(sco, output, NoopCaptureSource)
+        runSynthesis(route, text, voiceStylePath, lang, totalSteps, speed, scoRate)
     }
 
     private suspend fun runSynthesis(

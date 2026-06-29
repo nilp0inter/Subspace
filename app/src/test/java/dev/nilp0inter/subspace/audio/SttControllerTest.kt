@@ -1,15 +1,12 @@
 package dev.nilp0inter.subspace.audio
 
-import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.ScoState
-import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.SttStatus
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -25,14 +22,16 @@ class SttControllerTest {
     private fun makeController(
         scope: kotlinx.coroutines.CoroutineScope,
         sco: ScoRoute,
-        recorder: AudioRecorder,
+        captureService: CaptureService,
+        source: CaptureSource,
         output: PcmOutput,
         transcriber: FakeSttTranscriber,
         dispatcher: CoroutineDispatcher,
     ): SttController = SttController(
         scope = scope,
         sco = sco,
-        recorder = recorder,
+        captureService = captureService,
+        source = source,
         output = output,
         transcriptionService = TranscriptionService(transcriber, dispatcher),
     )
@@ -40,10 +39,11 @@ class SttControllerTest {
     @Test
     fun releaseBeforeScoReadyCancelsWithoutRecordingOrTranscription() = runTest {
         val sco = FakeScoRoute(acquireDelayMs = 1_000)
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -51,7 +51,7 @@ class SttControllerTest {
         controller.onPttReleased()
         advanceUntilIdle()
 
-        assertFalse(recorder.started)
+        assertEquals(0, source.openCount)
         assertEquals(0, transcriber.callCount)
         assertEquals(SttStatus.Cancelled, controller.status.value)
     }
@@ -59,19 +59,20 @@ class SttControllerTest {
     @Test
     fun normalPressReleaseTranscribesReturnedText() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Success("hello world"))
         }
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
         runCurrent()
 
         assertEquals(1, output.beepCount)
-        assertTrue(recorder.started)
+        assertEquals(1, source.openCount)
         assertEquals(SttStatus.Recording, controller.status.value)
 
         controller.onPttReleased()
@@ -87,10 +88,11 @@ class SttControllerTest {
     @Test
     fun emptyAudioReportsEmptyAudioStatusWithoutCallingParakeet() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder(returnEmpty = true)
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.emptySource()
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -106,12 +108,13 @@ class SttControllerTest {
     @Test
     fun maxDurationStopsRecordingAndWaitsForReleaseBeforeTranscribing() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Success("max transcript"))
         }
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -120,7 +123,7 @@ class SttControllerTest {
         runCurrent()
 
         assertEquals(SttStatus.MaxDurationReached, controller.status.value)
-        assertFalse(recorder.isActive)
+        assertFalse(captureService.isCapturing.value)
         assertEquals(0, transcriber.callCount)
 
         controller.onPttReleased()
@@ -134,12 +137,13 @@ class SttControllerTest {
     @Test
     fun transcriberFailureSurfacesErrorStatus() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber().apply {
             setOutcome(TranscriptionOutcome.Failure("inference blew up"))
         }
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
@@ -154,19 +158,21 @@ class SttControllerTest {
     @Test
     fun cancellationReleasesScoAndReturnsToIdle() = runTest {
         val sco = FakeScoRoute()
-        val recorder = FakeRecorder()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3, 4))
         val output = FakeOutput()
         val transcriber = FakeSttTranscriber()
-        val controller = makeController(this, sco, recorder, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
+        val controller = makeController(this, sco, captureService, source, output, transcriber, coroutineContext[CoroutineDispatcher]!!)
         controller.setEnabled(true)
 
         controller.onPttPressed()
         runCurrent()
         controller.cancelAndRelease()
+        runCurrent()
 
         assertEquals(SttStatus.Idle, controller.status.value)
         assertEquals(1, sco.releaseCount)
-        assertFalse(recorder.isActive)
+        assertFalse(captureService.isCapturing.value)
     }
 
     private class FakeScoRoute(
@@ -189,30 +195,6 @@ class SttControllerTest {
         override fun release() {
             releaseCount += 1
             _state.value = ScoState.Inactive
-        }
-    }
-
-    private class FakeRecorder(
-        private val returnEmpty: Boolean = false,
-    ) : AudioRecorder {
-        var started = false
-        override var isActive: Boolean = false
-            private set
-
-        override suspend fun start(): Boolean {
-            started = true
-            isActive = true
-            return true
-        }
-
-        override fun stopIfActiveOrEmpty(): RecordedPcm {
-            if (!isActive) return RecordedPcm(shortArrayOf(), 16_000)
-            isActive = false
-            return if (returnEmpty) {
-                RecordedPcm(shortArrayOf(), 16_000)
-            } else {
-                RecordedPcm(shortArrayOf(1, 2, 3, 4), 16_000)
-            }
         }
     }
 
