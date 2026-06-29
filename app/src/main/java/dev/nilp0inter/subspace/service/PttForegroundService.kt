@@ -87,6 +87,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -133,10 +134,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var echo: EchoController
     private var sttController: SttController? = null
     private var sttTranscriber: SttTranscriber? = null
+    private val sttReady = CompletableDeferred<SttTranscriber?>()
+    private var sttModelDir: java.io.File? = null
     private var transcriptionService: TranscriptionService? = null
     private var sttModelStatusJob: Job? = null
     private var ttsController: TtsController? = null
     private var ttsSynthesizer: TtsSynthesizer? = null
+    private var supertonicModelDir: java.io.File? = null
     private var announcer: SystemAnnouncer? = null
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
@@ -201,8 +205,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             output = AndroidPcmOutput(audioManager),
         )
 
+        val initStartNanos = SystemClock.elapsedRealtimeNanos()
         initializeStt(audioManager)
         initializeTts(audioManager)
+        android.util.Log.d(
+            TAG,
+            "onCreate off-main model init launched in " +
+                "${(SystemClock.elapsedRealtimeNanos() - initStartNanos) / 1_000_000}ms",
+        )
         initializeJournal(audioManager)
         
         updateActiveControllers()
@@ -229,47 +239,53 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun initializeStt(audioManager: AudioManager) {
-        val transcriber = try {
-            val nativeLibDir = applicationInfo.nativeLibraryDir
-            val modelDir = ParakeetAssetExtractor.extract(this, PARAKEET_ASSET_VERSION)
-            ParakeetJniTranscriber(
-                nativeLibDir = nativeLibDir,
-                modelDir = modelDir.absolutePath,
-            )
-        } catch (err: Throwable) {
-            android.util.Log.w(TAG, "STT transcriber unavailable: ${err.message}")
-            null
-        }
-        sttTranscriber = transcriber
-        if (transcriber != null) {
-            val transcription = TranscriptionService(transcriber)
-            transcriptionService = transcription
-            sttController = SttController(
-                scope = serviceScope,
-                sco = sco,
-                captureService = captureService,
-                source = voiceCommunicationSource,
-                output = AndroidPcmOutput(audioManager),
-                transcriptionService = transcription,
-            )
-            sttModelStatusJob = serviceScope.launch {
-                var lastStatus: SttModelStatus? = null
-                while (true) {
-                    val status = transcriber.modelStatus
-                    if (status != lastStatus) {
-                        lastStatus = status
-                        updateMonitor { it.copy(sttModelStatus = status) }
-                    }
-                    kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
-                }
+        serviceScope.launch(Dispatchers.IO) {
+            val transcriber = try {
+                val nativeLibDir = applicationInfo.nativeLibraryDir
+                val modelDir = ParakeetAssetExtractor.extract(this@PttForegroundService, PARAKEET_ASSET_VERSION)
+                sttModelDir = modelDir
+                ParakeetJniTranscriber(
+                    nativeLibDir = nativeLibDir,
+                    modelDir = modelDir.absolutePath,
+                )
+            } catch (err: Throwable) {
+                android.util.Log.w(TAG, "STT transcriber unavailable: ${err.message}")
+                null
             }
-            serviceScope.launch {
-                sttController?.status?.collect { status ->
-                    if (isTerminalCarStatus(status)) forceReleaseActivePtt()
-                    updateMonitor {
-                        val newTranscript = (status as? SttStatus.Transcribed)?.text
-                            ?: it.sttTranscript
-                        it.copy(sttStatus = status, sttTranscript = newTranscript)
+            sttReady.complete(transcriber)
+            if (transcriber != null) {
+                sttTranscriber = transcriber
+                serviceScope.launch {
+                    val transcription = TranscriptionService(transcriber)
+                    transcriptionService = transcription
+                    sttController = SttController(
+                        scope = serviceScope,
+                        sco = sco,
+                        captureService = captureService,
+                        source = voiceCommunicationSource,
+                        output = AndroidPcmOutput(audioManager),
+                        transcriptionService = transcription,
+                    )
+                    sttModelStatusJob = serviceScope.launch {
+                        var lastStatus: SttModelStatus? = null
+                        while (true) {
+                            val status = transcriber.modelStatus
+                            if (status != lastStatus) {
+                                lastStatus = status
+                                updateMonitor { it.copy(sttModelStatus = status) }
+                            }
+                            kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
+                        }
+                    }
+                    serviceScope.launch {
+                        sttController?.status?.collect { status ->
+                            if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                            updateMonitor {
+                                val newTranscript = (status as? SttStatus.Transcribed)?.text
+                                    ?: it.sttTranscript
+                                it.copy(sttStatus = status, sttTranscript = newTranscript)
+                            }
+                        }
                     }
                 }
             }
@@ -277,69 +293,80 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun initializeTts(audioManager: AudioManager) {
-        val synth = try {
-            val nativeLibDir = applicationInfo.nativeLibraryDir
-            val modelDir = SupertonicAssetExtractor.extract(this, SUPERTONIC_ASSET_VERSION)
-            SupertonicJniSynthesizer(
-                nativeLibDir = nativeLibDir,
-                modelDir = modelDir.absolutePath,
-            )
-        } catch (err: Throwable) {
-            android.util.Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
-            null
-        }
-        ttsSynthesizer = synth
-        if (synth != null) {
-            announcer = SystemAnnouncer(synth)
-            val vocabulary = mapOf(
-                "sys.menu.channels" to "Channels",
-                "chan.${JournalChannel.ID}.name" to "Journal Channel",
-                "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
-                "chan.${DebugChannel.ID}.name" to "Debug Channel",
-                "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected"
-            )
-            val voiceStylePath = voiceStyleFile(_appState.value.monitor.ttsVoiceStyle).absolutePath
-            serviceScope.launch {
-                announcer?.precompute(vocabulary, voiceStylePath, SCO_RATE)
+        serviceScope.launch(Dispatchers.IO) {
+            val synth = try {
+                val nativeLibDir = applicationInfo.nativeLibraryDir
+                val modelDir = SupertonicAssetExtractor.extract(this@PttForegroundService, SUPERTONIC_ASSET_VERSION)
+                supertonicModelDir = modelDir
+                SupertonicJniSynthesizer(
+                    nativeLibDir = nativeLibDir,
+                    modelDir = modelDir.absolutePath,
+                )
+            } catch (err: Throwable) {
+                android.util.Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
+                null
             }
-
-            ttsController = TtsController(
-                scope = serviceScope,
-                sco = sco,
-                output = AndroidPcmOutput(audioManager),
-                synthesizer = synth,
-            )
-            sttTtsController = SttTtsController(
-                scope = serviceScope,
-                sco = sco,
-                captureService = captureService,
-                source = voiceCommunicationSource,
-                output = AndroidPcmOutput(audioManager),
-                transcriber = sttTranscriber ?: return,
-                synthesizer = synth,
-            )
-            ttsModelStatusJob = serviceScope.launch {
-                var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
-                while (true) {
-                    val status = synth.modelStatus
-                    if (status != lastStatus) {
-                        lastStatus = status
-                        updateMonitor { it.copy(ttsModelStatus = status) }
+            if (synth != null) {
+                ttsSynthesizer = synth
+                serviceScope.launch {
+                    announcer = SystemAnnouncer(synth)
+                    val vocabulary = mapOf(
+                        "sys.menu.channels" to "Channels",
+                        "chan.${JournalChannel.ID}.name" to "Journal Channel",
+                        "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
+                        "chan.${DebugChannel.ID}.name" to "Debug Channel",
+                        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected"
+                    )
+                    val styleDir = supertonicModelDir ?: return@launch
+                    val voiceStylePath = java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
+                    serviceScope.launch {
+                        announcer?.precompute(vocabulary, voiceStylePath, SCO_RATE)
                     }
-                    kotlinx.coroutines.delay(TTS_MODEL_POLL_MS)
-                }
-            }
-            serviceScope.launch {
-                ttsController?.status?.collect { status ->
-                    updateMonitor { it.copy(ttsStatus = status) }
-                }
-            }
-            serviceScope.launch {
-                sttTtsController?.status?.collect { status ->
-                    if (isTerminalCarStatus(status)) forceReleaseActivePtt()
-                    val transcript = (status as? SttTtsStatus.Transcript)?.text
-                        ?: _appState.value.monitor.sttTtsTranscript
-                    updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
+
+                    ttsController = TtsController(
+                        scope = serviceScope,
+                        sco = sco,
+                        output = AndroidPcmOutput(audioManager),
+                        synthesizer = synth,
+                    )
+                    ttsModelStatusJob = serviceScope.launch {
+                        var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
+                        while (true) {
+                            val status = synth.modelStatus
+                            if (status != lastStatus) {
+                                lastStatus = status
+                                updateMonitor { it.copy(ttsModelStatus = status) }
+                            }
+                            kotlinx.coroutines.delay(TTS_MODEL_POLL_MS)
+                        }
+                    }
+                    serviceScope.launch {
+                        ttsController?.status?.collect { status ->
+                            updateMonitor { it.copy(ttsStatus = status) }
+                        }
+                    }
+                    serviceScope.launch {
+                        val transcriber = sttReady.await()
+                        if (transcriber != null) {
+                            sttTtsController = SttTtsController(
+                                scope = serviceScope,
+                                sco = sco,
+                                captureService = captureService,
+                                source = voiceCommunicationSource,
+                                output = AndroidPcmOutput(audioManager),
+                                transcriber = transcriber,
+                                synthesizer = synth,
+                            )
+                            serviceScope.launch {
+                                sttTtsController?.status?.collect { status ->
+                                    if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                                    val transcript = (status as? SttTtsStatus.Transcript)?.text
+                                        ?: _appState.value.monitor.sttTtsTranscript
+                                    updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -373,6 +400,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
         journalPttController?.cancelAndRelease()
+        serviceScope.cancel()
         stopForegroundIfNeeded()
         super.onDestroy()
     }
@@ -800,8 +828,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     fun requestTtsSynthesis() {
         val tts = ttsController ?: return
         if (!tts.enabled) return
+        val modelDir = supertonicModelDir ?: return
         val monitor = _appState.value.monitor
-        val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath
+        val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath
         tts.synthesize(
             text = monitor.ttsText,
             voiceStylePath = voiceStylePath,
@@ -812,10 +841,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         )
     }
 
-    private fun voiceStyleFile(style: String): java.io.File {
-        val modelDir = SupertonicAssetExtractor.extract(this, SUPERTONIC_ASSET_VERSION)
-        return java.io.File(modelDir, "$style.json")
-    }
+    private fun voiceStyleFile(style: String, modelDir: java.io.File): java.io.File =
+        java.io.File(modelDir, "$style.json")
 
     private fun cycleActiveChannel(next: Boolean) {
         val offset = if (next) 1 else -1
@@ -985,15 +1012,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     DebugMode.STT -> sttController?.onPttPressed(route)
                     DebugMode.TTS -> {
                         val monitor = appState.monitor
-                        ttsController?.onPttPressed(
-                            route = route,
-                            text = monitor.ttsText,
-                            voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle).absolutePath,
-                            lang = monitor.ttsLang,
-                            totalSteps = monitor.ttsTotalSteps,
-                            speed = monitor.ttsSpeed,
-                            scoRate = SCO_RATE,
-                        )
+                        val tts = ttsController
+                        val modelDir = supertonicModelDir
+                        if (tts != null && modelDir != null) {
+                            tts.onPttPressed(
+                                route = route,
+                                text = monitor.ttsText,
+                                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath,
+                                lang = monitor.ttsLang,
+                                totalSteps = monitor.ttsTotalSteps,
+                                speed = monitor.ttsSpeed,
+                                scoRate = SCO_RATE,
+                            )
+                        }
                     }
                     DebugMode.STT_TTS -> sttTtsController?.onPttPressed(route)
                 }
@@ -1051,14 +1082,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     DebugMode.TTS -> ttsController?.onPttReleased()
                     DebugMode.STT_TTS -> {
                         val monitor = appState.monitor
-                        sttTtsController?.onPttReleased(
-                            route,
-                            voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle).absolutePath,
-                            lang = monitor.sttTtsLang,
-                            totalSteps = monitor.sttTtsTotalSteps,
-                            speed = monitor.sttTtsSpeed,
-                            scoRate = SCO_RATE,
-                        )
+                        val sttTts = sttTtsController
+                        val modelDir = supertonicModelDir
+                        if (sttTts != null && modelDir != null) {
+                            sttTts.onPttReleased(
+                                route,
+                                voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath,
+                                lang = monitor.sttTtsLang,
+                                totalSteps = monitor.sttTtsTotalSteps,
+                                speed = monitor.sttTtsSpeed,
+                                scoRate = SCO_RATE,
+                            )
+                        }
                     }
                 }
             }
