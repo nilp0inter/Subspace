@@ -46,6 +46,8 @@ import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 fun MainDashboardScreen(
     connected: Boolean,
     appState: AppState,
+    level: Float,
+    isCapturing: Boolean,
     actions: PttUiActions,
     onConnectionClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -66,6 +68,8 @@ fun MainDashboardScreen(
             connected = connected,
             onClick = onConnectionClick,
         )
+
+        VuMeter(level = level, isCapturing = isCapturing)
 
         InputModeSelector(appState, actions)
 
@@ -452,3 +456,12 @@ private val previewChannels = listOf(
         description = "Placeholder for a future network-backed channel.",
     )
 )
+
+data class DashboardVuMeterState(
+    val isPresent: Boolean,
+    val level: Float,
+)
+
+fun dashboardVuMeterState(isCapturing: Boolean, level: Float): DashboardVuMeterState =
+    if (isCapturing) DashboardVuMeterState(isPresent = true, level = level)
+    else DashboardVuMeterState(isPresent = false, level = 0f)

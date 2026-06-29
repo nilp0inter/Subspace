@@ -63,6 +63,10 @@ class MainActivity : ComponentActivity() {
             val currentServiceState by rememberUpdatedState(currentService)
             val state by currentService?.appState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(AppState()) }
+            val level by currentService?.level?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(0f) }
+            val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(false) }
             var route by remember { mutableStateOf(MainRoute.Dashboard) }
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
@@ -218,6 +222,8 @@ class MainActivity : ComponentActivity() {
                         MainRoute.Dashboard -> MainDashboardScreen(
                             connected = state.readyForMonitor,
                             appState = state,
+                            level = level,
+                            isCapturing = isCapturing,
                             actions = actions,
                             onConnectionClick = {
                                 route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
