@@ -52,7 +52,7 @@ The system SHALL keep the dashboard as the home surface and treat the legacy con
 - **THEN** the system returns to the dashboard instead of switching directly between legacy screens
 
 ### Requirement: Dashboard shows channels
-The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones and phone-side PTT zones. The cards SHALL display their current readiness state.
+The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones and phone-side PTT zones. The cards SHALL display their current readiness state. Functional cards SHALL also display phone PTT hold, lock-direction, locked, and stop feedback while a phone-originated PTT session is active from that card. Dedicated configuration controls SHALL remain outside the phone PTT gesture surface.
 
 #### Scenario: Channel selected for activation
 - **WHEN** the user taps the main surface area of a functional channel card
@@ -62,6 +62,19 @@ The system SHALL show a channel panel on the dashboard. Real channels like Capta
 - **WHEN** the user long-presses the main surface area of a functional channel card
 - **THEN** the system SHALL set that channel as the single active channel
 - **AND** start a phone-originated PTT session for that channel
+- **AND** show held-recording feedback on that channel card
+
+#### Scenario: Held phone PTT shows lock direction
+- **WHEN** a phone-originated PTT session is active from a functional channel card
+- **AND** the session is not locked
+- **THEN** the dashboard SHALL show a lock instruction on that card
+- **AND** the instruction SHALL point right when the initial press started on the left side of the card's PTT surface
+- **AND** the instruction SHALL point left when the initial press started on the right side of the card's PTT surface
+
+#### Scenario: Locked phone PTT shows stop affordance
+- **WHEN** a phone-originated PTT session from a functional channel card has been slide-locked
+- **THEN** the dashboard SHALL show that the PTT session is locked on that card
+- **AND** the dashboard SHALL show an explicit stop affordance for ending the locked PTT session
 
 #### Scenario: Captain's Log not configured
 - **WHEN** the dashboard is visible and the Captain's Log has no directory selected
@@ -82,6 +95,7 @@ The system SHALL show a channel panel on the dashboard. Real channels like Capta
 #### Scenario: Channel card opens configuration
 - **WHEN** the user taps the dedicated "Config" button on a functional channel card
 - **THEN** the system SHALL show the respective channel configuration surface without altering the channel's active state
+- **AND** the system SHALL NOT start, lock, stop, or release a phone-originated PTT session from that config-button tap
 
 ### Requirement: Dashboard renders the VU meter during capture
 

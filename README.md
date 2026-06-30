@@ -16,7 +16,7 @@ work from hardware controls whenever possible.
 The current app is an implementation step toward that model. It validates the
 target hardware and provides the first operator dashboard:
 
-- Main dashboard with device connection status and static channel cards.
+- Main dashboard with device connection status, functional channel cards, and phone-side PTT slide-lock.
 - Legacy connection and monitor screens retained as hardware validation tools.
 - Bluetooth Classic SPP/RFCOMM serial connection.
 - Raw button token parsing and hardware mode tracking.

@@ -3,8 +3,6 @@ package dev.nilp0inter.subspace.ui
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,30 +15,41 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.JournalChannel
-import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
+import kotlinx.coroutines.withTimeoutOrNull
 
 @Composable
 fun MainDashboardScreen(
@@ -52,6 +61,48 @@ fun MainDashboardScreen(
     onConnectionClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val phonePttLockThresholdPx = with(LocalDensity.current) { PhonePttLockThreshold.toPx() }
+    var phonePttGesture by remember { mutableStateOf<PhonePttGestureState>(PhonePttGestureState.Idle) }
+
+    fun applyPhonePttTransition(transition: PhonePttGestureTransition) {
+        phonePttGesture = transition.state
+        for (command in transition.commands) {
+            val channelId = when (val state = transition.state) {
+                PhonePttGestureState.Idle -> return
+                is PhonePttGestureState.Armed -> state.channelId
+                is PhonePttGestureState.Locked -> state.channelId
+                is PhonePttGestureState.Finalized -> state.channelId
+            }
+            when (command) {
+                PhonePttGestureCommand.Press -> actions.phonePttPressed(channelId)
+                PhonePttGestureCommand.Release -> actions.phonePttReleased(channelId)
+            }
+        }
+        if (transition.state is PhonePttGestureState.Finalized) {
+            phonePttGesture = PhonePttGestureState.Idle
+        }
+    }
+
+    val currentPhonePttGesture by rememberUpdatedState(phonePttGesture)
+    val currentApplyPhonePttTransition by rememberUpdatedState<(PhonePttGestureTransition) -> Unit> {
+        applyPhonePttTransition(it)
+    }
+
+    LaunchedEffect(isCapturing) {
+        currentApplyPhonePttTransition(currentPhonePttGesture.captureChangedPhonePttGesture(isCapturing))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                currentApplyPhonePttTransition(currentPhonePttGesture.focusLostPhonePttGesture())
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -73,7 +124,13 @@ fun MainDashboardScreen(
 
         InputModeSelector(appState, actions)
 
-        ChannelPanel(appState, actions)
+        ChannelPanel(
+            appState = appState,
+            actions = actions,
+            phonePttGesture = phonePttGesture,
+            phonePttLockThresholdPx = phonePttLockThresholdPx,
+            onPhonePttTransition = ::applyPhonePttTransition,
+        )
     }
 }
 
@@ -217,6 +274,9 @@ private fun ModeSegment(
 private fun ChannelPanel(
     appState: AppState,
     actions: PttUiActions,
+    phonePttGesture: PhonePttGestureState,
+    phonePttLockThresholdPx: Float,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
@@ -225,8 +285,20 @@ private fun ChannelPanel(
             color = MaterialTheme.colorScheme.primary,
         )
 
-        JournalCard(appState, actions)
-        DebugChannelCard(appState, actions)
+        JournalCard(
+            appState = appState,
+            actions = actions,
+            phonePttGesture = phonePttGesture,
+            phonePttLockThresholdPx = phonePttLockThresholdPx,
+            onPhonePttTransition = onPhonePttTransition,
+        )
+        DebugChannelCard(
+            appState = appState,
+            actions = actions,
+            phonePttGesture = phonePttGesture,
+            phonePttLockThresholdPx = phonePttLockThresholdPx,
+            onPhonePttTransition = onPhonePttTransition,
+        )
 
         previewChannels.forEach { channel ->
             ChannelCard(channel)
@@ -238,68 +310,72 @@ private fun ChannelPanel(
 private fun JournalCard(
     appState: AppState,
     actions: PttUiActions,
+    phonePttGesture: PhonePttGestureState,
+    phonePttLockThresholdPx: Float,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
     val channel = appState.journal
-    val isActive = appState.activeChannelId == JournalChannel.ID
+    val channelId = JournalChannel.ID
+    val isActive = appState.activeChannelId == channelId
     val isReady = channel.isReady
     val accent = when {
+        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
         isActive -> MaterialTheme.colorScheme.primary
         isReady -> MaterialTheme.colorScheme.secondary
         else -> MaterialTheme.colorScheme.outline
     }
     Card(
-        onClick = { actions.setActiveChannel(JournalChannel.ID) },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(
+        Row(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Column(
                     modifier = Modifier
-                        .weight(1f)
+                        .fillMaxWidth()
                         .phonePttInput(
-                            channelId = JournalChannel.ID,
-                            onPttPressed = actions::phonePttPressed,
-                            onPttReleased = actions::phonePttReleased,
+                            channelId = channelId,
+                            lockThresholdPx = phonePttLockThresholdPx,
+                            onSelect = actions::setActiveChannel,
+                            onPhonePttTransition = onPhonePttTransition,
                         ),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    StatusPill(
-                        label = when {
-                            isActive -> "ACTIVE"
-                            isReady -> "READY"
-                            else -> "STANDBY"
-                        },
-                        accent = accent,
-                    )
-                    IconButton(onClick = actions::navigateToJournalConfig) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Config")
+                    if (!isReady) {
+                        Text(
+                            text = "Requires configuration to broadcast.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
                     }
+                    HeldPhonePttInstruction(channelId, phonePttGesture)
                 }
+                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
             }
-            if (!isReady) {
-                Text(
-                    text = "Requires configuration to broadcast.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.phonePttInput(
-                        channelId = JournalChannel.ID,
-                        onPttPressed = actions::phonePttPressed,
-                        onPttReleased = actions::phonePttReleased,
-                    ),
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                StatusPill(
+                    label = when {
+                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
+                        phonePttGesture.activeChannelId == channelId -> "PTT"
+                        isActive -> "ACTIVE"
+                        isReady -> "READY"
+                        else -> "STANDBY"
+                    },
+                    accent = accent,
                 )
+                IconButton(onClick = actions::navigateToJournalConfig) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Config")
+                }
             }
         }
     }
@@ -309,62 +385,111 @@ private fun JournalCard(
 private fun DebugChannelCard(
     appState: AppState,
     actions: PttUiActions,
+    phonePttGesture: PhonePttGestureState,
+    phonePttLockThresholdPx: Float,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
     val channel = appState.debugChannel
-    val isActive = appState.activeChannelId == DebugChannel.ID
-    val isReady = channel.isReady
-    val accent = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+    val channelId = DebugChannel.ID
+    val isActive = appState.activeChannelId == channelId
+    val accent = when {
+        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
+        isActive -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.secondary
+    }
 
     Card(
-        onClick = { actions.setActiveChannel(DebugChannel.ID) },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(
+        Row(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Column(
                     modifier = Modifier
-                        .weight(1f)
+                        .fillMaxWidth()
                         .phonePttInput(
-                            channelId = DebugChannel.ID,
-                            onPttPressed = actions::phonePttPressed,
-                            onPttReleased = actions::phonePttReleased,
+                            channelId = channelId,
+                            lockThresholdPx = phonePttLockThresholdPx,
+                            onSelect = actions::setActiveChannel,
+                            onPhonePttTransition = onPhonePttTransition,
                         ),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    StatusPill(
-                        label = if (isActive) "ACTIVE" else "READY",
-                        accent = accent,
+                    Text(
+                        text = "Mode: ${channel.mode.name}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    IconButton(onClick = actions::navigateToDebugConfig) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Config")
-                    }
+                    HeldPhonePttInstruction(channelId, phonePttGesture)
+                }
+                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                StatusPill(
+                    label = when {
+                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
+                        phonePttGesture.activeChannelId == channelId -> "PTT"
+                        isActive -> "ACTIVE"
+                        else -> "READY"
+                    },
+                    accent = accent,
+                )
+                IconButton(onClick = actions::navigateToDebugConfig) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Config")
                 }
             }
-
-            Text(
-                text = "Mode: ${channel.mode.name}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.phonePttInput(
-                    channelId = DebugChannel.ID,
-                    onPttPressed = actions::phonePttPressed,
-                    onPttReleased = actions::phonePttReleased,
-                ),
-            )
         }
+    }
+}
+
+@Composable
+private fun HeldPhonePttInstruction(
+    channelId: String,
+    phonePttGesture: PhonePttGestureState,
+) {
+    val armed = phonePttGesture as? PhonePttGestureState.Armed
+    if (armed?.channelId != channelId) return
+    val direction = when (armed.lockDirection) {
+        PhonePttLockDirection.Right -> "slide right to lock ▶"
+        PhonePttLockDirection.Left -> "◀ slide left to lock"
+    }
+    Text(
+        text = "RECORDING — $direction",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.secondary,
+        fontWeight = FontWeight.Bold,
+    )
+}
+
+@Composable
+private fun LockedPhonePttStop(
+    channelId: String,
+    phonePttGesture: PhonePttGestureState,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
+) {
+    val locked = phonePttGesture as? PhonePttGestureState.Locked
+    if (locked?.channelId != channelId) return
+    Text(
+        text = "RECORDING LOCKED",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.secondary,
+        fontWeight = FontWeight.Bold,
+    )
+    Button(
+        onClick = { onPhonePttTransition(phonePttGesture.stopPhonePttGesture()) },
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text("STOP")
     }
 }
 
@@ -411,18 +536,88 @@ private fun ChannelCard(channel: MockChannel) {
     }
 }
 
+private val PhonePttLockThreshold = 88.dp
+
+private enum class PreArmGestureResult {
+    Tap,
+    Cancel,
+}
+
 private fun Modifier.phonePttInput(
     channelId: String,
-    onPttPressed: (String) -> Unit,
-    onPttReleased: (String) -> Unit,
-): Modifier = pointerInput(channelId, onPttPressed, onPttReleased) {
+    lockThresholdPx: Float,
+    onSelect: (String) -> Unit,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
+): Modifier = pointerInput(channelId, lockThresholdPx, onSelect, onPhonePttTransition) {
     awaitEachGesture {
-        val down = awaitFirstDown()
-        val longPress = awaitLongPressOrCancellation(down.id) ?: return@awaitEachGesture
-        longPress.consume()
-        onPttPressed(channelId)
-        waitForUpOrCancellation()
-        onPttReleased(channelId)
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val initialX = down.position.x
+        val initialY = down.position.y
+        val touchSlopSquared = viewConfiguration.touchSlop * viewConfiguration.touchSlop
+        var movedBeforeArmed = false
+
+        val preArmResult = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Main)
+                val change = event.changes.firstOrNull { it.id == down.id }
+                    ?: return@withTimeoutOrNull PreArmGestureResult.Cancel
+                val dx = change.position.x - initialX
+                val dy = change.position.y - initialY
+                if (dx * dx + dy * dy > touchSlopSquared) {
+                    movedBeforeArmed = true
+                }
+                if (!change.pressed) {
+                    return@withTimeoutOrNull if (movedBeforeArmed) {
+                        PreArmGestureResult.Cancel
+                    } else {
+                        PreArmGestureResult.Tap
+                    }
+                }
+            }
+        }
+
+        when (preArmResult) {
+            PreArmGestureResult.Tap -> {
+                onSelect(channelId)
+                return@awaitEachGesture
+            }
+            PreArmGestureResult.Cancel -> return@awaitEachGesture
+            null -> Unit
+        }
+
+        down.consume()
+        var localState = startPhonePttGesture(
+            target = PhonePttGestureTarget.MainSurface,
+            channelId = channelId,
+            initialX = initialX,
+            surfaceWidth = size.width.toFloat(),
+        ).also(onPhonePttTransition).state
+
+        while (localState.isActive) {
+            val event = awaitPointerEvent(PointerEventPass.Main)
+            val change = event.changes.firstOrNull { it.id == down.id }
+            if (change == null) {
+                val transition = localState.cancelPhonePttGesture()
+                onPhonePttTransition(transition)
+                localState = transition.state
+                break
+            }
+
+            change.consume()
+            val transition = if (change.pressed) {
+                localState.movePhonePttGesture(
+                    currentX = change.position.x,
+                    lockThresholdPx = lockThresholdPx,
+                )
+            } else {
+                localState.releasePhonePttGesture()
+            }
+            if (transition.state != localState || transition.commands.isNotEmpty()) {
+                onPhonePttTransition(transition)
+            }
+            localState = transition.state
+            if (!change.pressed) break
+        }
     }
 }
 
