@@ -162,6 +162,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var sppStateJob: Job? = null
     private val reconnectPolicy = ReconnectPolicy()
     private var reconnectJob: Job? = null
+    private var readinessRefreshJob: Job? = null
     private var foreground = false
 
     private data class PttSession(
@@ -390,6 +391,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         idleTimerJob?.cancel()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
+        stopReadinessRefreshLoop()
         serialJob?.cancel()
         sppStateJob?.cancel()
         sppClient?.disconnect()
@@ -597,6 +599,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         forceReleaseActivePtt()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
+        stopReadinessRefreshLoop()
         serialJob?.cancel()
         sppStateJob?.cancel()
         sppClient?.disconnect()
@@ -1301,6 +1304,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         _appState.value = _appState.value.copy(connection = transform(_appState.value.connection))
         updateInputMode()
         updateCarMediaState()
+        syncReadinessRefreshLoop()
     }
 
     private fun updateMonitor(transform: (MonitorState) -> MonitorState) {
@@ -1324,6 +1328,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 startForeground(NOTIFICATION_ID, notification)
             }
             foreground = true
+            syncReadinessRefreshLoop()
         }.onFailure {
             foreground = false
             stopSelf()
@@ -1339,6 +1344,40 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             stopForeground(true)
         }
         foreground = false
+        syncReadinessRefreshLoop()
+    }
+
+    private fun syncReadinessRefreshLoop() {
+        when (
+            ReadinessRefreshLoopPolicy.decide(
+                refreshAllowed = foreground && reconnectPolicy.monitoringRequested,
+                readyForMonitor = _appState.value.readyForMonitor,
+                refreshLoopActive = readinessRefreshJob?.isActive == true,
+            )
+        ) {
+            ReadinessRefreshLoopDecision.KeepCurrentLoop -> Unit
+            ReadinessRefreshLoopDecision.StartRefreshLoop -> startReadinessRefreshLoop()
+            ReadinessRefreshLoopDecision.StopRefreshLoop -> stopReadinessRefreshLoop()
+        }
+    }
+
+    private fun startReadinessRefreshLoop() {
+        if (readinessRefreshJob?.isActive == true) return
+        readinessRefreshJob = serviceScope.launch {
+            while (true) {
+                delay(READINESS_REFRESH_INTERVAL_MS)
+                if (!foreground || _appState.value.readyForMonitor) {
+                    syncReadinessRefreshLoop()
+                    return@launch
+                }
+                refreshReadiness()
+            }
+        }
+    }
+
+    private fun stopReadinessRefreshLoop() {
+        readinessRefreshJob?.cancel()
+        readinessRefreshJob = null
     }
 
     private fun createNotificationChannel() {
@@ -1375,6 +1414,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         private const val SUPERTONIC_ASSET_VERSION = "supertonic-3-2026-06-24"
         private const val STT_MODEL_POLL_MS = 500L
         private const val TTS_MODEL_POLL_MS = 500L
+        private const val READINESS_REFRESH_INTERVAL_MS = 5_000L
         private const val SCO_RATE = 16_000
         private const val POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS = 3_000L
         private const val IDLE_TIMEOUT_MS = 30_000L
