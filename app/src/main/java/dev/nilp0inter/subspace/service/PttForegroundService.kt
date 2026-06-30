@@ -406,34 +406,39 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun initializeJournal(audioManager: AudioManager) {
-        val transcriber = transcriptionService ?: object : PcmTranscriber {
-            override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
-                throw IllegalStateException("STT transcriber unavailable")
-            }
-        }
-        val journalController = JournalController(
-            scope = serviceScope,
-            encoder = OggEncoder(),
-            transcriber = transcriber,
-        )
-        journalPttController = JournalPttController(
-            scope = serviceScope,
-            sco = sco,
-            output = AndroidPcmOutput(audioManager),
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            journal = journalController,
-            channelProvider = { _appState.value.journal },
-        )
-
-        val journal = _appState.value.journal
-        val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
-        if (baseDir != null) {
-            journalController.runRecovery(java.io.File(baseDir))
-        }
-
         serviceScope.launch {
-            var lastBaseDir: String? = null
+            val sttTranscriber = sttReady.await()
+            val transcriber: PcmTranscriber = if (sttTranscriber != null) {
+                TranscriptionService(sttTranscriber)
+            } else {
+                object : PcmTranscriber {
+                    override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
+                        throw IllegalStateException("STT transcriber unavailable")
+                    }
+                }
+            }
+            val journalController = JournalController(
+                scope = serviceScope,
+                encoder = OggEncoder(),
+                transcriber = transcriber,
+            )
+            journalPttController = JournalPttController(
+                scope = serviceScope,
+                sco = sco,
+                output = AndroidPcmOutput(audioManager),
+                captureService = captureService,
+                source = voiceCommunicationSource,
+                journal = journalController,
+                channelProvider = { _appState.value.journal },
+            )
+
+            val journal = _appState.value.journal
+            val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
+            if (baseDir != null) {
+                journalController.runRecovery(java.io.File(baseDir))
+            }
+
+            var lastBaseDir: String? = baseDir
             _appState.collect { state ->
                 val currentDir = state.journal.baseDirectory?.takeIf { it.isNotBlank() }
                 if (currentDir != null && currentDir != lastBaseDir) {
