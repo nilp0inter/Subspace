@@ -45,6 +45,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.Channel
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.JournalChannel
@@ -285,20 +286,31 @@ private fun ChannelPanel(
             color = MaterialTheme.colorScheme.primary,
         )
 
-        JournalCard(
-            appState = appState,
-            actions = actions,
-            phonePttGesture = phonePttGesture,
-            phonePttLockThresholdPx = phonePttLockThresholdPx,
-            onPhonePttTransition = onPhonePttTransition,
-        )
-        DebugChannelCard(
-            appState = appState,
-            actions = actions,
-            phonePttGesture = phonePttGesture,
-            phonePttLockThresholdPx = phonePttLockThresholdPx,
-            onPhonePttTransition = onPhonePttTransition,
-        )
+        appState.channels.forEach { channel ->
+            when (channel) {
+                is JournalChannel -> JournalCard(
+                    channel = channel,
+                    activeChannelId = appState.activeChannelId,
+                    actions = actions,
+                    phonePttGesture = phonePttGesture,
+                    phonePttLockThresholdPx = phonePttLockThresholdPx,
+                    onPhonePttTransition = onPhonePttTransition,
+                )
+                is DebugChannel -> DebugChannelCard(
+                    channel = channel,
+                    activeChannelId = appState.activeChannelId,
+                    actions = actions,
+                    phonePttGesture = phonePttGesture,
+                    phonePttLockThresholdPx = phonePttLockThresholdPx,
+                    onPhonePttTransition = onPhonePttTransition,
+                )
+                else -> UnknownChannelCard(channel)
+            }
+        }
+
+        Button(onClick = actions::addDebugChannel, modifier = Modifier.fillMaxWidth()) {
+            Text("Add Debug Channel")
+        }
 
         previewChannels.forEach { channel ->
             ChannelCard(channel)
@@ -308,15 +320,15 @@ private fun ChannelPanel(
 
 @Composable
 private fun JournalCard(
-    appState: AppState,
+    channel: JournalChannel,
+    activeChannelId: String,
     actions: PttUiActions,
     phonePttGesture: PhonePttGestureState,
     phonePttLockThresholdPx: Float,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
-    val channel = appState.journal
-    val channelId = JournalChannel.ID
-    val isActive = appState.activeChannelId == channelId
+    val channelId = channel.id
+    val isActive = activeChannelId == channelId
     val isReady = channel.isReady
     val accent = when {
         phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
@@ -350,7 +362,7 @@ private fun JournalCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    Text("CH-${channel.position + 1} / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                     if (!isReady) {
                         Text(
                             text = "Requires configuration to broadcast.",
@@ -373,7 +385,7 @@ private fun JournalCard(
                     },
                     accent = accent,
                 )
-                IconButton(onClick = actions::navigateToJournalConfig) {
+                IconButton(onClick = { actions.navigateToJournalConfig(channelId) }) {
                     Icon(Icons.Filled.Settings, contentDescription = "Config")
                 }
             }
@@ -383,15 +395,15 @@ private fun JournalCard(
 
 @Composable
 private fun DebugChannelCard(
-    appState: AppState,
+    channel: DebugChannel,
+    activeChannelId: String,
     actions: PttUiActions,
     phonePttGesture: PhonePttGestureState,
     phonePttLockThresholdPx: Float,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
-    val channel = appState.debugChannel
-    val channelId = DebugChannel.ID
-    val isActive = appState.activeChannelId == channelId
+    val channelId = channel.id
+    val isActive = activeChannelId == channelId
     val accent = when {
         phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
         isActive -> MaterialTheme.colorScheme.primary
@@ -424,7 +436,7 @@ private fun DebugChannelCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    Text("CH-${channel.position + 1} / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
                     Text(
                         text = "Mode: ${channel.mode.name}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -444,10 +456,25 @@ private fun DebugChannelCard(
                     },
                     accent = accent,
                 )
-                IconButton(onClick = actions::navigateToDebugConfig) {
+                IconButton(onClick = { actions.navigateToDebugConfig(channelId) }) {
                     Icon(Icons.Filled.Settings, contentDescription = "Config")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun UnknownChannelCard(channel: Channel) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Unknown channel type: ${channel.typeId}", color = MaterialTheme.colorScheme.error)
+            StatusPill(label = "STANDBY", accent = MaterialTheme.colorScheme.outline)
         }
     }
 }

@@ -15,6 +15,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -58,6 +59,22 @@ fun JournalConfigScreen(
                 text = "Configuration",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary,
+            )
+
+            OutlinedTextField(
+                value = channel.name,
+                onValueChange = { actions.updateChannelName(channel.id, it) },
+                label = { Text("Channel name") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+
+            OutlinedTextField(
+                value = (channel.position + 1).toString(),
+                onValueChange = { value -> value.toIntOrNull()?.let { actions.moveChannel(channel.id, it - 1) } },
+                label = { Text("List position") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
             )
 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -22,7 +22,9 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
@@ -67,7 +69,7 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(0f) }
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(false) }
-            var route by remember { mutableStateOf(MainRoute.Dashboard) }
+            var route by remember { mutableStateOf<MainRoute>(MainRoute.Dashboard) }
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
@@ -146,16 +148,28 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setInputMode(mode)
                     }
 
-                    override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {
-                        currentServiceState?.setDebugChannelMode(mode)
+                    override fun addDebugChannel() {
+                        currentServiceState?.addDebugChannel()
                     }
 
-                    override fun navigateToJournalConfig() {
-                        route = MainRoute.JournalConfig
+                    override fun updateChannelName(id: String, name: String) {
+                        currentServiceState?.updateChannelName(id, name)
                     }
 
-                    override fun navigateToDebugConfig() {
-                        route = MainRoute.DebugChannelConfig
+                    override fun moveChannel(id: String, position: Int) {
+                        currentServiceState?.moveChannel(id, position)
+                    }
+
+                    override fun setDebugChannelMode(channelId: String, mode: dev.nilp0inter.subspace.model.DebugMode) {
+                        currentServiceState?.setDebugChannelMode(channelId, mode)
+                    }
+
+                    override fun navigateToJournalConfig(channelId: String) {
+                        route = MainRoute.JournalConfig(channelId)
+                    }
+
+                    override fun navigateToDebugConfig(channelId: String) {
+                        route = MainRoute.DebugChannelConfig(channelId)
                     }
 
                     override fun navigateBack() {
@@ -232,13 +246,13 @@ class MainActivity : ComponentActivity() {
 
                         MainRoute.Connection -> ConnectionScreen(state.connection, actions)
                         MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                        MainRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
-                            channel = state.journal,
+                        is MainRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
+                            channel = state.channel(route.channelId) as? JournalChannel ?: state.journal,
                             actions = actions,
                             onBack = { route = MainRoute.Dashboard },
                         )
-                        MainRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
-                            channel = state.debugChannel,
+                        is MainRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
+                            channel = state.channel(route.channelId) as? DebugChannel ?: state.debugChannel,
                             monitorState = state.monitor,
                             actions = actions,
                             onBack = { route = MainRoute.Dashboard },
@@ -272,5 +286,11 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig }
+    private sealed interface MainRoute {
+        data object Dashboard : MainRoute
+        data object Connection : MainRoute
+        data object Monitor : MainRoute
+        data class JournalConfig(val channelId: String) : MainRoute
+        data class DebugChannelConfig(val channelId: String) : MainRoute
+    }
 }

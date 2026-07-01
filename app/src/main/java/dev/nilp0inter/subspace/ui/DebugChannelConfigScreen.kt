@@ -78,6 +78,22 @@ fun DebugChannelConfigScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            OutlinedTextField(
+                value = channel.name,
+                onValueChange = { actions.updateChannelName(channel.id, it) },
+                label = { Text("Channel name") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+
+            OutlinedTextField(
+                value = (channel.position + 1).toString(),
+                onValueChange = { value -> value.toIntOrNull()?.let { actions.moveChannel(channel.id, it - 1) } },
+                label = { Text("List position") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+
             Text("Diagnostic Mode", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 8.dp))
 
             Column(Modifier.selectableGroup()) {
@@ -86,28 +102,28 @@ fun DebugChannelConfigScreen(
                     selectedMode = channel.mode,
                     label = "Echo",
                     description = "Records audio on PTT and plays it back immediately",
-                    onSelect = { actions.setDebugChannelMode(DebugMode.ECHO) }
+                    onSelect = { actions.setDebugChannelMode(channel.id, DebugMode.ECHO) }
                 )
                 DebugModeOption(
                     mode = DebugMode.STT,
                     selectedMode = channel.mode,
                     label = "Speech-to-Text",
                     description = "Transcribes speech to text using Parakeet v3",
-                    onSelect = { actions.setDebugChannelMode(DebugMode.STT) }
+                    onSelect = { actions.setDebugChannelMode(channel.id, DebugMode.STT) }
                 )
                 DebugModeOption(
                     mode = DebugMode.TTS,
                     selectedMode = channel.mode,
                     label = "Text-to-Speech",
                     description = "Synthesizes text to speech using Supertonic 3",
-                    onSelect = { actions.setDebugChannelMode(DebugMode.TTS) }
+                    onSelect = { actions.setDebugChannelMode(channel.id, DebugMode.TTS) }
                 )
                 DebugModeOption(
                     mode = DebugMode.STT_TTS,
                     selectedMode = channel.mode,
                     label = "Round-trip (STT↔TTS)",
                     description = "Transcribes speech and reads it back",
-                    onSelect = { actions.setDebugChannelMode(DebugMode.STT_TTS) }
+                    onSelect = { actions.setDebugChannelMode(channel.id, DebugMode.STT_TTS) }
                 )
             }
 

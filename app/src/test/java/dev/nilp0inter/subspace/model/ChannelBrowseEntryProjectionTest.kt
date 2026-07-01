@@ -7,95 +7,80 @@ import org.junit.Test
 class ChannelBrowseEntryProjectionTest {
     @Test
     fun projectsActiveChannelAsActiveKind() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = "/storage/emulated/0/Subspace"),
-            activeChannelId = JournalChannel.ID,
-        )
+        val journal = JournalChannel(baseDirectory = "/storage/emulated/0/Subspace")
+        val state = AppState(channels = listOf(journal, DebugChannel()), activeChannelId = journal.id)
 
         val entries = projectChannelBrowseEntries(state)
 
         assertEquals(2, entries.size)
-        val journal = entries.first { it.id == JournalChannel.ID }
-        val debug = entries.first { it.id == DebugChannel.ID }
-        assertEquals(ChannelStatusKind.Active, journal.statusKind)
-        assertEquals(ChannelStatusKind.Ready, debug.statusKind)
+        assertEquals(ChannelStatusKind.Active, entries.first { it.id == journal.id }.statusKind)
+        assertEquals(ChannelStatusKind.Ready, entries.first { it.id == DebugChannel.ID }.statusKind)
     }
 
     @Test
     fun projectsReadyChannelAsReadyWhenNotActive() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = "/storage/emulated/0/Subspace"),
-            activeChannelId = DebugChannel.ID,
-        )
+        val journal = JournalChannel(baseDirectory = "/storage/emulated/0/Subspace")
+        val debug = DebugChannel()
+        val state = AppState(channels = listOf(journal, debug), activeChannelId = debug.id)
 
         val entries = projectChannelBrowseEntries(state)
 
-        val journal = entries.first { it.id == JournalChannel.ID }
-        val debug = entries.first { it.id == DebugChannel.ID }
-        assertEquals(ChannelStatusKind.Ready, journal.statusKind)
-        assertEquals(ChannelStatusKind.Active, debug.statusKind)
+        assertEquals(ChannelStatusKind.Ready, entries.first { it.id == journal.id }.statusKind)
+        assertEquals(ChannelStatusKind.Active, entries.first { it.id == debug.id }.statusKind)
     }
 
     @Test
     fun projectsUnconfiguredChannelAsStandby() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = null),
-            activeChannelId = DebugChannel.ID,
+        val journal = JournalChannel(baseDirectory = null)
+        val debug = DebugChannel()
+        val state = AppState(channels = listOf(journal, debug), activeChannelId = debug.id)
+
+        val entries = projectChannelBrowseEntries(state)
+
+        assertEquals(ChannelStatusKind.Standby, entries.first { it.id == journal.id }.statusKind)
+    }
+
+    @Test
+    fun activeUnconfiguredChannelStillProjectsActive() {
+        val journal = JournalChannel(baseDirectory = null)
+        val debug = DebugChannel()
+        val state = AppState(channels = listOf(journal, debug), activeChannelId = journal.id)
+
+        val entries = projectChannelBrowseEntries(state)
+
+        assertEquals(ChannelStatusKind.Active, entries.first { it.id == journal.id }.statusKind)
+        assertEquals(ChannelStatusKind.Ready, entries.first { it.id == debug.id }.statusKind)
+    }
+
+    @Test
+    fun projectionUsesConfiguredChannelOrder() {
+        val channels = normalizeChannelPositions(
+            listOf(
+                DebugChannel(id = "debug-a", name = "Debug A", position = 4),
+                JournalChannel(position = 2),
+                DebugChannel(id = "debug-b", name = "Debug B", position = 3),
+            ),
         )
+        val state = AppState(channels = channels, activeChannelId = channels.first().id)
 
         val entries = projectChannelBrowseEntries(state)
 
-        val journal = entries.first { it.id == JournalChannel.ID }
-        assertEquals(ChannelStatusKind.Standby, journal.statusKind)
-    }
-
-    @Test
-    fun projectsActiveChannelStandbyWhenUnconfigured() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = null),
-            activeChannelId = JournalChannel.ID,
-        )
-
-        val entries = projectChannelBrowseEntries(state)
-
-        val journal = entries.first { it.id == JournalChannel.ID }
-        assertEquals(ChannelStatusKind.Active, journal.statusKind)
-        val debug = entries.first { it.id == DebugChannel.ID }
-        assertEquals(ChannelStatusKind.Ready, debug.statusKind)
-    }
-
-    @Test
-    fun orderingIsJournalThenDebugByOrderIndex() {
-        val state = AppState()
-
-        val entries = projectChannelBrowseEntries(state)
-
-        assertEquals(listOf(JournalChannel.ID, DebugChannel.ID), entries.map { it.id })
-    }
-
-    @Test
-    fun pendingCountDefaultsToZeroWhenMapMissingChannel() {
-        val state = AppState()
-
-        val entries = projectChannelBrowseEntries(state, pendingCounts = emptyMap())
-
-        entries.forEach { assertEquals(0, it.pendingCount) }
+        assertEquals(listOf("captains-log", "debug-b", "debug-a"), entries.map { it.id })
     }
 
     @Test
     fun pendingCountPulledFromMapWhenSupplied() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = "/subspace"),
-            activeChannelId = DebugChannel.ID,
-        )
+        val journal = JournalChannel(baseDirectory = "/subspace")
+        val debug = DebugChannel(id = "debug-two", name = "Debug Two")
+        val state = AppState(channels = listOf(journal, debug), activeChannelId = debug.id)
 
         val entries = projectChannelBrowseEntries(
             state,
-            pendingCounts = mapOf(JournalChannel.ID to 5, DebugChannel.ID to 2),
+            pendingCounts = mapOf(journal.id to 5, debug.id to 2),
         )
 
-        assertEquals(5, entries.first { it.id == JournalChannel.ID }.pendingCount)
-        assertEquals(2, entries.first { it.id == DebugChannel.ID }.pendingCount)
+        assertEquals(5, entries.first { it.id == journal.id }.pendingCount)
+        assertEquals(2, entries.first { it.id == debug.id }.pendingCount)
     }
 
     @Test
@@ -109,31 +94,13 @@ class ChannelBrowseEntryProjectionTest {
     }
 
     @Test
-    fun channelOrderIndexesAreStable() {
-        val state = AppState()
-        val channels = listOf(state.journal, state.debugChannel)
-
-        assertEquals(0, channels.first { it is JournalChannel }.orderIndex)
-        assertEquals(1, channels.first { it is DebugChannel }.orderIndex)
-        // Re-running projection gives the same order — stable across calls.
-        val first = projectChannelBrowseEntries(state).map { it.id }
-        val second = projectChannelBrowseEntries(state).map { it.id }
-        assertEquals(first, second)
-    }
-
-    @Test
     fun selectChannelByOffsetSaturatesWithoutWraparound() {
-        val ordered = listOf(JournalChannel.ID, DebugChannel.ID)
+        val ordered = listOf("journal", "debug-a", "debug-b")
 
-        // Negative offset past first index saturates at first — no wraparound.
-        assertEquals(JournalChannel.ID, selectChannelByOffset(ordered, JournalChannel.ID, -1))
-        assertEquals(JournalChannel.ID, selectChannelByOffset(ordered, JournalChannel.ID, -10))
-        // Positive offset past last index saturates at last — no wraparound.
-        assertEquals(DebugChannel.ID, selectChannelByOffset(ordered, DebugChannel.ID, +1))
-        assertEquals(DebugChannel.ID, selectChannelByOffset(ordered, DebugChannel.ID, +10))
-        // Standard advance.
-        assertEquals(DebugChannel.ID, selectChannelByOffset(ordered, JournalChannel.ID, +1))
-        assertEquals(JournalChannel.ID, selectChannelByOffset(ordered, DebugChannel.ID, -1))
+        assertEquals("journal", selectChannelByOffset(ordered, "journal", -10))
+        assertEquals("debug-b", selectChannelByOffset(ordered, "debug-b", +10))
+        assertEquals("debug-a", selectChannelByOffset(ordered, "journal", +1))
+        assertEquals("debug-a", selectChannelByOffset(ordered, "debug-b", -1))
     }
 
     @Test
@@ -147,7 +114,6 @@ class ChannelBrowseEntryProjectionTest {
     fun selectChannelByOffsetSaturatesAtBoundsWhenCurrentIdUnknown() {
         val ordered = listOf(JournalChannel.ID, DebugChannel.ID)
 
-        // Unknown id defaults to the zeroth channel then offsets from there.
         assertEquals(JournalChannel.ID, selectChannelByOffset(ordered, "missing", 0))
         assertEquals(DebugChannel.ID, selectChannelByOffset(ordered, "missing", +1))
         assertEquals(JournalChannel.ID, selectChannelByOffset(ordered, "missing", -10))
@@ -155,11 +121,27 @@ class ChannelBrowseEntryProjectionTest {
 
     @Test
     fun projectionNameUsesChannelDisplayName() {
-        val state = AppState()
+        val state = AppState(
+            channels = listOf(
+                JournalChannel(name = "Field Notes"),
+                DebugChannel(id = "debug-two", name = "Loopback"),
+            ),
+            activeChannelId = "debug-two",
+        )
 
         val entries = projectChannelBrowseEntries(state)
 
-        assertTrue(entries.any { it.name == JournalChannel.NAME })
-        assertTrue(entries.any { it.name == DebugChannel.NAME })
+        assertTrue(entries.any { it.name == "Field Notes" })
+        assertTrue(entries.any { it.name == "Loopback" })
+    }
+
+    @Test
+    fun unknownChannelProjectsAsStandby() {
+        val unknown = UnknownChannel(id = "x", typeId = "future", name = "Future", position = 0)
+        val state = AppState(channels = listOf(unknown), activeChannelId = "missing")
+
+        val entries = projectChannelBrowseEntries(state)
+
+        assertEquals(ChannelStatusKind.Standby, entries.single().statusKind)
     }
 }
