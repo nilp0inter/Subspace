@@ -3,6 +3,7 @@ import java.security.MessageDigest
 
 plugins {
     id("com.android.application")
+    id("com.chaquo.python")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
@@ -98,6 +99,13 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+}
+
+chaquopy {
+    defaultConfig {
+        version = "3.13"
+        buildPython = listOf("python3")
     }
 }
 
