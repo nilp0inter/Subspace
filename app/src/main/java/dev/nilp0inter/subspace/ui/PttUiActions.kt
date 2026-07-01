@@ -1,6 +1,8 @@
 package dev.nilp0inter.subspace.ui
 
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.WebhookHeader
+import dev.nilp0inter.subspace.model.WebhookVerb
 
 interface PttUiActions {
     fun requestPermissions()
@@ -17,8 +19,13 @@ interface PttUiActions {
     fun setActiveChannel(id: String)
     fun setInputMode(mode: InputMode)
     fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode)
+    fun setWebhookUrl(url: String)
+    fun setWebhookVerb(verb: WebhookVerb)
+    fun setWebhookHeaders(headers: List<WebhookHeader>)
+    fun setWebhookBodyTemplate(bodyTemplate: String)
     fun navigateToJournalConfig()
     fun navigateToDebugConfig()
+    fun navigateToWebhookConfig()
     fun navigateBack()
     fun setTtsText(text: String)
     fun setTtsVoiceStyle(style: String)

@@ -23,6 +23,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.WebhookHeader
+import dev.nilp0inter.subspace.model.WebhookVerb
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
@@ -30,6 +32,7 @@ import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
+import dev.nilp0inter.subspace.ui.WebhookChannelConfigScreen
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 
 class MainActivity : ComponentActivity() {
@@ -150,12 +153,32 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setDebugChannelMode(mode)
                     }
 
+                    override fun setWebhookUrl(url: String) {
+                        currentServiceState?.setWebhookUrl(url)
+                    }
+
+                    override fun setWebhookVerb(verb: WebhookVerb) {
+                        currentServiceState?.setWebhookVerb(verb)
+                    }
+
+                    override fun setWebhookHeaders(headers: List<WebhookHeader>) {
+                        currentServiceState?.setWebhookHeaders(headers)
+                    }
+
+                    override fun setWebhookBodyTemplate(bodyTemplate: String) {
+                        currentServiceState?.setWebhookBodyTemplate(bodyTemplate)
+                    }
+
                     override fun navigateToJournalConfig() {
                         route = MainRoute.JournalConfig
                     }
 
                     override fun navigateToDebugConfig() {
                         route = MainRoute.DebugChannelConfig
+                    }
+
+                    override fun navigateToWebhookConfig() {
+                        route = MainRoute.WebhookChannelConfig
                     }
 
                     override fun navigateBack() {
@@ -243,6 +266,12 @@ class MainActivity : ComponentActivity() {
                             actions = actions,
                             onBack = { route = MainRoute.Dashboard },
                         )
+                        MainRoute.WebhookChannelConfig -> WebhookChannelConfigScreen(
+                            channel = state.webhookChannel,
+                            status = state.webhookStatus,
+                            actions = actions,
+                            onBack = { route = MainRoute.Dashboard },
+                        )
                     }
                 }
             }
@@ -272,5 +301,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig }
+    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig, WebhookChannelConfig }
 }

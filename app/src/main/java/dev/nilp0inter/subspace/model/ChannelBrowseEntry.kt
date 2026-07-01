@@ -26,17 +26,19 @@ enum class ChannelStatusKind { Active, Ready, Standby }
  * index on both the phone dashboard and the Android Auto browse tree so
  * "Next/Prev" steering-wheel semantics and dashboard tap-to-activate share the
  * same mental model (see `car-media-channel-browse` spec: "Channel ordering is
- * stable across surfaces"). Defaults give [JournalChannel] index 0 and
- * [DebugChannel] index 1.
+ * stable across surfaces"). Defaults give [JournalChannel] index 0,
+ * [WebhookChannel] index 1, and [DebugChannel] index 2.
  */
 val Channel.orderIndex: Int
     get() = when (this) {
         is JournalChannel -> JOURNAL_ORDER_INDEX
+        is WebhookChannel -> WEBHOOK_ORDER_INDEX
         is DebugChannel -> DEBUG_ORDER_INDEX
     }
 
 private const val JOURNAL_ORDER_INDEX = 0
-private const val DEBUG_ORDER_INDEX = 1
+private const val WEBHOOK_ORDER_INDEX = 1
+private const val DEBUG_ORDER_INDEX = 2
 
 /**
  * Pure projection from [AppState] to a [ChannelBrowseEntry] list ordered by
@@ -54,7 +56,7 @@ fun projectChannelBrowseEntries(
     appState: AppState,
     pendingCounts: Map<String, Int> = emptyMap(),
 ): List<ChannelBrowseEntry> {
-    val channels = listOf(appState.journal, appState.debugChannel)
+    val channels = listOf(appState.journal, appState.webhookChannel, appState.debugChannel)
     return channels
         .sortedBy { it.orderIndex }
         .map { channel ->

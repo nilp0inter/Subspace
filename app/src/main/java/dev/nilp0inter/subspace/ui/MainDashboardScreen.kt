@@ -49,6 +49,8 @@ import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
+import dev.nilp0inter.subspace.model.WebhookChannel
+import dev.nilp0inter.subspace.model.displayText
 import kotlinx.coroutines.withTimeoutOrNull
 
 @Composable
@@ -292,6 +294,13 @@ private fun ChannelPanel(
             phonePttLockThresholdPx = phonePttLockThresholdPx,
             onPhonePttTransition = onPhonePttTransition,
         )
+        WebhookChannelCard(
+            appState = appState,
+            actions = actions,
+            phonePttGesture = phonePttGesture,
+            phonePttLockThresholdPx = phonePttLockThresholdPx,
+            onPhonePttTransition = onPhonePttTransition,
+        )
         DebugChannelCard(
             appState = appState,
             actions = actions,
@@ -374,6 +383,87 @@ private fun JournalCard(
                     accent = accent,
                 )
                 IconButton(onClick = actions::navigateToJournalConfig) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Config")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WebhookChannelCard(
+    appState: AppState,
+    actions: PttUiActions,
+    phonePttGesture: PhonePttGestureState,
+    phonePttLockThresholdPx: Float,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
+) {
+    val channel = appState.webhookChannel
+    val channelId = WebhookChannel.ID
+    val isActive = appState.activeChannelId == channelId
+    val isReady = channel.isReady
+    val accent = when {
+        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
+        isActive -> MaterialTheme.colorScheme.primary
+        isReady -> MaterialTheme.colorScheme.secondary
+        else -> MaterialTheme.colorScheme.outline
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(1.dp, accent),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .phonePttInput(
+                            channelId = channelId,
+                            lockThresholdPx = phonePttLockThresholdPx,
+                            onSelect = actions::setActiveChannel,
+                            onPhonePttTransition = onPhonePttTransition,
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("CH-02 / WEBHOOK", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    Text(
+                        text = appState.webhookStatus.displayText(),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    if (!isReady) {
+                        Text(
+                            text = "Configure URL and {{message}} body placeholder before broadcast.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    HeldPhonePttInstruction(channelId, phonePttGesture)
+                }
+                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                StatusPill(
+                    label = when {
+                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
+                        phonePttGesture.activeChannelId == channelId -> "PTT"
+                        isActive -> "ACTIVE"
+                        isReady -> "READY"
+                        else -> "STANDBY"
+                    },
+                    accent = accent,
+                )
+                IconButton(onClick = actions::navigateToWebhookConfig) {
                     Icon(Icons.Filled.Settings, contentDescription = "Config")
                 }
             }
