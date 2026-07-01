@@ -6,7 +6,6 @@ import dev.nilp0inter.subspace.audio.CaptureSource
 import dev.nilp0inter.subspace.audio.CaptureStartResult
 import dev.nilp0inter.subspace.audio.JournalWavWriter
 import dev.nilp0inter.subspace.audio.PcmOutput
-import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.WavPcmReader
@@ -61,21 +60,20 @@ class JournalPttController(
 
     fun cancelAndRelease() {
         setupJob?.cancel()
-        // framesJob is joined inside finishSession on the normal path; for
-        // the cancel-and-release teardown path we cancel it here and let
-        // the writer's thread-safe finalize be the safety net.
-        framesJob?.cancel()
-        framesJob = null
         val session = activeSession
+        val writer = activeWavWriter
+        val collector = framesJob
         activeSession = null
-        if (session != null) {
-            scope.launch { captureService.cancelSession(session) }
-        }
-        activeWavWriter?.finalize()
         activeWavWriter = null
         activeEntryPaths = null
         activeChannel = null
-        scope.launch { output.releaseRoute() }
+        framesJob = null
+        scope.launch {
+            collector?.cancelAndJoin()
+            if (session != null) captureService.cancelSession(session)
+            writer?.finalize()
+            output.releaseRoute()
+        }
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -135,18 +133,20 @@ class JournalPttController(
                 }
             }
         }.onFailure {
-            framesJob?.cancel()
-            framesJob = null
             val session = activeSession
+            val writer = activeWavWriter
+            val collector = framesJob
             activeSession = null
-            if (session != null) {
-                scope.launch { captureService.cancelSession(session) }
-            }
-            activeWavWriter?.finalize()
             activeWavWriter = null
             activeEntryPaths = null
             activeChannel = null
-            scope.launch { route.output.releaseRoute() }
+            framesJob = null
+            scope.launch {
+                collector?.cancelAndJoin()
+                if (session != null) captureService.cancelSession(session)
+                writer?.finalize()
+                route.output.releaseRoute()
+            }
         }
     }
 
@@ -165,12 +165,6 @@ class JournalPttController(
         activeChannel = null
 
         scope.launch {
-            // Preserve current behavior: a no-op play call for the non-telecom
-            // path before releasing the route. Telecom's releaseRoute() already
-            // does the right thing (await disconnect), so both paths now go
-            // through route.output.releaseRoute().
-            route.output.play(RecordedPcm(shortArrayOf(), session.sampleRate))
-
             withContext(Dispatchers.IO) {
                 // Join the frames collector before finalizing so the
                 // collector has fully unwound before the file is closed
@@ -235,9 +229,9 @@ class JournalPttController(
                         paths.metadataFile,
                     )
                 }
-                journal.processCaptureFile(paths)
             }
             route.output.releaseRoute()
+            journal.processCaptureFile(paths)
         }
     }
 
