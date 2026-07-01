@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.coroutines.coroutineContext
@@ -87,6 +88,21 @@ class RouteSwitchOnReleaseTest {
         output.releaseRoute()
     }
 
+    @Test
+    fun telecomReleaseRouteReleasesAndAwaitsWithoutMediaPlayback() = runTest {
+        val events = mutableListOf<String>()
+        val output = TelecomCapturePcmOutput(
+            captureOutput = RouteTrackingOutput(),
+            mediaResponsePlayer = FakeResponsePlayer(events),
+            releaseCaptureRoute = { events += "releaseCaptureRoute" },
+            awaitTelecomDisconnected = { events += "awaitTelecomDisconnected" },
+        )
+
+        output.releaseRoute()
+
+        assertEquals(listOf("releaseCaptureRoute", "awaitTelecomDisconnected"), events)
+    }
+
     private class FakeScoRoute : ScoRoute {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
         override val state: StateFlow<ScoState> = _state
@@ -111,5 +127,13 @@ class RouteSwitchOnReleaseTest {
         override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun play(recording: RecordedPcm) { playCount++ }
         override suspend fun releaseRoute() { releaseRouteCount++ }
+    }
+
+    private class FakeResponsePlayer(
+        private val events: MutableList<String>,
+    ) : ResponsePlayer {
+        override suspend fun play(recording: RecordedPcm) {
+            events += "media.play"
+        }
     }
 }

@@ -26,6 +26,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -76,6 +77,46 @@ class JournalPttControllerTest {
             1,
             output.releaseRouteCount,
         )
+    }
+
+    @Test
+    fun pressReleaseFinalizesCaptureBeforeNoPlaybackRouteRelease() = runTest {
+        val events = mutableListOf<String>()
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = TrackingContinuousFakeSource(events)
+        val output = FakeOutput(events)
+        val journalController = journalController()
+        val channel = JournalChannel(baseDirectory = baseDir.absolutePath)
+        val controller = JournalPttController(
+            scope = this,
+            sco = sco,
+            output = output,
+            captureService = captureService,
+            source = source,
+            journal = journalController,
+            channelProvider = { channel },
+        )
+
+        controller.onPttPressed()
+        runCurrent()
+        advanceTimeBy(200)
+        runCurrent()
+        controller.onPttReleased()
+        runCurrent()
+        awaitReleaseRoute(output, expected = 1)
+
+        assertFalse(
+            "Journal no-response route release must not be triggered through empty playback: $events",
+            events.contains("output.play"),
+        )
+        assertTrue("capture source must close before route release: $events", events.contains("source.close"))
+        assertTrue("route must be released: $events", events.contains("output.releaseRoute"))
+        assertTrue(
+            "capture source must close before route release: $events",
+            events.indexOf("source.close") < events.indexOf("output.releaseRoute"),
+        )
+        assertEquals(1, output.releaseRouteCount)
     }
 
     @Test
@@ -191,10 +232,26 @@ class JournalPttControllerTest {
     private class FakeOutput : PcmOutput {
         var releaseRouteCount = 0; private set
         var playCount = 0; private set
+        private val events: MutableList<String>?
+
+        constructor() {
+            events = null
+        }
+
+        constructor(events: MutableList<String>) {
+            this.events = events
+        }
+
         override suspend fun playReadyBeep(coldStart: Boolean) {}
         override suspend fun playErrorBeep(coldStart: Boolean) {}
-        override suspend fun play(recording: RecordedPcm) { playCount++ }
-        override suspend fun releaseRoute() { releaseRouteCount += 1 }
+        override suspend fun play(recording: RecordedPcm) {
+            playCount++
+            events?.add("output.play")
+        }
+        override suspend fun releaseRoute() {
+            releaseRouteCount += 1
+            events?.add("output.releaseRoute")
+        }
     }
 
     private class NoopEncoder : AudioEncoder {
@@ -232,5 +289,34 @@ class JournalPttControllerTest {
         }
 
         override fun close() { closed = true }
+    }
+
+    private class TrackingContinuousFakeSource(
+        private val events: MutableList<String>,
+        override val sourceId: dev.nilp0inter.subspace.audio.CaptureSourceId =
+            dev.nilp0inter.subspace.audio.CaptureSourceId.VoiceCommunication,
+    ) : dev.nilp0inter.subspace.audio.CaptureSource {
+        override suspend fun open(): dev.nilp0inter.subspace.audio.OpenedCaptureSource =
+            TrackingContinuousOpenedSource(events)
+    }
+
+    private class TrackingContinuousOpenedSource(
+        private val events: MutableList<String>,
+    ) : dev.nilp0inter.subspace.audio.OpenedCaptureSource {
+        override val sampleRate: Int = 16_000
+        override val bufferSizeShorts: Int = 64
+        private var closed = false
+
+        override fun read(buffer: ShortArray): Int {
+            if (closed) return -1
+            val n = minOf(buffer.size, 64)
+            for (i in 0 until n) buffer[i] = (i * 100).toShort()
+            return n
+        }
+
+        override fun close() {
+            closed = true
+            events.add("source.close")
+        }
     }
 }

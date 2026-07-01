@@ -411,10 +411,12 @@ class CaptureService(
             }
         }
 
-        fun cancel(): RecordedPcm {
+        suspend fun cancel(): RecordedPcm {
             val existing = finalized
             if (existing != null) return existing
-            return finalize(CaptureCompletion.Cancelled(readFinalPcm()))
+            return finalize(CaptureCompletion.Cancelled(readFinalPcm())).also {
+                runCatching { readJob.join() }
+            }
         }
     }
 
