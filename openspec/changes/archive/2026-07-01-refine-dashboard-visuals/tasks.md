@@ -28,5 +28,5 @@
 ## 5. Verification
 
 - [x] 5.1 Run `nix develop --no-write-lock-file -c gradle test` and fix regressions caused by this change.
-- [ ] 5.2 Run `nix develop --no-write-lock-file -c gradle assembleDebug` and fix compile or resource errors.
-- [ ] 5.3 Perform dashboard visual QA on a device or emulator: title clear of Android status bar, three fixed-height icon tiles visible, RSM setup reachable by unavailable tap and long-press, VU meter present while idle and active, and no major section shifts across state changes.
+- [x] 5.2 Run `nix develop --no-write-lock-file -c gradle assembleDebug` and fix compile or resource errors.
+- [x] 5.3 Perform dashboard visual QA on a device or emulator: title clear of Android status bar, three fixed-height icon tiles visible, RSM setup reachable by unavailable tap and long-press, VU meter present while idle and active, and no major section shifts across state changes.
