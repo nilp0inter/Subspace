@@ -7,3 +7,5 @@ local.properties
 .opencode
 rust/target/
 .omo
+release.keystore
+*.keystore

@@ -77,6 +77,21 @@ nix develop -c ./gradlew build
 nix develop -c ./gradlew test
 ```
 
+## Releases
+
+Releases are cut by pushing an annotated, GPG-signed `v*` tag. The
+`Release` GitHub Actions workflow verifies the tag signature, builds a
+release-signed APK from keystores provisioned via repository secrets,
+verifies the APK signature, and publishes the artifact to GitHub
+Releases. See `RELEASE_SIGNING.md` for the full operator checklist
+(keystore generation, backups, rotation, GPG tag-signing setup).
+
+The release signing config reads its keystore path and passwords from
+environment variables (`ANDROID_RELEASE_KEYSTORE_PATH`,
+`ANDROID_RELEASE_KEYSTORE_PASSWORD`, `ANDROID_RELEASE_KEY_PASSWORD`);
+when these are unset, `gradle assembleRelease` produces an unsigned APK
+and does not fall back to debug signing.
+
 ## Android Device Testing
 
 Use a physical Android 12+ device with USB debugging enabled. The target hardware is `B02PTT-FF01`.

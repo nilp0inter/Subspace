@@ -42,11 +42,22 @@ android {
             keyAlias = "androiddebugkey"
             keyPassword = "android"
         }
+        create("release") {
+            storeFile = System.getenv("ANDROID_RELEASE_KEYSTORE_PATH")?.let(::file)
+            storePassword = System.getenv("ANDROID_RELEASE_KEYSTORE_PASSWORD") ?: ""
+            keyAlias = "subspace-release"
+            keyPassword = System.getenv("ANDROID_RELEASE_KEY_PASSWORD") ?: ""
+        }
     }
 
     buildTypes {
         getByName("debug") {
             signingConfig = signingConfigs.getByName("debug")
+        }
+        getByName("release") {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

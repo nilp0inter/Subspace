@@ -63,14 +63,40 @@ CI runs these commands in order:
 
 1. `nix flake check --no-write-lock-file`
 2. `nix develop --no-write-lock-file -c gradle --version`
-3. `nix develop --no-write-lock-file -c gradle test`
-4. `nix develop --no-write-lock-file -c gradle assembleDebug`
+3. Provision the debug keystore from the `ANDROID_DEBUG_KEYSTORE_BASE64` repository secret to `.android/debug.keystore`
+4. `nix develop --no-write-lock-file -c gradle test`
+5. `nix develop --no-write-lock-file -c gradle assembleDebug`
 
 The debug APK is published as a workflow artifact named `subspace-debug-apk`,
 sourced from `app/build/outputs/apk/debug/*.apk` with 14-day retention.
 
-CI builds the debug APK only. Release signing, Play Store/F-Droid publishing,
-and GitHub Release deployment are out of scope.
+The debug keystore is required because `app/build.gradle.kts` pins its path
+to `rootProject.file(".android/debug.keystore")`. The path is gitignored
+(see `.gitignore`), so CI provisions the file from a base64-encoded secret
+on every run. See `RELEASE_SIGNING.md` for keystore setup.
+
+## Releases
+
+Releases are tag-triggered. Pushing an annotated, GPG-signed tag matching
+`v*` (for example `v0.2.0`) triggers the `Release` workflow, which:
+
+1. Verifies the tag's GPG signature against the public key committed at
+   `.github/release-signing-pubkey.asc`. Unsigned or badly-signed tags
+   fail the workflow before any build runs.
+2. Provisions the debug and release keystores from GitHub Actions
+   secrets.
+3. Builds a release-signed APK via `gradle assembleRelease` using an
+   environment-driven signing config (no debug fallback).
+4. Verifies the APK signature with `apksigner`.
+5. Publishes the APK to GitHub Releases via the `gh` CLI, with
+   auto-generated release notes.
+
+The release build type disables R8, ProGuard, and resource shrinking
+for the first releases; minification will be added in a separate change
+with hardware-verified keep rules.
+
+Operator-facing release procedure (keystore setup, backups, rotation,
+release-cutting checklist) is documented in `RELEASE_SIGNING.md`.
 
 ## Dependency Maintenance
 
