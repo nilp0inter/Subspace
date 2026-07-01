@@ -8,15 +8,24 @@ val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805f9b34fb")
 data class AppState(
     val connection: ConnectionState = ConnectionState(),
     val monitor: MonitorState = MonitorState(),
-    val journal: JournalChannel = JournalChannel(),
-    val debugChannel: DebugChannel = DebugChannel(),
-    val activeChannelId: String = JournalChannel.ID,
+    val channels: List<Channel> = normalizeChannelPositions(listOf(JournalChannel(), DebugChannel())),
+    val activeChannelId: String = channels.firstOrNull()?.id ?: "",
     val inputMode: InputMode = InputMode.OnAPinch,
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
     val inputModeAvailability: InputModeAvailability = InputModeAvailability(),
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor
+
+    val journal: JournalChannel
+        get() = channels.filterIsInstance<JournalChannel>().firstOrNull() ?: JournalChannel()
+
+    val debugChannel: DebugChannel
+        get() = channels.filterIsInstance<DebugChannel>().firstOrNull() ?: DebugChannel()
+
+    fun channel(id: String): Channel? = channels.firstOrNull { it.id == id }
+
+    fun activeChannel(): Channel? = channel(activeChannelId)
 }
 
 /**

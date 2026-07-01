@@ -1,24 +1,101 @@
 package dev.nilp0inter.subspace.model
 
-import android.content.Context
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChannelRepositoryTest {
     @Test
-    fun journalRoundTripPersistsConfiguration() {
+    fun freshInstallSeedsDefaultChannels() {
         val repository = ChannelRepository(FakeSharedPreferences())
-        val channel = JournalChannel(
-            baseDirectory = "/storage/emulated/0/Subspace",
-            saveVoice = false,
-            saveText = true,
+
+        val config = repository.loadConfiguration()
+
+        assertEquals(listOf(JournalChannel.ID, DebugChannel.ID), config.channels.map { it.id })
+        assertEquals(JournalChannel.ID, config.activeChannelId)
+    }
+
+    @Test
+    fun existingInstallMigratesLegacyJournalAndDebugConfig() {
+        val prefs = FakeSharedPreferences()
+        prefs.edit()
+            .putString("journal_base_directory", "/storage/emulated/0/Subspace")
+            .putBoolean("journal_save_voice", false)
+            .putBoolean("journal_save_text", true)
+            .putString("debug_channel_mode", DebugMode.STT.name)
+            .putString("active_channel_id", DebugChannel.ID)
+            .apply()
+        val repository = ChannelRepository(prefs)
+
+        val config = repository.loadConfiguration()
+
+        val journal = config.channels.filterIsInstance<JournalChannel>().single()
+        val debug = config.channels.filterIsInstance<DebugChannel>().single()
+        assertEquals("/storage/emulated/0/Subspace", journal.baseDirectory)
+        assertEquals(false, journal.saveVoice)
+        assertEquals(true, journal.saveText)
+        assertEquals(DebugMode.STT, debug.mode)
+        assertEquals(debug.id, config.activeChannelId)
+    }
+
+    @Test
+    fun channelListRoundTripPersistsDuplicateDebugInstances() {
+        val repository = ChannelRepository(FakeSharedPreferences())
+        val channels = listOf(
+            JournalChannel(name = "Journal", position = 0),
+            DebugChannel(id = "debug-a", name = "Echo", position = 1, mode = DebugMode.ECHO),
+            DebugChannel(id = "debug-b", name = "Speech", position = 2, mode = DebugMode.STT),
         )
 
-        repository.saveJournal(channel)
+        repository.saveChannels(channels)
 
-        assertEquals(channel, repository.loadJournal())
+        val loaded = repository.loadChannels()
+        assertEquals(channels, loaded)
+    }
+
+    @Test
+    fun duplicatePositionsNormalizeByPositionThenId() {
+        val repository = ChannelRepository(FakeSharedPreferences())
+        repository.saveChannels(
+            listOf(
+                DebugChannel(id = "debug-b", position = 0),
+                DebugChannel(id = "debug-a", position = 0),
+                JournalChannel(position = 0),
+            ),
+        )
+
+        val loaded = repository.loadChannels()
+
+        assertEquals(listOf("captains-log", "debug-a", "debug-b"), loaded.map { it.id })
+        assertEquals(listOf(0, 1, 2), loaded.map { it.position })
+    }
+
+    @Test
+    fun missingActiveChannelRecoversToFirstConfiguredChannel() {
+        val prefs = FakeSharedPreferences()
+        val repository = ChannelRepository(prefs)
+        repository.saveChannels(listOf(DebugChannel(id = "debug-a", position = 0)))
+        repository.saveActiveChannelId("missing")
+
+        val config = repository.loadConfiguration()
+
+        assertEquals("debug-a", config.activeChannelId)
+        assertEquals("debug-a", repository.loadActiveChannelId())
+    }
+
+    @Test
+    fun addDebugChannelCreatesIndependentInstanceAtRequestedPosition() {
+        val repository = ChannelRepository(FakeSharedPreferences())
+        repository.loadConfiguration()
+
+        val created = repository.addDebugChannel(name = "Second Debug", position = 1)
+        val loaded = repository.loadChannels()
+
+        assertTrue(created.id.startsWith("debug-"))
+        assertEquals(listOf(JournalChannel.ID, created.id, DebugChannel.ID), loaded.map { it.id })
+        assertEquals("Second Debug", loaded[1].name)
     }
 
     @Test

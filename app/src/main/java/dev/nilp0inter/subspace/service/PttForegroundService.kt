@@ -53,6 +53,7 @@ import dev.nilp0inter.subspace.channel.JournalEntryPaths
 import dev.nilp0inter.subspace.channel.JournalMetadataStore
 import dev.nilp0inter.subspace.channel.JournalPttController
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.Channel
 import dev.nilp0inter.subspace.model.ChannelBrowseEntry
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.InputModeAvailability
@@ -167,6 +168,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private data class PttSession(
         val source: PttSource,
         val channelId: String,
+        val channel: Channel,
         val route: ResolvedAudioRoute,
     )
 
@@ -179,10 +181,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         channelRepository = ChannelRepository(applicationContext)
+        val channelConfiguration = channelRepository.loadConfiguration()
         _appState.value = _appState.value.copy(
-            journal = channelRepository.loadJournal(),
-            debugChannel = channelRepository.loadDebugChannel(),
-            activeChannelId = channelRepository.loadActiveChannelId(),
+            channels = channelConfiguration.channels,
+            activeChannelId = channelConfiguration.activeChannelId,
         )
 
         val audioManager = getSystemService(AudioManager::class.java)
@@ -310,13 +312,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 ttsSynthesizer = synth
                 serviceScope.launch {
                     announcer = SystemAnnouncer(synth)
-                    val vocabulary = mapOf(
-                        "sys.menu.channels" to "Channels",
-                        "chan.${JournalChannel.ID}.name" to "Journal Channel",
-                        "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
-                        "chan.${DebugChannel.ID}.name" to "Debug Channel",
-                        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected"
-                    )
+                    val vocabulary = channelAnnouncementVocabulary(_appState.value)
                     val styleDir = supertonicModelDir ?: return@launch
                     val voiceStylePath = java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
                     serviceScope.launch {
@@ -429,7 +425,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 captureService = captureService,
                 source = voiceCommunicationSource,
                 journal = journalController,
-                channelProvider = { _appState.value.journal },
+                channelProvider = { _appState.value.activeChannel() as? JournalChannel ?: _appState.value.journal },
             )
 
             val journal = _appState.value.journal
@@ -451,10 +447,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun updateActiveControllers() {
         val state = _appState.value
-        val activeChannelId = state.activeChannelId
-        val mode = state.debugChannel.mode
+        val activeChannel = state.activeChannel()
+        val mode = (activeChannel as? DebugChannel)?.mode
 
-        val isDebugActive = activeChannelId == DebugChannel.ID
+        val isDebugActive = activeChannel is DebugChannel
 
         echo.setEnabled(isDebugActive && mode == DebugMode.ECHO)
         if (!(isDebugActive && mode == DebugMode.ECHO)) {
@@ -480,7 +476,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
         }
         
-        if (activeChannelId != JournalChannel.ID) {
+        if (activeChannel !is JournalChannel) {
             journalPttController?.cancelAndRelease()
         }
     }
@@ -613,25 +609,26 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     fun setJournalDirectory(path: String) {
-        val channel = channelRepository.loadJournal().copy(baseDirectory = path)
-        saveJournal(channel)
+        val channel = _appState.value.activeChannel() as? JournalChannel ?: _appState.value.journal
+        saveChannel(channel.copy(baseDirectory = path))
     }
 
     fun setJournalSaveVoice(enabled: Boolean) {
         val current = _appState.value.journal
         if (!enabled && !current.saveText) return
-        saveJournal(current.copy(saveVoice = enabled))
+        saveChannel(current.copy(saveVoice = enabled))
     }
 
     fun setJournalSaveText(enabled: Boolean) {
         val current = _appState.value.journal
         if (!enabled && !current.saveVoice) return
-        saveJournal(current.copy(saveText = enabled))
+        saveChannel(current.copy(saveText = enabled))
     }
 
     fun setActiveChannelId(id: String) {
         val current = _appState.value
         if (current.activeChannelId == id) return
+        if (current.channels.none { it.id == id }) return
 
         channelRepository.saveActiveChannelId(id)
         _appState.update { it.copy(activeChannelId = id) }
@@ -655,6 +652,38 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         channelRepository.saveActiveChannelId(newId)
         _appState.update { it.copy(activeChannelId = newId) }
         updateActiveControllers()
+    }
+
+    fun addDebugChannel() {
+        val channel = channelRepository.addDebugChannel(
+            name = "Debug Channel ${_appState.value.channels.count { it is DebugChannel } + 1}",
+        )
+        reloadChannels(activeChannelId = channel.id)
+        precomputeChannelAnnouncements()
+    }
+
+    fun updateChannelName(id: String, name: String) {
+        channelRepository.updateChannelName(id, name)
+        reloadChannels(activeChannelId = _appState.value.activeChannelId)
+        precomputeChannelAnnouncements()
+    }
+
+    fun moveChannel(id: String, position: Int) {
+        channelRepository.moveChannel(id, position)
+        reloadChannels(activeChannelId = _appState.value.activeChannelId)
+    }
+
+    private fun reloadChannels(activeChannelId: String) {
+        val channels = channelRepository.loadChannels()
+        val recoveredActiveId = if (channels.any { it.id == activeChannelId }) {
+            activeChannelId
+        } else {
+            channels.firstOrNull()?.id.orEmpty()
+        }
+        channelRepository.saveActiveChannelId(recoveredActiveId)
+        _appState.update { it.copy(channels = channels, activeChannelId = recoveredActiveId) }
+        updateActiveControllers()
+        updateCarMediaState()
     }
 
     /**
@@ -718,16 +747,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val session = activePttSession ?: return
         activePttSession = null
         cancelIdleTimer()
-        when (session.channelId) {
-            JournalChannel.ID -> journalPttController?.cancelAndRelease()
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
+        when (val channel = session.channel) {
+            is JournalChannel -> journalPttController?.cancelAndRelease()
+            is DebugChannel -> {
+                when (channel.mode) {
                     DebugMode.ECHO -> echo.cancelAndRelease()
                     DebugMode.STT -> sttController?.cancelAndRelease()
                     DebugMode.TTS -> ttsController?.cancelAndRelease()
                     DebugMode.STT_TTS -> sttTtsController?.cancelAndRelease()
                 }
             }
+            else -> Unit
         }
         TelecomCarPttCoordinator.forceAbort()
         updateCarMediaState()
@@ -779,19 +809,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
 
-    fun setDebugChannelMode(mode: DebugMode) {
-        saveDebugChannel(_appState.value.debugChannel.copy(mode = mode))
+    fun setDebugChannelMode(channelId: String, mode: DebugMode) {
+        val channel = _appState.value.channel(channelId) as? DebugChannel ?: return
+        saveChannel(channel.copy(mode = mode))
         updateActiveControllers()
     }
 
-    private fun saveJournal(channel: JournalChannel) {
-        channelRepository.saveJournal(channel)
-        _appState.value = _appState.value.copy(journal = channel)
-    }
-
-    private fun saveDebugChannel(channel: DebugChannel) {
-        channelRepository.saveDebugChannel(channel)
-        _appState.value = _appState.value.copy(debugChannel = channel)
+    private fun saveChannel(channel: Channel) {
+        channelRepository.saveChannel(channel)
+        _appState.value = _appState.value.copy(
+            channels = _appState.value.channels.map { if (it.id == channel.id) channel else it },
+        )
     }
 
     fun setTtsText(text: String) {
@@ -848,6 +876,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun voiceStyleFile(style: String, modelDir: java.io.File): java.io.File =
         java.io.File(modelDir, "$style.json")
+
+    private fun channelAnnouncementVocabulary(state: AppState): Map<String, String> =
+        buildMap {
+            put("sys.menu.channels", "Channels")
+            state.channels.forEach { channel ->
+                put("chan.${channel.id}.name", channel.name)
+                put("chan.${channel.id}.selected", "${channel.name} Selected")
+            }
+        }
+
+    private fun precomputeChannelAnnouncements() {
+        val modelDir = supertonicModelDir ?: return
+        val voiceStylePath = voiceStyleFile(_appState.value.monitor.ttsVoiceStyle, modelDir).absolutePath
+        serviceScope.launch {
+            announcer?.precompute(channelAnnouncementVocabulary(_appState.value), voiceStylePath, SCO_RATE)
+        }
+    }
 
     private fun cycleActiveChannel(next: Boolean) {
         val offset = if (next) 1 else -1
@@ -991,6 +1036,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val appState = _appState.value
         val decision = decidePttDispatch(appState) ?: return false
         val activeChannelId = decision.channelId
+        val activeChannel = decision.channel
 
         val route = resolvePttAudioRoute(inputModeController.mode)
 
@@ -1006,13 +1052,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         activePttSession = PttSession(
             source = source,
             channelId = activeChannelId,
+            channel = activeChannel,
             route = route,
         )
 
-        when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttPressed(route)
-            DebugChannel.ID -> {
-                when (appState.debugChannel.mode) {
+        when (activeChannel) {
+            is JournalChannel -> journalPttController?.onPttPressed(route)
+            is DebugChannel -> {
+                when (activeChannel.mode) {
                     DebugMode.ECHO -> echo.onPttPressed(route)
                     DebugMode.STT -> sttController?.onPttPressed(route)
                     DebugMode.TTS -> {
@@ -1034,6 +1081,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     DebugMode.STT_TTS -> sttTtsController?.onPttPressed(route)
                 }
             }
+            else -> Unit
         }
         updateCarMediaState()
         return true
@@ -1074,14 +1122,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
         activePttSession = null
         val appState = _appState.value
-        val activeChannelId = session.channelId
+        val activeChannel = session.channel
 
         val route = session.route
 
-        when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttReleased(route)
-            DebugChannel.ID -> {
-                when (appState.debugChannel.mode) {
+        when (activeChannel) {
+            is JournalChannel -> journalPttController?.onPttReleased(route)
+            is DebugChannel -> {
+                when (activeChannel.mode) {
                     DebugMode.ECHO -> echo.onPttReleased(route)
                     DebugMode.STT -> sttController?.onPttReleased(route)
                     DebugMode.TTS -> ttsController?.onPttReleased()
@@ -1102,6 +1150,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     }
                 }
             }
+            else -> Unit
         }
         if (inputModeController.mode == InputMode.OnTheRoad) {
             startIdleTimer()
