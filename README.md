@@ -53,3 +53,28 @@ nix flake check --no-write-lock-file
 nix develop --no-write-lock-file -c gradle test
 nix develop --no-write-lock-file -c gradle assembleDebug
 ```
+
+## Continuous Integration
+
+GitHub Actions CI runs on every pull request, push to `main`, and manual
+dispatch. The workflow uses the same Nix devshell as local development — no
+standalone Android, Java, or Gradle setup actions are used.
+
+CI runs these commands in order:
+
+1. `nix flake check --no-write-lock-file`
+2. `nix develop --no-write-lock-file -c gradle --version`
+3. `nix develop --no-write-lock-file -c gradle test`
+4. `nix develop --no-write-lock-file -c gradle assembleDebug`
+
+The debug APK is published as a workflow artifact named `subspace-debug-apk`,
+sourced from `app/build/outputs/apk/debug/*.apk` with 14-day retention.
+
+CI builds the debug APK only. Release signing, Play Store/F-Droid publishing,
+and GitHub Release deployment are out of scope.
+
+## Dependency Maintenance
+
+[Renovate](https://docs.renovatebot.com/) keeps GitHub Actions pins, Nix flake
+inputs, Gradle/Maven dependencies, and Cargo dependencies up to date. The
+configuration lives in `renovate.json` at the repository root.
