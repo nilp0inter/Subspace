@@ -7,7 +7,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -55,9 +54,8 @@ class TtsControllerTest {
         assertEquals(8, synth.lastRequest?.totalSteps)
         assertEquals(1.0f, synth.lastRequest!!.speed, 0.001f)
 
-        advanceTimeBy(30_000)
-        runCurrent()
-        assertEquals(1, sco.releaseCount)
+        assertEquals(1, output.releaseRouteCount)
+        assertEquals(0, sco.releaseCount)
     }
 
     @Test
@@ -139,9 +137,35 @@ class TtsControllerTest {
         controller.synthesize("hello", "/tmp/M1.json", "en", 8, 1.0f, 16_000)
         runCurrent()
         controller.cancelAndRelease()
+        advanceUntilIdle()
 
         assertEquals(TtsStatus.Idle, controller.status.value)
-        assertEquals(1, sco.releaseCount)
+        assertEquals(1, output.releaseRouteCount)
+        assertEquals(0, sco.releaseCount)
+    }
+
+    @Test
+    fun cancellationDuringPlaybackReleasesRouteWithoutErrorStatus() = runTest {
+        val sco = FakeScoRoute()
+        val output = FakeOutput(playDelayMs = 60_000)
+        val synth = FakeTtsSynthesizer().apply {
+            setOutcome(SynthesisOutcome.Success(FloatArray(100) { 0.5f }))
+        }
+        val controller = makeController(this, sco, output, synth, coroutineContext[CoroutineDispatcher]!!)
+        controller.setEnabled(true)
+
+        controller.synthesize("hello", "/tmp/M1.json", "en", 8, 1.0f, 16_000)
+        runCurrent()
+
+        assertEquals(TtsStatus.Playing, controller.status.value)
+
+        controller.cancelAndRelease()
+        advanceUntilIdle()
+
+        assertEquals(TtsStatus.Idle, controller.status.value)
+        assertEquals(1, output.playbackCount)
+        assertEquals(1, output.releaseRouteCount)
+        assertEquals(0, sco.releaseCount)
     }
 
     private class FakeScoRoute(
@@ -167,9 +191,12 @@ class TtsControllerTest {
         }
     }
 
-    private class FakeOutput : PcmOutput {
+    private class FakeOutput(
+        private val playDelayMs: Long = 0,
+    ) : PcmOutput {
         var beepCount = 0
         var playbackCount = 0
+        var releaseRouteCount = 0
 
         override suspend fun playErrorBeep(coldStart: Boolean) {}
         override suspend fun playReadyBeep(coldStart: Boolean) {
@@ -178,6 +205,11 @@ class TtsControllerTest {
 
         override suspend fun play(recording: RecordedPcm) {
             playbackCount += 1
+            if (playDelayMs > 0) delay(playDelayMs)
+        }
+
+        override suspend fun releaseRoute() {
+            releaseRouteCount += 1
         }
     }
 }

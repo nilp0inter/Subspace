@@ -13,9 +13,10 @@ import kotlin.math.sin
 
 class AndroidPcmOutput(
     private val audioManager: AudioManager,
+    private val communicationDevice: () -> AudioDeviceInfo? = { audioManager.communicationDevice },
 ) : PcmOutput {
     override suspend fun playReadyBeep(coldStart: Boolean) {
-        ensureScoActive()
+        val device = requireScoDevice()
         val sampleRate = 16_000
         var samples = generateSinePcm16(
             frequencyHz = 880.0,
@@ -32,12 +33,12 @@ class AndroidPcmOutput(
             samples = samples,
             sampleRate = sampleRate,
             contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
-            preferredDevice = audioManager.communicationDevice,
+            preferredDevice = device,
         )
     }
 
     override suspend fun playErrorBeep(coldStart: Boolean) {
-        ensureScoActive()
+        val device = requireScoDevice()
         val sampleRate = 16_000
         val tone1 = generateSinePcm16(
             frequencyHz = 400.0,
@@ -61,24 +62,31 @@ class AndroidPcmOutput(
             samples = samples,
             sampleRate = sampleRate,
             contentType = AudioAttributes.CONTENT_TYPE_SONIFICATION,
-            preferredDevice = audioManager.communicationDevice,
+            preferredDevice = device,
         )
     }
 
     override suspend fun play(recording: RecordedPcm) {
-        ensureScoActive()
+        val device = requireScoDevice()
         if (recording.isEmpty) return
         playStaticPcm(
             samples = recording.samples,
             sampleRate = recording.sampleRate,
             contentType = AudioAttributes.CONTENT_TYPE_SPEECH,
+            preferredDevice = device,
         )
     }
 
-    private fun ensureScoActive() {
-        check(audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+    private fun requireScoDevice(): AudioDeviceInfo {
+        val device = communicationDevice()
+        check(device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
             "Bluetooth SCO route is not active"
         }
+        val active = audioManager.communicationDevice
+        check(active != null && sameAudioDevice(active, device)) {
+            "Selected Bluetooth SCO route is not active"
+        }
+        return device
     }
 
     private suspend fun playStaticPcm(
@@ -133,5 +141,4 @@ class AndroidPcmOutput(
         }
     }
 }
-
 

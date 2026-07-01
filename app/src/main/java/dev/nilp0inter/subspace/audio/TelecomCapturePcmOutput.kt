@@ -2,7 +2,7 @@ package dev.nilp0inter.subspace.audio
 
 class TelecomCapturePcmOutput(
     private val captureOutput: PcmOutput,
-    private val mediaResponsePlayer: MediaResponsePlayer,
+    private val mediaResponsePlayer: ResponsePlayer,
     private val releaseCaptureRoute: suspend () -> Unit,
     private val awaitTelecomDisconnected: suspend () -> Unit,
 ) : PcmOutput {
