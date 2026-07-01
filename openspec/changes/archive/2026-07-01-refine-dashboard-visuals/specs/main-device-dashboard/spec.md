@@ -1,21 +1,4 @@
-## Purpose
-
-TBD. Defines the main device dashboard home surface and its relationship to the legacy connection and monitor views.
-
-## Requirements
-
-### Requirement: Dashboard is the default app view
-The system SHALL show a main dashboard as the default app view after launch instead of automatically replacing the root view with the legacy connection or monitor screen.
-
-#### Scenario: App starts while device is not ready
-- **WHEN** the app launches and the device readiness gate is false
-- **THEN** the system shows the main dashboard
-- **AND** the system does not automatically show the legacy connection screen
-
-#### Scenario: App starts while device is ready
-- **WHEN** the app launches and the device readiness gate is true
-- **THEN** the system shows the main dashboard
-- **AND** the system does not automatically show the legacy monitor screen
+## MODIFIED Requirements
 
 ### Requirement: Dashboard shows device connection state
 The system SHALL show the RSM device connection state on the dashboard as a
@@ -61,59 +44,6 @@ disconnect actions.
 - **THEN** the system shows the legacy monitor view
 - **AND** the legacy monitor view keeps its existing button-state, hardware-mode, echo-control, audio-status, and disconnect actions
 
-### Requirement: Legacy views are secondary screens
-The system SHALL keep the dashboard as the home surface and treat the legacy connection and monitor views as drill-down screens opened from the dashboard.
-
-#### Scenario: Returning from a legacy view
-- **WHEN** the user is viewing a legacy connection or monitor screen opened from the dashboard and requests back navigation
-- **THEN** the system returns to the dashboard instead of switching directly between legacy screens
-
-### Requirement: Dashboard shows channels
-The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones and phone-side PTT zones. The cards SHALL display their current readiness state. Functional cards SHALL also display phone PTT hold, lock-direction, locked, and stop feedback while a phone-originated PTT session is active from that card. Dedicated configuration controls SHALL remain outside the phone PTT gesture surface.
-
-#### Scenario: Channel selected for activation
-- **WHEN** the user taps the main surface area of a functional channel card
-- **THEN** the system SHALL set that channel as the single active channel
-
-#### Scenario: Channel long-pressed for PTT
-- **WHEN** the user long-presses the main surface area of a functional channel card
-- **THEN** the system SHALL set that channel as the single active channel
-- **AND** start a phone-originated PTT session for that channel
-- **AND** show held-recording feedback on that channel card
-
-#### Scenario: Held phone PTT shows lock direction
-- **WHEN** a phone-originated PTT session is active from a functional channel card
-- **AND** the session is not locked
-- **THEN** the dashboard SHALL show a lock instruction on that card
-- **AND** the instruction SHALL point right when the initial press started on the left side of the card's PTT surface
-- **AND** the instruction SHALL point left when the initial press started on the right side of the card's PTT surface
-
-#### Scenario: Locked phone PTT shows stop affordance
-- **WHEN** a phone-originated PTT session from a functional channel card has been slide-locked
-- **THEN** the dashboard SHALL show that the PTT session is locked on that card
-- **AND** the dashboard SHALL show an explicit stop affordance for ending the locked PTT session
-
-#### Scenario: Captain's Log not configured
-- **WHEN** the dashboard is visible and the Captain's Log has no directory selected
-- **THEN** the system SHALL show the Captain's Log channel card with a prompt to configure it
-
-#### Scenario: Channel configured and active
-- **WHEN** the dashboard is visible and a channel (e.g. Captain's Log or Debug Channel) is configured and active
-- **THEN** the system SHALL show the channel card as active with its current configuration state
-
-#### Scenario: Channel configured but inactive
-- **WHEN** the dashboard is visible and a channel is configured but another channel is active
-- **THEN** the system SHALL show the channel card as visually inactive (Standby/Ready)
-
-#### Scenario: Mock channels still shown
-- **WHEN** the dashboard is visible
-- **THEN** the system SHALL continue to show non-functional mock channel entries for Command Uplink
-
-#### Scenario: Channel card opens configuration
-- **WHEN** the user taps the dedicated "Config" button on a functional channel card
-- **THEN** the system SHALL show the respective channel configuration surface without altering the channel's active state
-- **AND** the system SHALL NOT start, lock, stop, or release a phone-originated PTT session from that config-button tap
-
 ### Requirement: Dashboard renders the VU meter during capture
 
 The main dashboard SHALL always render the VU meter (see `vu-meter` capability)
@@ -138,6 +68,8 @@ shift when capture starts or stops.
 #### Scenario: Meter reflects any talk mode
 - **WHEN** the dashboard is visible and a capture session is active on any channel (journal, STT, or a future channel)
 - **THEN** the dashboard renders the VU meter driven by the unified capture signal, with no per-mode wiring
+
+## ADDED Requirements
 
 ### Requirement: Dashboard respects system status area
 The dashboard SHALL position the terminal header inside the safe drawing area so
