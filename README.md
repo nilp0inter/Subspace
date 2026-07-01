@@ -17,6 +17,7 @@ The current app is an implementation step toward that model. It validates the
 target hardware and provides the first operator dashboard:
 
 - Main dashboard with device connection status, functional channel cards, and phone-side PTT slide-lock.
+- Webhook Channel demo: configure URL, verb, headers, and `{{message}}` body template; speak over PTT; transcribe locally with Parakeet; send transcript text to the configured webhook.
 - Legacy connection and monitor screens retained as hardware validation tools.
 - Bluetooth Classic SPP/RFCOMM serial connection.
 - Raw button token parsing and hardware mode tracking.
@@ -25,9 +26,9 @@ target hardware and provides the first operator dashboard:
 - Foreground service ownership while serial monitoring is active, so echo can continue after switching apps.
 - Bundled Chakra Petch and Inter fonts plus the visual identity from `VISUAL_IDENTITY.md`.
 
-Real channel routing, persistent channel history, channel configuration, channel
-backlog, replay/skip behavior, priority-channel capture, and hardware-driven
-channel/history navigation are not implemented yet.
+Persistent channel history, channel backlog, replay/skip behavior,
+priority-channel capture, and hardware-driven channel/history navigation are not
+implemented yet.
 
 ## Repository Docs
 

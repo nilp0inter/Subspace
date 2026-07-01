@@ -28,6 +28,40 @@ class ChannelRepositoryTest {
         }
     }
 
+    @Test
+    fun webhookRoundTripPersistsConfiguration() {
+        val repository = ChannelRepository(FakeSharedPreferences())
+        val channel = WebhookChannel(
+            url = "https://example.test/hook",
+            verb = WebhookVerb.PUT,
+            headers = listOf(WebhookHeader("Authorization", "Bearer token")),
+            bodyTemplate = "{\"text\":\"{{message}}\"}",
+        )
+
+        repository.saveWebhookChannel(channel)
+
+        assertEquals(channel, repository.loadWebhookChannel())
+    }
+
+    @Test
+    fun webhookReadinessRequiresUrlAndBodyPlaceholder() {
+        val ready = WebhookChannel(url = "https://example.test/hook")
+        val missingUrl = WebhookChannel(url = "")
+        val missingPlaceholder = WebhookChannel(
+            url = "https://example.test/hook",
+            bodyTemplate = "{\"text\":\"static\"}",
+        )
+        val invalidHeader = WebhookChannel(
+            url = "https://example.test/hook",
+            headers = listOf(WebhookHeader("Bad:Name", "value")),
+        )
+
+        assertEquals(true, ready.isReady)
+        assertEquals(false, missingUrl.isReady)
+        assertEquals(false, missingPlaceholder.isReady)
+        assertEquals(false, invalidHeader.isReady)
+    }
+
     private class FakeSharedPreferences : SharedPreferences {
         private val values = mutableMapOf<String, Any?>()
 

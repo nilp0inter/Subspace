@@ -75,6 +75,9 @@ import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.SttStatus
 import dev.nilp0inter.subspace.model.SttTtsStatus
 import dev.nilp0inter.subspace.model.TtsStatus
+import dev.nilp0inter.subspace.model.WebhookChannel
+import dev.nilp0inter.subspace.model.WebhookHeader
+import dev.nilp0inter.subspace.model.WebhookVerb
 import dev.nilp0inter.subspace.model.projectChannelBrowseEntries
 import dev.nilp0inter.subspace.model.orderedChannelIds
 import dev.nilp0inter.subspace.model.selectChannelByOffset
@@ -82,6 +85,8 @@ import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
 import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
+import dev.nilp0inter.subspace.webhook.AndroidWebhookClient
+import dev.nilp0inter.subspace.webhook.WebhookPttController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -145,6 +150,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
     private var journalPttController: JournalPttController? = null
+    private var webhookPttController: WebhookPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private lateinit var localOutput: LocalPcmOutput
@@ -182,6 +188,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         _appState.value = _appState.value.copy(
             journal = channelRepository.loadJournal(),
             debugChannel = channelRepository.loadDebugChannel(),
+            webhookChannel = channelRepository.loadWebhookChannel(),
             activeChannelId = channelRepository.loadActiveChannelId(),
         )
 
@@ -214,6 +221,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 "${(SystemClock.elapsedRealtimeNanos() - initStartNanos) / 1_000_000}ms",
         )
         initializeJournal(audioManager)
+        initializeWebhook()
         
         updateActiveControllers()
 
@@ -400,6 +408,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
         journalPttController?.cancelAndRelease()
+        webhookPttController?.cancelAndRelease()
         serviceScope.cancel()
         stopForegroundIfNeeded()
         super.onDestroy()
@@ -449,6 +458,33 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
 
+    private fun initializeWebhook() {
+        serviceScope.launch {
+            val sttTranscriber = sttReady.await()
+            val transcriber: PcmTranscriber = if (sttTranscriber != null) {
+                TranscriptionService(sttTranscriber)
+            } else {
+                object : PcmTranscriber {
+                    override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
+                        throw IllegalStateException("STT transcriber unavailable")
+                    }
+                }
+            }
+            val controller = WebhookPttController(
+                scope = serviceScope,
+                captureService = captureService,
+                transcriber = transcriber,
+                client = AndroidWebhookClient(),
+                channelProvider = { _appState.value.webhookChannel },
+            )
+            webhookPttController = controller
+            controller.status.collect { status ->
+                _appState.update { it.copy(webhookStatus = status) }
+                updateCarMediaState()
+            }
+        }
+    }
+
     private fun updateActiveControllers() {
         val state = _appState.value
         val activeChannelId = state.activeChannelId
@@ -482,6 +518,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         
         if (activeChannelId != JournalChannel.ID) {
             journalPttController?.cancelAndRelease()
+        }
+
+        if (activeChannelId != WebhookChannel.ID) {
+            webhookPttController?.cancelAndRelease()
         }
     }
 
@@ -607,6 +647,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
         journalPttController?.cancelAndRelease()
+        webhookPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
@@ -627,6 +668,22 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val current = _appState.value.journal
         if (!enabled && !current.saveVoice) return
         saveJournal(current.copy(saveText = enabled))
+    }
+
+    fun setWebhookUrl(url: String) {
+        saveWebhookChannel(_appState.value.webhookChannel.copy(url = url))
+    }
+
+    fun setWebhookVerb(verb: WebhookVerb) {
+        saveWebhookChannel(_appState.value.webhookChannel.copy(verb = verb))
+    }
+
+    fun setWebhookHeaders(headers: List<WebhookHeader>) {
+        saveWebhookChannel(_appState.value.webhookChannel.copy(headers = headers))
+    }
+
+    fun setWebhookBodyTemplate(bodyTemplate: String) {
+        saveWebhookChannel(_appState.value.webhookChannel.copy(bodyTemplate = bodyTemplate))
     }
 
     fun setActiveChannelId(id: String) {
@@ -720,6 +777,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         cancelIdleTimer()
         when (session.channelId) {
             JournalChannel.ID -> journalPttController?.cancelAndRelease()
+            WebhookChannel.ID -> webhookPttController?.cancelAndRelease(session.route)
             DebugChannel.ID -> {
                 when (_appState.value.debugChannel.mode) {
                     DebugMode.ECHO -> echo.cancelAndRelease()
@@ -792,6 +850,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun saveDebugChannel(channel: DebugChannel) {
         channelRepository.saveDebugChannel(channel)
         _appState.value = _appState.value.copy(debugChannel = channel)
+    }
+
+    private fun saveWebhookChannel(channel: WebhookChannel) {
+        channelRepository.saveWebhookChannel(channel)
+        _appState.value = _appState.value.copy(webhookChannel = channel)
+        updateCarMediaState()
     }
 
     fun setTtsText(text: String) {
@@ -1011,6 +1075,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         when (activeChannelId) {
             JournalChannel.ID -> journalPttController?.onPttPressed(route)
+            WebhookChannel.ID -> webhookPttController?.onPttPressed(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttPressed(route)
@@ -1080,6 +1145,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         when (activeChannelId) {
             JournalChannel.ID -> journalPttController?.onPttReleased(route)
+            WebhookChannel.ID -> webhookPttController?.onPttReleased(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttReleased(route)
@@ -1208,6 +1274,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
         journalPttController?.cancelAndRelease()
+        webhookPttController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {

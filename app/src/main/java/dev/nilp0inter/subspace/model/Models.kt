@@ -10,6 +10,8 @@ data class AppState(
     val monitor: MonitorState = MonitorState(),
     val journal: JournalChannel = JournalChannel(),
     val debugChannel: DebugChannel = DebugChannel(),
+    val webhookChannel: WebhookChannel = WebhookChannel(),
+    val webhookStatus: WebhookStatus = WebhookStatus.Idle,
     val activeChannelId: String = JournalChannel.ID,
     val inputMode: InputMode = InputMode.OnAPinch,
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
@@ -172,6 +174,18 @@ sealed interface SttStatus {
     data class Error(val reason: String) : SttStatus
 }
 
+sealed interface WebhookStatus {
+    data object Idle : WebhookStatus
+    data object WaitingForAudio : WebhookStatus
+    data object Recording : WebhookStatus
+    data object Transcribing : WebhookStatus
+    data object Sending : WebhookStatus
+    data class Sent(val responseCode: Int) : WebhookStatus
+    data object EmptyAudio : WebhookStatus
+    data object Cancelled : WebhookStatus
+    data class Error(val reason: String) : WebhookStatus
+}
+
 fun SttModelStatus.displayText(): String = when (this) {
     SttModelStatus.Idle -> "STT model idle"
     SttModelStatus.Loading -> "STT model loading"
@@ -190,6 +204,18 @@ fun SttStatus.displayText(): String = when (this) {
     SttStatus.EmptyAudio -> "Empty audio"
     SttStatus.Cancelled -> "Cancelled"
     is SttStatus.Error -> "Error: $reason"
+}
+
+fun WebhookStatus.displayText(): String = when (this) {
+    WebhookStatus.Idle -> "Idle"
+    WebhookStatus.WaitingForAudio -> "Waiting for audio"
+    WebhookStatus.Recording -> "Recording"
+    WebhookStatus.Transcribing -> "Transcribing"
+    WebhookStatus.Sending -> "Sending webhook"
+    is WebhookStatus.Sent -> "Webhook sent: HTTP $responseCode"
+    WebhookStatus.EmptyAudio -> "Empty audio"
+    WebhookStatus.Cancelled -> "Cancelled"
+    is WebhookStatus.Error -> "Error: $reason"
 }
 
 // ---------------------------------------------------------------------------
