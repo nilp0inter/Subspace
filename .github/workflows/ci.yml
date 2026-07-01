@@ -34,6 +34,14 @@ jobs:
       - name: Verify devshell toolchain
         run: nix develop --no-write-lock-file -c gradle --version
 
+      - name: Provision debug keystore
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p .android
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 -d > .android/debug.keystore
+          test -s .android/debug.keystore
+
       - name: Run JVM tests
         run: nix develop --no-write-lock-file -c gradle test
 
