@@ -17,6 +17,7 @@ interface PttUiActions {
     fun setActiveChannel(id: String)
     fun setInputMode(mode: InputMode)
     fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode)
+    fun navigateToRsmSetup()
     fun navigateToJournalConfig()
     fun navigateToDebugConfig()
     fun navigateBack()

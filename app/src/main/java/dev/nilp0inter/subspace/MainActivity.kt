@@ -68,6 +68,7 @@ class MainActivity : ComponentActivity() {
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(false) }
             var route by remember { mutableStateOf(MainRoute.Dashboard) }
+            val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
@@ -150,6 +151,10 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setDebugChannelMode(mode)
                     }
 
+                    override fun navigateToRsmSetup() {
+                        route = if (currentReadyForMonitor) MainRoute.Monitor else MainRoute.Connection
+                    }
+
                     override fun navigateToJournalConfig() {
                         route = MainRoute.JournalConfig
                     }
@@ -220,14 +225,10 @@ class MainActivity : ComponentActivity() {
 
                     when (route) {
                         MainRoute.Dashboard -> MainDashboardScreen(
-                            connected = state.readyForMonitor,
                             appState = state,
                             level = level,
                             isCapturing = isCapturing,
                             actions = actions,
-                            onConnectionClick = {
-                                route = if (state.readyForMonitor) MainRoute.Monitor else MainRoute.Connection
-                            },
                         )
 
                         MainRoute.Connection -> ConnectionScreen(state.connection, actions)
