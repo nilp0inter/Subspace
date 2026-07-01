@@ -11,7 +11,11 @@ data class RecordedPcm(
         get() = samples.isEmpty()
 }
 
+enum class AudioRouteEndpoint { Rsm, Car, Local, Unspecified }
+
 interface ScoRoute {
+    val endpoint: AudioRouteEndpoint
+        get() = AudioRouteEndpoint.Unspecified
     val state: StateFlow<ScoState>
     val coldStart: Boolean
         get() = false
@@ -32,6 +36,7 @@ data class ResolvedAudioRoute(
     val sco: ScoRoute,
     val output: PcmOutput,
     val source: CaptureSource,
+    val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Unspecified,
 )
 
 object NoopCaptureSource : CaptureSource {
@@ -61,25 +66,27 @@ class ScopedPcmOutput(
     override suspend fun releaseRoute() = release()
 }
 
-fun resolveAudioRoute(
+fun resolveScoAudioRoute(
     scoRoute: ScoRoute,
     scoOutput: PcmOutput,
     scoSource: CaptureSource,
+    endpoint: AudioRouteEndpoint,
+): ResolvedAudioRoute {
+    require(scoRoute.endpoint == endpoint) { "Route endpoint mismatch: ${scoRoute.endpoint} != $endpoint" }
+    return ResolvedAudioRoute(
+        sco = scoRoute,
+        output = ScopedPcmOutput(scoOutput) { scoRoute.release() },
+        source = scoSource,
+        endpoint = endpoint,
+    )
+}
+
+fun resolveLocalAudioRoute(
     localOutput: PcmOutput,
     localSource: CaptureSource,
-): ResolvedAudioRoute {
-    val scoUsable = scoRoute.hasAvailableScoDevice() || scoRoute.isActive()
-    return if (scoUsable) {
-        ResolvedAudioRoute(
-            sco = scoRoute,
-            output = ScopedPcmOutput(scoOutput) { scoRoute.release() },
-            source = scoSource,
-        )
-    } else {
-        ResolvedAudioRoute(
-            sco = NoopScoRoute(),
-            output = ScopedPcmOutput(localOutput) { },
-            source = localSource,
-        )
-    }
-}
+): ResolvedAudioRoute = ResolvedAudioRoute(
+    sco = NoopScoRoute(),
+    output = ScopedPcmOutput(localOutput) { },
+    source = localSource,
+    endpoint = AudioRouteEndpoint.Local,
+)

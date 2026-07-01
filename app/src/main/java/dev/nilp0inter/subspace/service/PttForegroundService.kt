@@ -23,11 +23,11 @@ import dev.nilp0inter.subspace.R
 import dev.nilp0inter.subspace.audio.AndroidMicCaptureSource
 import dev.nilp0inter.subspace.audio.AndroidPcmOutput
 import dev.nilp0inter.subspace.audio.AndroidVoiceCommunicationCaptureSource
+import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
-import dev.nilp0inter.subspace.audio.NoopScoRoute
 import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
@@ -42,9 +42,11 @@ import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
+import dev.nilp0inter.subspace.audio.TelecomCallScoRoute
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TranscriptionService
-import dev.nilp0inter.subspace.audio.resolveAudioRoute
+import dev.nilp0inter.subspace.audio.resolveLocalAudioRoute
+import dev.nilp0inter.subspace.audio.resolveScoAudioRoute
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
 import dev.nilp0inter.subspace.channel.JournalController
@@ -127,8 +129,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var bluetoothAdapter: BluetoothAdapter? = null
     private lateinit var scanner: DeviceScanner
     private lateinit var channelRepository: ChannelRepository
+    private lateinit var audioManager: AudioManager
     private lateinit var sco: ScoAudioController
     private lateinit var pcmOutput: AndroidPcmOutput
+    private lateinit var telecomCaptureOutput: AndroidPcmOutput
     private lateinit var captureService: CaptureService
     private lateinit var voiceCommunicationSource: AndroidVoiceCommunicationCaptureSource
     private lateinit var echo: EchoController
@@ -185,9 +189,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             activeChannelId = channelRepository.loadActiveChannelId(),
         )
 
-        val audioManager = getSystemService(AudioManager::class.java)
+        audioManager = getSystemService(AudioManager::class.java)
         sco = ScoAudioController(serviceScope, audioManager)
-        pcmOutput = AndroidPcmOutput(audioManager)
+        pcmOutput = AndroidPcmOutput(audioManager, sco::selectedCommunicationDevice)
+        telecomCaptureOutput = AndroidPcmOutput(audioManager)
         localOutput = LocalPcmOutput()
         micSource = AndroidMicCaptureSource()
         captureService = CaptureService(serviceScope)
@@ -202,7 +207,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             sco = sco,
             captureService = captureService,
             source = voiceCommunicationSource,
-            output = AndroidPcmOutput(audioManager),
+            output = pcmOutput,
         )
 
         val initStartNanos = SystemClock.elapsedRealtimeNanos()
@@ -263,7 +268,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         sco = sco,
                         captureService = captureService,
                         source = voiceCommunicationSource,
-                        output = AndroidPcmOutput(audioManager),
+                        output = pcmOutput,
                         transcriptionService = transcription,
                     )
                     sttModelStatusJob = serviceScope.launch {
@@ -326,7 +331,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     ttsController = TtsController(
                         scope = serviceScope,
                         sco = sco,
-                        output = AndroidPcmOutput(audioManager),
+                        output = pcmOutput,
                         synthesizer = synth,
                     )
                     ttsModelStatusJob = serviceScope.launch {
@@ -353,7 +358,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                                 sco = sco,
                                 captureService = captureService,
                                 source = voiceCommunicationSource,
-                                output = AndroidPcmOutput(audioManager),
+                                output = pcmOutput,
                                 transcriber = transcriber,
                                 synthesizer = synth,
                             )
@@ -425,7 +430,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             journalPttController = JournalPttController(
                 scope = serviceScope,
                 sco = sco,
-                output = AndroidPcmOutput(audioManager),
+                output = pcmOutput,
                 captureService = captureService,
                 source = voiceCommunicationSource,
                 journal = journalController,
@@ -911,17 +916,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun playCarErrorBeep() {
-        val route = resolveAudioRoute(
-            scoRoute = sco,
-            scoOutput = pcmOutput,
-            scoSource = voiceCommunicationSource,
-            localOutput = localOutput,
-            localSource = micSource,
-        )
+        val route = resolvePttAudioRoute(inputModeController.mode)
         serviceScope.launch {
-            route.sco.acquire()
-            route.output.playErrorBeep(route.sco.coldStart)
-            route.sco.release()
+            if (route.sco.acquire()) {
+                route.output.playErrorBeep(route.sco.coldStart)
+                route.output.releaseRoute()
+            }
         }
     }
 
@@ -979,9 +979,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         if (!inputModeController.autoTransitionFor(source)) {
             val route = resolvePttAudioRoute(inputModeController.mode)
             serviceScope.launch {
-                route.sco.acquire()
-                route.output.playErrorBeep(route.sco.coldStart)
-                route.sco.release()
+                if (route.sco.acquire()) {
+                    route.output.playErrorBeep(route.sco.coldStart)
+                    route.output.releaseRoute()
+                }
             }
             return false
         }
@@ -996,9 +997,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         if (decision is PttDispatchDecision.ErrorBeep) {
             serviceScope.launch {
-                route.sco.acquire()
-                route.output.playErrorBeep(route.sco.coldStart)
-                route.sco.release()
+                if (route.sco.acquire()) {
+                    route.output.playErrorBeep(route.sco.coldStart)
+                    route.output.releaseRoute()
+                }
             }
             return false
         }
@@ -1042,28 +1044,29 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun resolvePttAudioRoute(mode: InputMode): ResolvedAudioRoute {
         return when (mode) {
             InputMode.OnTheRoad -> ResolvedAudioRoute(
-                sco = sco,
+                sco = TelecomCallScoRoute(TelecomCarPttCoordinator::isCaptureRouteReady),
                 output = TelecomCapturePcmOutput(
-                    captureOutput = pcmOutput,
+                    captureOutput = telecomCaptureOutput,
                     mediaResponsePlayer = mediaResponsePlayer,
-                    releaseCaptureRoute = { sco.releaseImmediately() },
+                    releaseCaptureRoute = { releaseTelecomCaptureRoute() },
                     awaitTelecomDisconnected = { withTimeoutOrNull(POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS) { telecomDisconnected.await() } },
                 ),
                 source = voiceCommunicationSource,
+                endpoint = AudioRouteEndpoint.Car,
             )
-            InputMode.Work -> resolveAudioRoute(
+            InputMode.Work -> resolveScoAudioRoute(
                 scoRoute = sco,
                 scoOutput = pcmOutput,
                 scoSource = voiceCommunicationSource,
-                localOutput = localOutput,
-                localSource = micSource,
+                endpoint = AudioRouteEndpoint.Rsm,
             )
-            InputMode.OnAPinch -> ResolvedAudioRoute(
-                sco = NoopScoRoute(),
-                output = localOutput,
-                source = micSource,
-            )
+            InputMode.OnAPinch -> resolveLocalAudioRoute(localOutput, micSource)
         }
+    }
+
+    private fun releaseTelecomCaptureRoute() {
+        audioManager.clearCommunicationDevice()
+        audioManager.mode = AudioManager.MODE_NORMAL
     }
 
     private fun dispatchPttReleased() {

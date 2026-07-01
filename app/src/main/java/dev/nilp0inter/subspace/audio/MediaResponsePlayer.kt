@@ -7,13 +7,17 @@ import android.media.AudioManager
 import android.os.Build
 import kotlinx.coroutines.delay
 
+interface ResponsePlayer {
+    suspend fun play(recording: RecordedPcm)
+}
+
 class MediaResponsePlayer(
     private val audioManager: AudioManager,
     private val output: PcmOutput,
-) {
+) : ResponsePlayer {
     private var focusRequest: AudioFocusRequest? = null
 
-    suspend fun play(recording: RecordedPcm) {
+    override suspend fun play(recording: RecordedPcm) {
         if (recording.isEmpty) return
         waitForMediaRoute()
         if (!requestFocus()) return

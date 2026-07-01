@@ -52,6 +52,9 @@ internal object TelecomCarPttCoordinator {
         lifecycle.routeChanged(acceptable)
     }
 
+    fun isCaptureRouteReady(): Boolean =
+        lifecycle.currentState == TelecomCarPttLifecycle.State.Recording
+
     fun checkRouteTimeout() {
         lifecycle.checkTimeout(SystemClock.elapsedRealtime())
     }

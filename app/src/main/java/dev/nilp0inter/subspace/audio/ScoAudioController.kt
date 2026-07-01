@@ -4,7 +4,6 @@ import android.annotation.SuppressLint
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import dev.nilp0inter.subspace.model.ScoState
-import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -22,23 +21,25 @@ class ScoAudioController(
 ) : ScoRoute {
     private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
     override val state: StateFlow<ScoState> = _state.asStateFlow()
+    override val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Rsm
     private var _coldStart: Boolean = false
     override val coldStart: Boolean get() = _coldStart
 
     private val mutex = Mutex()
     private var activeClients = 0
     private var keepWarmJob: Job? = null
+    private var selectedDeviceId: Int? = null
 
     @SuppressLint("MissingPermission")
     override fun hasAvailableScoDevice(): Boolean = findScoDevice() != null
 
     @SuppressLint("MissingPermission")
     override suspend fun acquire(): Boolean = mutex.withLock {
-        activeClients++
         keepWarmJob?.cancel()
         keepWarmJob = null
 
         if (isActive()) {
+            activeClients++
             _state.value = ScoState.Active
             _coldStart = false
             return true
@@ -46,7 +47,6 @@ class ScoAudioController(
 
         _coldStart = true
         _state.value = ScoState.Starting
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
 
         val device = findScoDevice()
         if (device == null) {
@@ -55,9 +55,13 @@ class ScoAudioController(
             return false
         }
 
+        activeClients++
+        selectedDeviceId = device.id
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
         val accepted = audioManager.setCommunicationDevice(device)
         if (!accepted) {
-            _coldStart = false
+            failAcquisition()
             _state.value = ScoState.Failed("Android rejected Bluetooth SCO route")
             return false
         }
@@ -67,17 +71,23 @@ class ScoAudioController(
             true
         } == true
 
-        if (!active) _coldStart = false
         _state.value = if (active) {
             ScoState.Active
         } else {
+            failAcquisition()
             ScoState.Failed("Timed out waiting for SCO route")
         }
         return active
     }
 
-    override fun isActive(): Boolean =
-        audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    @SuppressLint("MissingPermission")
+    fun selectedCommunicationDevice(): AudioDeviceInfo? {
+        val selectedId = selectedDeviceId ?: return null
+        val device = audioManager.communicationDevice ?: return null
+        return device.takeIf { it.id == selectedId && it.isTargetRsmScoEndpoint() }
+    }
+
+    override fun isActive(): Boolean = selectedCommunicationDevice() != null
 
     override fun release() {
         scope.launch {
@@ -92,6 +102,7 @@ class ScoAudioController(
                         mutex.withLock {
                             if (activeClients == 0) {
                                 _state.value = ScoState.Closing
+                                selectedDeviceId = null
                                 audioManager.clearCommunicationDevice()
                                 audioManager.mode = AudioManager.MODE_NORMAL
                                 _state.value = ScoState.Inactive
@@ -110,19 +121,27 @@ class ScoAudioController(
             keepWarmJob?.cancel()
             keepWarmJob = null
             _state.value = ScoState.Closing
+            selectedDeviceId = null
             audioManager.clearCommunicationDevice()
             audioManager.mode = AudioManager.MODE_NORMAL
             _state.value = ScoState.Inactive
         }
     }
 
+    private fun failAcquisition() {
+        if (activeClients > 0) activeClients--
+        _coldStart = false
+        selectedDeviceId = null
+        if (activeClients == 0) {
+            audioManager.clearCommunicationDevice()
+            audioManager.mode = AudioManager.MODE_NORMAL
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun findScoDevice(): AudioDeviceInfo? {
         val devices = audioManager.availableCommunicationDevices
-        return devices.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
-                it.productName?.contains(TARGET_DEVICE_NAME, ignoreCase = true) == true
-        } ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+        return devices.firstOrNull { it.isTargetRsmScoEndpoint() }
     }
 
     companion object {
