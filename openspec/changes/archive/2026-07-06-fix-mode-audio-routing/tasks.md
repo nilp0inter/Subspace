@@ -11,7 +11,7 @@
 
 ## 2. RSM Endpoint Route
 
-- [ ] 2.1 Update the normal SCO route implementation so available-device lookup requires the B02PTT-FF01 endpoint and removes the arbitrary first-SCO fallback
+- [x] 2.1 Update the normal SCO route implementation so available-device lookup requires the B02PTT-FF01 endpoint and removes the arbitrary first-SCO fallback
 - [ ] 2.2 Track the selected RSM `AudioDeviceInfo` for the current acquisition and make `isActive()` verify that the current communication device matches it
 - [ ] 2.3 Update `hasAvailableScoDevice()` and readiness refresh so `HeadsetAudioState.Available` means RSM SCO is available, not any SCO endpoint
 - [ ] 2.4 Ensure RSM route acquisition fails cleanly when the active communication device is a different SCO endpoint

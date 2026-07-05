@@ -5,20 +5,51 @@ Defines the Bluetooth SCO (Synchronous Connection Oriented) audio route lifecycl
 ## Requirements
 
 ### Requirement: SCO route is acquired on PTT press
+The system SHALL acquire the Work Bluetooth SCO communication route by targeting the `B02PTT-FF01` `BluetoothDevice` through the `BluetoothHeadset` profile, then using the active `TYPE_BLUETOOTH_SCO` `AudioDeviceInfo` only as the transport after target RSM ownership is proven.
 
-The system SHALL acquire the Bluetooth SCO communication route when the user presses PTT while any audio-capturing mode is enabled.
+#### Scenario: Work SCO is inactive on PTT press
+- **WHEN** Work SCO is inactive, Work mode is selected or auto-selected, and the user presses RSM PTT
+- **THEN** the system SHALL resolve the target RSM `BluetoothDevice`
+- **AND** verify the target RSM Headset/HFP profile connection is connected
+- **AND** call `BluetoothHeadset.startVoiceRecognition(targetRsm)`
+- **AND** poll `BluetoothHeadset.isAudioConnected(targetRsm)` or observe target audio state until RSM HFP audio is connected
+- **AND** select the active `TYPE_BLUETOOTH_SCO` communication device as the Work transport
+- **AND** report SCO state transitions: `Inactive → Starting → Active`
 
-#### Scenario: SCO is inactive on PTT press
-- **WHEN** SCO is inactive, an audio-capturing mode is enabled, and the user presses PTT
-- **THEN** the system sets the audio manager mode to `MODE_IN_COMMUNICATION`
-- **AND** the system sets the SCO device as the communication device
-- **AND** the system polls for the communication device type to become `TYPE_BLUETOOTH_SCO`
-- **AND** the system reports SCO state transitions: `Inactive → Starting → Active`
+#### Scenario: Work SCO is already active on PTT press
+- **WHEN** Work SCO is already active and owned by `B02PTT-FF01` from a previous warm Work session
+- **AND** the user presses RSM PTT
+- **THEN** the system SHALL return immediately without re-acquisition
+- **AND** the system SHALL report SCO state `Active`
 
-#### Scenario: SCO is already active on PTT press
-- **WHEN** SCO is already active (warm from a previous session) and the user presses PTT
-- **THEN** the system returns immediately without re-acquisition
-- **AND** the system reports SCO state `Active`
+#### Scenario: Target RSM HFP is not connected
+- **WHEN** Work route acquisition starts
+- **AND** the target RSM Headset/HFP profile is not connected
+- **THEN** the system SHALL report SCO state `Failed("Target RSM HFP not connected")`
+- **AND** the system SHALL return acquisition failure to the caller
+- **AND** the caller SHALL NOT proceed with beep or recording
+
+#### Scenario: Targeted voice recognition start fails
+- **WHEN** Work route acquisition calls `BluetoothHeadset.startVoiceRecognition(targetRsm)`
+- **AND** the call returns false or throws
+- **THEN** the system SHALL report SCO state `Failed("Target RSM HFP audio start failed")`
+- **AND** the system SHALL return acquisition failure to the caller
+- **AND** the caller SHALL NOT proceed with beep or recording
+
+#### Scenario: Targeted HFP audio connection times out
+- **WHEN** Work route acquisition starts target RSM voice recognition
+- **AND** `BluetoothHeadset.isAudioConnected(targetRsm)` does not become true before timeout
+- **THEN** the system SHALL report SCO state `Failed("Timed out waiting for target RSM HFP audio")`
+- **AND** the system SHALL stop target RSM voice recognition if needed
+- **AND** the system SHALL return acquisition failure to the caller
+- **AND** the caller SHALL NOT proceed with beep or recording
+
+#### Scenario: Generic SCO device is not found after target ownership proof
+- **WHEN** `BluetoothHeadset.isAudioConnected(targetRsm)` is true
+- **BUT** no `TYPE_BLUETOOTH_SCO` communication transport is available to route AudioTrack output
+- **THEN** the system SHALL report SCO state `Failed("Bluetooth SCO transport not available")`
+- **AND** the system SHALL stop target RSM voice recognition if needed
+- **AND** the system SHALL return acquisition failure
 
 #### Scenario: SCO acquisition times out
 - **WHEN** the system polls for 5 seconds and the SCO route does not become active
@@ -45,10 +76,8 @@ The system SHALL play the ready beep at the exact instant the SCO route becomes 
 #### Scenario: Warm-start SCO — subsequent beeps within warmup window
 - **WHEN** SCO is already active from a previous session (warm) and PTT is pressed
 - **THEN** the system SHALL play the ready beep through the SCO device route without priming
-- **AND** the user SHALL hear the beep through the Bluetooth headset
 
 ### Requirement: Recording always starts after ready beep completes
-
 The system SHALL start audio recording only after the ready beep playback has fully completed.
 
 #### Scenario: Beep completes before recording starts
@@ -69,26 +98,6 @@ The system SHALL start audio recording only after the ready beep playback has fu
 - **AND** the system SHALL NOT start recording
 - **AND** the system SHALL retain the SCO route warm for 30 seconds
 
-### Requirement: SCO warmup retention
-
-The system SHALL use centralized reference counting to keep the SCO route active for 30 seconds after the last active client releases the route, so that subsequent sessions or rapid navigational announcements get instant SCO acquisition and reliable beep playback.
-
-#### Scenario: Active client drops to zero — SCO retained warm
-- **WHEN** all components that have acquired the SCO route release it (active client count drops to 0)
-- **THEN** the system SHALL keep the SCO communication device set for 30 seconds
-- **AND** the system SHALL report SCO state as `Active` during the warmup window
-
-#### Scenario: Warmup expires
-- **WHEN** 30 seconds pass with the active client count remaining at 0
-- **THEN** the system SHALL clear the communication device
-- **AND** the system SHALL set audio manager mode back to `MODE_NORMAL`
-- **AND** the system SHALL report SCO state transition: `Active → Closing → Inactive`
-
-#### Scenario: Route acquired during warmup
-- **WHEN** a warmup delay is active and a component requests to acquire the SCO route
-- **THEN** the system SHALL cancel the warmup delay
-- **AND** the system SHALL increment the active client count
-- **AND** the system SHALL return immediately without re-acquisition since the route is already active
 
 ### Requirement: AudioTrack routes through SCO device
 

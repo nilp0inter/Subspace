@@ -27,6 +27,6 @@
 
 - [x] 5.1 Run `nix develop --no-write-lock-file -c gradle test` and confirm JVM tests still pass
 - [x] 5.2 Run `nix develop --no-write-lock-file -c gradle assembleDebug` and confirm the debug APK builds
-- [ ] 5.3 Capture `SubspaceRoute` logcat for a car-only PTT cycle and confirm Telecom route lines are present
-- [ ] 5.4 Capture `SubspaceRoute` logcat for RSM PTT with car and RSM connected and confirm SCO scan, selection branch, acquisition, and warm-retention lines are present
-- [ ] 5.5 Capture `SubspaceRoute` logcat for phone/local PTT after the mixed car/RSM path and confirm the local route snapshot shows whether stale communication routing is present
+- [x] 5.3 Capture `SubspaceRoute` logcat for a car-only PTT cycle and confirm Telecom route lines are present
+- [x] 5.4 Capture `SubspaceRoute` logcat for RSM PTT with car and RSM connected and confirm SCO scan, selection branch, acquisition, and warm-retention lines are present
+- [x] 5.5 Capture `SubspaceRoute` logcat for phone/local PTT after the mixed car/RSM path and confirm the local route snapshot shows whether stale communication routing is present

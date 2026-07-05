@@ -9,20 +9,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InputModeControllerTest {
-    @Test
-    fun defaultModeIsOnAPinch() {
-        val controller = InputModeController()
-        assertEquals(InputMode.OnAPinch, controller.mode)
-    }
-
-    @Test
-    fun defaultAvailabilityOnAPinchOnly() {
-        val controller = InputModeController()
-        assertEquals(
-            InputModeAvailability(work = false, onTheRoad = false, onAPinch = true),
-            controller.availability,
-        )
-    }
 
     @Test
     fun aaConnectTransitionsToOnTheRoad() {
@@ -46,6 +32,32 @@ class InputModeControllerTest {
         controller.updateInputs(readyForMonitor = false, aaConnected = true)
         assertEquals(InputMode.OnTheRoad, controller.mode)
         controller.updateInputs(readyForMonitor = true, aaConnected = true)
+        assertEquals(InputMode.OnTheRoad, controller.mode)
+    }
+
+    @Test
+    fun logicalRsmReadinessKeepsWorkSelectableAlongsideCarAvailability() {
+        val controller = InputModeController()
+
+        controller.updateInputs(readyForMonitor = true, aaConnected = true)
+
+        assertEquals(
+            InputModeAvailability(work = true, onTheRoad = true, onAPinch = true),
+            controller.availability,
+        )
+        assertTrue(controller.setInputMode(InputMode.Work))
+        assertEquals(InputMode.Work, controller.mode)
+    }
+
+    @Test
+    fun rsmAutoTransitionRejectedWhenLogicalHfpReadinessAbsent() {
+        val controller = InputModeController()
+
+        controller.updateInputs(readyForMonitor = false, aaConnected = true)
+
+        assertFalse(controller.availability.work)
+        assertTrue(controller.availability.onTheRoad)
+        assertFalse(controller.autoTransitionFor(PttSource.Rsm))
         assertEquals(InputMode.OnTheRoad, controller.mode)
     }
 

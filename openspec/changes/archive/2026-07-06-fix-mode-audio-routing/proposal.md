@@ -1,3 +1,5 @@
+> Superseded: this change was archived as a superseded plan. The implemented route model is captured in `openspec/changes/archive/2026-07-06-targeted-rsm-hfp-routing/`, after diagnostics showed the target phone exposes the RSM SCO transport as an anonymous `AudioDeviceInfo` (`productName` is not `B02PTT-FF01`). Do not sync this change's delta specs into main specs; keep it only as historical context.
+
 ## Why
 
 Subspace already models `InputMode` as the authority for audio routing, but the current route primitives still accept generic Bluetooth SCO state. When the car and the RSM are connected at the same time, `Work` can treat a car SCO route as usable and `OnTheRoad` can be confused with normal headset SCO, causing capture or response audio to leave through the wrong physical device.
