@@ -25,6 +25,26 @@ The system SHALL require channels to provide a computed `isReady` state indicati
 ### Requirement: PTT routing respects readiness
 The system SHALL evaluate the target channel's readiness state before dispatching a PTT capture, regardless of which input mode or actuator initiated the PTT. Route resolution SHALL be based on the active `InputMode`, not on the `PttSource`.
 
+### Requirement: Work SCO endpoint ownership is proven by target RSM HFP
+The system SHALL prove Work/RSM SCO ownership with the target `B02PTT-FF01` `BluetoothDevice` in the `BluetoothHeadset` profile before treating any generic `TYPE_BLUETOOTH_SCO` `AudioDeviceInfo` as the Work transport.
+
+#### Scenario: Target RSM owns anonymous SCO transport
+- **WHEN** Work route acquisition calls `BluetoothHeadset.startVoiceRecognition(targetRsm)`
+- **AND** `BluetoothHeadset.isAudioConnected(targetRsm)` becomes true
+- **AND** `AudioManager.communicationDevice` is `TYPE_BLUETOOTH_SCO` but its product name does not identify `B02PTT-FF01`
+- **THEN** the system SHALL treat that SCO device as the Work transport owned by the target RSM
+- **AND** the system SHALL route Work ready beep, capture, and playback through that transport
+
+#### Scenario: Anonymous SCO without target RSM ownership
+- **WHEN** a `TYPE_BLUETOOTH_SCO` device is available
+- **BUT** `BluetoothHeadset.isAudioConnected(targetRsm)` is false or cannot be queried
+- **THEN** the system SHALL NOT treat the SCO device as a Work/RSM transport
+- **AND** the system SHALL NOT fall back to the first available SCO device
+
+#### Scenario: Target HFP ownership diagnostics
+- **WHEN** Work route acquisition starts, succeeds, fails, or releases
+- **THEN** the system SHALL log target RSM HFP state, `startVoiceRecognition` result, `isAudioConnected(targetRsm)` state, selected SCO transport, and release result
+- **AND** the system SHALL NOT log Bluetooth MAC addresses or PCM/audio payloads
 #### Scenario: PTT on a ready active channel in Work mode
 - **WHEN** PTT is pressed while in `Work` mode and the active channel's `isReady` state is true
 - **THEN** the system SHALL resolve the audio route for `Work` mode (SCO via RSM headset)

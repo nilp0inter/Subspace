@@ -3,6 +3,7 @@ package dev.nilp0inter.subspace.audio
 import dev.nilp0inter.subspace.model.ScoState
 import dev.nilp0inter.subspace.model.TtsModelStatus
 import dev.nilp0inter.subspace.model.TtsStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -113,9 +114,6 @@ class TtsController(
     fun cancelAndRelease() {
         val activeJob = synthesisJob?.takeIf { it.isActive }
         activeJob?.cancel()
-        if (activeJob != null) {
-            sco.release()
-        }
         _status.value = TtsStatus.Idle
     }
 
@@ -140,12 +138,14 @@ class TtsController(
         speed: Float,
         scoRate: Int,
     ) {
-        runCatching {
+        var acquired = false
+        try {
             _status.value = TtsStatus.WaitingForModel
             if (!route.sco.acquire()) {
                 _status.value = TtsStatus.Error("SCO unavailable")
                 return
             }
+            acquired = true
 
             _status.value = TtsStatus.Synthesizing
             val request = SynthesisRequest(
@@ -161,42 +161,34 @@ class TtsController(
                 is SynthesisOutcome.Success -> {
                     if (outcome.samples.isEmpty()) {
                         _status.value = TtsStatus.Error("Synthesis produced no audio")
-                        route.output.releaseRoute()
-                        route.sco.release()
                         return
                     }
                     _status.value = TtsStatus.Playing
                     val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
                     if (playback.isEmpty) {
                         _status.value = TtsStatus.Idle
-                        route.output.releaseRoute()
-                        route.sco.release()
                         return
                     }
                     route.output.play(playback)
                     _status.value = TtsStatus.Idle
-                    route.sco.release()
                 }
                 is SynthesisOutcome.ModelNotReady -> {
                     _status.value = TtsStatus.Error("TTS model not ready")
-                    route.output.releaseRoute()
-                    route.sco.release()
                 }
                 is SynthesisOutcome.Failure -> {
                     _status.value = TtsStatus.Error(outcome.reason)
-                    route.output.releaseRoute()
-                    route.sco.release()
                 }
                 SynthesisOutcome.EmptyText -> {
                     _status.value = TtsStatus.EmptyText
-                    route.output.releaseRoute()
-                    route.sco.release()
                 }
             }
-        }.onFailure { error ->
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
             _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
-            route.output.releaseRoute()
-            route.sco.release()
+        } finally {
+            if (acquired) {
+                route.output.releaseRoute()
+            }
         }
     }
 }

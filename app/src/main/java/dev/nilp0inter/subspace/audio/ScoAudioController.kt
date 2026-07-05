@@ -3,8 +3,8 @@ package dev.nilp0inter.subspace.audio
 import android.annotation.SuppressLint
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.util.Log
 import dev.nilp0inter.subspace.model.ScoState
-import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -19,47 +19,150 @@ import kotlinx.coroutines.withTimeoutOrNull
 class ScoAudioController(
     private val scope: CoroutineScope,
     private val audioManager: AudioManager,
+    private val rsmHfpConnected: () -> Boolean = { false },
+    private val targetRsmName: () -> String? = { null },
+    private val startTargetRsmHfpAudio: () -> Boolean = { false },
+    private val stopTargetRsmHfpAudio: () -> Boolean = { false },
+    private val isTargetRsmHfpAudioConnected: () -> Boolean = { false },
 ) : ScoRoute {
     private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
     override val state: StateFlow<ScoState> = _state.asStateFlow()
+    override val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Rsm
     private var _coldStart: Boolean = false
     override val coldStart: Boolean get() = _coldStart
 
     private val mutex = Mutex()
     private var activeClients = 0
     private var keepWarmJob: Job? = null
+    private var selectedDeviceId: Int? = null
+    private var targetRsmAudioOwned = false
+    private var lastFailure: String? = null
 
     @SuppressLint("MissingPermission")
-    override fun hasAvailableScoDevice(): Boolean = findScoDevice() != null
+    override fun hasAvailableScoDevice(): Boolean {
+        val available = rsmHfpConnected()
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_AVAILABLE result=$available target='${targetRsmName().orEmpty()}' " +
+                "rsmHfpConnected=$available current=${audioManager.communicationDevice.routeDebugString()} " +
+                "devices=${audioManager.availableCommunicationDevices.routeDebugString()}",
+        )
+        return available
+    }
 
     @SuppressLint("MissingPermission")
     override suspend fun acquire(): Boolean = mutex.withLock {
-        activeClients++
         keepWarmJob?.cancel()
         keepWarmJob = null
 
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_ACQUIRE_BEGIN activeClients=$activeClients state=${_state.value} selectedId=$selectedDeviceId " +
+                "target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned lastFailure=$lastFailure " +
+                "current=${audioManager.communicationDevice.routeDebugString()}",
+        )
+
         if (isActive()) {
+            activeClients++
             _state.value = ScoState.Active
             _coldStart = false
+            lastFailure = null
+            Log.d(
+                ROUTE_LOG_TAG,
+                "SCO_ACQUIRE_END reused=true active=true activeClients=$activeClients selectedId=$selectedDeviceId " +
+                    "target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned " +
+                    "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+            )
             return true
         }
 
         _coldStart = true
         _state.value = ScoState.Starting
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        lastFailure = null
 
-        val device = findScoDevice()
-        if (device == null) {
-            _coldStart = false
-            _state.value = ScoState.Failed("Bluetooth SCO headset not available")
-            return false
+        if (!rsmHfpConnected()) {
+            return failAcquisition(
+                reason = "target-rsm-hfp-disconnected",
+                message = "Target RSM HFP not connected",
+            )
         }
 
+        val startReturned = runCatching { startTargetRsmHfpAudio() }
+            .onFailure {
+                Log.d(
+                    ROUTE_LOG_TAG,
+                    "RSM_HFP_START_THROW target='${targetRsmName().orEmpty()}' error=${it.javaClass.simpleName}",
+                )
+            }
+            .getOrDefault(false)
+        Log.d(
+            ROUTE_LOG_TAG,
+            "RSM_HFP_START target='${targetRsmName().orEmpty()}' returned=$startReturned " +
+                "current=${audioManager.communicationDevice.routeDebugString()}",
+        )
+        if (!startReturned) {
+            return failAcquisition(
+                reason = "target-rsm-hfp-start-failed",
+                message = "Target RSM HFP audio start failed",
+                stopTargetAudio = true,
+            )
+        }
+
+        val owned = withTimeoutOrNull(TARGET_HFP_AUDIO_TIMEOUT_MS) {
+            var attempt = 0
+            while (!isTargetRsmHfpAudioConnected()) {
+                Log.d(
+                    ROUTE_LOG_TAG,
+                    "RSM_HFP_POLL attempt=$attempt target='${targetRsmName().orEmpty()}' audioConnected=false " +
+                        "audioMode=${audioManager.mode.audioModeDebugString()} " +
+                        "current=${audioManager.communicationDevice.routeDebugString()}",
+                )
+                attempt++
+                delay(TARGET_HFP_AUDIO_POLL_MS)
+            }
+            Log.d(
+                ROUTE_LOG_TAG,
+                "RSM_HFP_AUDIO_CONNECTED target='${targetRsmName().orEmpty()}' true " +
+                    "audioMode=${audioManager.mode.audioModeDebugString()} " +
+                    "current=${audioManager.communicationDevice.routeDebugString()}",
+            )
+            true
+        } == true
+        if (!owned) {
+            return failAcquisition(
+                reason = "target-rsm-hfp-audio-timeout",
+                message = "Timed out waiting for target RSM HFP audio",
+                stopTargetAudio = true,
+            )
+        }
+        targetRsmAudioOwned = true
+
+        val device = findOwnedScoTransport()
+        Log.d(ROUTE_LOG_TAG, "SCO_ACQUIRE_CANDIDATE owner=Rsm device=${device.routeDebugString()}")
+        if (device == null) {
+            return failAcquisition(
+                reason = "transport-unavailable",
+                message = "Bluetooth SCO transport not available",
+                stopTargetAudio = true,
+            )
+        }
+
+        activeClients++
+        selectedDeviceId = device.id
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
         val accepted = audioManager.setCommunicationDevice(device)
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_SET_COMM accepted=$accepted owner=Rsm requested=${device.routeDebugString()} " +
+                "current=${audioManager.communicationDevice.routeDebugString()} selectedId=$selectedDeviceId",
+        )
         if (!accepted) {
-            _coldStart = false
-            _state.value = ScoState.Failed("Android rejected Bluetooth SCO route")
-            return false
+            return failAcquisition(
+                reason = "android-rejected",
+                message = "Android rejected Bluetooth SCO route",
+                stopTargetAudio = true,
+            )
         }
 
         val active = withTimeoutOrNull(5_000) {
@@ -67,65 +170,248 @@ class ScoAudioController(
             true
         } == true
 
-        if (!active) _coldStart = false
-        _state.value = if (active) {
-            ScoState.Active
-        } else {
-            ScoState.Failed("Timed out waiting for SCO route")
+        if (!active) {
+            return failAcquisition(
+                reason = "transport-timeout",
+                message = "Timed out waiting for SCO route",
+                stopTargetAudio = true,
+            )
         }
-        return active
+
+        _state.value = ScoState.Active
+        lastFailure = null
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_ACQUIRE_END reused=false active=true activeClients=$activeClients selectedId=$selectedDeviceId " +
+                "target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned " +
+                "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+        )
+        return true
     }
 
-    override fun isActive(): Boolean =
-        audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    @SuppressLint("MissingPermission")
+    fun selectedCommunicationDevice(): AudioDeviceInfo? {
+        val selectedId = selectedDeviceId ?: return null
+        val device = audioManager.communicationDevice ?: return null
+        return device.takeIf {
+            it.id == selectedId &&
+                acceptsWorkScoTransport(
+                    targetRsmAudioOwned = targetRsmAudioOwned,
+                    targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
+                    transportIsBluetoothSco = it.isBluetoothScoEndpoint(),
+                )
+        }
+    }
+
+    override fun isActive(): Boolean = selectedCommunicationDevice() != null
 
     override fun release() {
         scope.launch {
             mutex.withLock {
+                Log.d(
+                    ROUTE_LOG_TAG,
+                    "SCO_RELEASE_REQUEST activeClients=$activeClients selectedId=$selectedDeviceId " +
+                        "target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned " +
+                        "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+                )
                 if (activeClients > 0) {
                     activeClients--
                 }
-                
-                if (activeClients == 0 && keepWarmJob == null) {
+
+                if (activeClients == 0 && keepWarmJob == null && targetRsmAudioOwned) {
+                    Log.d(
+                        ROUTE_LOG_TAG,
+                        "SCO_RELEASE_WARM_START warmMs=$SCO_WARMUP_MS selectedId=$selectedDeviceId " +
+                            "target='${targetRsmName().orEmpty()}' " +
+                            "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+                    )
                     keepWarmJob = scope.launch {
                         delay(SCO_WARMUP_MS)
                         mutex.withLock {
                             if (activeClients == 0) {
-                                _state.value = ScoState.Closing
-                                audioManager.clearCommunicationDevice()
-                                audioManager.mode = AudioManager.MODE_NORMAL
-                                _state.value = ScoState.Inactive
-                                keepWarmJob = null
+                                clearOwnedRouteLocked("warm-expired")
+                            } else {
+                                Log.d(
+                                    ROUTE_LOG_TAG,
+                                    "SCO_RELEASE_WARM_SKIP activeClients=$activeClients selectedId=$selectedDeviceId " +
+                                        "target='${targetRsmName().orEmpty()}' " +
+                                        "current=${audioManager.communicationDevice.routeDebugString()}",
+                                )
                             }
                         }
                     }
+                } else {
+                    Log.d(
+                        ROUTE_LOG_TAG,
+                        "SCO_RELEASE_RETAINED activeClients=$activeClients keepWarm=${keepWarmJob != null} " +
+                            "selectedId=$selectedDeviceId target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned " +
+                            "current=${audioManager.communicationDevice.routeDebugString()}",
+                    )
                 }
             }
         }
     }
 
-    suspend fun releaseImmediately() {
+    suspend fun releaseImmediately(reason: String = "immediate") {
         mutex.withLock {
-            activeClients = 0
-            keepWarmJob?.cancel()
-            keepWarmJob = null
-            _state.value = ScoState.Closing
-            audioManager.clearCommunicationDevice()
-            audioManager.mode = AudioManager.MODE_NORMAL
-            _state.value = ScoState.Inactive
+            clearOwnedRouteLocked(reason)
+        }
+        val disconnected = withTimeoutOrNull(TARGET_HFP_AUDIO_RELEASE_TIMEOUT_MS) {
+            while (isTargetRsmHfpAudioConnected()) delay(TARGET_HFP_AUDIO_POLL_MS)
+            true
+        } == true
+        Log.d(
+            ROUTE_LOG_TAG,
+            "RSM_HFP_STOP_WAIT target='${targetRsmName().orEmpty()}' disconnected=$disconnected reason=$reason " +
+                "audioAfter=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)} " +
+                "current=${audioManager.communicationDevice.routeDebugString()}",
+        )
+    }
+
+    fun requestImmediateRelease(reason: String) {
+        scope.launch {
+            releaseImmediately(reason)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun findScoDevice(): AudioDeviceInfo? {
+    private fun clearOwnedRouteLocked(reason: String) {
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_RELEASE_IMMEDIATE_BEGIN reason=$reason activeClients=$activeClients selectedId=$selectedDeviceId " +
+                "target='${targetRsmName().orEmpty()}' owned=$targetRsmAudioOwned " +
+                "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+        )
+        val ownsOrTouchesTargetRsm = shouldClearTargetRsmRoute(
+            TargetRsmScoRouteState(
+                activeClients = activeClients,
+                selectedDeviceId = selectedDeviceId,
+                targetRsmAudioOwned = targetRsmAudioOwned,
+                targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
+            ),
+        )
+        if (!ownsOrTouchesTargetRsm) {
+            keepWarmJob?.cancel()
+            keepWarmJob = null
+            _state.value = ScoState.Inactive
+            Log.d(
+                ROUTE_LOG_TAG,
+                "SCO_RELEASE_IMMEDIATE_SKIP reason=$reason target='${targetRsmName().orEmpty()}' " +
+                    "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+            )
+            return
+        }
+        activeClients = 0
+        keepWarmJob?.cancel()
+        keepWarmJob = null
+        _state.value = ScoState.Closing
+        val stopReturned = if (targetRsmAudioOwned || isTargetRsmHfpAudioConnected()) {
+            runCatching { stopTargetRsmHfpAudio() }
+                .onFailure {
+                    Log.d(
+                        ROUTE_LOG_TAG,
+                        "RSM_HFP_STOP_THROW target='${targetRsmName().orEmpty()}' error=${it.javaClass.simpleName}",
+                    )
+                }
+                .getOrDefault(false)
+        } else {
+            false
+        }
+        Log.d(
+            ROUTE_LOG_TAG,
+            "RSM_HFP_STOP target='${targetRsmName().orEmpty()}' returned=$stopReturned reason=$reason " +
+                "audioAfter=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)}",
+        )
+        targetRsmAudioOwned = false
+        selectedDeviceId = null
+        _coldStart = false
+        audioManager.clearCommunicationDevice()
+        audioManager.mode = AudioManager.MODE_NORMAL
+        _state.value = ScoState.Inactive
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_RELEASE_IMMEDIATE_DONE reason=$reason current=${audioManager.communicationDevice.routeDebugString()} " +
+                "state=${_state.value}",
+        )
+    }
+
+    private fun failAcquisition(
+        reason: String,
+        message: String,
+        stopTargetAudio: Boolean = false,
+    ): Boolean {
+        lastFailure = message
+        if (activeClients > 0) activeClients--
+        _coldStart = false
+        if (stopTargetAudio || targetRsmAudioOwned) {
+            runCatching { stopTargetRsmHfpAudio() }
+                .onFailure {
+                    Log.d(
+                        ROUTE_LOG_TAG,
+                        "RSM_HFP_STOP_THROW target='${targetRsmName().orEmpty()}' error=${it.javaClass.simpleName}",
+                    )
+                }
+                .onSuccess {
+                    Log.d(
+                        ROUTE_LOG_TAG,
+                        "RSM_HFP_STOP target='${targetRsmName().orEmpty()}' returned=$it reason=acquire-failed-$reason " +
+                            "audioAfter=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)}",
+                    )
+                }
+        }
+        targetRsmAudioOwned = false
+        selectedDeviceId = null
+        if (activeClients == 0) {
+            audioManager.clearCommunicationDevice()
+            audioManager.mode = AudioManager.MODE_NORMAL
+        }
+        _state.value = ScoState.Failed(message)
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_ACQUIRE_FAIL reason=$reason target='${targetRsmName().orEmpty()}' activeClients=$activeClients " +
+                "current=${audioManager.communicationDevice.routeDebugString()} state=${_state.value}",
+        )
+        return false
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun findOwnedScoTransport(): AudioDeviceInfo? {
+        val current = audioManager.communicationDevice
         val devices = audioManager.availableCommunicationDevices
-        return devices.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
-                it.productName?.contains(TARGET_DEVICE_NAME, ignoreCase = true) == true
-        } ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+        Log.d(
+            ROUTE_LOG_TAG,
+            "SCO_SCAN owner=Rsm target='${targetRsmName().orEmpty()}' rsmHfpConnected=${rsmHfpConnected()} " +
+                "targetAudioConnected=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)} " +
+                "current=${current.routeDebugString()} devices=${devices.routeDebugString()}",
+        )
+        current?.takeIf {
+            acceptsWorkScoTransport(
+                targetRsmAudioOwned = targetRsmAudioOwned,
+                targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
+                transportIsBluetoothSco = it.isBluetoothScoEndpoint(),
+            )
+        }?.let {
+            Log.d(ROUTE_LOG_TAG, "SCO_TRANSPORT_SELECT owner=Rsm reason=current device=${it.routeDebugString()}")
+            return it
+        }
+        devices.firstOrNull {
+            acceptsWorkScoTransport(
+                targetRsmAudioOwned = targetRsmAudioOwned,
+                targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
+                transportIsBluetoothSco = it.isBluetoothScoEndpoint(),
+            )
+        }?.let {
+            Log.d(ROUTE_LOG_TAG, "SCO_TRANSPORT_SELECT owner=Rsm reason=available device=${it.routeDebugString()}")
+            return it
+        }
+        Log.d(ROUTE_LOG_TAG, "SCO_TRANSPORT_SELECT owner=Rsm reason=none")
+        return null
     }
 
     companion object {
         private const val SCO_WARMUP_MS = 30_000L
+        private const val TARGET_HFP_AUDIO_TIMEOUT_MS = 5_000L
+        private const val TARGET_HFP_AUDIO_POLL_MS = 50L
+        private const val TARGET_HFP_AUDIO_RELEASE_TIMEOUT_MS = 1_500L
     }
 }

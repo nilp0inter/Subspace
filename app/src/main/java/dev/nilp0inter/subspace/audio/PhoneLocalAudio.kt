@@ -16,6 +16,7 @@ import kotlin.math.sin
 class NoopScoRoute : ScoRoute {
     private val _state = MutableStateFlow<ScoState>(ScoState.Active)
     override val state: StateFlow<ScoState> = _state.asStateFlow()
+    override val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Local
     override val coldStart: Boolean = false
 
     override fun hasAvailableScoDevice(): Boolean = false
@@ -128,5 +129,4 @@ class LocalPcmOutput : PcmOutput {
         }
     }
 }
-
 

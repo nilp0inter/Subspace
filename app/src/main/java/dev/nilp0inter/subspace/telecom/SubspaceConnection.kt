@@ -1,10 +1,14 @@
 package dev.nilp0inter.subspace.telecom
 
+import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
 import android.telecom.CallAudioState
+import android.util.Log
+import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import android.telecom.Connection
 import android.telecom.DisconnectCause
+import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 
 internal class SubspaceConnection : Connection() {
     private val handler = Handler(Looper.getMainLooper())
@@ -81,8 +85,21 @@ internal class SubspaceConnection : Connection() {
         TelecomCarPttCoordinator.onAbort()
     }
 
-    private fun isAcceptableCaptureRoute(state: CallAudioState): Boolean =
-        state.route == CallAudioState.ROUTE_BLUETOOTH ||
-            (state.supportedRouteMask and CallAudioState.ROUTE_BLUETOOTH) != 0 &&
-            state.activeBluetoothDevice != null
+    @SuppressLint("MissingPermission")
+    private fun isAcceptableCaptureRoute(state: CallAudioState): Boolean {
+        val activeDevice = state.activeBluetoothDevice
+        val name = runCatching { activeDevice?.name }.getOrNull()
+        val bluetoothRoute = state.route == CallAudioState.ROUTE_BLUETOOTH ||
+            (state.supportedRouteMask and CallAudioState.ROUTE_BLUETOOTH) != 0
+        val acceptable = activeDevice != null &&
+            bluetoothRoute &&
+            name?.contains(TARGET_DEVICE_NAME, ignoreCase = true) != true
+        val displayName = name?.let { "'$it'" } ?: "none"
+        Log.d(
+            ROUTE_LOG_TAG,
+            "TELECOM_CALL_AUDIO route=${state.route} supported=${state.supportedRouteMask} " +
+                "activeBtName=$displayName bluetoothRoute=$bluetoothRoute acceptable=$acceptable",
+        )
+        return acceptable
+    }
 }
