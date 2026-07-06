@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.model
 
+import io.sleepwalker.core.keymap.HostProfile
+
 sealed interface Channel {
     val id: String
     val name: String
@@ -40,5 +42,21 @@ data class DebugChannel(
     companion object {
         const val ID = "debug-channel"
         const val NAME = "Debug Channel"
+    }
+}
+
+data class KeyboardChannel(
+    override val id: String = ID,
+    override val name: String = NAME,
+    val hostProfile: HostProfile = HostProfile.LINUX_US,
+    val orderIndex: Int = 2,
+    @Transient private val bridgeConnectedProvider: () -> Boolean = { false },
+) : Channel {
+    override val isReady: Boolean
+        get() = bridgeConnectedProvider()
+
+    companion object {
+        const val ID = "keyboard-channel"
+        const val NAME = "Keyboard Channel"
     }
 }

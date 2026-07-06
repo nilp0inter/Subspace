@@ -2,8 +2,11 @@ package dev.nilp0inter.subspace.model
 
 import android.content.Context
 import android.content.SharedPreferences
+import io.sleepwalker.core.keymap.HostProfile
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChannelRepositoryTest {
@@ -26,6 +29,44 @@ class ChannelRepositoryTest {
         assertThrows(IllegalArgumentException::class.java) {
             JournalChannel(saveVoice = false, saveText = false)
         }
+    }
+
+    @Test
+    fun keyboardChannelIsReadyDependsOnBridgeConnectionState() {
+        val channelConnected = KeyboardChannel(
+            hostProfile = HostProfile.LINUX_US,
+            bridgeConnectedProvider = { true }
+        )
+        assertTrue(channelConnected.isReady)
+
+        val channelDisconnected = KeyboardChannel(
+            hostProfile = HostProfile.LINUX_US,
+            bridgeConnectedProvider = { false }
+        )
+        assertFalse(channelDisconnected.isReady)
+    }
+
+    @Test
+    fun keyboardRoundTripPersistsHostProfile() {
+        val prefs = FakeSharedPreferences()
+        val repository = ChannelRepository(prefs)
+        val channel = KeyboardChannel(
+            hostProfile = HostProfile.LINUX_US
+        )
+
+        repository.saveKeyboard(channel)
+
+        assertEquals("LINUX_US", prefs.getString("keyboard_host_profile", null))
+
+        var bridgeConnectedCalled = false
+        val loaded = repository.loadKeyboard(bridgeConnectedProvider = {
+            bridgeConnectedCalled = true
+            true
+        })
+
+        assertEquals(HostProfile.LINUX_US, loaded.hostProfile)
+        assertTrue(loaded.isReady)
+        assertTrue(bridgeConnectedCalled)
     }
 
     private class FakeSharedPreferences : SharedPreferences {
