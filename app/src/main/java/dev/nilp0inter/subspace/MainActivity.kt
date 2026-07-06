@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,30 +29,32 @@ import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
 import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
+import dev.nilp0inter.subspace.ui.MainViewModel
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 
 class MainActivity : ComponentActivity() {
-    private var service by mutableStateOf<PttForegroundService?>(null)
+    private val viewModel: MainViewModel by viewModels()
     private var bound = false
     private var pendingJournalDirectory: String? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
-            service = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
+            val connectedService = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
                 pendingJournalDirectory?.let { path ->
                     connectedService.setJournalDirectory(path)
                     pendingJournalDirectory = null
                 }
                 connectedService.refreshReadiness()
             }
+            viewModel.onServiceConnected(connectedService)
             bound = true
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
             bound = false
-            service = null
+            viewModel.onServiceDisconnected()
         }
     }
 
@@ -59,27 +62,23 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         setContent {
-            val currentService = service
-            val currentServiceState by rememberUpdatedState(currentService)
-            val state by currentService?.appState?.collectAsStateWithLifecycle()
-                ?: remember { mutableStateOf(AppState()) }
-            val level by currentService?.level?.collectAsStateWithLifecycle()
-                ?: remember { mutableStateOf(0f) }
-            val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
-                ?: remember { mutableStateOf(false) }
+            val state by viewModel.appState.collectAsStateWithLifecycle()
+            val level by viewModel.level.collectAsStateWithLifecycle()
+            val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
             var route by remember { mutableStateOf(MainRoute.Dashboard) }
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
+            
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
-                currentServiceState?.refreshReadiness()
+                viewModel.service?.refreshReadiness()
             }
             val directoryLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocumentTree(),
             ) { uri ->
                 val path = uri?.let(StoragePathResolver::resolveTreeUri)
                 if (path != null) {
-                    val connectedService = currentServiceState
+                    val connectedService = viewModel.service
                     if (connectedService == null) {
                         pendingJournalDirectory = path
                     } else {
@@ -88,7 +87,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            val actions = remember(currentService, permissionLauncher, directoryLauncher) {
+            val actions = remember(permissionLauncher, directoryLauncher) {
                 object : PttUiActions {
                     override fun requestPermissions() {
                         permissionLauncher.launch(RequiredPermissions.runtimePermissions())
@@ -107,11 +106,11 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun scanForDevice() {
-                        currentServiceState?.scanForDevice()
+                        viewModel.service?.scanForDevice()
                     }
 
                     override fun pairTarget() {
-                        currentServiceState?.pairTarget()
+                        viewModel.service?.pairTarget()
                     }
 
                     override fun connectSerial() {
@@ -120,47 +119,47 @@ class MainActivity : ComponentActivity() {
                             Intent(this@MainActivity, PttForegroundService::class.java)
                                 .setAction(PttForegroundService.ACTION_START_MONITORING),
                         )
-                        currentServiceState?.connectSerial()
+                        viewModel.service?.connectSerial()
                     }
 
                     override fun retry() {
-                        currentServiceState?.refreshReadiness()
+                        viewModel.service?.refreshReadiness()
                     }
 
                     override fun disconnectSerial() {
-                        currentServiceState?.disconnectSerial()
+                        viewModel.service?.disconnectSerial()
                     }
 
                     override fun setJournalSaveVoice(enabled: Boolean) {
-                        currentServiceState?.setJournalSaveVoice(enabled)
+                        viewModel.service?.setJournalSaveVoice(enabled)
                     }
 
                     override fun setJournalSaveText(enabled: Boolean) {
-                        currentServiceState?.setJournalSaveText(enabled)
+                        viewModel.service?.setJournalSaveText(enabled)
                     }
 
                     override fun setActiveChannel(id: String) {
-                        currentServiceState?.setActiveChannelId(id)
+                        viewModel.service?.setActiveChannelId(id)
                     }
 
                     override fun setInputMode(mode: InputMode) {
-                        currentServiceState?.setInputMode(mode)
+                        viewModel.service?.setInputMode(mode)
                     }
 
                     override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {
-                        currentServiceState?.setDebugChannelMode(mode)
+                        viewModel.service?.setDebugChannelMode(mode)
                     }
 
                     override fun setKeyboardHostProfile(profile: io.sleepwalker.core.keymap.HostProfile) {
-                        currentServiceState?.setKeyboardHostProfile(profile)
+                        viewModel.service?.setKeyboardHostProfile(profile)
                     }
 
                     override fun connectKeyboardBridge() {
-                        currentServiceState?.connectKeyboardBridge()
+                        viewModel.service?.connectKeyboardBridge()
                     }
 
                     override fun disconnectKeyboardBridge() {
-                        currentServiceState?.disconnectKeyboardBridge()
+                        viewModel.service?.disconnectKeyboardBridge()
                     }
 
                     override fun navigateToRsmSetup() {
@@ -168,6 +167,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun navigateToJournalConfig() {
+                        route = MainRoute.Dashboard // Fallback, handled below
                         route = MainRoute.JournalConfig
                     }
 
@@ -184,51 +184,51 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun setTtsText(text: String) {
-                        currentServiceState?.setTtsText(text)
+                        viewModel.service?.setTtsText(text)
                     }
 
                     override fun setTtsVoiceStyle(style: String) {
-                        currentServiceState?.setTtsVoiceStyle(style)
+                        viewModel.service?.setTtsVoiceStyle(style)
                     }
 
                     override fun setTtsLang(lang: String) {
-                        currentServiceState?.setTtsLang(lang)
+                        viewModel.service?.setTtsLang(lang)
                     }
 
                     override fun setTtsTotalSteps(steps: Int) {
-                        currentServiceState?.setTtsTotalSteps(steps)
+                        viewModel.service?.setTtsTotalSteps(steps)
                     }
 
                     override fun setTtsSpeed(speed: Float) {
-                        currentServiceState?.setTtsSpeed(speed)
+                        viewModel.service?.setTtsSpeed(speed)
                     }
 
                     override fun requestTtsSynthesis() {
-                        currentServiceState?.requestTtsSynthesis()
+                        viewModel.service?.requestTtsSynthesis()
                     }
 
                     override fun setSttTtsVoiceStyle(style: String) {
-                        currentServiceState?.setSttTtsVoiceStyle(style)
+                        viewModel.service?.setSttTtsVoiceStyle(style)
                     }
 
                     override fun setSttTtsLang(lang: String) {
-                        currentServiceState?.setSttTtsLang(lang)
+                        viewModel.service?.setSttTtsLang(lang)
                     }
 
                     override fun setSttTtsTotalSteps(steps: Int) {
-                        currentServiceState?.setSttTtsTotalSteps(steps)
+                        viewModel.service?.setSttTtsTotalSteps(steps)
                     }
 
                     override fun setSttTtsSpeed(speed: Float) {
-                        currentServiceState?.setSttTtsSpeed(speed)
+                        viewModel.service?.setSttTtsSpeed(speed)
                     }
 
                     override fun phonePttPressed(channelId: String) {
-                        currentServiceState?.phonePttPressed(channelId)
+                        viewModel.service?.phonePttPressed(channelId)
                     }
 
                     override fun phonePttReleased(channelId: String) {
-                        currentServiceState?.phonePttReleased(channelId)
+                        viewModel.service?.phonePttReleased(channelId)
                     }
                 }
             }
@@ -283,7 +283,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        service?.refreshReadiness()
+        viewModel.service?.refreshReadiness()
     }
 
     override fun onStop() {
@@ -291,7 +291,7 @@ class MainActivity : ComponentActivity() {
             unbindService(serviceConnection)
             bound = false
         }
-        service = null
+        viewModel.onServiceDisconnected()
         super.onStop()
     }
 

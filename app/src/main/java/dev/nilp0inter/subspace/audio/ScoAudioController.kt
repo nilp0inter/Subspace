@@ -388,7 +388,7 @@ class ScoAudioController(
             acceptsWorkScoTransport(
                 targetRsmAudioOwned = targetRsmAudioOwned,
                 targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
-                transportIsBluetoothSco = it.isBluetoothScoEndpoint(),
+                transportIsBluetoothSco = it.isTargetRsmScoEndpoint(),
             )
         }?.let {
             Log.d(ROUTE_LOG_TAG, "SCO_TRANSPORT_SELECT owner=Rsm reason=current device=${it.routeDebugString()}")
@@ -398,7 +398,7 @@ class ScoAudioController(
             acceptsWorkScoTransport(
                 targetRsmAudioOwned = targetRsmAudioOwned,
                 targetRsmHfpAudioConnected = isTargetRsmHfpAudioConnected(),
-                transportIsBluetoothSco = it.isBluetoothScoEndpoint(),
+                transportIsBluetoothSco = it.isTargetRsmScoEndpoint(),
             )
         }?.let {
             Log.d(ROUTE_LOG_TAG, "SCO_TRANSPORT_SELECT owner=Rsm reason=available device=${it.routeDebugString()}")

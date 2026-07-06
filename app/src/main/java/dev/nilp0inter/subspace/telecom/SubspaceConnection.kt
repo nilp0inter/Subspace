@@ -76,6 +76,9 @@ internal class SubspaceConnection : Connection() {
 
     fun destroyFromCoordinator() {
         coordinatorDestroy = true
+        if (state != STATE_DISCONNECTED) {
+            setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
+        }
         destroy()
     }
 
