@@ -1,0 +1,65 @@
+# Changelog
+
+All notable changes to Subspace are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and release versions follow semantic versioning while the app is pre-1.0.
+
+## [Unreleased]
+
+## [0.3.0] - 2026-07-06
+
+### Added
+
+- Endpoint-bound PTT audio routing by input mode: Work uses the target RSM SCO endpoint, On The Road uses the Telecom car route, and On A Pinch uses the phone-local route.
+- Telecom car PTT readiness hooks and response playback plumbing for car-routed sessions.
+- Diagnostic-only `SubspaceRoute` logging for mixed car/RSM/mobile routing investigation, including route resolution, SCO selection, PTT session, and Telecom route state.
+- Periodic readiness refresh while serial monitoring is active and the target device remains disconnected or unready.
+- Keyboard channel backed by Sleepwalker BLE bridge integration, including keyboard-channel configuration UI, BLE connection adapter, PTT controller, and `sleepwalker-core` Android library module.
+
+### Changed
+
+- Refined the main dashboard with safe-area padding, fixed-height icon mode tiles, embedded RSM Bluetooth status, and an always-visible VU meter standby state.
+- Restricted RSM SCO acquisition to the target `B02PTT-FF01` endpoint instead of accepting any Bluetooth SCO device.
+- Reworked route resolution around explicit physical endpoints (`Rsm`, `Car`, `Local`) instead of mode-agnostic SCO/local decisions.
+- Updated OpenSpec archives and synced routing, input-mode, SCO-audio, dashboard, VU-meter, reconnect, channel-framework, and keyboard-channel specs to match implemented behavior.
+
+### Fixed
+
+- Fixed mixed car and RSM audio routing so Work-mode PTT no longer captures/routes through the car endpoint and On The Road no longer selects the RSM as the car route.
+- Fixed route-error feedback so unavailable endpoint-specific routes fail closed with an error cue instead of silently using the wrong endpoint.
+- Fixed `TtsController` cancellation handling so coroutine cancellation is rethrown instead of converted to an error status.
+- Fixed disconnected-device readiness staleness by refreshing readiness until the device becomes ready while monitoring continues.
+- Fixed dashboard status-bar overlap and layout instability caused by the previous text-heavy mode selector and conditional VU-meter layout.
+
+## [0.2.0] - 2026-07-01
+
+### Added
+
+- First signed GitHub Release pipeline with GPG-signed tag verification, release keystore provisioning through GitHub Actions secrets, release APK signing, `apksigner` verification, artifact upload, and GitHub Release publication.
+- CI pipeline using the Nix devshell for flake validation, Gradle toolchain verification, JVM tests, debug APK assembly, and debug APK artifact upload.
+- Debug keystore provisioning from repository secrets for CI signing validation.
+- Main operator dashboard with device connection status, channel cards, phone-side PTT fallback, slide-to-lock PTT, VU-meter signal display, and Subspace visual identity.
+- Bluetooth Classic SPP/RFCOMM monitoring for the `B02PTT-FF01` device, raw button token parsing, hardware mode tracking, and foreground-service ownership while serial monitoring is active.
+- Echo, Journal, Captain's Log/Journal rename, Debug, Parakeet STT test, Supertonic TTS test, active channel routing, and Android Auto live-loop projection groundwork.
+- Telecom self-managed VoIP car PTT foundation.
+- Release signing operator documentation covering keystore storage, backup, rotation, loss handling, GPG signing setup, and release-cutting checklist.
+
+### Changed
+
+- Centralized SCO keep-warm and capture plumbing around shared services to support channel-specific capture and playback flows.
+- Unified PTT audio capture into a shared `CaptureService` and propagated capture-level signal to UI tests.
+- Renamed Captain's Log to Journal channel and added metadata-driven streaming WAV capture artifacts.
+- Aligned README and product documentation with the hardware-first, voice-first channel-router vision.
+
+### Fixed
+
+- Fixed cold-start ready-beep reliability and short-tap SCO warmup behavior.
+- Fixed JNI startup UI blocking by moving initialization off the main thread and closing the STT/TTS init race.
+- Fixed journal STT binding after off-main initialization completes.
+- Fixed SCO reference-count balance, sample-rate propagation, and Journal thread safety after the capture-service refactor.
+- Fixed release workflow `apksigner` lookup by using the full Android build-tools path.
+- Fixed release build-type configuration for Android Gradle Plugin pre-created build types.
+
+[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nilp0inter/Subspace/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/nilp0inter/Subspace/releases/tag/v0.2.0
