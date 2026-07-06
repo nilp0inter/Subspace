@@ -55,6 +55,12 @@ import dev.nilp0inter.subspace.audio.resolveLocalAudioRoute
 import dev.nilp0inter.subspace.audio.resolveScoAudioRoute
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
+import dev.nilp0inter.subspace.bluetooth.SleepwalkerBleConnection
+import dev.nilp0inter.subspace.channel.KeyboardPttController
+import dev.nilp0inter.subspace.model.KeyboardChannel
+import dev.nilp0inter.subspace.model.KeyboardConnectionState
+import dev.nilp0inter.subspace.model.KeyboardStatus
+import io.sleepwalker.core.hid.LowLevelHidImpl
 import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.JournalEntryDiscovery
 import dev.nilp0inter.subspace.channel.JournalEntryPaths
@@ -171,6 +177,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var ttsModelStatusJob: Job? = null
     private var sttTtsController: SttTtsController? = null
     private var journalPttController: JournalPttController? = null
+    lateinit var sleepwalkerConnection: SleepwalkerBleConnection
+    var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private lateinit var localOutput: LocalPcmOutput
@@ -222,10 +230,22 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         bluetoothAdapter?.getProfileProxy(this, headsetServiceListener, BluetoothProfile.HEADSET)
+        sleepwalkerConnection = SleepwalkerBleConnection()
+        serviceScope.launch {
+            sleepwalkerConnection.connectionState.collect { state ->
+                updateMonitor { it.copy(keyboardConnectionState = state) }
+                val currentKeyboard = _appState.value.keyboard
+                _appState.value = _appState.value.copy(
+                    keyboard = currentKeyboard.copy()
+                )
+                refreshReadiness()
+            }
+        }
         channelRepository = ChannelRepository(applicationContext)
         _appState.value = _appState.value.copy(
             journal = channelRepository.loadJournal(),
             debugChannel = channelRepository.loadDebugChannel(),
+            keyboard = channelRepository.loadKeyboard({ sleepwalkerConnection.connectionState.value == KeyboardConnectionState.Connected }),
             activeChannelId = channelRepository.loadActiveChannelId(),
         )
 
@@ -340,6 +360,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                             }
                         }
                     }
+                    keyboardController = KeyboardPttController(
+                        scope = serviceScope,
+                        sco = sco,
+                        captureService = captureService,
+                        source = voiceCommunicationSource,
+                        output = pcmOutput,
+                        transcriptionService = transcription,
+                        connection = sleepwalkerConnection,
+                        hid = LowLevelHidImpl(),
+                        hostProfileProvider = { _appState.value.keyboard.hostProfile },
+                    )
+                    serviceScope.launch {
+                        keyboardController?.status?.collect { status ->
+                            if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                            updateMonitor { it.copy(keyboardStatus = status) }
+                        }
+                    }
                 }
             }
         }
@@ -368,7 +405,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         "chan.${JournalChannel.ID}.name" to "Journal Channel",
                         "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
                         "chan.${DebugChannel.ID}.name" to "Debug Channel",
-                        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected"
+                        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected",
+                        "chan.${KeyboardChannel.ID}.name" to "Keyboard Channel",
+                        "chan.${KeyboardChannel.ID}.selected" to "Keyboard Channel Selected"
                     )
                     val styleDir = supertonicModelDir ?: return@launch
                     val voiceStylePath = java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
@@ -436,6 +475,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     override fun onDestroy() {
         forceReleaseActivePtt()
+        keyboardController?.cancelAndRelease()
+        sleepwalkerConnection.disconnect()
         CarPttCommandBus.setListener(null)
         AndroidAutoPresenceBus.setListener(null)
         TelecomCarPttCoordinator.setListener(null)
@@ -639,9 +680,15 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             sttTtsController?.cancelAndRelease()
             updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
         }
-        
         if (activeChannelId != JournalChannel.ID) {
             journalPttController?.cancelAndRelease()
+        }
+
+        val isKeyboardActive = activeChannelId == KeyboardChannel.ID
+        keyboardController?.setEnabled(isKeyboardActive)
+        if (!isKeyboardActive) {
+            keyboardController?.cancelAndRelease()
+            updateMonitor { it.copy(keyboardStatus = KeyboardStatus.Idle) }
         }
     }
 
@@ -754,6 +801,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun disconnectSerial() {
         forceReleaseActivePtt()
+        keyboardController?.cancelAndRelease()
+        sleepwalkerConnection.disconnect()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
         stopReadinessRefreshLoop()
@@ -775,6 +824,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     fun setJournalDirectory(path: String) {
         val channel = channelRepository.loadJournal().copy(baseDirectory = path)
         saveJournal(channel)
+    }
+
+    fun setKeyboardHostProfile(profile: io.sleepwalker.core.keymap.HostProfile) {
+        val currentKeyboard = _appState.value.keyboard
+        val newKeyboard = currentKeyboard.copy(hostProfile = profile)
+        channelRepository.saveKeyboard(newKeyboard)
+        _appState.value = _appState.value.copy(keyboard = newKeyboard)
+        refreshReadiness()
+    }
+
+    fun connectKeyboardBridge() {
+        val adapter = bluetoothAdapter ?: return
+        sleepwalkerConnection.connect(adapter, this)
+    }
+
+    fun disconnectKeyboardBridge() {
+        sleepwalkerConnection.disconnect()
     }
 
     fun setJournalSaveVoice(enabled: Boolean) {
@@ -882,6 +948,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         cancelIdleTimer()
         when (session.channelId) {
             JournalChannel.ID -> journalPttController?.cancelAndRelease()
+            KeyboardChannel.ID -> keyboardController?.cancelAndRelease()
             DebugChannel.ID -> {
                 when (_appState.value.debugChannel.mode) {
                     DebugMode.ECHO -> echo.cancelAndRelease()
@@ -1204,6 +1271,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         when (activeChannelId) {
             JournalChannel.ID -> journalPttController?.onPttPressed(route)
+            KeyboardChannel.ID -> keyboardController?.onPttPressed(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttPressed(route)
@@ -1282,6 +1350,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         when (activeChannelId) {
             JournalChannel.ID -> journalPttController?.onPttReleased(route)
+            KeyboardChannel.ID -> keyboardController?.onPttReleased(route)
             DebugChannel.ID -> {
                 when (appState.debugChannel.mode) {
                     DebugMode.ECHO -> echo.onPttReleased(route)
@@ -1332,6 +1401,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun isTerminalCarStatus(status: SttTtsStatus): Boolean = isTerminalCarSource() &&
         (status is SttTtsStatus.Error || status == SttTtsStatus.MaxDurationReached)
+
+    private fun isTerminalCarStatus(status: KeyboardStatus): Boolean = isTerminalCarSource() &&
+        (status is KeyboardStatus.Error || status == KeyboardStatus.MaxDurationReached)
 
     private fun isTerminalCarSource(): Boolean = activePttSession?.source == PttSource.CarTelecom
 
@@ -1405,6 +1477,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
         forceReleaseActivePtt()
+        keyboardController?.cancelAndRelease()
         echo.cancelAndRelease("SPP disconnected")
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()

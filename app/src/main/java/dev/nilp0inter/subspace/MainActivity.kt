@@ -151,6 +151,18 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setDebugChannelMode(mode)
                     }
 
+                    override fun setKeyboardHostProfile(profile: io.sleepwalker.core.keymap.HostProfile) {
+                        currentServiceState?.setKeyboardHostProfile(profile)
+                    }
+
+                    override fun connectKeyboardBridge() {
+                        currentServiceState?.connectKeyboardBridge()
+                    }
+
+                    override fun disconnectKeyboardBridge() {
+                        currentServiceState?.disconnectKeyboardBridge()
+                    }
+
                     override fun navigateToRsmSetup() {
                         route = if (currentReadyForMonitor) MainRoute.Monitor else MainRoute.Connection
                     }
@@ -161,6 +173,10 @@ class MainActivity : ComponentActivity() {
 
                     override fun navigateToDebugConfig() {
                         route = MainRoute.DebugChannelConfig
+                    }
+
+                    override fun navigateToKeyboardConfig() {
+                        route = MainRoute.KeyboardConfig
                     }
 
                     override fun navigateBack() {
@@ -244,6 +260,12 @@ class MainActivity : ComponentActivity() {
                             actions = actions,
                             onBack = { route = MainRoute.Dashboard },
                         )
+                        MainRoute.KeyboardConfig -> dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
+                            channel = state.keyboard,
+                            monitorState = state.monitor,
+                            actions = actions,
+                            onBack = { route = MainRoute.Dashboard },
+                        )
                     }
                 }
             }
@@ -273,5 +295,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig }
+    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
 }

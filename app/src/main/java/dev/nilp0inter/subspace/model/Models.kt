@@ -10,6 +10,7 @@ data class AppState(
     val monitor: MonitorState = MonitorState(),
     val journal: JournalChannel = JournalChannel(),
     val debugChannel: DebugChannel = DebugChannel(),
+    val keyboard: KeyboardChannel = KeyboardChannel(),
     val activeChannelId: String = JournalChannel.ID,
     val inputMode: InputMode = InputMode.OnAPinch,
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
@@ -48,6 +49,7 @@ data class ConnectionState(
 enum class PermissionState { Missing, Granted }
 enum class DevicePresence { NotFound, Scanning, Found, Pairing, Bonded, PairingFailed }
 enum class SppState { Disconnected, Connecting, Connected, Failed }
+enum class KeyboardConnectionState { Disconnected, Scanning, Connecting, Connected }
 enum class HeadsetAudioState { Unavailable, Available }
 
 data class MonitorState(
@@ -75,6 +77,8 @@ data class MonitorState(
     val sttTtsLang: String = DEFAULT_TTS_LANG,
     val sttTtsTotalSteps: Int = DEFAULT_TTS_TOTAL_STEPS,
     val sttTtsSpeed: Float = DEFAULT_TTS_SPEED,
+    val keyboardStatus: KeyboardStatus = KeyboardStatus.Idle,
+    val keyboardConnectionState: KeyboardConnectionState = KeyboardConnectionState.Disconnected,
 )
 
 data class ButtonStates(
@@ -170,6 +174,32 @@ sealed interface SttStatus {
     data object EmptyAudio : SttStatus
     data object Cancelled : SttStatus
     data class Error(val reason: String) : SttStatus
+}
+
+sealed interface KeyboardStatus {
+    data object Idle : KeyboardStatus
+    data object WaitingForAudio : KeyboardStatus
+    data object Recording : KeyboardStatus
+    data object MaxDurationReached : KeyboardStatus
+    data object Transcribing : KeyboardStatus
+    data object Typing : KeyboardStatus
+    data class Done(val text: String) : KeyboardStatus
+    data object EmptyAudio : KeyboardStatus
+    data object Cancelled : KeyboardStatus
+    data class Error(val reason: String) : KeyboardStatus
+}
+
+fun KeyboardStatus.displayText(): String = when (this) {
+    KeyboardStatus.Idle -> "Idle"
+    KeyboardStatus.WaitingForAudio -> "Waiting for audio"
+    KeyboardStatus.Recording -> "Recording"
+    KeyboardStatus.MaxDurationReached -> "Max duration reached"
+    KeyboardStatus.Transcribing -> "Transcribing"
+    KeyboardStatus.Typing -> "Typing"
+    is KeyboardStatus.Done -> text
+    KeyboardStatus.EmptyAudio -> "Empty audio"
+    KeyboardStatus.Cancelled -> "Cancelled"
+    is KeyboardStatus.Error -> "Error: $reason"
 }
 
 fun SttModelStatus.displayText(): String = when (this) {

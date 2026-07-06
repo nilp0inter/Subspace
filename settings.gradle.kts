@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Subspace"
 include(":app")
+include(":sleepwalker-core")

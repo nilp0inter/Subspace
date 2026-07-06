@@ -33,10 +33,12 @@ val Channel.orderIndex: Int
     get() = when (this) {
         is JournalChannel -> JOURNAL_ORDER_INDEX
         is DebugChannel -> DEBUG_ORDER_INDEX
+        is KeyboardChannel -> KEYBOARD_ORDER_INDEX
     }
 
 private const val JOURNAL_ORDER_INDEX = 0
 private const val DEBUG_ORDER_INDEX = 1
+private const val KEYBOARD_ORDER_INDEX = 2
 
 /**
  * Pure projection from [AppState] to a [ChannelBrowseEntry] list ordered by
@@ -54,7 +56,7 @@ fun projectChannelBrowseEntries(
     appState: AppState,
     pendingCounts: Map<String, Int> = emptyMap(),
 ): List<ChannelBrowseEntry> {
-    val channels = listOf(appState.journal, appState.debugChannel)
+    val channels = listOf(appState.journal, appState.debugChannel, appState.keyboard)
     return channels
         .sortedBy { it.orderIndex }
         .map { channel ->

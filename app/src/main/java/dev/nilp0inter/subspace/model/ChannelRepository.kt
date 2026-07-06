@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.model
 
+import io.sleepwalker.core.keymap.HostProfile
+
 import android.content.Context
 import android.content.SharedPreferences
 
@@ -34,6 +36,20 @@ class ChannelRepository(
             .apply()
     }
 
+    fun loadKeyboard(bridgeConnectedProvider: () -> Boolean = { false }): KeyboardChannel {
+        val profileName = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, HostProfile.LINUX_US.name) ?: HostProfile.LINUX_US.name
+        return KeyboardChannel(
+            hostProfile = HostProfile.valueOf(profileName),
+            bridgeConnectedProvider = bridgeConnectedProvider
+        )
+    }
+
+    fun saveKeyboard(channel: KeyboardChannel) {
+        prefs.edit()
+            .putString(KEY_KEYBOARD_HOST_PROFILE, channel.hostProfile.name)
+            .apply()
+    }
+
     /**
      * The single source of truth for channel ordering across both surfaces
      * (phone dashboard + Android Auto browse tree). Order emanates solely from
@@ -42,7 +58,7 @@ class ChannelRepository(
      * (JournalChannel at index 0, DebugChannel at index 1 today).
      */
     fun loadChannels(): List<Channel> =
-        listOf(loadJournal(), loadDebugChannel()).sortedBy { it.orderIndex }
+        listOf(loadJournal(), loadDebugChannel(), loadKeyboard()).sortedBy { it.orderIndex }
 
     fun loadActiveChannelId(): String =
         prefs.getString(KEY_ACTIVE_CHANNEL, JournalChannel.ID) ?: JournalChannel.ID
@@ -58,5 +74,6 @@ class ChannelRepository(
         private const val KEY_SAVE_TEXT = "journal_save_text"
         private const val KEY_DEBUG_MODE = "debug_channel_mode"
         private const val KEY_ACTIVE_CHANNEL = "active_channel_id"
+        private const val KEY_KEYBOARD_HOST_PROFILE = "keyboard_host_profile"
     }
 }

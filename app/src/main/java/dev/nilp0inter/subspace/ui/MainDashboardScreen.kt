@@ -58,6 +58,7 @@ import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.JournalChannel
+import dev.nilp0inter.subspace.model.KeyboardChannel
 import kotlinx.coroutines.withTimeoutOrNull
 
 @Composable
@@ -330,6 +331,13 @@ private fun ChannelPanel(
             phonePttLockThresholdPx = phonePttLockThresholdPx,
             onPhonePttTransition = onPhonePttTransition,
         )
+        KeyboardChannelCard(
+            appState = appState,
+            actions = actions,
+            phonePttGesture = phonePttGesture,
+            phonePttLockThresholdPx = phonePttLockThresholdPx,
+            onPhonePttTransition = onPhonePttTransition,
+        )
         DebugChannelCard(
             appState = appState,
             actions = actions,
@@ -418,6 +426,82 @@ private fun JournalCard(
         }
     }
 }
+
+@Composable
+private fun KeyboardChannelCard(
+    appState: AppState,
+    actions: PttUiActions,
+    phonePttGesture: PhonePttGestureState,
+    phonePttLockThresholdPx: Float,
+    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
+) {
+    val channel = appState.keyboard
+    val channelId = KeyboardChannel.ID
+    val isActive = appState.activeChannelId == channelId
+    val isReady = channel.isReady
+    val accent = when {
+        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
+        isActive -> MaterialTheme.colorScheme.primary
+        isReady -> MaterialTheme.colorScheme.secondary
+        else -> MaterialTheme.colorScheme.outline
+    }
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        border = BorderStroke(1.dp, accent),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .phonePttInput(
+                            channelId = channelId,
+                            lockThresholdPx = phonePttLockThresholdPx,
+                            onSelect = actions::setActiveChannel,
+                            onPhonePttTransition = onPhonePttTransition,
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("CH-02 / BLE HID", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    if (!isReady) {
+                        Text(
+                            text = "Requires active BLE bridge connection.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    HeldPhonePttInstruction(channelId, phonePttGesture)
+                }
+                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                StatusPill(
+                    label = when {
+                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
+                        phonePttGesture.activeChannelId == channelId -> "PTT"
+                        isActive -> "ACTIVE"
+                        isReady -> "READY"
+                        else -> "STANDBY"
+                    },
+                    accent = accent,
+                )
+                IconButton(onClick = actions::navigateToKeyboardConfig) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Config")
+                }
+            }
+        }
+    }
+}
+
 
 @Composable
 private fun DebugChannelCard(
