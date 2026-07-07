@@ -63,14 +63,10 @@ android {
 
     sourceSets {
         getByName("main") {
-            // The Parakeet and Supertonic model assets are downloaded into
-            // build/generated/assets/{parakeet,supertonic} by their respective
-            // download tasks and wired as runtime assets source roots.
-            assets.srcDirs(
-                "src/main/assets",
-                layout.buildDirectory.dir("generated/assets/parakeet"),
-                layout.buildDirectory.dir("generated/assets/supertonic"),
-            )
+            // Only `src/main/assets` is bundled. Model ONNX/JSON files are
+            // downloaded at runtime by `ModelDownloader`; the build emits only
+            // `model-hashes.json` (via `generateModelHashes`) into this dir.
+            assets.srcDirs("src/main/assets")
             jniLibs.srcDirs("src/main/jniLibs", layout.buildDirectory.dir("generated/jniLibs"))
         }
     }
@@ -114,6 +110,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.3")
     implementation(project(":sleepwalker-core"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
@@ -288,9 +285,6 @@ val downloadParakeetAssets by tasks.registering {
     }
 }
 
-tasks.matching { it.name == "preBuild" }.configureEach {
-    dependsOn(downloadParakeetAssets)
-}
 
 // ---------------------------------------------------------------------------
 // Supertonic model asset download (ONNX, configs, voice styles)
@@ -436,9 +430,86 @@ val downloadSupertonicAssets by tasks.registering {
     }
 }
 
-tasks.matching { it.name == "preBuild" }.configureEach {
+
+// ---------------------------------------------------------------------------
+// model-hashes.json manifest generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Model set metadata consumed by both the device-side `ModelDownloader` and
+ * the Gradle `generateModelHashes` task. The `version` is written to
+ * `.subspace_assets_version` on disk after a successful download so the
+ * device can detect version drift. The `repo` is the HuggingFace Hub
+ * identifier used to build download URLs. Manifest `files` keys are HF paths
+ * (flat for parakeet, `onnx/`- or `voice_styles/`-prefixed for supertonic);
+ * the downloader saves each file to `{filesDir}/{dir}/{basename}`.
+ */
+val parakeetModelSet = ModelSetSpec(
+    dirName = "parakeet-tdt-0.6b-v3-int8",
+    version = "int8-2026-06-23",
+    repo = "smcleod/parakeet-tdt-0.6b-v3-int8",
+    files = parakeetAssetSpecs.map { it.name to it.sha256 },
+)
+
+val supertonicModelSet = ModelSetSpec(
+    dirName = "supertonic-3",
+    version = "supertonic-3-2026-06-24",
+    repo = "Supertone/supertonic-3",
+    files = supertonicAssetSpecs.map { it.hfPath to it.sha256 },
+)
+
+val modelHashesManifest = layout.projectDirectory.file("src/main/assets/model-hashes.json")
+
+val generateModelHashes by tasks.registering {
+    group = "model"
+    description = "Writes src/main/assets/model-hashes.json from the Parakeet/Supertonic asset specs."
+    val sets = listOf(parakeetModelSet, supertonicModelSet)
+    val outFile = modelHashesManifest
+    outputs.file(outFile)
+    doLast {
+        outFile.asFile.parentFile.mkdirs()
+        val sb = StringBuilder()
+        sb.append("{\n")
+        sets.forEachIndexed { index, set ->
+            if (index > 0) sb.append(",\n")
+            sb.append("  \"").append(set.dirName).append("\": {\n")
+            sb.append("    \"version\": \"").append(set.version).append("\",\n")
+            sb.append("    \"repo\": \"").append(set.repo).append("\",\n")
+            sb.append("    \"files\": {")
+            if (set.files.isEmpty()) {
+                sb.append("}\n")
+            } else {
+                sb.append("\n")
+                set.files.forEachIndexed { fidx, (name, hash) ->
+                    if (fidx > 0) sb.append(",\n")
+                    sb.append("      \"").append(name).append("\": \"sha256:").append(hash).append("\"")
+                }
+                sb.append("\n    }\n")
+            }
+            sb.append("  }")
+        }
+        sb.append("\n}\n")
+        val target = outFile.asFile
+        target.writeText(sb.toString())
+        logger.lifecycle("Wrote model hash manifest to {}", target.absolutePath)
+    }
+}
+
+generateModelHashes.configure {
+    dependsOn(downloadParakeetAssets)
     dependsOn(downloadSupertonicAssets)
 }
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(generateModelHashes)
+}
+
+data class ModelSetSpec(
+    val dirName: String,
+    val version: String,
+    val repo: String,
+    val files: List<Pair<String, String>>,
+)
 
 fun sha256OfFile(file: File): String {
     val md = MessageDigest.getInstance("SHA-256")
