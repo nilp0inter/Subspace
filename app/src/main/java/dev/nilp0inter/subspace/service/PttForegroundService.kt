@@ -180,7 +180,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var sttTtsController: SttTtsController? = null
     private var journalPttController: JournalPttController? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
-    private val keymapDatabase = JsonKeymapDatabase(resources)
+    private val keymapDatabase: JsonKeymapDatabase by lazy { JsonKeymapDatabase(resources) }
     private var keyboardProfilesCache: List<Pair<HostProfile, String>>? = null
     var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
