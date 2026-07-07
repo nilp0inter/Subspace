@@ -118,7 +118,8 @@ project(":sleepwalker-core").afterEvaluate {
     tasks.configureEach {
         if (name == "generateDebugResources" || name == "generateReleaseResources" ||
             name == "mergeDebugResources" || name == "mergeReleaseResources" ||
-            name == "packageDebugResources" || name == "packageReleaseResources") {
+            name == "packageDebugResources" || name == "packageReleaseResources" ||
+            name == "mapDebugSourceSetPaths" || name == "mapReleaseSourceSetPaths") {
             dependsOn(copyKeymapResources)
         }
     }

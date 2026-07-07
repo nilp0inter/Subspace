@@ -6,7 +6,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-
 ## [0.4.0] - 2026-07-07
 
 ### Added
@@ -16,6 +15,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Changed
 
 - Adapted app code to upstream sleepwalker-core breaking API changes: `HostProfile`, `KeymapEntry`, `TextPlanner`, and related types.
+
+### Fixed
+
+- Fixed release APK build failure caused by missing Gradle dependency declaration between `copyKeymapResources` and `mapReleaseSourceSetPaths` in `:sleepwalker-core`.
 
 ### Removed
 
