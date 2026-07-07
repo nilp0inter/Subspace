@@ -6,9 +6,17 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
+    omni-keymap = {
+      url = "github:nilp0inter/OmniKeymap/main";
+      flake = false;
+    };
+    sleepwalker = {
+      url = "github:nilp0inter/sleepwalker/aeb5adc6c48d3f8f779314b7401964f6c5e5e905";
+      flake = false;
+    };
   };
 
-  outputs = { nixpkgs, flake-utils, fenix, ... }:
+  outputs = { nixpkgs, flake-utils, fenix, omni-keymap, sleepwalker, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -67,6 +75,8 @@
           JAVA_HOME = pkgs.jdk17.home;
           GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/${androidBuildToolsVersion}/aapt2";
           HF_HUB_ENABLE_HF_TRANSFER = "1";
+          OMNI_KEYMAP_PATH = "${omni-keymap}";
+          SLEEPWALKER_CORE_PATH = "${sleepwalker}/android/sleepwalker-core";
 
           shellHook = ''
             export GRADLE_USER_HOME="$PWD/.gradle"

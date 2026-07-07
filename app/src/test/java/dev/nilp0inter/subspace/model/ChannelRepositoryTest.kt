@@ -56,7 +56,7 @@ class ChannelRepositoryTest {
 
         repository.saveKeyboard(channel)
 
-        assertEquals("LINUX_US", prefs.getString("keyboard_host_profile", null))
+        assertEquals("linux:us", prefs.getString("keyboard_host_profile", null))
 
         var bridgeConnectedCalled = false
         val loaded = repository.loadKeyboard(bridgeConnectedProvider = {

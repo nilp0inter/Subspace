@@ -37,17 +37,31 @@ class ChannelRepository(
     }
 
     fun loadKeyboard(bridgeConnectedProvider: () -> Boolean = { false }): KeyboardChannel {
-        val profileName = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, HostProfile.LINUX_US.name) ?: HostProfile.LINUX_US.name
+        val profileKey = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, HostProfile.LINUX_US.key) ?: HostProfile.LINUX_US.key
         return KeyboardChannel(
-            hostProfile = HostProfile.valueOf(profileName),
+            hostProfile = parseHostProfileKey(profileKey),
             bridgeConnectedProvider = bridgeConnectedProvider
         )
     }
 
     fun saveKeyboard(channel: KeyboardChannel) {
         prefs.edit()
-            .putString(KEY_KEYBOARD_HOST_PROFILE, channel.hostProfile.name)
+            .putString(KEY_KEYBOARD_HOST_PROFILE, channel.hostProfile.key)
             .apply()
+    }
+
+    /**
+     * Parse a [HostProfile] from its [HostProfile.key] string ("hostOs:layout[:variant]").
+     * Falls back to [HostProfile.LINUX_US] if the key is malformed.
+     */
+    private fun parseHostProfileKey(key: String): HostProfile {
+        val parts = key.split(":")
+        if (parts.size < 2 || parts.any { it.isBlank() }) return HostProfile.LINUX_US
+        return HostProfile(
+            hostOs = parts[0],
+            layout = parts[1],
+            variant = if (parts.size >= 3) parts[2] else null,
+        )
     }
 
     /**

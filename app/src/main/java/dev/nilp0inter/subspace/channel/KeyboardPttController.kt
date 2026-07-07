@@ -9,8 +9,10 @@ import io.sleepwalker.core.hid.LowLevelHid
 import io.sleepwalker.core.hid.LowLevelOp
 import io.sleepwalker.core.hid.toFrameBytes
 import io.sleepwalker.core.keymap.HostProfile
+import io.sleepwalker.core.keymap.KeymapDatabase
 import io.sleepwalker.core.text.TapScriptCompiler
 import io.sleepwalker.core.text.TextPlanner
+import io.sleepwalker.core.protocol.Usages
 import io.sleepwalker.core.text.TextRenderingFailure
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,6 +31,7 @@ class KeyboardPttController(
     private val transcriptionService: PcmTranscriber,
     private val connection: SleepwalkerBleConnection,
     private val hid: LowLevelHid,
+    private val keymapDatabase: KeymapDatabase,
     private val hostProfileProvider: () -> HostProfile,
 ) {
     companion object {
@@ -110,6 +113,18 @@ class KeyboardPttController(
 
         scope.launch { output.releaseRoute() }
         _status.value = KeyboardStatus.Idle
+    }
+
+    fun sendEnter() {
+        scope.launch {
+            try {
+                connection.sendOp(hid.arm())
+                connection.sendOp(hid.keyTap(Usages.USB_KEY_ENTER))
+                connection.sendOp(hid.disarm())
+            } catch (e: Exception) {
+                Log.d(TAG, "SEND_ENTER_FAILED msg=${e.message}")
+            }
+        }
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -213,17 +228,20 @@ class KeyboardPttController(
     }
 
     private fun startTyping(text: String) {
+        if (text.isEmpty()) return
+        if (text.endsWith(" ")) return
+        val adjustedText = "$text "
         typingJob = scope.launch {
             try {
                 _status.value = KeyboardStatus.Typing
                 val hostProfile = hostProfileProvider()
-                val result = TextPlanner(hid = hid).plan(text, hostProfile)
+                val result = TextPlanner(database = keymapDatabase, hid = hid).plan(adjustedText, hostProfile)
                 val plan = result.plan
                 val failure = result.failure
                 if (plan == null || failure != null) {
                     val reason = when (failure) {
-                        is TextRenderingFailure.MissingLayout -> "Missing layout for ${failure.profile.name}"
-                        is TextRenderingFailure.UnrepresentableGlyph -> "Unrepresentable character '${failure.ch}' for profile ${failure.profile.name}"
+                        is TextRenderingFailure.MissingLayout -> "Missing layout for ${failure.profile.key}"
+                        is TextRenderingFailure.UnrepresentableGlyph -> "Unrepresentable character '${failure.ch}' for profile ${failure.profile.key}"
                         else -> "Text rendering failed"
                     }
                     _status.value = KeyboardStatus.Error(reason)
