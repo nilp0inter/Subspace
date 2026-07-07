@@ -61,6 +61,8 @@ import dev.nilp0inter.subspace.model.KeyboardChannel
 import dev.nilp0inter.subspace.model.KeyboardConnectionState
 import dev.nilp0inter.subspace.model.KeyboardStatus
 import io.sleepwalker.core.hid.LowLevelHidImpl
+import io.sleepwalker.core.keymap.JsonKeymapDatabase
+import io.sleepwalker.core.keymap.HostProfile
 import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.JournalEntryDiscovery
 import dev.nilp0inter.subspace.channel.JournalEntryPaths
@@ -178,6 +180,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var sttTtsController: SttTtsController? = null
     private var journalPttController: JournalPttController? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
+    private val keymapDatabase = JsonKeymapDatabase(resources)
+    private var keyboardProfilesCache: List<Pair<HostProfile, String>>? = null
     var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
@@ -369,6 +373,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         transcriptionService = transcription,
                         connection = sleepwalkerConnection,
                         hid = LowLevelHidImpl(),
+                        keymapDatabase = keymapDatabase,
                         hostProfileProvider = { _appState.value.keyboard.hostProfile },
                     )
                     serviceScope.launch {
@@ -834,8 +839,20 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         refreshReadiness()
     }
 
-    fun getKeymapProfiles(): List<Pair<io.sleepwalker.core.keymap.HostProfile, String>> =
-        speechEngineController.getKeymapProfiles()
+    fun getKeymapProfiles(): List<Pair<HostProfile, String>> {
+        keyboardProfilesCache?.let { return it }
+        val profiles = keymapDatabase.profiles.sortedBy { it.hostOs + it.layout + (it.variant ?: "") }
+        val result = profiles.map { profile ->
+            val displayName = buildString {
+                append(profile.layout)
+                profile.variant?.let { append(" ($it)") }
+                append(" [${profile.hostOs}]")
+            }
+            profile to displayName
+        }
+        keyboardProfilesCache = result
+        return result
+    }
 
     fun connectKeyboardBridge() {
         val adapter = bluetoothAdapter ?: return
