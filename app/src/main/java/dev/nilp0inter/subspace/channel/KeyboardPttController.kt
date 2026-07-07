@@ -9,6 +9,7 @@ import io.sleepwalker.core.hid.LowLevelHid
 import io.sleepwalker.core.hid.LowLevelOp
 import io.sleepwalker.core.hid.toFrameBytes
 import io.sleepwalker.core.keymap.HostProfile
+import io.sleepwalker.core.keymap.KeymapDatabase
 import io.sleepwalker.core.text.TapScriptCompiler
 import io.sleepwalker.core.text.TextPlanner
 import io.sleepwalker.core.text.TextRenderingFailure
@@ -29,6 +30,7 @@ class KeyboardPttController(
     private val transcriptionService: PcmTranscriber,
     private val connection: SleepwalkerBleConnection,
     private val hid: LowLevelHid,
+    private val keymapDatabase: KeymapDatabase,
     private val hostProfileProvider: () -> HostProfile,
 ) {
     companion object {
@@ -217,13 +219,13 @@ class KeyboardPttController(
             try {
                 _status.value = KeyboardStatus.Typing
                 val hostProfile = hostProfileProvider()
-                val result = TextPlanner(hid = hid).plan(text, hostProfile)
+                val result = TextPlanner(database = keymapDatabase, hid = hid).plan(text, hostProfile)
                 val plan = result.plan
                 val failure = result.failure
                 if (plan == null || failure != null) {
                     val reason = when (failure) {
-                        is TextRenderingFailure.MissingLayout -> "Missing layout for ${failure.profile.name}"
-                        is TextRenderingFailure.UnrepresentableGlyph -> "Unrepresentable character '${failure.ch}' for profile ${failure.profile.name}"
+                        is TextRenderingFailure.MissingLayout -> "Missing layout for ${failure.profile.key}"
+                        is TextRenderingFailure.UnrepresentableGlyph -> "Unrepresentable character '${failure.ch}' for profile ${failure.profile.key}"
                         else -> "Text rendering failed"
                     }
                     _status.value = KeyboardStatus.Error(reason)

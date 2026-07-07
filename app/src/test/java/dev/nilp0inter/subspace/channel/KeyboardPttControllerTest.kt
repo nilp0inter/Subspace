@@ -11,6 +11,7 @@ import io.sleepwalker.core.hid.LowLevelHidImpl
 import io.sleepwalker.core.hid.LowLevelOp
 import io.sleepwalker.core.hid.toFrameBytes
 import io.sleepwalker.core.keymap.HostProfile
+import io.sleepwalker.core.keymap.SeedKeymapDatabase
 import io.sleepwalker.core.text.TapScriptCompiler
 import io.sleepwalker.core.text.TextPlanner
 import kotlinx.coroutines.CoroutineDispatcher
@@ -48,6 +49,7 @@ class KeyboardPttControllerTest {
         transcriptionService = transcriptionService,
         connection = connection,
         hid = hid,
+        keymapDatabase = SeedKeymapDatabase,
         hostProfileProvider = { HostProfile.LINUX_US }
     )
 
@@ -242,7 +244,7 @@ class KeyboardPttControllerTest {
         advanceUntilIdle()
 
         assertEquals(
-            KeyboardStatus.Error("Unrepresentable character '£' for profile LINUX_US"),
+            KeyboardStatus.Error("Unrepresentable character '£' for profile linux:us"),
             controller.status.value
         )
         assertEquals(0, connection.sentOps.size)

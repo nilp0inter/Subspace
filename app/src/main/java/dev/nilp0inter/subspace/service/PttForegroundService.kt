@@ -834,6 +834,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         refreshReadiness()
     }
 
+    fun getKeymapProfiles(): List<Pair<io.sleepwalker.core.keymap.HostProfile, String>> =
+        speechEngineController.getKeymapProfiles()
+
     fun connectKeyboardBridge() {
         val adapter = bluetoothAdapter ?: return
         sleepwalkerConnection.connect(adapter, this)

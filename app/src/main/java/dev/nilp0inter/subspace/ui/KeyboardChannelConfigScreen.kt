@@ -45,6 +45,7 @@ fun KeyboardChannelConfigScreen(
     channel: KeyboardChannel,
     monitorState: MonitorState,
     actions: PttUiActions,
+    keymapProfiles: List<Pair<HostProfile, String>>,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -91,6 +92,7 @@ fun KeyboardChannelConfigScreen(
                     )
                     HostProfileDropdown(
                         selected = channel.hostProfile,
+                        options = keymapProfiles,
                         onSelect = { actions.setKeyboardHostProfile(it) },
                     )
                 }
@@ -183,27 +185,29 @@ fun KeyboardChannelConfigScreen(
 @Composable
 private fun HostProfileDropdown(
     selected: HostProfile,
+    options: List<Pair<HostProfile, String>>,
     onSelect: (HostProfile) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val options = HostProfile.values()
     Box(modifier = modifier) {
         OutlinedButton(
             onClick = { expanded = true },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Profile: ${selected.name}")
+            val selectedName = options.find { it.first == selected }?.second
+                ?: "${selected.layout}${selected.variant?.let { " ($it)" } ?: ""}"
+            Text("Profile: $selectedName")
         }
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
         ) {
-            options.forEach { option ->
+            options.forEach { (profile, displayName) ->
                 DropdownMenuItem(
-                    text = { Text(option.name) },
+                    text = { Text(displayName) },
                     onClick = {
-                        onSelect(option)
+                        onSelect(profile)
                         expanded = false
                     },
                 )

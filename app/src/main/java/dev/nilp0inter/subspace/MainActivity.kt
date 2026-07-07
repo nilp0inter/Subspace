@@ -264,6 +264,7 @@ class MainActivity : ComponentActivity() {
                             channel = state.keyboard,
                             monitorState = state.monitor,
                             actions = actions,
+                            keymapProfiles = viewModel.service?.getKeymapProfiles() ?: emptyList(),
                             onBack = { route = MainRoute.Dashboard },
                         )
                     }
