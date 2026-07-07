@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+
+## [0.4.0] - 2026-07-07
+
+### Added
+
+- Sleepwalker-core and OmniKeymap consumed as Nix flake inputs, enabling automatic dependency updates through `nix flake update`.
+
+### Changed
+
+- Adapted app code to upstream sleepwalker-core breaking API changes: `HostProfile`, `KeymapEntry`, `TextPlanner`, and related types.
+
+### Removed
+
+- Vendored `sleepwalker-core/` directory (~2100 lines), replaced by flake input consumption.
+
 ## [0.3.0] - 2026-07-06
 
 ### Added
@@ -60,6 +75,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Fixed release workflow `apksigner` lookup by using the full Android build-tools path.
 - Fixed release build-type configuration for Android Gradle Plugin pre-created build types.
 
-[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nilp0inter/Subspace/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nilp0inter/Subspace/releases/tag/v0.2.0
