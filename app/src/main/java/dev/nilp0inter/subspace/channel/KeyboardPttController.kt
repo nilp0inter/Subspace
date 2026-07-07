@@ -12,6 +12,7 @@ import io.sleepwalker.core.keymap.HostProfile
 import io.sleepwalker.core.keymap.KeymapDatabase
 import io.sleepwalker.core.text.TapScriptCompiler
 import io.sleepwalker.core.text.TextPlanner
+import io.sleepwalker.core.protocol.Usages
 import io.sleepwalker.core.text.TextRenderingFailure
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -112,6 +113,18 @@ class KeyboardPttController(
 
         scope.launch { output.releaseRoute() }
         _status.value = KeyboardStatus.Idle
+    }
+
+    fun sendEnter() {
+        scope.launch {
+            try {
+                connection.sendOp(hid.arm())
+                connection.sendOp(hid.keyTap(Usages.USB_KEY_ENTER))
+                connection.sendOp(hid.disarm())
+            } catch (e: Exception) {
+                Log.d(TAG, "SEND_ENTER_FAILED msg=${e.message}")
+            }
+        }
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -215,11 +228,14 @@ class KeyboardPttController(
     }
 
     private fun startTyping(text: String) {
+        if (text.isEmpty()) return
+        if (text.endsWith(" ")) return
+        val adjustedText = "$text "
         typingJob = scope.launch {
             try {
                 _status.value = KeyboardStatus.Typing
                 val hostProfile = hostProfileProvider()
-                val result = TextPlanner(database = keymapDatabase, hid = hid).plan(text, hostProfile)
+                val result = TextPlanner(database = keymapDatabase, hid = hid).plan(adjustedText, hostProfile)
                 val plan = result.plan
                 val failure = result.failure
                 if (plan == null || failure != null) {

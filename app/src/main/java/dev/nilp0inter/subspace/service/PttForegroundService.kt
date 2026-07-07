@@ -1234,6 +1234,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 }
             }
             RawButtonEvent.PttReleased -> dispatchPttReleased()
+            RawButtonEvent.SosPressed -> {
+                if (_appState.value.activeChannelId == KeyboardChannel.ID) {
+                    keyboardController?.sendEnter()
+                }
+            }
             else -> Unit
         }
     }

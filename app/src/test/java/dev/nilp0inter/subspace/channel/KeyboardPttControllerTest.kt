@@ -95,7 +95,7 @@ class KeyboardPttControllerTest {
         assertTrue("Expected at least arm and disarm ops", sent.size >= 2)
         assertEquals(io.sleepwalker.core.protocol.Opcodes.ARM, sent.first().opcode)
         assertEquals(io.sleepwalker.core.protocol.Opcodes.DISARM, sent.last().opcode)
-        val expectedPlan = TextPlanner(hid = hid).plan("hello world", HostProfile.LINUX_US).plan!!
+        val expectedPlan = TextPlanner(hid = hid).plan("hello world ", HostProfile.LINUX_US).plan!!
         val expectedCompiled = TapScriptCompiler.compile(expectedPlan, hid)
         val typedOps = sent.subList(1, sent.size - 1)
         assertEquals(expectedCompiled.size, typedOps.size)
