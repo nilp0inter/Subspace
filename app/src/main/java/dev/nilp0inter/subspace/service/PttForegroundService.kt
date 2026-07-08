@@ -33,14 +33,14 @@ import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
 import dev.nilp0inter.subspace.audio.OggEncoder
-import dev.nilp0inter.subspace.audio.ParakeetAssetExtractor
+import dev.nilp0inter.subspace.audio.ModelDownloader
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.PcmTranscriber
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
-import dev.nilp0inter.subspace.audio.SupertonicAssetExtractor
+import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
@@ -319,7 +319,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         serviceScope.launch(Dispatchers.IO) {
             val transcriber = try {
                 val nativeLibDir = applicationInfo.nativeLibraryDir
-                val modelDir = ParakeetAssetExtractor.extract(this@PttForegroundService, PARAKEET_ASSET_VERSION)
+                val modelDir = ModelDownloader.ensure(this@PttForegroundService, ModelVerifier.PARAKEET_DIR)
                 sttModelDir = modelDir
                 ParakeetJniTranscriber(
                     nativeLibDir = nativeLibDir,
@@ -391,7 +391,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         serviceScope.launch(Dispatchers.IO) {
             val synth = try {
                 val nativeLibDir = applicationInfo.nativeLibraryDir
-                val modelDir = SupertonicAssetExtractor.extract(this@PttForegroundService, SUPERTONIC_ASSET_VERSION)
+                val modelDir = ModelDownloader.ensure(this@PttForegroundService, ModelVerifier.SUPERTONIC_DIR)
                 supertonicModelDir = modelDir
                 SupertonicJniSynthesizer(
                     nativeLibDir = nativeLibDir,
@@ -1707,8 +1707,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         const val NOTIFICATION_ID = 41
 
         private const val TAG = "SubspacePttService"
-        private const val PARAKEET_ASSET_VERSION = "int8-2026-06-23"
-        private const val SUPERTONIC_ASSET_VERSION = "supertonic-3-2026-06-24"
         private const val STT_MODEL_POLL_MS = 500L
         private const val TTS_MODEL_POLL_MS = 500L
         private const val READINESS_REFRESH_INTERVAL_MS = 5_000L

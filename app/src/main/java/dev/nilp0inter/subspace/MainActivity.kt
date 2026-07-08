@@ -14,6 +14,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -23,10 +28,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.SetupState
+import dev.nilp0inter.subspace.audio.ModelDownloader
+import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.ConnectionScreen
 import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
+import dev.nilp0inter.subspace.ui.InitialSetupScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
@@ -67,7 +76,26 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(0f) }
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(false) }
-            var route by remember { mutableStateOf(MainRoute.Dashboard) }
+            var route by remember { mutableStateOf(MainRoute.Setup) }
+            var setupState by remember { mutableStateOf(SetupState()) }
+            val scope = rememberCoroutineScope()
+
+            LaunchedEffect(Unit) {
+                val ctx = this@MainActivity
+                val permissionsDone = withContext(Dispatchers.IO) {
+                    RequiredPermissions.missing(ctx).isEmpty()
+                }
+                val modelsDone = withContext(Dispatchers.IO) {
+                    runCatching { ModelVerifier.isComplete(ctx) }.getOrDefault(false)
+                }
+                setupState = setupState.copy(
+                    permissionsDone = permissionsDone,
+                    modelsDone = modelsDone,
+                )
+                if (permissionsDone && modelsDone) {
+                    route = MainRoute.Dashboard
+                }
+            }
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
@@ -235,11 +263,42 @@ class MainActivity : ComponentActivity() {
 
             SubspaceTheme {
                 Surface {
-                    BackHandler(enabled = route != MainRoute.Dashboard) {
+                    BackHandler(enabled = route != MainRoute.Dashboard && route != MainRoute.Setup) {
                         route = MainRoute.Dashboard
                     }
 
                     when (route) {
+                        MainRoute.Setup -> InitialSetupScreen(
+                            state = setupState,
+                            onGrantPermissions = {
+                                val missing = RequiredPermissions.missing(this@MainActivity)
+                                setupState = setupState.copy(permissionsDone = missing.isEmpty())
+                            },
+                            onStartModelDownload = {
+                                scope.launch {
+                                    setupState = setupState.copy(downloading = true, error = null)
+                                    try {
+                                        val ctx = this@MainActivity
+                                        withContext(Dispatchers.IO) {
+                                            ModelDownloader.ensure(ctx, ModelVerifier.PARAKEET_DIR) { p ->
+                                                setupState = setupState.copy(parakeetProgress = p)
+                                            }
+                                            ModelDownloader.ensure(ctx, ModelVerifier.SUPERTONIC_DIR) { p ->
+                                                setupState = setupState.copy(supertonicProgress = p)
+                                            }
+                                        }
+                                        setupState = setupState.copy(downloading = false, modelsDone = true)
+                                    } catch (e: Exception) {
+                                        setupState = setupState.copy(
+                                            downloading = false,
+                                            error = e.message ?: "Download failed",
+                                        )
+                                    }
+                                }
+                            },
+                            onEnterSubspace = { route = MainRoute.Dashboard },
+                        )
+
                         MainRoute.Dashboard -> MainDashboardScreen(
                             appState = state,
                             level = level,
@@ -296,5 +355,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
+    private enum class MainRoute { Setup, Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
 }

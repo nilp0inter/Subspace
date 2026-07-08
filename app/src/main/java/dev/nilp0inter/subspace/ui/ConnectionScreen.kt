@@ -26,7 +26,6 @@ import androidx.compose.ui.unit.dp
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DevicePresence
 import dev.nilp0inter.subspace.model.HeadsetAudioState
-import dev.nilp0inter.subspace.model.PermissionState
 import dev.nilp0inter.subspace.model.SppState
 import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 
@@ -64,7 +63,6 @@ private fun StatusPanel(state: ConnectionState) {
         Column(Modifier.padding(16.dp)) {
             Text("READINESS MATRIX", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(12.dp))
-            StatusRow("Permissions", permissionText(state))
             StatusRow("Android Bluetooth", if (state.bluetoothEnabled) "on" else "off")
             StatusRow("Target device", state.devicePresence.displayText())
             StatusRow("Serial control channel", state.spp.displayText(state.sppError))
@@ -77,8 +75,6 @@ private fun StatusPanel(state: ConnectionState) {
 @Composable
 private fun GuidancePanel(state: ConnectionState) {
     val text = when {
-        state.permissions == PermissionState.Missing ->
-            "Grant Bluetooth and microphone permissions before scanning or connecting."
         !state.bluetoothEnabled ->
             "Enable Bluetooth in Android settings."
         state.devicePresence == DevicePresence.NotFound ->
@@ -109,12 +105,6 @@ private fun GuidancePanel(state: ConnectionState) {
 @Composable
 private fun ActionPanel(state: ConnectionState, actions: PttUiActions) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (state.permissions == PermissionState.Missing) {
-            Button(onClick = actions::requestPermissions, modifier = Modifier.fillMaxWidth()) {
-                Text("Grant permissions")
-            }
-        }
-
         if (!state.bluetoothEnabled || state.devicePresence == DevicePresence.PairingFailed ||
             state.headsetAudio == HeadsetAudioState.Unavailable
         ) {
@@ -123,7 +113,7 @@ private fun ActionPanel(state: ConnectionState, actions: PttUiActions) {
             }
         }
 
-        if (state.permissions == PermissionState.Granted && state.bluetoothEnabled &&
+        if (state.bluetoothEnabled &&
             state.devicePresence != DevicePresence.Bonded
         ) {
             Button(onClick = actions::scanForDevice, modifier = Modifier.fillMaxWidth()) {
@@ -170,11 +160,6 @@ fun TerminalHeader(title: String, subtitle: String) {
         Text(title, style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary)
         Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-}
-
-private fun permissionText(state: ConnectionState): String = when (state.permissions) {
-    PermissionState.Granted -> "granted"
-    PermissionState.Missing -> "missing: ${state.missingPermissions.size}"
 }
 
 private fun DevicePresence.displayText(): String = when (this) {
