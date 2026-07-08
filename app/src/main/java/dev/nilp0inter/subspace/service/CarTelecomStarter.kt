@@ -44,6 +44,7 @@ internal class CarTelecomStarter(
     private val publishInputMode: () -> Unit,
     private val cancelIdleTimer: () -> Unit,
     private val startIdleTimer: () -> Unit,
+    private val isActivePttSession: () -> Boolean,
     private val decidePttDispatch: () -> PttDispatchDecision?,
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
@@ -75,12 +76,16 @@ internal class CarTelecomStarter(
     private suspend fun startTelecomCarPttAfterRouteRelease() {
         Log.d(
             ROUTE_LOG_TAG,
-            "CAR_PTT_START activeSession= modeBefore=${inputModeController.mode} " +
+            "CAR_PTT_START activeSession=${isActivePttSession()} modeBefore=${inputModeController.mode} " +
                 "availability=${inputModeController.availability}",
         )
         logAudioRouteSnapshot("car-ptt-start")
         if (!telecomDisconnected.isCompleted) {
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=telecom-disconnect-pending")
+            return
+        }
+        if (isActivePttSession()) {
+            Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=active-session")
             return
         }
         val transitioned = inputModeController.autoTransitionFor(PttSource.CarTelecom)
@@ -100,6 +105,11 @@ internal class CarTelecomStarter(
         publishInputMode()
         cancelIdleTimer()
         val decision = decidePttDispatch() ?: return
+        if (decision is PttDispatchDecision.ErrorBeep) {
+            Log.d(ROUTE_LOG_TAG, "CAR_PTT_ERROR_BEEP reason=dispatch-decision mode=${inputModeController.mode}")
+            playCarErrorBeep()
+            return
+        }
 
         sco.releaseImmediately("car-ptt-start")
         primeCarHfpForTelecom()

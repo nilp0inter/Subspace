@@ -268,6 +268,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             publishInputMode = ::publishInputMode,
             cancelIdleTimer = ::cancelIdleTimer,
             startIdleTimer = ::startIdleTimer,
+            isActivePttSession = { pttDispatcher.activePttSession != null },
             decidePttDispatch = { decidePttDispatch(_appState.value) },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
             updateCarMediaState = ::updateCarMediaState,
