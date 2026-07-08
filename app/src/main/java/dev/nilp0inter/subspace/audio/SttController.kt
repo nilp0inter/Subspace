@@ -148,14 +148,13 @@ class SttController(
 
         if (recording.isEmpty) {
             if (session == null) {
-                // Setup still in flight or already failed; the service owns
-                // SCO release on Cancelled / RecordingFailed. Do not release
-                // the route here.
+                // Setup still in flight or already failed
                 if (_status.value != SttStatus.Idle && _status.value !is SttStatus.Error) {
                     _status.value = SttStatus.Cancelled
                 }
                 setupJob?.cancel()
                 setupJob = null
+                scope.launch { route.output.releaseRoute() }
             } else {
                 if (enabled || _status.value != SttStatus.Idle) cancelSession(route)
                 _status.value = SttStatus.EmptyAudio

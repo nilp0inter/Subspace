@@ -1,4 +1,5 @@
 package dev.nilp0inter.subspace.audio
+import android.util.Log
 
 import dev.nilp0inter.subspace.model.SttTtsStatus
 import kotlinx.coroutines.CancellationException
@@ -37,6 +38,7 @@ class SttTtsController(
     private var transcribeJob: Job? = null
 
     fun setEnabled(value: Boolean) {
+        logD("SubspaceSttTts", "setEnabled value=$value was=$enabled activeSession=${activeSession != null} setupJobActive=${setupJob?.isActive}")
         enabled = value
         if (!value && activeSession == null && setupJob?.isActive != true) {
             _status.value = SttTtsStatus.Idle
@@ -49,6 +51,7 @@ class SttTtsController(
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
+        logD("SubspaceSttTts", "onPttPressed this=${System.identityHashCode(this)} enabled=$enabled setupJobActive=${setupJob?.isActive} activeSession=${activeSession != null}")
         if (!enabled) return
         if (setupJob?.isActive == true || activeSession != null) return
 
@@ -56,6 +59,7 @@ class SttTtsController(
         transcribeJob = null
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession(route) }
+        logD("SubspaceSttTts", "setupJob launched")
     }
 
     fun onPttReleased(
@@ -96,14 +100,16 @@ class SttTtsController(
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
+        logD("SubspaceSttTts", "startSession entered, pttDown=$pttDown route source=${route.source.sourceId}")
         runCatching {
             _status.value = SttTtsStatus.WaitingForAudio
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
                 output = route.output,
-                shouldProceed = { pttDown },
+                shouldProceed = { logD("SubspaceSttTts", "shouldProceed pttDown=$pttDown"); pttDown },
             )
+            logD("SubspaceSttTts", "captureService.startSession result=$result")
             when (result) {
                 CaptureStartResult.SessionActive -> {
                     _status.value = SttTtsStatus.Error("Capture session already active")
@@ -174,6 +180,7 @@ class SttTtsController(
                 }
                 setupJob?.cancel()
                 setupJob = null
+                scope.launch { route.output.releaseRoute() }
             } else {
                 if (enabled || _status.value != SttTtsStatus.Idle) cancelSession(route)
                 _status.value = SttTtsStatus.EmptyAudio
@@ -256,5 +263,13 @@ class SttTtsController(
 
     private companion object {
         const val DEFAULT_RATE = 16_000
+    }
+}
+
+private fun logD(tag: String, msg: String) {
+    try {
+        android.util.Log.d(tag, msg)
+    } catch (e: Throwable) {
+        println("[$tag] $msg")
     }
 }

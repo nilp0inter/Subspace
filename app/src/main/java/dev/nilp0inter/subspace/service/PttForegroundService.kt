@@ -1424,7 +1424,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     // -- ChannelRouter implementation --------------------------------------------------
 
     override fun onPttPressed(channelId: String, route: ResolvedAudioRoute) {
-        Log.d(ROUTE_LOG_TAG, "CHANNEL_PTT_PRESSED channel=$channelId mode=${_appState.value.debugChannel.mode} sttController=${sttController != null} sttEnabled=${sttController?.enabled}")
+        Log.d(ROUTE_LOG_TAG, "CHANNEL_PTT_PRESSED channel=$channelId mode=${_appState.value.debugChannel.mode} " +
+            "stt=${sttController != null}(e=${sttController?.enabled}) " +
+            "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
+            "tts=${ttsController != null}(e=${ttsController?.enabled})")
         when (channelId) {
             JournalChannel.ID -> journalPttController?.onPttPressed(route)
             KeyboardChannel.ID -> keyboardController?.onPttPressed(route)

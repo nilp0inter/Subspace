@@ -54,6 +54,7 @@ internal class CarTelecomStarter(
         private set
 
     private var primedCarHfpDevice: BluetoothDevice? = null
+    private var lastDisconnectTime = 0L
 
     /** Launches the car-PTT coroutine. */
     fun startTelecomCarPtt() {
@@ -64,6 +65,7 @@ internal class CarTelecomStarter(
 
     /** Notify that the telecom connection ended (called from service listener). */
     fun notifyTelecomDisconnected() {
+        lastDisconnectTime = android.os.SystemClock.elapsedRealtime()
         if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
     }
 
@@ -71,9 +73,15 @@ internal class CarTelecomStarter(
     private fun resetTelecomDisconnected() {
         telecomDisconnected = CompletableDeferred()
     }
-
     @SuppressLint("MissingPermission")
     private suspend fun startTelecomCarPttAfterRouteRelease() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val timeSinceLastDisconnect = now - lastDisconnectTime
+        if (timeSinceLastDisconnect < 500) {
+            val waitMs = 500 - timeSinceLastDisconnect
+            Log.d(ROUTE_LOG_TAG, "CAR_PTT_DELAY waitMs=$waitMs")
+            delay(waitMs)
+        }
         Log.d(
             ROUTE_LOG_TAG,
             "CAR_PTT_START activeSession=${isActivePttSession()} modeBefore=${inputModeController.mode} " +
