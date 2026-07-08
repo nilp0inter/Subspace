@@ -74,9 +74,10 @@ internal class PttDispatcher(
         cancelIdleTimer()
 
         val appState = appStateProvider()
-        val decision = decidePttDispatch(appState) ?: return false
+        val decision = decidePttDispatch(appState)
+        Log.d(ROUTE_LOG_TAG, "PTT_DECIDE decision=${decision?.let { it::class.simpleName }} channel=${decision?.channelId}")
+        if (decision == null) return false
         val activeChannelId = decision.channelId
-
         val route = resolvePttAudioRoute(inputModeController.mode)
 
         if (decision is PttDispatchDecision.ErrorBeep) {
@@ -96,6 +97,7 @@ internal class PttDispatcher(
             route = route,
         )
 
+        Log.d(ROUTE_LOG_TAG, "PTT_DISPATCH channel=${activeChannelId} route=${route.routeDebugString()}")
         channelRouter.onPttPressed(activeChannelId, route)
         updateCarMediaState()
         return true

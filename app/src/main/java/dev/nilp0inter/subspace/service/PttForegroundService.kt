@@ -372,6 +372,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         output = pcmOutput,
                         transcriptionService = transcription,
                     )
+                    Log.d(ROUTE_LOG_TAG, "STT_CONTROLLER_INIT sttController set")
                     sttModelStatusJob = serviceScope.launch {
                         var lastStatus: SttModelStatus? = null
                         while (true) {
@@ -411,6 +412,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                             updateMonitor { it.copy(keyboardStatus = status) }
                         }
                     }
+                    updateActiveControllers()
                 }
             }
         }
@@ -471,6 +473,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                             updateMonitor { it.copy(ttsStatus = status) }
                         }
                     }
+                    updateActiveControllers()
                     serviceScope.launch {
                         val transcriber = sttReady.await()
                         if (transcriber != null) {
@@ -491,6 +494,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                                     updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
                                 }
                             }
+                            updateActiveControllers()
                         }
                     }
                 }
@@ -634,6 +638,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             updateMonitor { it.copy(echoStatus = EchoStatus.Idle) }
         }
 
+        Log.d(ROUTE_LOG_TAG, "UPDATE_CONTROLLERS isDebugActive=$isDebugActive mode=$mode sttController=${sttController != null} setting=${isDebugActive && mode == DebugMode.STT}")
         sttController?.setEnabled(isDebugActive && mode == DebugMode.STT)
         if (!(isDebugActive && mode == DebugMode.STT)) {
             sttController?.cancelAndRelease()
@@ -937,6 +942,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
     override fun onTelecomRouteTimeout() {
         carTelecomStarter.playCarErrorBeep()
+        carTelecomStarter.notifyTelecomDisconnected()
         updateCarMediaState()
     }
     override fun onTelecomConnectionEnded() {
@@ -1418,6 +1424,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     // -- ChannelRouter implementation --------------------------------------------------
 
     override fun onPttPressed(channelId: String, route: ResolvedAudioRoute) {
+        Log.d(ROUTE_LOG_TAG, "CHANNEL_PTT_PRESSED channel=$channelId mode=${_appState.value.debugChannel.mode} sttController=${sttController != null} sttEnabled=${sttController?.enabled}")
         when (channelId) {
             JournalChannel.ID -> journalPttController?.onPttPressed(route)
             KeyboardChannel.ID -> keyboardController?.onPttPressed(route)

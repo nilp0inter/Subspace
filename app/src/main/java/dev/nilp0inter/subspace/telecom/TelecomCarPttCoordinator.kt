@@ -17,6 +17,8 @@ internal object TelecomCarPttCoordinator {
         override fun onRouteTimeout() {
             listener?.onTelecomRouteTimeout()
             connection?.disconnectFromCoordinator()
+            connection = null
+            releaseLifecycleAfterTeardown()
         }
 
         override fun onDisconnected() {

@@ -1,4 +1,5 @@
 package dev.nilp0inter.subspace.audio
+import android.util.Log
 
 import dev.nilp0inter.subspace.model.SttStatus
 import kotlinx.coroutines.CancellationException
@@ -31,6 +32,7 @@ class SttController(
     private var transcribeJob: Job? = null
 
     fun setEnabled(value: Boolean) {
+        logD("SubspaceStt", "setEnabled value=$value was=$enabled activeSession=${activeSession != null} setupJobActive=${setupJob?.isActive}")
         enabled = value
         if (!value && activeSession == null && setupJob?.isActive != true) {
             _status.value = SttStatus.Idle
@@ -43,13 +45,14 @@ class SttController(
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
+        logD("SubspaceStt", "onPttPressed this=${System.identityHashCode(this)} enabled=$enabled setupJobActive=${setupJob?.isActive} activeSession=${activeSession != null}")
         if (!enabled) return
         if (setupJob?.isActive == true || activeSession != null) return
-
         transcribeJob?.cancel()
         transcribeJob = null
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession(route) }
+        logD("SubspaceStt", "setupJob launched")
     }
 
     fun onPttReleased() {
@@ -77,14 +80,16 @@ class SttController(
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
+        logD("SubspaceStt", "startSession entered, pttDown=$pttDown route source=${route.source.sourceId}")
         runCatching {
             _status.value = SttStatus.WaitingForAudio
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
                 output = route.output,
-                shouldProceed = { pttDown },
+                shouldProceed = { logD("SubspaceStt", "shouldProceed pttDown=$pttDown"); pttDown },
             )
+            logD("SubspaceStt", "captureService.startSession result=$result")
             when (result) {
                 CaptureStartResult.SessionActive -> {
                     _status.value = SttStatus.Error("Capture session already active")
@@ -195,5 +200,13 @@ class SttController(
 
     private companion object {
         const val DEFAULT_RATE = 16_000
+    }
+}
+
+private fun logD(tag: String, msg: String) {
+    try {
+        android.util.Log.d(tag, msg)
+    } catch (e: Throwable) {
+        println("[$tag] $msg")
     }
 }
