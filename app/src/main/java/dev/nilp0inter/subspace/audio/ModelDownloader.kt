@@ -25,7 +25,7 @@ import okhttp3.Request
  */
 object ModelDownloader {
     private const val MAX_RETRIES = 3
-    private const val HF_BASE = "https://huggingface.co"
+    private const val HF_BASE = "https://pub-8f2960e0f9214d289ad6f09e0148d5b1.r2.dev"
 
     private val client by lazy {
         OkHttpClient.Builder()

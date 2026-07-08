@@ -4,7 +4,7 @@ class TelecomCapturePcmOutput(
     private val captureOutput: PcmOutput,
     private val mediaResponsePlayer: ResponsePlayer,
     private val releaseCaptureRoute: suspend () -> Unit,
-    private val awaitTelecomDisconnected: suspend () -> Unit,
+    private val awaitTelecomDisconnected: suspend () -> Unit?,
 ) : PcmOutput {
     override suspend fun playReadyBeep(coldStart: Boolean) {
         captureOutput.playReadyBeep(coldStart)
