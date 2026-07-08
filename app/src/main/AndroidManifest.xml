@@ -43,6 +43,19 @@
             </intent-filter>
         </activity>
 
+        <activity-alias
+            android:name=".AssistantEntryActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/assistant_entry_name"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <action android:name="android.intent.action.VOICE_ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".service.PttForegroundService"
             android:exported="false"

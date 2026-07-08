@@ -10,4 +10,5 @@
     <string name="car_media_finalizing_title">Subspace finalizing</string>
     <string name="car_media_not_ready_title">Subspace not ready</string>
     <string name="telecom_phone_account_description">Subspace car push-to-talk</string>
+    <string name="assistant_entry_name">Subspace Assistant</string>
 </resources>
