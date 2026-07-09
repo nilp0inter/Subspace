@@ -79,6 +79,48 @@ class SttController(
         _status.value = SttStatus.Idle
     }
 
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        pttDown = true
+        transcribeJob?.cancel()
+        transcribeJob = null
+        retainedAfterMaxDuration = null
+        if (enabled) _status.value = SttStatus.Recording
+    }
+
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+        pttDown = false
+        retainedAfterMaxDuration = null
+        if (recording.isEmpty) {
+            _status.value = SttStatus.EmptyAudio
+            return ChannelInputResult.None
+        }
+        _status.value = SttStatus.Transcribing
+        runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
+            .onSuccess { text ->
+                _status.value = SttStatus.Transcribed(text)
+            }
+            .onFailure { error ->
+                if (error is CancellationException) throw error
+                _status.value = when (error) {
+                    TranscriptionException.EmptyInput -> SttStatus.EmptyAudio
+                    is TranscriptionException.Failed -> SttStatus.Error(error.reason)
+                    TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
+                    else -> SttStatus.Error(error.message ?: "Transcription failed")
+                }
+            }
+        return ChannelInputResult.None
+    }
+
+    fun onInputCancelled(reason: String? = null) {
+        transcribeJob?.cancel()
+        retainedAfterMaxDuration = null
+        _status.value = if (reason == null) SttStatus.Cancelled else SttStatus.Error(reason)
+    }
+
+    fun onInputFailed(reason: String) {
+        _status.value = SttStatus.Error(reason)
+    }
+
     private suspend fun startSession(route: ResolvedAudioRoute) {
         logD("SubspaceStt", "startSession entered, pttDown=$pttDown route source=${route.source.sourceId}")
         runCatching {

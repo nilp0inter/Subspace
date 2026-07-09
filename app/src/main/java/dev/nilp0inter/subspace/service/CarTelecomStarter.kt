@@ -46,6 +46,8 @@ internal class CarTelecomStarter(
     private val startIdleTimer: () -> Unit,
     private val isActivePttSession: () -> Boolean,
     private val decidePttDispatch: () -> PttDispatchDecision?,
+    private val reservePendingCarPtt: (String) -> Boolean,
+    private val cancelPendingCarPtt: (String) -> Unit,
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
 ) {
@@ -119,15 +121,23 @@ internal class CarTelecomStarter(
             return
         }
 
+        if (!reservePendingCarPtt(decision.channelId)) {
+            Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=pending-reservation-rejected")
+            return
+        }
         sco.releaseImmediately("car-ptt-start")
         primeCarHfpForTelecom()
         telecomRegistrar.register()
         if (!telecomRegistrar.isEnabled()) {
+            cancelPendingCarPtt("telecom-account-disabled")
             context.startActivity(telecomRegistrar.setupIntent())
             return
         }
 
-        val telecom = context.getSystemService(android.telecom.TelecomManager::class.java) ?: return
+        val telecom = context.getSystemService(android.telecom.TelecomManager::class.java) ?: run {
+            cancelPendingCarPtt("telecom-manager-unavailable")
+            return
+        }
         val extras = Bundle().apply {
             putParcelable(
                 android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE,
@@ -139,6 +149,7 @@ internal class CarTelecomStarter(
             telecom.placeCall(telecomRegistrar.callAddress(), extras)
         }.onFailure {
             if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
+            cancelPendingCarPtt("place-call-failed")
             playCarErrorBeep()
         }
     }

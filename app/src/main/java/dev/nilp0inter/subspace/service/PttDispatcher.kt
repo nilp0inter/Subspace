@@ -3,15 +3,15 @@ package dev.nilp0inter.subspace.service
 import android.util.Log
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
-import dev.nilp0inter.subspace.audio.routeDebugString
 import dev.nilp0inter.subspace.audio.ScoAudioController
+import dev.nilp0inter.subspace.audio.routeDebugString
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.KeyboardChannel
 import dev.nilp0inter.subspace.model.PttSource
+import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
-import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
-import dev.nilp0inter.subspace.model.KeyboardChannel
 
 /**
  * Encapsulates PTT press/release dispatch and session tracking.
@@ -23,7 +23,7 @@ internal class PttDispatcher(
     private val serviceScope: CoroutineScope,
     private val sco: ScoAudioController,
     private val inputModeController: InputModeController,
-    private val channelRouter: ChannelRouter,
+    private val audioSessionManager: PttAudioSessionManager,
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
     private val cancelIdleTimer: () -> Unit,
@@ -33,24 +33,21 @@ internal class PttDispatcher(
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
 ) {
-    /** Active PTT session — tracks the current source, channel, and route. */
-    var activePttSession: PttSession? = null
-        private set
+    val activePttSession: PttAudioSessionManager.SessionSnapshot?
+        get() = audioSessionManager.activeSession
 
-    data class PttSession(
-        val source: PttSource,
-        val channelId: String,
-        val route: ResolvedAudioRoute,
-    )
+    fun reservePendingPtt(source: PttSource, channelId: String): Boolean =
+        audioSessionManager.reservePending(source, channelId, inputModeController.mode)
 
     fun dispatchPttPressed(source: PttSource): Boolean {
         Log.d(
             ROUTE_LOG_TAG,
-            "PTT_PRESS_BEGIN source=$source activeSession=${activePttSession != null} " +
+            "PTT_PRESS_BEGIN source=$source activeSession=${audioSessionManager.isActive} " +
                 "modeBefore=${inputModeController.mode} availability=${inputModeController.availability}",
         )
         logAudioRouteSnapshot("ptt-press-begin-$source")
-        if (activePttSession != null) {
+        val pendingSameSource = activePttSession?.source == source
+        if (audioSessionManager.isActive && !pendingSameSource) {
             Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=active-session")
             return false
         }
@@ -78,9 +75,9 @@ internal class PttDispatcher(
         Log.d(ROUTE_LOG_TAG, "PTT_DECIDE decision=${decision?.let { it::class.simpleName }} channel=${decision?.channelId}")
         if (decision == null) return false
         val activeChannelId = decision.channelId
-        val route = resolvePttAudioRoute(inputModeController.mode)
 
         if (decision is PttDispatchDecision.ErrorBeep) {
+            val route = resolvePttAudioRoute(inputModeController.mode)
             Log.d(
                 ROUTE_LOG_TAG,
                 "PTT_ERROR_BEEP source=$source reason=dispatch-decision route=${route.routeDebugString()}",
@@ -91,25 +88,24 @@ internal class PttDispatcher(
             return false
         }
 
-        activePttSession = PttSession(
+        val started = audioSessionManager.start(
             source = source,
             channelId = activeChannelId,
-            route = route,
+            mode = inputModeController.mode,
         )
+        if (!started) {
+            Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=session-start-rejected")
+            return false
+        }
 
-        Log.d(ROUTE_LOG_TAG, "PTT_DISPATCH channel=${activeChannelId} route=${route.routeDebugString()}")
-        channelRouter.onPttPressed(activeChannelId, route)
+        Log.d(ROUTE_LOG_TAG, "PTT_DISPATCH channel=$activeChannelId mode=${inputModeController.mode}")
         updateCarMediaState()
         return true
     }
 
     fun dispatchPttReleased(source: PttSource) {
         val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
-        activePttSession = null
-        val activeChannelId = session.channelId
-        val route = session.route
-
-        channelRouter.onPttReleased(activeChannelId, route)
+        audioSessionManager.release(source)
 
         if (inputModeController.mode == InputMode.OnTheRoad) {
             startIdleTimer()
@@ -120,10 +116,11 @@ internal class PttDispatcher(
     /** Forcefully abort the current PTT session (regardless of source). */
     fun forceReleaseActivePtt() {
         val session = activePttSession ?: return
-        activePttSession = null
         cancelIdleTimer()
-        channelRouter.cancelAndRelease(session.channelId)
-        TelecomCarPttCoordinator.forceAbort()
+        audioSessionManager.cancelActive("Force release")
+        if (session.source == PttSource.CarTelecom) {
+            TelecomCarPttCoordinator.forceAbort()
+        }
         updateCarMediaState()
     }
 
@@ -132,6 +129,4 @@ internal class PttDispatcher(
 
     fun isKeyguardSession(): Boolean =
         activePttSession?.channelId == KeyboardChannel.ID
-
-    fun activeRoute(): ResolvedAudioRoute? = activePttSession?.route
 }

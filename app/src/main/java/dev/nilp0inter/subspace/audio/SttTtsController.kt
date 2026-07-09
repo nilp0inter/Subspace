@@ -99,6 +99,101 @@ class SttTtsController(
         _status.value = SttTtsStatus.Idle
     }
 
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        pttDown = true
+        transcribeJob?.cancel()
+        transcribeJob = null
+        retainedAfterMaxDuration = null
+        if (enabled) _status.value = SttTtsStatus.Recording
+    }
+
+    suspend fun onInputReleased(
+        recording: RecordedPcm,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ): ChannelInputResult {
+        pttDown = false
+        retainedAfterMaxDuration = null
+        if (recording.isEmpty) {
+            _status.value = SttTtsStatus.EmptyAudio
+            return ChannelInputResult.None
+        }
+        _status.value = SttTtsStatus.Transcribing
+        val samples = SttAudio.toParakeetInput(recording)
+        return when (val transcriptOutcome = withContext(transcriptionDispatcher) { transcriber.transcribe(samples) }) {
+            is TranscriptionOutcome.Success -> {
+                val transcript = transcriptOutcome.text
+                if (transcript.isBlank()) {
+                    _status.value = SttTtsStatus.EmptyTranscript
+                    ChannelInputResult.None
+                } else {
+                    _status.value = SttTtsStatus.Transcript(transcript)
+                    _status.value = SttTtsStatus.Synthesizing
+                    val synthRequest = SynthesisRequest(
+                        text = transcript,
+                        voiceStylePath = voiceStylePath,
+                        lang = lang,
+                        totalSteps = totalSteps,
+                        speed = speed,
+                    )
+                    when (val synthOutcome = withContext(synthesisDispatcher) { synthesizer.synthesize(synthRequest) }) {
+                        is SynthesisOutcome.Success -> {
+                            if (synthOutcome.samples.isEmpty()) {
+                                _status.value = SttTtsStatus.Error("Synthesis produced no audio")
+                                ChannelInputResult.None
+                            } else {
+                                _status.value = SttTtsStatus.Playing
+                                val playback = TtsAudio.toScoPlayback(synthOutcome.samples, scoRate)
+                                if (playback.isEmpty) ChannelInputResult.None else ChannelInputResult.Playback(playback)
+                            }
+                        }
+                        is SynthesisOutcome.ModelNotReady -> {
+                            _status.value = SttTtsStatus.Error("TTS model not ready")
+                            ChannelInputResult.None
+                        }
+                        is SynthesisOutcome.Failure -> {
+                            _status.value = SttTtsStatus.Error(synthOutcome.reason)
+                            ChannelInputResult.None
+                        }
+                        SynthesisOutcome.EmptyText -> {
+                            _status.value = SttTtsStatus.EmptyTranscript
+                            ChannelInputResult.None
+                        }
+                    }
+                }
+            }
+            is TranscriptionOutcome.Failure -> {
+                _status.value = SttTtsStatus.Error("Transcription failed: ${transcriptOutcome.reason}")
+                ChannelInputResult.None
+            }
+            TranscriptionOutcome.ModelNotReady -> {
+                _status.value = SttTtsStatus.Error("STT model not ready")
+                ChannelInputResult.None
+            }
+            TranscriptionOutcome.EmptyInput -> {
+                _status.value = SttTtsStatus.EmptyAudio
+                ChannelInputResult.None
+            }
+        }
+    }
+
+    fun onInputPlaybackCompleted() {
+        _status.value = SttTtsStatus.Idle
+    }
+
+    fun onInputCancelled(reason: String? = null) {
+        transcribeJob?.cancel()
+        retainedAfterMaxDuration = null
+        _status.value = if (reason == null) SttTtsStatus.Cancelled else SttTtsStatus.Error(reason)
+    }
+
+    fun onInputFailed(reason: String) {
+        _status.value = SttTtsStatus.Error(reason)
+    }
+
     private suspend fun startSession(route: ResolvedAudioRoute) {
         logD("SubspaceSttTts", "startSession entered, pttDown=$pttDown route source=${route.source.sourceId}")
         runCatching {

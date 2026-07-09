@@ -117,6 +117,74 @@ class TtsController(
         _status.value = TtsStatus.Idle
     }
 
+    suspend fun onInputReleased(
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ): ChannelInputResult {
+        if (!enabled) return ChannelInputResult.None
+        if (text.isBlank()) {
+            _status.value = TtsStatus.EmptyText
+            return ChannelInputResult.None
+        }
+        return synthesizePlayback(text, voiceStylePath, lang, totalSteps, speed, scoRate)
+    }
+
+    fun onInputPlaybackCompleted() {
+        _status.value = TtsStatus.Idle
+    }
+
+    private suspend fun synthesizePlayback(
+        text: String,
+        voiceStylePath: String,
+        lang: String,
+        totalSteps: Int,
+        speed: Float,
+        scoRate: Int,
+    ): ChannelInputResult {
+        return try {
+            _status.value = TtsStatus.Synthesizing
+            val request = SynthesisRequest(
+                text = text,
+                voiceStylePath = voiceStylePath,
+                lang = lang,
+                totalSteps = totalSteps,
+                speed = speed,
+            )
+            when (val outcome = withContext(synthesisDispatcher) { synthesizer.synthesize(request) }) {
+                is SynthesisOutcome.Success -> {
+                    if (outcome.samples.isEmpty()) {
+                        _status.value = TtsStatus.Error("Synthesis produced no audio")
+                        ChannelInputResult.None
+                    } else {
+                        _status.value = TtsStatus.Playing
+                        val playback = TtsAudio.toScoPlayback(outcome.samples, scoRate)
+                        if (playback.isEmpty) ChannelInputResult.None else ChannelInputResult.Playback(playback)
+                    }
+                }
+                is SynthesisOutcome.ModelNotReady -> {
+                    _status.value = TtsStatus.Error("TTS model not ready")
+                    ChannelInputResult.None
+                }
+                is SynthesisOutcome.Failure -> {
+                    _status.value = TtsStatus.Error(outcome.reason)
+                    ChannelInputResult.None
+                }
+                SynthesisOutcome.EmptyText -> {
+                    _status.value = TtsStatus.EmptyText
+                    ChannelInputResult.None
+                }
+            }
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
+            ChannelInputResult.None
+        }
+    }
+
     private suspend fun runSynthesis(
         text: String,
         voiceStylePath: String,

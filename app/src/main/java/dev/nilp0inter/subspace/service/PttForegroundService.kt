@@ -28,6 +28,9 @@ import dev.nilp0inter.subspace.audio.AndroidVoiceCommunicationCaptureSource
 import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
+import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
@@ -189,6 +192,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var telecomRegistrar: SubspacePhoneAccountRegistrar
     private lateinit var mediaResponsePlayer: MediaResponsePlayer
     private lateinit var carTelecomStarter: CarTelecomStarter
+    private lateinit var audioSessionManager: PttAudioSessionManager
     private lateinit var pttDispatcher: PttDispatcher
     private lateinit var controllerRegistry: PttControllerRegistry
     private val inputModeController = InputModeController()
@@ -255,6 +259,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         telecomRegistrar = SubspacePhoneAccountRegistrar(this)
         telecomRegistrar.register()
         mediaResponsePlayer = MediaResponsePlayer(audioManager, localOutput)
+        audioSessionManager = PttAudioSessionManager(
+            scope = serviceScope,
+            captureService = captureService,
+            channelRouter = this,
+            resolvePttAudioRoute = ::resolvePttAudioRoute,
+        )
         carTelecomStarter = CarTelecomStarter(
             context = this,
             serviceScope = serviceScope,
@@ -270,6 +280,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             startIdleTimer = ::startIdleTimer,
             isActivePttSession = { pttDispatcher.activePttSession != null },
             decidePttDispatch = { decidePttDispatch(_appState.value) },
+            reservePendingCarPtt = { channelId ->
+                pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId)
+            },
+            cancelPendingCarPtt = {
+                pttDispatcher.forceReleaseActivePtt()
+            },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
             updateCarMediaState = ::updateCarMediaState,
         )
@@ -277,7 +293,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             serviceScope = serviceScope,
             sco = sco,
             inputModeController = inputModeController,
-            channelRouter = this,
+            audioSessionManager = audioSessionManager,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
             cancelIdleTimer = ::cancelIdleTimer,
@@ -941,11 +957,15 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
     override fun onTelecomRouteTimeout() {
+        pttDispatcher.forceReleaseActivePtt()
         carTelecomStarter.playCarErrorBeep()
         carTelecomStarter.notifyTelecomDisconnected()
         updateCarMediaState()
     }
     override fun onTelecomConnectionEnded() {
+        if (pttDispatcher.activePttSession?.source == PttSource.CarTelecom) {
+            pttDispatcher.forceReleaseActivePtt()
+        }
         carTelecomStarter.notifyTelecomDisconnected()
         startIdleTimer()
         updateCarMediaState()
@@ -1423,25 +1443,42 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     // -- ChannelRouter implementation --------------------------------------------------
 
-    override fun onPttPressed(channelId: String, route: ResolvedAudioRoute) {
-        Log.d(ROUTE_LOG_TAG, "CHANNEL_PTT_PRESSED channel=$channelId mode=${_appState.value.debugChannel.mode} " +
-            "stt=${sttController != null}(e=${sttController?.enabled}) " +
-            "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
-            "tts=${ttsController != null}(e=${ttsController?.enabled})")
+    override fun onInputStarted(channelId: String, session: ChannelAudioInputSession) {
+        Log.d(
+            ROUTE_LOG_TAG,
+            "CHANNEL_INPUT_STARTED channel=$channelId mode=${_appState.value.debugChannel.mode} " +
+                "stt=${sttController != null}(e=${sttController?.enabled}) " +
+                "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
+                "tts=${ttsController != null}(e=${ttsController?.enabled})",
+        )
         when (channelId) {
-            JournalChannel.ID -> journalPttController?.onPttPressed(route)
-            KeyboardChannel.ID -> keyboardController?.onPttPressed(route)
+            JournalChannel.ID -> journalPttController?.onInputStarted(session)
+            KeyboardChannel.ID -> keyboardController?.onInputStarted(session)
             DebugChannel.ID -> {
                 when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttPressed(route)
-                    DebugMode.STT -> sttController?.onPttPressed(route)
+                    DebugMode.ECHO -> echo.onInputStarted(session)
+                    DebugMode.STT -> sttController?.onInputStarted(session)
+                    DebugMode.TTS -> Unit
+                    DebugMode.STT_TTS -> sttTtsController?.onInputStarted(session)
+                }
+            }
+        }
+    }
+
+    override suspend fun onInputReleased(channelId: String, recording: RecordedPcm): ChannelInputResult {
+        return when (channelId) {
+            JournalChannel.ID -> journalPttController?.onInputReleased(recording) ?: ChannelInputResult.None
+            KeyboardChannel.ID -> keyboardController?.onInputReleased(recording) ?: ChannelInputResult.None
+            DebugChannel.ID -> {
+                when (_appState.value.debugChannel.mode) {
+                    DebugMode.ECHO -> echo.onInputReleased(recording)
+                    DebugMode.STT -> sttController?.onInputReleased(recording) ?: ChannelInputResult.None
                     DebugMode.TTS -> {
                         val monitor = _appState.value.monitor
                         val tts = ttsController
                         val modelDir = supertonicModelDir
                         if (tts != null && modelDir != null) {
-                            tts.onPttPressed(
-                                route = route,
+                            tts.onInputReleased(
                                 text = monitor.ttsText,
                                 voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath,
                                 lang = monitor.ttsLang,
@@ -1449,53 +1486,71 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                                 speed = monitor.ttsSpeed,
                                 scoRate = SCO_RATE,
                             )
+                        } else {
+                            ChannelInputResult.None
                         }
                     }
-                    DebugMode.STT_TTS -> sttTtsController?.onPttPressed(route)
-                }
-            }
-        }
-    }
-
-    override fun onPttReleased(channelId: String, route: ResolvedAudioRoute) {
-        when (channelId) {
-            JournalChannel.ID -> journalPttController?.onPttReleased(route)
-            KeyboardChannel.ID -> keyboardController?.onPttReleased(route)
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttReleased(route)
-                    DebugMode.STT -> sttController?.onPttReleased(route)
-                    DebugMode.TTS -> ttsController?.onPttReleased()
                     DebugMode.STT_TTS -> {
                         val monitor = _appState.value.monitor
                         val sttTts = sttTtsController
                         val modelDir = supertonicModelDir
                         if (sttTts != null && modelDir != null) {
-                            sttTts.onPttReleased(
-                                route,
+                            sttTts.onInputReleased(
+                                recording,
                                 voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath,
                                 lang = monitor.sttTtsLang,
                                 totalSteps = monitor.sttTtsTotalSteps,
                                 speed = monitor.sttTtsSpeed,
                                 scoRate = SCO_RATE,
                             )
+                        } else {
+                            ChannelInputResult.None
                         }
                     }
+                }
+            }
+            else -> ChannelInputResult.None
+        }
+    }
+
+    override fun onInputPlaybackCompleted(channelId: String) {
+        when (channelId) {
+            DebugChannel.ID -> {
+                when (_appState.value.debugChannel.mode) {
+                    DebugMode.ECHO -> echo.onInputPlaybackCompleted()
+                    DebugMode.TTS -> ttsController?.onInputPlaybackCompleted()
+                    DebugMode.STT_TTS -> sttTtsController?.onInputPlaybackCompleted()
+                    else -> Unit
                 }
             }
         }
     }
 
-    override fun cancelAndRelease(channelId: String) {
+    override fun onInputCancelled(channelId: String, reason: String) {
         when (channelId) {
-            JournalChannel.ID -> journalPttController?.cancelAndRelease()
-            KeyboardChannel.ID -> keyboardController?.cancelAndRelease()
+            JournalChannel.ID -> journalPttController?.onInputCancelled()
+            KeyboardChannel.ID -> keyboardController?.onInputCancelled(reason)
             DebugChannel.ID -> {
                 when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.cancelAndRelease()
-                    DebugMode.STT -> sttController?.cancelAndRelease()
+                    DebugMode.ECHO -> echo.onInputCancelled(reason)
+                    DebugMode.STT -> sttController?.onInputCancelled(reason)
                     DebugMode.TTS -> ttsController?.cancelAndRelease()
-                    DebugMode.STT_TTS -> sttTtsController?.cancelAndRelease()
+                    DebugMode.STT_TTS -> sttTtsController?.onInputCancelled(reason)
+                }
+            }
+        }
+    }
+
+    override fun onInputFailed(channelId: String, reason: String) {
+        when (channelId) {
+            JournalChannel.ID -> journalPttController?.onInputFailed()
+            KeyboardChannel.ID -> keyboardController?.onInputFailed(reason)
+            DebugChannel.ID -> {
+                when (_appState.value.debugChannel.mode) {
+                    DebugMode.ECHO -> echo.onInputFailed(reason)
+                    DebugMode.STT -> sttController?.onInputFailed(reason)
+                    DebugMode.TTS -> Unit
+                    DebugMode.STT_TTS -> sttTtsController?.onInputFailed(reason)
                 }
             }
         }

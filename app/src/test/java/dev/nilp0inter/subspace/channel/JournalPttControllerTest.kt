@@ -146,6 +146,54 @@ class JournalPttControllerTest {
         )
     }
 
+    @Test
+    fun sequentialSessionsProduceTwoRecordingFiles() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = ContinuousFakeSource(sampleRate = 16_000)
+        val output = FakeOutput()
+        val journalController = journalController()
+        val channel = JournalChannel(baseDirectory = baseDir.absolutePath)
+        val controller = JournalPttController(
+            scope = this,
+            sco = sco,
+            output = output,
+            captureService = captureService,
+            source = source,
+            journal = journalController,
+            channelProvider = { channel },
+        )
+
+        // 1. First session start and release
+        controller.onPttPressed()
+        runCurrent()
+        advanceTimeBy(100)
+        runCurrent()
+        controller.onPttReleased()
+        runCurrent()
+        awaitReleaseRoute(output, expected = 1)
+
+        // 2. New session starts on a new route
+        val newRoute = ResolvedAudioRoute(
+            sco = FakeScoRoute(),
+            output = FakeOutput(),
+            source = source,
+        )
+        controller.onPttPressed(newRoute)
+        runCurrent()
+        advanceTimeBy(100)
+        runCurrent()
+        controller.onPttReleased(newRoute)
+        runCurrent()
+        awaitReleaseRoute(newRoute.output as FakeOutput, expected = 1)
+
+        // 3. Verify that both OGG/JSON files were produced
+        val oggFiles = baseDir.walkTopDown().filter { it.isFile && it.extension == "ogg" }.toList()
+        assertEquals("Two OGG recording files must be produced", 2, oggFiles.size)
+        val jsonFiles = baseDir.walkTopDown().filter { it.isFile && it.extension == "json" }.toList()
+        assertEquals("Two metadata JSON files must be produced", 2, jsonFiles.size)
+    }
+
     private suspend fun TestScope.awaitReleaseRoute(output: FakeOutput, expected: Int) {
         // finishSession uses withContext(Dispatchers.IO) which runs on a
         // real thread pool outside the test scheduler. advanceUntilIdle

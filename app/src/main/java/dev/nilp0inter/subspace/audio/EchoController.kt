@@ -72,6 +72,47 @@ class EchoController(
         _status.value = if (reason == null) EchoStatus.Idle else EchoStatus.Error(reason)
     }
 
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        pttDown = true
+        retainedAfterMaxDuration = null
+        if (enabled) _status.value = EchoStatus.Recording
+    }
+
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+        pttDown = false
+        if (recording.isEmpty) {
+            _status.value = EchoStatus.Cancelled
+            return ChannelInputResult.None
+        }
+        _status.value = EchoStatus.Playback
+        return ChannelInputResult.Playback(recording)
+    }
+
+    fun onInputPlaybackCompleted() {
+        _status.value = EchoStatus.Warm
+        scope.launch {
+            delay(COOLDOWN_MS)
+            if (_status.value == EchoStatus.Warm) {
+                _status.value = EchoStatus.Idle
+            }
+        }
+    }
+
+    fun onInputCancelled(reason: String? = null) {
+        retainedAfterMaxDuration = null
+        _status.value = if (reason == null) EchoStatus.Cancelled else EchoStatus.Error(reason)
+        scope.launch {
+            delay(COOLDOWN_MS)
+            if (_status.value == EchoStatus.Cancelled) {
+                _status.value = EchoStatus.Idle
+            }
+        }
+    }
+
+    fun onInputFailed(reason: String) {
+        _status.value = EchoStatus.Error(reason)
+    }
+
     private suspend fun startEchoSession(route: ResolvedAudioRoute) {
         runCatching {
             _status.value = EchoStatus.WaitingForAudio

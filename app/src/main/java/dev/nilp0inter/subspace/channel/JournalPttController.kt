@@ -4,6 +4,8 @@ import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.CaptureSession
 import dev.nilp0inter.subspace.audio.CaptureSource
 import dev.nilp0inter.subspace.audio.CaptureStartResult
+import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
+import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.JournalWavWriter
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
@@ -76,6 +78,68 @@ class JournalPttController(
         activeEntryPaths = null
         activeChannel = null
         scope.launch { output.releaseRoute() }
+    }
+
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        val channel = channelProvider()
+        if (!channel.isReady) return
+        val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() } ?: return
+        val startedAt = ZonedDateTime.now()
+        val paths = pathGenerator.preparePaths(File(baseDirectory), startedAt)
+        val writer = JournalWavWriter(paths.captureFile, session.sampleRate)
+        framesJob = scope.launch {
+            session.frames.collect { chunk ->
+                writer.writeChunk(chunk)
+            }
+        }
+        activeWavWriter = writer
+        activeEntryPaths = paths
+        activeChannel = channel
+        metadataStore.write(
+            JournalEntryMetadata(
+                entryId = paths.stem,
+                startedAt = startedAt.toString(),
+                timezoneOffset = paths.timezoneOffset,
+                channel = MetadataChannelSnapshot(
+                    id = channel.id,
+                    saveVoice = channel.saveVoice,
+                    saveText = channel.saveText,
+                ),
+                capture = CaptureState(state = CaptureTaskState.recording),
+            ),
+            paths.metadataFile,
+        )
+    }
+
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+        val paths = activeEntryPaths ?: return ChannelInputResult.None
+        val channel = activeChannel ?: return ChannelInputResult.None
+        val writer = activeWavWriter ?: return ChannelInputResult.None
+        val fJob = framesJob
+        activeWavWriter = null
+        activeEntryPaths = null
+        activeChannel = null
+        framesJob = null
+        withContext(Dispatchers.IO) {
+            fJob?.cancelAndJoin()
+            writer.finalize()
+            writeTerminalMetadata(paths, channel)
+            journal.processCaptureFile(paths)
+        }
+        return ChannelInputResult.None
+    }
+
+    fun onInputCancelled() {
+        framesJob?.cancel()
+        framesJob = null
+        activeWavWriter?.finalize()
+        activeWavWriter = null
+        activeEntryPaths = null
+        activeChannel = null
+    }
+
+    fun onInputFailed() {
+        onInputCancelled()
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {
@@ -159,10 +223,12 @@ class JournalPttController(
         val channel = activeChannel ?: return
         val session = activeSession ?: return
         val writer = activeWavWriter ?: return
+        val fJob = framesJob
         activeSession = null
         activeWavWriter = null
         activeEntryPaths = null
         activeChannel = null
+        framesJob = null
 
         scope.launch {
             // Preserve current behavior: a no-op play call for the non-telecom
@@ -175,8 +241,7 @@ class JournalPttController(
                 // Join the frames collector before finalizing so the
                 // collector has fully unwound before the file is closed
                 // (D6 layer 2). The thread-safe writer is the safety net.
-                framesJob?.cancelAndJoin()
-                framesJob = null
+                fJob?.cancelAndJoin()
                 session.stop()
                 writer.finalize()
                 val captureFile = paths.captureFile
@@ -241,6 +306,68 @@ class JournalPttController(
         }
     }
 
+
+    private fun writeTerminalMetadata(
+        paths: JournalEntryPaths.EntryPaths,
+        channel: JournalChannel,
+    ) {
+        val captureFile = paths.captureFile
+        val wavInfo = WavPcmReader.read(captureFile)
+        if (wavInfo != null && wavInfo.samples.isNotEmpty()) {
+            metadataStore.write(
+                JournalEntryMetadata(
+                    entryId = paths.stem,
+                    startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                    endedAt = ZonedDateTime.now().toString(),
+                    timezoneOffset = paths.timezoneOffset,
+                    channel = MetadataChannelSnapshot(
+                        id = channel.id,
+                        saveVoice = channel.saveVoice,
+                        saveText = channel.saveText,
+                    ),
+                    capture = CaptureState(
+                        state = CaptureTaskState.finished,
+                        path = captureFile.name,
+                        sampleRate = wavInfo.sampleRate,
+                        channels = wavInfo.channelCount,
+                        encoding = "pcm_s16le",
+                        durationMs = wavInfo.durationMs,
+                        bytes = wavInfo.dataSize,
+                    ),
+                    encoding = if (channel.saveVoice)
+                        DerivedTaskState(state = DerivedTaskStatus.pending)
+                    else
+                        DerivedTaskState(state = DerivedTaskStatus.skipped),
+                    transcription = if (channel.saveText)
+                        DerivedTaskState(state = DerivedTaskStatus.pending)
+                    else
+                        DerivedTaskState(state = DerivedTaskStatus.skipped),
+                ),
+                paths.metadataFile,
+            )
+        } else {
+            metadataStore.write(
+                JournalEntryMetadata(
+                    entryId = paths.stem,
+                    startedAt = readStartedAt(metadataStore, paths.metadataFile) ?: ZonedDateTime.now().toString(),
+                    endedAt = ZonedDateTime.now().toString(),
+                    timezoneOffset = paths.timezoneOffset,
+                    channel = MetadataChannelSnapshot(
+                        id = channel.id,
+                        saveVoice = channel.saveVoice,
+                        saveText = channel.saveText,
+                    ),
+                    capture = CaptureState(
+                        state = CaptureTaskState.failed,
+                        error = if (wavInfo == null) "WAV read failed" else "Empty capture",
+                    ),
+                    encoding = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                    transcription = DerivedTaskState(state = DerivedTaskStatus.skipped),
+                ),
+                paths.metadataFile,
+            )
+        }
+    }
     private fun readStartedAt(store: JournalMetadataStore, file: File): String? =
         store.read(file)?.startedAt
 }
