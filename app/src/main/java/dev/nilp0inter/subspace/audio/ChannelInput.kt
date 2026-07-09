@@ -19,6 +19,20 @@ sealed interface ChannelInputResult {
     data class Playback(val recording: RecordedPcm) : ChannelInputResult
 }
 
+sealed interface ChannelInputAcceptance {
+    data class Accepted(val target: ChannelInputTarget) : ChannelInputAcceptance
+    data class Refused(val reason: String) : ChannelInputAcceptance
+    data class Unavailable(val reason: String) : ChannelInputAcceptance
+}
+
+interface ChannelInputTarget {
+    fun onInputStarted(session: ChannelAudioInputSession)
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult
+    fun onInputPlaybackCompleted() {}
+    fun onInputCancelled(reason: String)
+    fun onInputFailed(reason: String)
+}
+
 internal class CaptureChannelAudioInputSession(
     private val delegate: CaptureSession,
 ) : ChannelAudioInputSession {

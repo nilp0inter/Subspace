@@ -289,14 +289,14 @@ class CaptureServiceTest {
     }
 
     @Test
-    fun shouldProceedFalseAfterBeepCancelsBeforeRecording() = runTest {
+    fun shouldProceedFalseAfterPreflightCancelsBeforeBeep() = runTest {
         val service = captureService()
         val source = FakeSource(continuous = true)
         val sco = FakeScoRoute()
         val output = FakeOutput()
 
-        // First predicate call (after SCO acquire) returns true → beep plays.
-        // Second predicate call (after beep) returns false → cancelled.
+        // First predicate call (after SCO acquire) returns true → source preflight opens.
+        // Second predicate call (after preflight) returns false → no beep, no recording.
         var predicateCalls = 0
         val result = service.startSession(source, sco, output) {
             predicateCalls += 1
@@ -304,10 +304,10 @@ class CaptureServiceTest {
         }
 
         assertEquals(CaptureStartResult.Cancelled, result)
-        assertEquals(1, output.readyBeepCount)
-        assertEquals(0, source.openCount)
+        assertEquals(0, output.readyBeepCount)
+        assertEquals(1, source.openCount)
         assertEquals(
-            "service must release SCO on Cancelled after beep (PTT released during beep)",
+            "service must release SCO on Cancelled after preflight before beep",
             1,
             sco.releaseCount,
         )
@@ -323,10 +323,10 @@ class CaptureServiceTest {
         val result = service.startSession(source, sco, output) { true }
 
         assertEquals(CaptureStartResult.RecordingFailed, result)
-        assertEquals(1, output.readyBeepCount)
+        assertEquals(0, output.readyBeepCount)
         assertFalse(service.isCapturing.value)
         assertEquals(
-            "service must release SCO on RecordingFailed (source open returned null after beep)",
+            "service must release SCO on RecordingFailed (source open returned null before beep)",
             1,
             sco.releaseCount,
         )

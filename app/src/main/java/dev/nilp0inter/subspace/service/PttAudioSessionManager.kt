@@ -2,13 +2,15 @@ package dev.nilp0inter.subspace.service
 
 import android.util.Log
 import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
-import dev.nilp0inter.subspace.audio.CaptureService
-import dev.nilp0inter.subspace.audio.CaptureStartResult
-import dev.nilp0inter.subspace.audio.CaptureSession
-import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.CaptureChannelAudioInputSession
-import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
+import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.audio.CaptureSession
+import dev.nilp0inter.subspace.audio.CaptureStartResult
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
+import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
+import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.routeDebugString
@@ -82,10 +84,8 @@ internal class PttAudioSessionManager(
         session.cancelRequested = true
         val capture = session.captureSession
         if (capture == null) {
-            if (session.route == null && session.setupJob == null) {
-                channelRouter.onInputCancelled(session.channelId, reason)
-                clearIfActive(session)
-            }
+            session.channelTarget?.onInputCancelled(reason)
+            clearIfActive(session)
             return
         }
         scope.launch { cancelRunningSession(session, capture, reason) }
@@ -119,6 +119,19 @@ internal class PttAudioSessionManager(
                     return
                 }
             }
+            val target = when (val acceptance = channelRouter.prepareInput(channelId)) {
+                is ChannelInputAcceptance.Accepted -> acceptance.target
+                is ChannelInputAcceptance.Refused -> {
+                    failSetup(session, acceptance.reason)
+                    return
+                }
+                is ChannelInputAcceptance.Unavailable -> {
+                    failSetup(session, acceptance.reason)
+                    return
+                }
+            }
+            if (active !== session) return
+            session.channelTarget = target
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
@@ -151,10 +164,7 @@ internal class PttAudioSessionManager(
                         completeRelease(session, recording, cancelled = session.cancelRequested)
                     } else {
                         session.captureSession = result.session
-                        channelRouter.onInputStarted(
-                            channelId,
-                            CaptureChannelAudioInputSession(result.session),
-                        )
+                        target.onInputStarted(CaptureChannelAudioInputSession(result.session))
                     }
                 }
             }
@@ -170,8 +180,9 @@ internal class PttAudioSessionManager(
         reason: String,
         releaseRoute: Boolean = true,
     ) {
+        playProblemBeep(session)
         if (releaseRoute) releaseRouteOnce(session)
-        channelRouter.onInputFailed(session.channelId, reason)
+        session.channelTarget?.onInputFailed(reason)
         clearIfActive(session)
     }
 
@@ -180,8 +191,9 @@ internal class PttAudioSessionManager(
         reason: String,
         releaseRoute: Boolean,
     ) {
+        playProblemBeep(session)
         if (releaseRoute) releaseRouteOnce(session)
-        channelRouter.onInputCancelled(session.channelId, reason)
+        session.channelTarget?.onInputCancelled(reason)
         clearIfActive(session)
     }
 
@@ -202,7 +214,7 @@ internal class PttAudioSessionManager(
         session.releasing = true
         session.captureSession = null
         val recording = captureService.cancelSession(capture)
-        channelRouter.onInputCancelled(session.channelId, reason)
+        session.channelTarget?.onInputCancelled(reason)
         releaseRouteOnce(session)
         clearIfActive(session)
         if (!recording.isEmpty) logRoute("AUDIO_SESSION_CANCEL_DROPPED_PCM id=${session.id} samples=${recording.samples.size}")
@@ -215,16 +227,17 @@ internal class PttAudioSessionManager(
     ) {
         if (active !== session) return
         if (cancelled) {
-            channelRouter.onInputCancelled(session.channelId, "Cancelled")
+            session.channelTarget?.onInputCancelled("Cancelled")
         } else {
-            val played = when (val result = channelRouter.onInputReleased(session.channelId, recording)) {
+            val target = session.channelTarget
+            val played = when (val result = target?.onInputReleased(recording) ?: ChannelInputResult.None) {
                 ChannelInputResult.None -> false
                 is ChannelInputResult.Playback -> {
                     session.route?.output?.play(result.recording)
                     true
                 }
             }
-            if (played) channelRouter.onInputPlaybackCompleted(session.channelId)
+            if (played) target?.onInputPlaybackCompleted()
         }
         releaseRouteOnce(session)
         clearIfActive(session)
@@ -234,6 +247,11 @@ internal class PttAudioSessionManager(
     private fun logRoute(message: String) {
         runCatching { Log.d(ROUTE_LOG_TAG, message) }
     }
+    private suspend fun playProblemBeep(session: ActiveSession) {
+        val route = session.route ?: return
+        runCatching { route.output.playErrorBeep(route.sco.coldStart) }
+    }
+
     private suspend fun releaseRouteOnce(session: ActiveSession) {
         if (session.routeReleased) return
         session.routeReleased = true
@@ -256,6 +274,7 @@ internal class PttAudioSessionManager(
         val source: PttSource,
         val channelId: String,
         val mode: InputMode,
+        var channelTarget: ChannelInputTarget? = null,
         var route: ResolvedAudioRoute? = null,
         var captureSession: CaptureSession? = null,
         var setupJob: Job? = null,

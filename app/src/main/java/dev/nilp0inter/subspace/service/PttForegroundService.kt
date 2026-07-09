@@ -29,7 +29,9 @@ import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
@@ -251,7 +253,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             isTargetRsmHfpAudioConnected = ::isTargetRsmHfpAudioConnected,
         )
         pcmOutput = AndroidPcmOutput(audioManager, sco::selectedCommunicationDevice)
-        telecomCaptureOutput = AndroidPcmOutput(audioManager)
+        telecomCaptureOutput = AndroidPcmOutput(audioManager, requireActiveScoCommunicationDevice = false)
         localOutput = LocalPcmOutput()
         micSource = AndroidMicCaptureSource()
         captureService = CaptureService(serviceScope)
@@ -1444,114 +1446,164 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     // -- ChannelRouter implementation --------------------------------------------------
 
-    override fun onInputStarted(channelId: String, session: ChannelAudioInputSession) {
+    override fun prepareInput(channelId: String): ChannelInputAcceptance {
         Log.d(
             ROUTE_LOG_TAG,
-            "CHANNEL_INPUT_STARTED channel=$channelId mode=${_appState.value.debugChannel.mode} " +
+            "CHANNEL_INPUT_PREPARE channel=$channelId mode=${_appState.value.debugChannel.mode} " +
                 "stt=${sttController != null}(e=${sttController?.enabled}) " +
                 "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
                 "tts=${ttsController != null}(e=${ttsController?.enabled})",
         )
-        when (channelId) {
-            JournalChannel.ID -> journalPttController?.onInputStarted(session)
-            KeyboardChannel.ID -> keyboardController?.onInputStarted(session)
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onInputStarted(session)
-                    DebugMode.STT -> sttController?.onInputStarted(session)
-                    DebugMode.TTS -> Unit
-                    DebugMode.STT_TTS -> sttTtsController?.onInputStarted(session)
-                }
-            }
-        }
-    }
-
-    override suspend fun onInputReleased(channelId: String, recording: RecordedPcm): ChannelInputResult {
         return when (channelId) {
-            JournalChannel.ID -> journalPttController?.onInputReleased(recording) ?: ChannelInputResult.None
-            KeyboardChannel.ID -> keyboardController?.onInputReleased(recording) ?: ChannelInputResult.None
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onInputReleased(recording)
-                    DebugMode.STT -> sttController?.onInputReleased(recording) ?: ChannelInputResult.None
-                    DebugMode.TTS -> {
-                        val monitor = _appState.value.monitor
-                        val tts = ttsController
-                        val modelDir = supertonicModelDir
-                        if (tts != null && modelDir != null) {
-                            tts.onInputReleased(
-                                text = monitor.ttsText,
-                                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath,
-                                lang = monitor.ttsLang,
-                                totalSteps = monitor.ttsTotalSteps,
-                                speed = monitor.ttsSpeed,
-                                scoRate = SCO_RATE,
-                            )
-                        } else {
-                            ChannelInputResult.None
+            JournalChannel.ID -> {
+                journalPttController?.prepareInput()
+                    ?: ChannelInputAcceptance.Unavailable("Journal controller unavailable")
+            }
+            KeyboardChannel.ID -> {
+                val keyboard = keyboardController
+                    ?: return ChannelInputAcceptance.Unavailable("Keyboard controller unavailable")
+                if (!keyboard.enabled) {
+                    ChannelInputAcceptance.Refused("Keyboard channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            keyboard.onInputStarted(session)
                         }
-                    }
-                    DebugMode.STT_TTS -> {
-                        val monitor = _appState.value.monitor
-                        val sttTts = sttTtsController
-                        val modelDir = supertonicModelDir
-                        if (sttTts != null && modelDir != null) {
-                            sttTts.onInputReleased(
-                                recording,
-                                voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath,
-                                lang = monitor.sttTtsLang,
-                                totalSteps = monitor.sttTtsTotalSteps,
-                                speed = monitor.sttTtsSpeed,
-                                scoRate = SCO_RATE,
-                            )
-                        } else {
-                            ChannelInputResult.None
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            keyboard.onInputReleased(recording)
+
+                        override fun onInputCancelled(reason: String) {
+                            keyboard.onInputCancelled(reason)
                         }
-                    }
+
+                        override fun onInputFailed(reason: String) {
+                            keyboard.onInputFailed(reason)
+                        }
+                    })
                 }
             }
-            else -> ChannelInputResult.None
+            DebugChannel.ID -> prepareDebugInput()
+            else -> ChannelInputAcceptance.Unavailable("Unknown channel: $channelId")
         }
     }
 
-    override fun onInputPlaybackCompleted(channelId: String) {
-        when (channelId) {
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onInputPlaybackCompleted()
-                    DebugMode.TTS -> ttsController?.onInputPlaybackCompleted()
-                    DebugMode.STT_TTS -> sttTtsController?.onInputPlaybackCompleted()
-                    else -> Unit
+    private fun prepareDebugInput(): ChannelInputAcceptance {
+        val monitor = _appState.value.monitor
+        return when (_appState.value.debugChannel.mode) {
+            DebugMode.ECHO -> {
+                if (!echo.enabled) {
+                    ChannelInputAcceptance.Refused("Echo debug channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            echo.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            echo.onInputReleased(recording)
+
+                        override fun onInputPlaybackCompleted() {
+                            echo.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            echo.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            echo.onInputFailed(reason)
+                        }
+                    })
                 }
             }
-        }
-    }
+            DebugMode.STT -> {
+                val stt = sttController
+                    ?: return ChannelInputAcceptance.Unavailable("STT controller unavailable")
+                if (!stt.enabled) {
+                    ChannelInputAcceptance.Refused("STT debug channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            stt.onInputStarted(session)
+                        }
 
-    override fun onInputCancelled(channelId: String, reason: String) {
-        when (channelId) {
-            JournalChannel.ID -> journalPttController?.onInputCancelled()
-            KeyboardChannel.ID -> keyboardController?.onInputCancelled(reason)
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onInputCancelled(reason)
-                    DebugMode.STT -> sttController?.onInputCancelled(reason)
-                    DebugMode.TTS -> ttsController?.cancelAndRelease()
-                    DebugMode.STT_TTS -> sttTtsController?.onInputCancelled(reason)
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            stt.onInputReleased(recording)
+
+                        override fun onInputCancelled(reason: String) {
+                            stt.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            stt.onInputFailed(reason)
+                        }
+                    })
                 }
             }
-        }
-    }
+            DebugMode.TTS -> {
+                val tts = ttsController
+                    ?: return ChannelInputAcceptance.Unavailable("TTS controller unavailable")
+                val modelDir = supertonicModelDir
+                    ?: return ChannelInputAcceptance.Unavailable("TTS model directory unavailable")
+                if (!tts.enabled) {
+                    ChannelInputAcceptance.Refused("TTS debug channel disabled")
+                } else {
+                    val text = monitor.ttsText
+                    val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath
+                    val lang = monitor.ttsLang
+                    val totalSteps = monitor.ttsTotalSteps
+                    val speed = monitor.ttsSpeed
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) = Unit
 
-    override fun onInputFailed(channelId: String, reason: String) {
-        when (channelId) {
-            JournalChannel.ID -> journalPttController?.onInputFailed()
-            KeyboardChannel.ID -> keyboardController?.onInputFailed(reason)
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onInputFailed(reason)
-                    DebugMode.STT -> sttController?.onInputFailed(reason)
-                    DebugMode.TTS -> Unit
-                    DebugMode.STT_TTS -> sttTtsController?.onInputFailed(reason)
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            tts.onInputReleased(text, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
+
+                        override fun onInputPlaybackCompleted() {
+                            tts.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            tts.cancelAndRelease()
+                        }
+
+                        override fun onInputFailed(reason: String) = Unit
+                    })
+                }
+            }
+            DebugMode.STT_TTS -> {
+                val sttTts = sttTtsController
+                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS controller unavailable")
+                val modelDir = supertonicModelDir
+                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS model directory unavailable")
+                if (!sttTts.enabled) {
+                    ChannelInputAcceptance.Refused("STT/TTS debug channel disabled")
+                } else {
+                    val voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath
+                    val lang = monitor.sttTtsLang
+                    val totalSteps = monitor.sttTtsTotalSteps
+                    val speed = monitor.sttTtsSpeed
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            sttTts.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            sttTts.onInputReleased(recording, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
+
+                        override fun onInputPlaybackCompleted() {
+                            sttTts.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            sttTts.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            sttTts.onInputFailed(reason)
+                        }
+                    })
                 }
             }
         }

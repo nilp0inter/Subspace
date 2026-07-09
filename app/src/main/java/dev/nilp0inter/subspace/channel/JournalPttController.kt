@@ -4,8 +4,10 @@ import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.CaptureSession
 import dev.nilp0inter.subspace.audio.CaptureSource
 import dev.nilp0inter.subspace.audio.CaptureStartResult
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.JournalWavWriter
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
@@ -80,35 +82,22 @@ class JournalPttController(
         scope.launch { output.releaseRoute() }
     }
 
-    fun onInputStarted(session: ChannelAudioInputSession) {
+    fun prepareInput(): ChannelInputAcceptance {
         val channel = channelProvider()
-        if (!channel.isReady) return
-        val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() } ?: return
+        if (!channel.isReady) return ChannelInputAcceptance.Refused("Journal channel not ready")
+        val baseDirectory = channel.baseDirectory?.takeIf { it.isNotBlank() }
+            ?: return ChannelInputAcceptance.Refused("Journal base directory unavailable")
         val startedAt = ZonedDateTime.now()
         val paths = pathGenerator.preparePaths(File(baseDirectory), startedAt)
-        val writer = JournalWavWriter(paths.captureFile, session.sampleRate)
-        framesJob = scope.launch {
-            session.frames.collect { chunk ->
-                writer.writeChunk(chunk)
-            }
+        return ChannelInputAcceptance.Accepted(JournalInputTarget(paths, startedAt, channel))
+    }
+
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        when (val acceptance = prepareInput()) {
+            is ChannelInputAcceptance.Accepted -> acceptance.target.onInputStarted(session)
+            is ChannelInputAcceptance.Refused -> onInputFailed()
+            is ChannelInputAcceptance.Unavailable -> onInputFailed()
         }
-        activeWavWriter = writer
-        activeEntryPaths = paths
-        activeChannel = channel
-        metadataStore.write(
-            JournalEntryMetadata(
-                entryId = paths.stem,
-                startedAt = startedAt.toString(),
-                timezoneOffset = paths.timezoneOffset,
-                channel = MetadataChannelSnapshot(
-                    id = channel.id,
-                    saveVoice = channel.saveVoice,
-                    saveText = channel.saveText,
-                ),
-                capture = CaptureState(state = CaptureTaskState.recording),
-            ),
-            paths.metadataFile,
-        )
     }
 
     suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
@@ -140,6 +129,49 @@ class JournalPttController(
 
     fun onInputFailed() {
         onInputCancelled()
+    }
+
+    private inner class JournalInputTarget(
+        private val paths: JournalEntryPaths.EntryPaths,
+        private val startedAt: ZonedDateTime,
+        private val channel: JournalChannel,
+    ) : ChannelInputTarget {
+        override fun onInputStarted(session: ChannelAudioInputSession) {
+            val writer = JournalWavWriter(paths.captureFile, session.sampleRate)
+            framesJob = scope.launch {
+                session.frames.collect { chunk ->
+                    writer.writeChunk(chunk)
+                }
+            }
+            activeWavWriter = writer
+            activeEntryPaths = paths
+            activeChannel = channel
+            metadataStore.write(
+                JournalEntryMetadata(
+                    entryId = paths.stem,
+                    startedAt = startedAt.toString(),
+                    timezoneOffset = paths.timezoneOffset,
+                    channel = MetadataChannelSnapshot(
+                        id = channel.id,
+                        saveVoice = channel.saveVoice,
+                        saveText = channel.saveText,
+                    ),
+                    capture = CaptureState(state = CaptureTaskState.recording),
+                ),
+                paths.metadataFile,
+            )
+        }
+
+        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+            this@JournalPttController.onInputReleased(recording)
+
+        override fun onInputCancelled(reason: String) {
+            this@JournalPttController.onInputCancelled()
+        }
+
+        override fun onInputFailed(reason: String) {
+            this@JournalPttController.onInputFailed()
+        }
     }
 
     private suspend fun startSession(route: ResolvedAudioRoute) {

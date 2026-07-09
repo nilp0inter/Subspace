@@ -194,12 +194,12 @@ class CaptureService(
      * Start a capture session.
      *
      * Performs: single-session assertion → acquire [sco] → check [shouldProceed]
-     * → play ready beep on [output] (cold-start priming from [ScoRoute.coldStart])
-     * → open [source] → start the read loop.
+     * → open [source] for capture preflight → play ready beep on [output]
+     * (cold-start priming from [ScoRoute.coldStart]) → start the read loop.
      *
      * The caller-supplied [shouldProceed] predicate is checked after SCO
-     * acquisition and after the beep — returning false in either place
-     * produces [CaptureStartResult.Cancelled] (short-tap-during-beep /
+     * acquisition, after capture preflight, and after the beep — returning
+     * false produces [CaptureStartResult.Cancelled] (short-tap-during-beep /
      * release-during-sco-acquisition per `sco-audio` spec).
      */
     suspend fun startSession(
@@ -222,19 +222,7 @@ class CaptureService(
                 return@withLock CaptureStartResult.Cancelled
             }
 
-            output.playReadyBeep(sco.coldStart)
-
-            // PTT released during the ready beep: no record, retain warm SCO.
-            // Service-owned release; controllers MUST NOT release SCO here.
-            if (!shouldProceed()) {
-                sco.release()
-                return@withLock CaptureStartResult.Cancelled
-            }
-
             opened = source.open() ?: run {
-                // Source open failed after the beep — service releases the SCO
-                // reference it acquired above so the warmup window starts and
-                // the route is not leaked for the rest of the session.
                 sco.release()
                 return@withLock CaptureStartResult.RecordingFailed
             }
@@ -248,6 +236,27 @@ class CaptureService(
                 sco.release()
                 opened = null
                 return@withLock CaptureStartResult.RecordingSilenced(evidence)
+            }
+
+            // PTT released after capture preflight but before the ready beep:
+            // no record, no ready signal, and no channel-visible frames.
+            if (!shouldProceed()) {
+                opened.close()
+                sco.release()
+                opened = null
+                return@withLock CaptureStartResult.Cancelled
+            }
+
+            output.playReadyBeep(sco.coldStart)
+
+            // PTT released during the ready beep: no record and no user audio
+            // delivery. The opened recorder is discarded before read-loop
+            // handoff, so any pre-beep frames remain channel-invisible.
+            if (!shouldProceed()) {
+                opened.close()
+                sco.release()
+                opened = null
+                return@withLock CaptureStartResult.Cancelled
             }
 
             val session = CaptureSessionImpl(
@@ -282,6 +291,10 @@ class CaptureService(
         } catch (cancellation: CancellationException) {
             opened?.close()
             throw cancellation
+        } catch (error: Throwable) {
+            opened?.close()
+            sco.release()
+            CaptureStartResult.RecordingFailed
         }
     }
 
