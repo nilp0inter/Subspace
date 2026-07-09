@@ -67,8 +67,8 @@ class AndroidPcmOutput(
     }
 
     override suspend fun play(recording: RecordedPcm) {
-        val device = requireScoDevice()
         if (recording.isEmpty) return
+        val device = requireScoDevice()
         playStaticPcm(
             samples = recording.samples,
             sampleRate = recording.sampleRate,
