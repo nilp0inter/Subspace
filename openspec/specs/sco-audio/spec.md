@@ -110,41 +110,37 @@ The system SHALL explicitly route all `PcmOutput` AudioTrack instances through t
 
 ### Requirement: Audio output owns route release
 
-The `PcmOutput` implementation paired with a resolved audio route SHALL own
-the release of that route's resources via `releaseRoute()`. Channel
-controllers SHALL call `route.output.releaseRoute()` to release the audio
-route after the post-capture consumer (playback, transcription, synthesis)
-finishes, and SHALL NOT call `ScoRoute.release()` directly in the PTT flow.
-The release mode (warm 30-second retention for SCO, immediate release for
-telecom, no-op for local fallback) SHALL be a property of the `PcmOutput`
-implementation, not a per-controller decision.
+The `PcmOutput` implementation paired with a resolved audio route SHALL retain the route-specific release behavior exposed by `releaseRoute()`. The central audio input session owner SHALL invoke `releaseRoute()` for the active session when capture, post-capture processing, failure, or cancellation reaches a terminal state. Channel controllers SHALL NOT receive the resolved route and SHALL NOT call `releaseRoute()` or `ScoRoute.release()` directly in the PTT flow. The release mode (warm 30-second retention for Work SCO, immediate release for Telecom, no-op for local fallback) SHALL remain a property of the resolved route output, not a per-channel decision.
 
 #### Scenario: SCO output releases with warm retention
-- **WHEN** a PTT cycle completes on the SCO route and the controller calls `route.output.releaseRoute()`
+- **WHEN** a PTT cycle completes on the SCO route and the audio input session owner releases the active route
 - **THEN** the SCO route's `release()` is invoked
 - **AND** the SCO controller starts the 30-second warmup retention window
 
 #### Scenario: Telecom output releases immediately
-- **WHEN** a PTT cycle completes on the telecom route and the controller calls `route.output.releaseRoute()`
+- **WHEN** a PTT cycle completes on the telecom route and the audio input session owner releases the active route
 - **THEN** the SCO route is released immediately (no warmup window)
 - **AND** the system awaits telecom disconnect before any post-capture playback
 
 #### Scenario: Local fallback output release is a no-op
-- **WHEN** a PTT cycle completes on the local fallback route and the controller calls `route.output.releaseRoute()`
+- **WHEN** a PTT cycle completes on the local fallback route and the audio input session owner releases the active route
 - **THEN** no route resources are released (there are none)
 
-#### Scenario: Controller does not touch ScoRoute directly
-- **WHEN** a channel controller handles a PTT press, release, cancel, or max-duration on any route
-- **THEN** the controller SHALL NOT call `ScoRoute.release()` on the post-capture path
-- **AND** the controller SHALL call `route.output.releaseRoute()` instead
+#### Scenario: Channel controller does not touch route release
+- **WHEN** a channel controller handles PTT input, terminal audio, cancellation, or max-duration on any route
+- **THEN** the controller SHALL NOT call `ScoRoute.release()` or `PcmOutput.releaseRoute()`
+- **AND** the audio input session owner SHALL release the active route exactly once
+
+### Requirement: Work route cleanup is session-owned
+The Work SCO route SHALL be cleared only by the audio input session that owns it or by explicit fail-safe service teardown. A stale release from an older session SHALL NOT clear a newer session's communication device.
+
+#### Scenario: Stale Work release ignored
+- **WHEN** an older Work session release runs after a newer audio input session has become active
+- **THEN** the older release does not clear the newer session's communication device
+- **AND** the newer session remains responsible for its own route release
 
 ### Requirement: SCO release on capture setup failure
-
-When the capture service acquires the SCO route during `startSession` and the
-setup fails before a running session is handed off (cancelled because PTT was
-released during acquisition or beep, or the capture source could not be
-opened), the capture service SHALL release the SCO route itself. Channel
-controllers SHALL NOT release the SCO route on those failure outcomes.
+The capture service SHALL release the SCO route itself when it acquires the SCO route during `startSession` and setup fails before a running session is handed off (cancelled because PTT was released during acquisition or beep, or the capture source could not be opened). Channel controllers SHALL NOT release the SCO route on those failure outcomes.
 
 #### Scenario: Capture cancelled during beep — service releases SCO
 - **WHEN** the capture service acquires SCO, begins the ready beep, and PTT is released before the beep completes
@@ -157,26 +153,20 @@ controllers SHALL NOT release the SCO route on those failure outcomes.
 - **AND** the channel controller does not additionally release the SCO route
 
 ### Requirement: SCO release on post-capture consumer cancellation
-
-When a channel controller's post-capture consumer (transcription, synthesis,
-playback) is cancelled by a new PTT press or a mode switch, the controller
-SHALL release the audio route via `route.output.releaseRoute()` on every
-exit path including cancellation. The release SHALL run in a `finally` block
-so it is guaranteed to execute on normal completion, failure, and
-cancellation.
+The audio input session owner SHALL release the audio route via `route.output.releaseRoute()` on every post-capture consumer exit path including normal completion, failure, and cancellation. Channel controllers SHALL NOT release the route directly.
 
 #### Scenario: Transcription cancelled by new PTT press releases the route
 - **WHEN** a STT or STT↔TTS transcription job is in flight and the user presses PTT again
 - **THEN** the transcription job is cancelled
-- **AND** the `finally` block releases the audio route via `route.output.releaseRoute()`
+- **AND** the audio input session owner releases the audio route via `route.output.releaseRoute()`
 - **AND** the SCO reference count is balanced (no leak)
 
 #### Scenario: Transcription completes normally and releases the route
 - **WHEN** a STT or STT↔TTS transcription job completes successfully
-- **THEN** the `finally` block releases the audio route via `route.output.releaseRoute()`
+- **THEN** the audio input session owner releases the audio route via `route.output.releaseRoute()`
 - **AND** the SCO reference count is balanced
 
 #### Scenario: Transcription fails and releases the route
 - **WHEN** a STT or STT↔TTS transcription job fails with a non-cancellation error
-- **THEN** the `finally` block releases the audio route via `route.output.releaseRoute()`
+- **THEN** the audio input session owner releases the audio route via `route.output.releaseRoute()`
 - **AND** the SCO reference count is balanced
