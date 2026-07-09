@@ -193,6 +193,9 @@ class KeyboardPttController(
                 CaptureStartResult.RecordingFailed -> {
                     _status.value = KeyboardStatus.Error("Recording failed")
                 }
+                is CaptureStartResult.RecordingSilenced -> {
+                    _status.value = KeyboardStatus.Error("Recording silenced")
+                }
                 is CaptureStartResult.Started -> {
                     activeSession = result.session
                     _status.value = KeyboardStatus.Recording

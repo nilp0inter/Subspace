@@ -171,6 +171,9 @@ class JournalPttController(
                 CaptureStartResult.RecordingFailed -> {
                     // Service already released SCO on this branch.
                 }
+                is CaptureStartResult.RecordingSilenced -> {
+                    // Service already released SCO on this branch.
+                }
                 is CaptureStartResult.Started -> {
                     val session = result.session
                     val writer = JournalWavWriter(paths.captureFile, session.sampleRate)

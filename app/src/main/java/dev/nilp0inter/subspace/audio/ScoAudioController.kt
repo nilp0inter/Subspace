@@ -205,6 +205,15 @@ class ScoAudioController(
 
     override fun isActive(): Boolean = selectedCommunicationDevice() != null
 
+    @SuppressLint("MissingPermission")
+    private fun communicationDeviceReleasedFromTargetRsm(selectedIdBeforeRelease: Int?): Boolean {
+        val current = audioManager.communicationDevice ?: return true
+        val stillSelectedWorkSco = selectedIdBeforeRelease != null &&
+            current.id == selectedIdBeforeRelease &&
+            current.isBluetoothScoEndpoint()
+        return !stillSelectedWorkSco && !current.isTargetRsmScoEndpoint()
+    }
+
     override fun release() {
         scope.launch {
             mutex.withLock {
@@ -252,20 +261,36 @@ class ScoAudioController(
         }
     }
 
-    suspend fun releaseImmediately(reason: String = "immediate") {
-        mutex.withLock {
+    suspend fun releaseImmediately(reason: String = "immediate"): RouteGateResult {
+        val selectedIdBeforeRelease = mutex.withLock {
+            val selectedId = selectedDeviceId
             clearOwnedRouteLocked(reason)
+            selectedId
         }
-        val disconnected = withTimeoutOrNull(TARGET_HFP_AUDIO_RELEASE_TIMEOUT_MS) {
-            while (isTargetRsmHfpAudioConnected()) delay(TARGET_HFP_AUDIO_POLL_MS)
+        val released = withTimeoutOrNull(TARGET_HFP_AUDIO_RELEASE_TIMEOUT_MS) {
+            while (
+                isTargetRsmHfpAudioConnected() ||
+                !communicationDeviceReleasedFromTargetRsm(selectedIdBeforeRelease)
+            ) {
+                delay(TARGET_HFP_AUDIO_POLL_MS)
+            }
             true
         } == true
+        val facts = listOf(
+            "targetHfpAudioConnected=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)}",
+            "communicationDevice=${audioManager.communicationDevice.routeDebugString()}",
+            "selectedIdBeforeRelease=$selectedIdBeforeRelease",
+        )
         Log.d(
             ROUTE_LOG_TAG,
-            "RSM_HFP_STOP_WAIT target='${targetRsmName().orEmpty()}' disconnected=$disconnected reason=$reason " +
-                "audioAfter=${runCatching { isTargetRsmHfpAudioConnected() }.getOrDefault(false)} " +
-                "current=${audioManager.communicationDevice.routeDebugString()}",
+            "RSM_HFP_STOP_WAIT target='${targetRsmName().orEmpty()}' released=$released reason=$reason " +
+                facts.joinToString(separator = " "),
         )
+        return if (released) {
+            RouteGateResult.Success(reason, facts)
+        } else {
+            RouteGateResult.Timeout("Timed out waiting for target RSM route release", facts)
+        }
     }
 
     fun requestImmediateRelease(reason: String) {

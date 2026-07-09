@@ -1131,6 +1131,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             micSource = micSource,
             pcmOutput = pcmOutput,
             awaitTelecomDisconnected = { withTimeoutOrNull(POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS) { carTelecomStarter.telecomDisconnected.await() } },
+            releaseStaleWorkRoute = { reason -> sco.releaseImmediately(reason) },
             releaseTelecomCaptureRoute = {
                 dev.nilp0inter.subspace.service.releaseTelecomCaptureRoute(
                     audioManager, carTelecomStarter::stopPrimedCarHfp, ::logAudioRouteSnapshot,

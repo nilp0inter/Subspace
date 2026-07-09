@@ -18,7 +18,17 @@ internal class TelecomCarPttLifecycle(
     }
 
     fun routeChanged(acceptable: Boolean) {
-        if (state != State.WaitingForRoute || !acceptable) return
+        routeChanged(
+            ReadinessFacts(
+                telecomRouteAcceptable = acceptable,
+                nonTelecomRouteReady = true,
+                hfpPrimeReady = true,
+            ),
+        )
+    }
+
+    fun routeChanged(facts: ReadinessFacts) {
+        if (state != State.WaitingForRoute || !facts.isReady) return
         state = State.Recording
         callbacks.onCaptureStart()
     }
@@ -51,6 +61,15 @@ internal class TelecomCarPttLifecycle(
     }
 
     enum class State { Idle, WaitingForRoute, Recording, Released }
+
+    data class ReadinessFacts(
+        val telecomRouteAcceptable: Boolean,
+        val nonTelecomRouteReady: Boolean,
+        val hfpPrimeReady: Boolean,
+    ) {
+        val isReady: Boolean
+            get() = telecomRouteAcceptable && nonTelecomRouteReady && hfpPrimeReady
+    }
 
     interface Callbacks {
         fun onCaptureStart()

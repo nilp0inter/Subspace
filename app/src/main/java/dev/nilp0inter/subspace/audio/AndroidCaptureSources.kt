@@ -53,6 +53,11 @@ abstract class AndroidCaptureSource(
             override val sampleRate: Int = selectedRate
             override val bufferSizeShorts: Int = minBuffer / Short.SIZE_BYTES
 
+            override val startupEvidence: CaptureStartupEvidence
+                get() = CaptureStartupEvidence(
+                    inputDeviceName = record.routedDevice?.routeDebugString(),
+                )
+
             override fun read(buffer: ShortArray): Int =
                 record.read(buffer, 0, buffer.size)
 

@@ -409,6 +409,53 @@ class CaptureServiceTest {
         session.stop()
     }
 
+    @Test
+    fun startSessionReturnsRecorderStartupEvidence() = runTest {
+        val service = captureService()
+        val source = FakeSource(
+            sampleRate = 8_000,
+            sourceId = CaptureSourceId.VoiceCommunication,
+            continuous = true,
+            startupEvidence = CaptureStartupEvidence(
+                clientSilenced = false,
+                inputDeviceName = "car-hfp",
+            ),
+        )
+
+        val result = service.startSession(source, FakeScoRoute(), FakeOutput()) { true }
+
+        assertTrue(result is CaptureStartResult.Started)
+        val started = result as CaptureStartResult.Started
+        val evidence = started.evidence
+        assertTrue(evidence.recorderOpened)
+        assertEquals(CaptureSourceId.VoiceCommunication, evidence.sourceId)
+        assertEquals(8_000, evidence.sampleRate)
+        assertEquals(false, evidence.clientSilenced)
+        assertEquals("car-hfp", evidence.inputDeviceName)
+        started.session.stop()
+    }
+
+    @Test
+    fun silencedRecorderIsTypedFailureAndClosesOpenedSource() = runTest {
+        val service = captureService()
+        val source = FakeSource(
+            continuous = true,
+            startupEvidence = CaptureStartupEvidence(clientSilenced = true),
+        )
+        val sco = FakeScoRoute()
+
+        val result = service.startSession(source, sco, FakeOutput()) { true }
+
+        assertTrue(result is CaptureStartResult.RecordingSilenced)
+        val evidence = (result as CaptureStartResult.RecordingSilenced).evidence
+        assertTrue(evidence.recorderOpened)
+        assertEquals(CaptureSourceId.VoiceCommunication, evidence.sourceId)
+        assertEquals(1, source.openCount)
+        assertEquals(1, source.lastOpened?.closeCount)
+        assertEquals(1, sco.releaseCount)
+        assertFalse(service.isCapturing.value)
+    }
+
     // -- helpers -------------------------------------------------------------
 
     private suspend fun startedSession(
@@ -441,10 +488,13 @@ class CaptureServiceTest {
         private val scriptedChunks: List<ShortArray> = emptyList(),
         private val continuous: Boolean = false,
         private val openShouldFail: Boolean = false,
+        private val startupEvidence: CaptureStartupEvidence = CaptureStartupEvidence(),
     ) : CaptureSource {
         var openCount: Int = 0; private set
         var openedSourceId: CaptureSourceId? = null; private set
         val scriptedChunkCount: Int get() = scriptedChunks.size
+        var lastOpened: Opened? = null
+            private set
 
         override suspend fun open(): OpenedCaptureSource? {
             openCount += 1
@@ -455,7 +505,8 @@ class CaptureServiceTest {
                 bufferSizeShorts = scriptedChunks.firstOrNull()?.size ?: DEFAULT_BUFFER_SHORTS,
                 scripted = scriptedChunks,
                 continuousAfter = continuous,
-            )
+                startupEvidence = startupEvidence,
+            ).also { lastOpened = it }
         }
     }
 
@@ -464,9 +515,12 @@ class CaptureServiceTest {
         override val bufferSizeShorts: Int,
         scripted: List<ShortArray>,
         private val continuousAfter: Boolean,
+        override val startupEvidence: CaptureStartupEvidence,
     ) : OpenedCaptureSource {
         private val queue = ArrayDeque<ShortArray>().apply { scripted.forEach { addLast(it) } }
         @Volatile private var closed: Boolean = false
+        var closeCount: Int = 0
+            private set
 
         override fun read(buffer: ShortArray): Int {
             if (closed) return -1
@@ -479,6 +533,7 @@ class CaptureServiceTest {
         }
 
         override fun close() {
+            closeCount += 1
             closed = true
         }
     }

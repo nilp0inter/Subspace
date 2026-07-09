@@ -147,6 +147,9 @@ class SttController(
                     // Service already released SCO on this branch.
                     _status.value = SttStatus.Error("Recording failed")
                 }
+                is CaptureStartResult.RecordingSilenced -> {
+                    _status.value = SttStatus.Error("Recording silenced")
+                }
                 is CaptureStartResult.Started -> {
                     activeSession = result.session
                     _status.value = SttStatus.Recording

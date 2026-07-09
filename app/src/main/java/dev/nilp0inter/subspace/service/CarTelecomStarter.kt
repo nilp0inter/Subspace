@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.util.Log
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
+import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.routeDebugString
 import dev.nilp0inter.subspace.model.AppState
@@ -125,8 +126,23 @@ internal class CarTelecomStarter(
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=pending-reservation-rejected")
             return
         }
-        sco.releaseImmediately("car-ptt-start")
-        primeCarHfpForTelecom()
+        when (val releaseResult = sco.releaseImmediately("car-ptt-start")) {
+            is RouteGateResult.Success -> Unit
+            is RouteGateResult.Failure,
+            is RouteGateResult.Timeout,
+            is RouteGateResult.Cancellation -> {
+                Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=work-route-release-failed result=$releaseResult")
+                cancelPendingCarPtt("work-route-release-failed")
+                playCarErrorBeep()
+                return
+            }
+        }
+        if (!primeCarHfpForTelecom()) {
+            Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=car-hfp-prime-failed")
+            cancelPendingCarPtt("car-hfp-prime-failed")
+            playCarErrorBeep()
+            return
+        }
         telecomRegistrar.register()
         if (!telecomRegistrar.isEnabled()) {
             cancelPendingCarPtt("telecom-account-disabled")

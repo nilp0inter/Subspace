@@ -11,6 +11,7 @@ import dev.nilp0inter.subspace.audio.ResponsePlayer
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.TelecomCallScoRoute
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
+import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.resolveLocalAudioRoute
 import dev.nilp0inter.subspace.audio.resolveScoAudioRoute
 import dev.nilp0inter.subspace.model.InputMode
@@ -38,6 +39,7 @@ internal fun resolvePttAudioRoute(
     pcmOutput: PcmOutput,
     awaitTelecomDisconnected: suspend () -> Unit?,
     releaseTelecomCaptureRoute: () -> Unit,
+    releaseStaleWorkRoute: suspend (String) -> RouteGateResult = { reason -> RouteGateResult.Success(reason) },
     logAudioRouteSnapshot: (String) -> Unit,
 ): ResolvedAudioRoute {
     val route = when (mode) {
@@ -51,6 +53,10 @@ internal fun resolvePttAudioRoute(
             ),
             source = voiceCommunicationSource,
             endpoint = AudioRouteEndpoint.Car,
+            routeGate = dev.nilp0inter.subspace.audio.releaseWorkRouteGate(
+                name = "release-work-before-car",
+                release = releaseStaleWorkRoute,
+            ),
         )
         InputMode.Work -> resolveScoAudioRoute(
             scoRoute = sco,
@@ -60,7 +66,14 @@ internal fun resolvePttAudioRoute(
         )
         InputMode.OnAPinch -> {
             logAudioRouteSnapshot("route-resolve-local-before")
-            resolveLocalAudioRoute(localOutput, micSource)
+            resolveLocalAudioRoute(
+                localOutput,
+                micSource,
+                routeGate = dev.nilp0inter.subspace.audio.releaseWorkRouteGate(
+                    name = "release-work-before-local",
+                    release = releaseStaleWorkRoute,
+                ),
+            )
         }
     }
     Log.d(ROUTE_LOG_TAG, "ROUTE_RESOLVE mode=$mode ${route.routeDebugString()}")

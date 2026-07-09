@@ -62,6 +62,10 @@ interface OpenedCaptureSource {
     /** Suggested read buffer size in samples (typ. `minBuffer / 2`). */
     val bufferSizeShorts: Int
 
+    /** Internal startup facts used by the audio input subsystem before channel handoff. */
+    val startupEvidence: CaptureStartupEvidence
+        get() = CaptureStartupEvidence()
+
     /**
      * Read up to [buffer.size] samples into [buffer]. Returns the number of
      * samples read, or a value `<= 0` to indicate "no data right now"
@@ -81,7 +85,10 @@ interface OpenedCaptureSource {
  */
 sealed interface CaptureStartResult {
     /** A new capture session is running. Hold [session] and call [CaptureSession.stop] on release. */
-    data class Started(val session: CaptureSession) : CaptureStartResult
+    data class Started(
+        val session: CaptureSession,
+        val evidence: CaptureStartupEvidence,
+    ) : CaptureStartResult
 
     /** Rejected: another session is already active. */
     data object SessionActive : CaptureStartResult
@@ -98,6 +105,9 @@ sealed interface CaptureStartResult {
 
     /** The selected [CaptureSource] could not be opened. */
     data object RecordingFailed : CaptureStartResult
+
+    /** Android reported that the opened recorder is silenced before channel handoff. */
+    data class RecordingSilenced(val evidence: CaptureStartupEvidence) : CaptureStartResult
 }
 
 /**
@@ -228,6 +238,17 @@ class CaptureService(
                 sco.release()
                 return@withLock CaptureStartResult.RecordingFailed
             }
+            val evidence = opened.startupEvidence.copy(
+                recorderOpened = true,
+                sourceId = source.sourceId,
+                sampleRate = opened.sampleRate,
+            )
+            if (evidence.clientSilenced == true) {
+                opened.close()
+                sco.release()
+                opened = null
+                return@withLock CaptureStartResult.RecordingSilenced(evidence)
+            }
 
             val session = CaptureSessionImpl(
                 scope = scope,
@@ -257,7 +278,7 @@ class CaptureService(
             opened = null // ownership transferred
             active = session
             _isCapturing.value = true
-            CaptureStartResult.Started(session)
+            CaptureStartResult.Started(session, evidence)
         } catch (cancellation: CancellationException) {
             opened?.close()
             throw cancellation

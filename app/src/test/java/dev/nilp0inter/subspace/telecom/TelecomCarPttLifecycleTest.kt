@@ -31,6 +31,53 @@ class TelecomCarPttLifecycleTest {
     }
 
     @Test
+    fun telecomRouteAloneDoesNotStartCaptureBeforeNonTelecomReadiness() {
+        val callbacks = RecordingCallbacks()
+        val lifecycle = TelecomCarPttLifecycle(callbacks)
+
+        lifecycle.startRequest(nowMs = 1_000)
+        lifecycle.routeChanged(
+            TelecomCarPttLifecycle.ReadinessFacts(
+                telecomRouteAcceptable = true,
+                nonTelecomRouteReady = false,
+                hfpPrimeReady = true,
+            ),
+        )
+
+        assertEquals(TelecomCarPttLifecycle.State.WaitingForRoute, lifecycle.currentState)
+        assertEquals(emptyList<String>(), callbacks.events)
+
+        lifecycle.routeChanged(
+            TelecomCarPttLifecycle.ReadinessFacts(
+                telecomRouteAcceptable = true,
+                nonTelecomRouteReady = true,
+                hfpPrimeReady = true,
+            ),
+        )
+
+        assertEquals(TelecomCarPttLifecycle.State.Recording, lifecycle.currentState)
+        assertEquals(listOf("start"), callbacks.events)
+    }
+
+    @Test
+    fun carHfpPrimeFailureDoesNotStartCapture() {
+        val callbacks = RecordingCallbacks()
+        val lifecycle = TelecomCarPttLifecycle(callbacks)
+
+        lifecycle.startRequest(nowMs = 1_000)
+        lifecycle.routeChanged(
+            TelecomCarPttLifecycle.ReadinessFacts(
+                telecomRouteAcceptable = true,
+                nonTelecomRouteReady = true,
+                hfpPrimeReady = false,
+            ),
+        )
+
+        assertEquals(TelecomCarPttLifecycle.State.WaitingForRoute, lifecycle.currentState)
+        assertEquals(emptyList<String>(), callbacks.events)
+    }
+
+    @Test
     fun routeTimeoutDisconnectsWithoutStartingCapture() {
         val callbacks = RecordingCallbacks()
         val lifecycle = TelecomCarPttLifecycle(callbacks, routeTimeoutMs = 500)
@@ -38,6 +85,14 @@ class TelecomCarPttLifecycleTest {
         lifecycle.startRequest(nowMs = 1_000)
         lifecycle.checkTimeout(nowMs = 1_500)
 
+        assertEquals(TelecomCarPttLifecycle.State.Released, lifecycle.currentState)
+        lifecycle.routeChanged(
+            TelecomCarPttLifecycle.ReadinessFacts(
+                telecomRouteAcceptable = true,
+                nonTelecomRouteReady = true,
+                hfpPrimeReady = true,
+            ),
+        )
         assertEquals(TelecomCarPttLifecycle.State.Released, lifecycle.currentState)
         assertEquals(listOf("timeout"), callbacks.events)
     }

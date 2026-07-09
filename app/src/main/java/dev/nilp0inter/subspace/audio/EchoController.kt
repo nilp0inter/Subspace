@@ -143,6 +143,9 @@ class EchoController(
                     // Service already released SCO on this branch.
                     _status.value = EchoStatus.Error("Recording failed")
                 }
+                is CaptureStartResult.RecordingSilenced -> {
+                    _status.value = EchoStatus.Error("Recording silenced")
+                }
                 is CaptureStartResult.Started -> {
                     activeSession = result.session
                     _status.value = EchoStatus.Recording

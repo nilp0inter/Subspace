@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.service
 
 import android.util.Log
+import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.CaptureStartResult
 import dev.nilp0inter.subspace.audio.CaptureSession
@@ -9,6 +10,7 @@ import dev.nilp0inter.subspace.audio.CaptureChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
+import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.routeDebugString
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
@@ -99,6 +101,24 @@ internal class PttAudioSessionManager(
             if (active !== session) return
             session.route = route
             logRoute("AUDIO_SESSION_ROUTE id=${session.id} ${route.routeDebugString()}")
+            val gateResult = route.routeGate.await()
+            logRoute("AUDIO_SESSION_ROUTE_GATE id=${session.id} gate=${route.routeGate.name} result=$gateResult")
+            if (active !== session) return
+            when (gateResult) {
+                is RouteGateResult.Success -> Unit
+                is RouteGateResult.Failure -> {
+                    failSetup(session, gateResult.reason)
+                    return
+                }
+                is RouteGateResult.Timeout -> {
+                    failSetup(session, gateResult.reason)
+                    return
+                }
+                is RouteGateResult.Cancellation -> {
+                    cancelSetup(session, gateResult.reason, releaseRoute = true)
+                    return
+                }
+            }
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
@@ -107,10 +127,23 @@ internal class PttAudioSessionManager(
             )
             if (active !== session) return
             when (result) {
-                CaptureStartResult.SessionActive -> failSetup(session, "Capture session already active")
-                CaptureStartResult.ScoUnavailable -> failSetup(session, "SCO unavailable")
-                CaptureStartResult.Cancelled -> cancelSetup(session, "Cancelled")
-                CaptureStartResult.RecordingFailed -> failSetup(session, "Recording failed")
+                CaptureStartResult.SessionActive -> {
+                    failSetup(
+                        session,
+                        "Capture session already active",
+                        releaseRoute = route.endpoint == AudioRouteEndpoint.Car,
+                    )
+                }
+                CaptureStartResult.ScoUnavailable -> {
+                    failSetup(session, "SCO unavailable", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
+                }
+                CaptureStartResult.Cancelled -> cancelSetup(session, "Cancelled", releaseRoute = false)
+                CaptureStartResult.RecordingFailed -> {
+                    failSetup(session, "Recording failed", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
+                }
+                is CaptureStartResult.RecordingSilenced -> {
+                    failSetup(session, "Recording silenced", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
+                }
                 is CaptureStartResult.Started -> {
                     if (session.releaseRequested || session.cancelRequested || !session.pttDown) {
                         val recording = captureService.cancelSession(result.session)
@@ -132,12 +165,22 @@ internal class PttAudioSessionManager(
         }
     }
 
-    private fun failSetup(session: ActiveSession, reason: String) {
+    private suspend fun failSetup(
+        session: ActiveSession,
+        reason: String,
+        releaseRoute: Boolean = true,
+    ) {
+        if (releaseRoute) releaseRouteOnce(session)
         channelRouter.onInputFailed(session.channelId, reason)
         clearIfActive(session)
     }
 
-    private fun cancelSetup(session: ActiveSession, reason: String) {
+    private suspend fun cancelSetup(
+        session: ActiveSession,
+        reason: String,
+        releaseRoute: Boolean,
+    ) {
+        if (releaseRoute) releaseRouteOnce(session)
         channelRouter.onInputCancelled(session.channelId, reason)
         clearIfActive(session)
     }

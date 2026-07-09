@@ -65,9 +65,6 @@ internal class PttDispatcher(
             return false
         }
         publishInputMode()
-        if (inputModeController.mode != InputMode.Work) {
-            sco.requestImmediateRelease("mode-switch-${inputModeController.mode}")
-        }
         cancelIdleTimer()
 
         val appState = appStateProvider()
