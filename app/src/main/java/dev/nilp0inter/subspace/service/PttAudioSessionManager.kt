@@ -66,12 +66,13 @@ internal class PttAudioSessionManager(
 
     fun release(source: PttSource) {
         val session = active?.takeIf { ownsPttRelease(it.source, source) } ?: return
+        if (!claimTerminal(session, TerminalClaim.NormalRelease)) return
         session.pttDown = false
+        session.releaseRequested = true
         val capture = session.captureSession
         if (capture == null) {
-            session.releaseRequested = true
             if (session.route == null && session.setupJob == null) {
-                clearIfActive(session)
+                scope.launch { completeSetupTerminal(session, "Released") }
             }
             return
         }
@@ -80,15 +81,30 @@ internal class PttAudioSessionManager(
 
     fun cancelActive(reason: String) {
         val session = active ?: return
+        if (!claimTerminal(session, TerminalClaim.Cancellation)) return
         session.pttDown = false
         session.cancelRequested = true
         val capture = session.captureSession
         if (capture == null) {
-            session.channelTarget?.onInputCancelled(reason)
-            clearIfActive(session)
+            if (session.route == null && session.setupJob == null) {
+                scope.launch { completeSetupTerminal(session, reason) }
+            }
             return
         }
         scope.launch { cancelRunningSession(session, capture, reason) }
+    }
+
+    fun cancelPending(source: PttSource, reason: String): Boolean {
+        val session = active?.takeIf {
+            it.source == source && it.captureSession == null
+        } ?: return false
+        if (!claimTerminal(session, TerminalClaim.Cancellation)) return false
+        session.pttDown = false
+        session.cancelRequested = true
+        if (session.route == null && session.setupJob == null) {
+            scope.launch { completeSetupTerminal(session, reason) }
+        }
+        return true
     }
 
     private suspend fun runSetup(
@@ -101,9 +117,11 @@ internal class PttAudioSessionManager(
             if (active !== session) return
             session.route = route
             logRoute("AUDIO_SESSION_ROUTE id=${session.id} ${route.routeDebugString()}")
+            if (completeClaimedSetup(session, "Released")) return
             val gateResult = route.routeGate.await()
             logRoute("AUDIO_SESSION_ROUTE_GATE id=${session.id} gate=${route.routeGate.name} result=$gateResult")
             if (active !== session) return
+            if (completeClaimedSetup(session, "Released")) return
             when (gateResult) {
                 is RouteGateResult.Success -> Unit
                 is RouteGateResult.Failure -> {
@@ -115,7 +133,7 @@ internal class PttAudioSessionManager(
                     return
                 }
                 is RouteGateResult.Cancellation -> {
-                    cancelSetup(session, gateResult.reason, releaseRoute = true)
+                    cancelSetup(session, gateResult.reason, playFeedback = true)
                     return
                 }
             }
@@ -132,36 +150,31 @@ internal class PttAudioSessionManager(
             }
             if (active !== session) return
             session.channelTarget = target
+            if (completeClaimedSetup(session, "Released")) return
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
                 output = route.output,
-                shouldProceed = { active === session && session.pttDown && !session.cancelRequested },
+                shouldProceed = {
+                    active === session &&
+                        session.pttDown &&
+                        session.terminalClaim == TerminalClaim.None
+                },
             )
             if (active !== session) return
             when (result) {
-                CaptureStartResult.SessionActive -> {
-                    failSetup(
-                        session,
-                        "Capture session already active",
-                        releaseRoute = route.endpoint == AudioRouteEndpoint.Car,
-                    )
-                }
-                CaptureStartResult.ScoUnavailable -> {
-                    failSetup(session, "SCO unavailable", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
-                }
-                CaptureStartResult.Cancelled -> cancelSetup(session, "Cancelled", releaseRoute = false)
-                CaptureStartResult.RecordingFailed -> {
-                    failSetup(session, "Recording failed", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
-                }
-                is CaptureStartResult.RecordingSilenced -> {
-                    failSetup(session, "Recording silenced", releaseRoute = route.endpoint == AudioRouteEndpoint.Car)
-                }
+                CaptureStartResult.SessionActive ->
+                    failSetup(session, "Capture session already active")
+                CaptureStartResult.ScoUnavailable -> failSetup(session, "SCO unavailable")
+                CaptureStartResult.Cancelled -> cancelSetup(session, "Cancelled")
+                CaptureStartResult.RecordingFailed -> failSetup(session, "Recording failed")
+                is CaptureStartResult.RecordingSilenced ->
+                    failSetup(session, "Recording silenced")
                 is CaptureStartResult.Started -> {
-                    if (session.releaseRequested || session.cancelRequested || !session.pttDown) {
+                    if (session.terminalClaim != TerminalClaim.None || !session.pttDown) {
                         val recording = captureService.cancelSession(result.session)
                         session.captureSession = null
-                        completeRelease(session, recording, cancelled = session.cancelRequested)
+                        completeRelease(session, recording, cancelled = true)
                     } else {
                         session.captureSession = result.session
                         target.onInputStarted(CaptureChannelAudioInputSession(result.session))
@@ -175,13 +188,13 @@ internal class PttAudioSessionManager(
         }
     }
 
-    private suspend fun failSetup(
-        session: ActiveSession,
-        reason: String,
-        releaseRoute: Boolean = true,
-    ) {
+    private suspend fun failSetup(session: ActiveSession, reason: String) {
+        if (!claimTerminal(session, TerminalClaim.Failure)) {
+            completeClaimedSetup(session, reason)
+            return
+        }
         playProblemBeep(session)
-        if (releaseRoute) releaseRouteOnce(session)
+        releaseRouteOnce(session)
         session.channelTarget?.onInputFailed(reason)
         clearIfActive(session)
     }
@@ -189,17 +202,18 @@ internal class PttAudioSessionManager(
     private suspend fun cancelSetup(
         session: ActiveSession,
         reason: String,
-        releaseRoute: Boolean,
+        playFeedback: Boolean = false,
     ) {
-        playProblemBeep(session)
-        if (releaseRoute) releaseRouteOnce(session)
-        session.channelTarget?.onInputCancelled(reason)
-        clearIfActive(session)
+        if (claimTerminal(session, TerminalClaim.Cancellation)) {
+            if (playFeedback) playProblemBeep(session)
+            completeSetupTerminal(session, reason)
+        } else {
+            completeClaimedSetup(session, reason)
+        }
     }
 
     private suspend fun finishSession(session: ActiveSession, capture: CaptureSession) {
-        if (active !== session || session.releasing) return
-        session.releasing = true
+        if (active !== session || session.terminalClaim != TerminalClaim.NormalRelease) return
         session.captureSession = null
         val recording = capture.stop()
         completeRelease(session, recording, cancelled = false)
@@ -210,8 +224,7 @@ internal class PttAudioSessionManager(
         capture: CaptureSession,
         reason: String,
     ) {
-        if (active !== session || session.releasing) return
-        session.releasing = true
+        if (active !== session || session.terminalClaim != TerminalClaim.Cancellation) return
         session.captureSession = null
         val recording = captureService.cancelSession(capture)
         session.channelTarget?.onInputCancelled(reason)
@@ -252,6 +265,26 @@ internal class PttAudioSessionManager(
         runCatching { route.output.playErrorBeep(route.sco.coldStart) }
     }
 
+    private fun claimTerminal(session: ActiveSession, claim: TerminalClaim): Boolean {
+        if (active !== session || session.terminalClaim != TerminalClaim.None) return false
+        session.terminalClaim = claim
+        return true
+    }
+
+    private suspend fun completeClaimedSetup(session: ActiveSession, reason: String): Boolean {
+        if (session.terminalClaim == TerminalClaim.None) return false
+        if (session.terminalClaim == TerminalClaim.Failure) return true
+        completeSetupTerminal(session, reason)
+        return true
+    }
+
+    private suspend fun completeSetupTerminal(session: ActiveSession, reason: String) {
+        if (active !== session || session.captureSession != null) return
+        if (session.route?.endpoint == AudioRouteEndpoint.Car) releaseRouteOnce(session)
+        session.channelTarget?.onInputCancelled(reason)
+        clearIfActive(session)
+    }
+
     private suspend fun releaseRouteOnce(session: ActiveSession) {
         if (session.routeReleased) return
         session.routeReleased = true
@@ -269,6 +302,13 @@ internal class PttAudioSessionManager(
         val mode: InputMode,
     )
 
+    private enum class TerminalClaim {
+        None,
+        NormalRelease,
+        Cancellation,
+        Failure,
+    }
+
     private data class ActiveSession(
         val id: Long,
         val source: PttSource,
@@ -281,7 +321,7 @@ internal class PttAudioSessionManager(
         var pttDown: Boolean = true,
         var releaseRequested: Boolean = false,
         var cancelRequested: Boolean = false,
-        var releasing: Boolean = false,
+        var terminalClaim: TerminalClaim = TerminalClaim.None,
         var routeReleased: Boolean = false,
     ) {
         fun snapshot(): SessionSnapshot = SessionSnapshot(id, source, channelId, mode)

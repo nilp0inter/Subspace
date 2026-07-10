@@ -5,6 +5,8 @@ import dev.nilp0inter.subspace.audio.NoopCaptureSource
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
+import dev.nilp0inter.subspace.audio.RouteGate
+import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.model.ScoState
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +18,63 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PttRouteErrorFeedbackTest {
+    @Test
+    fun warmWorkRouteIsReleasedBeforeUnavailablePhoneFeedback() = runTest {
+        val events = mutableListOf<String>()
+        val sco = RecordingScoRoute(
+            acquireResult = true,
+            endpoint = AudioRouteEndpoint.Local,
+            events = events,
+        )
+        val output = RecordingOutput(endpoint = AudioRouteEndpoint.Local, events = events)
+        val route = ResolvedAudioRoute(
+            sco = sco,
+            output = output,
+            source = NoopCaptureSource,
+            endpoint = AudioRouteEndpoint.Local,
+            routeGate = RouteGate("release-work-before-local") {
+                events += "gate"
+                RouteGateResult.Success("work-route-released")
+            },
+        )
+
+        val played = playRouteErrorBeepIfAcquired(route)
+
+        assertTrue(played)
+        assertEquals(listOf("gate", "acquire", "beep", "release"), events)
+        assertEquals(listOf(AudioRouteEndpoint.Local), output.errorBeepEndpoints)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun routeGateTimeoutSuppressesFeedbackAndCleansResolvedRoute() = runTest {
+        val events = mutableListOf<String>()
+        val sco = RecordingScoRoute(
+            acquireResult = true,
+            endpoint = AudioRouteEndpoint.Local,
+            events = events,
+        )
+        val output = RecordingOutput(endpoint = AudioRouteEndpoint.Local, events = events)
+        val route = ResolvedAudioRoute(
+            sco = sco,
+            output = output,
+            source = NoopCaptureSource,
+            endpoint = AudioRouteEndpoint.Local,
+            routeGate = RouteGate("release-work-before-local") {
+                events += "gate"
+                RouteGateResult.Timeout("work-route-release-timeout")
+            },
+        )
+
+        val played = playRouteErrorBeepIfAcquired(route)
+
+        assertFalse(played)
+        assertEquals(listOf("gate", "release"), events)
+        assertEquals(0, sco.acquireCount)
+        assertEquals(emptyList<AudioRouteEndpoint>(), output.errorBeepEndpoints)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
     @Test
     fun routeAcquisitionFailureSkipsErrorBeepAndRouteRelease() = runTest {
         val sco = RecordingScoRoute(acquireResult = false, endpoint = AudioRouteEndpoint.Rsm)
@@ -62,6 +121,7 @@ class PttRouteErrorFeedbackTest {
         private val acquireResult: Boolean,
         override val endpoint: AudioRouteEndpoint,
         override val coldStart: Boolean = false,
+        private val events: MutableList<String>? = null,
     ) : ScoRoute {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
         override val state: StateFlow<ScoState> = _state
@@ -71,6 +131,7 @@ class PttRouteErrorFeedbackTest {
         override fun hasAvailableScoDevice(): Boolean = acquireResult
 
         override suspend fun acquire(): Boolean {
+            events?.add("acquire")
             acquireCount += 1
             if (acquireResult) _state.value = ScoState.Active
             return acquireResult
@@ -82,6 +143,7 @@ class PttRouteErrorFeedbackTest {
 
     private class RecordingOutput(
         private val endpoint: AudioRouteEndpoint,
+        private val events: MutableList<String>? = null,
     ) : PcmOutput {
         val errorBeepEndpoints = mutableListOf<AudioRouteEndpoint>()
         val errorBeepColdStarts = mutableListOf<Boolean>()
@@ -91,6 +153,7 @@ class PttRouteErrorFeedbackTest {
         override suspend fun playReadyBeep(coldStart: Boolean) = Unit
 
         override suspend fun playErrorBeep(coldStart: Boolean) {
+            events?.add("beep")
             errorBeepEndpoints += endpoint
             errorBeepColdStarts += coldStart
         }
@@ -98,6 +161,7 @@ class PttRouteErrorFeedbackTest {
         override suspend fun play(recording: RecordedPcm) = Unit
 
         override suspend fun releaseRoute() {
+            events?.add("release")
             releaseRouteCount += 1
         }
     }

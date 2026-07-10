@@ -49,17 +49,24 @@ abstract class AndroidCaptureSource(
             return null
         }
 
+        // API 24+ exposes the active recording configuration; client-silencing
+        // is available on API 29+. The app minSdk is 31, so this is safe on all
+        // supported devices. A missing configuration remains unknown (null).
+        val activeConfiguration = record.activeRecordingConfiguration
+
         return object : OpenedCaptureSource {
             override val sampleRate: Int = selectedRate
             override val bufferSizeShorts: Int = minBuffer / Short.SIZE_BYTES
 
-            override val startupEvidence: CaptureStartupEvidence
-                get() = CaptureStartupEvidence(
-                    inputDeviceName = record.routedDevice?.routeDebugString(),
-                )
+            override val startupEvidence: CaptureStartupEvidence = CaptureStartupEvidence(
+                clientSilenced = activeConfiguration?.isClientSilenced,
+                inputDeviceName = record.routedDevice?.routeDebugString(),
+            )
 
             override fun read(buffer: ShortArray): Int =
-                record.read(buffer, 0, buffer.size)
+                // Non-blocking reads make pre-commit drain cancellation/join
+                // deterministic without closing the source under the reader.
+                record.read(buffer, 0, buffer.size, AudioRecord.READ_NON_BLOCKING)
 
             override fun close() {
                 runCatching { record.stop() }
@@ -67,6 +74,7 @@ abstract class AndroidCaptureSource(
             }
         }
     }
+
 
     private fun selectSampleRate(): Int? = listOf(16_000, 8_000).firstOrNull { rate ->
         AudioRecord.getMinBufferSize(

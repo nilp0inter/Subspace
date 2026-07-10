@@ -45,6 +45,102 @@ class JournalPttControllerTest {
         baseDir.deleteRecursively()
     }
 
+
+    @Test
+    fun activeCarHangFinalizesMetadataAndRunsDerivedProcessing() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = ContinuousFakeSource(sampleRate = 16_000)
+        val output = FakeOutput()
+        val encoder = RecordingEncoder()
+        val transcriber = RecordingTranscriber("car hang transcript")
+        val journalController = journalController(encoder, transcriber)
+        val channel = JournalChannel(baseDirectory = baseDir.absolutePath)
+        val controller = JournalPttController(
+            scope = this,
+            sco = sco,
+            output = output,
+            captureService = captureService,
+            source = source,
+            journal = journalController,
+            channelProvider = { channel },
+        )
+
+        controller.onPttPressed()
+        runCurrent()
+        advanceTimeBy(100)
+        runCurrent()
+        controller.onPttReleased()
+        awaitReleaseRoute(output, expected = 1)
+
+        val metadataFile = findMetadataFile(baseDir)
+        assertTrue("Normal car hang must persist terminal metadata", metadataFile != null)
+        val metadata = JournalMetadataStore().read(metadataFile!!)
+        assertTrue("Terminal metadata must be readable", metadata != null)
+        metadata!!
+        assertTrue("Normal terminal metadata must include endedAt", metadata.endedAt != null)
+        assertEquals(CaptureTaskState.deleted, metadata.capture.state)
+        assertEquals(16_000, metadata.capture.sampleRate)
+        assertEquals(1, metadata.capture.channels)
+        assertEquals("pcm_s16le", metadata.capture.encoding)
+        assertTrue("Final metadata must include capture duration", metadata.capture.durationMs != null)
+        assertTrue("Final metadata must include capture byte count", metadata.capture.bytes != null)
+        assertEquals(DerivedTaskStatus.finished, metadata.encoding?.state)
+        assertEquals(DerivedTaskStatus.finished, metadata.transcription?.state)
+        assertEquals("car hang transcript", metadata.transcription?.text)
+        assertEquals(1, encoder.callCount)
+        assertEquals(1, transcriber.callCount)
+
+        val markdownFiles = baseDir.walkTopDown().filter { it.isFile && it.extension == "md" }.toList()
+        assertEquals(1, markdownFiles.size)
+        assertTrue(markdownFiles.single().readText().contains("car hang transcript"))
+        assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun preCaptureCancellationLeavesEntryForRecovery() = runTest {
+        val sco = FakeScoRoute()
+        val captureService = CaptureServiceFakes.newService(this)
+        val source = ContinuousFakeSource(sampleRate = 16_000)
+        val output = FakeOutput()
+        val encoder = RecordingEncoder()
+        val transcriber = RecordingTranscriber("must not run")
+        val journalController = journalController(encoder, transcriber)
+        val channel = JournalChannel(baseDirectory = baseDir.absolutePath)
+        val controller = JournalPttController(
+            scope = this,
+            sco = sco,
+            output = output,
+            captureService = captureService,
+            source = source,
+            journal = journalController,
+            channelProvider = { channel },
+        )
+
+        controller.onPttPressed()
+        runCurrent()
+        controller.cancelAndRelease()
+        runCurrent()
+        awaitReleaseRoute(output, expected = 1)
+
+        val metadataFile = findMetadataFile(baseDir)
+        assertTrue("Pre-capture cancellation must leave recoverable metadata", metadataFile != null)
+        val beforeRecovery = JournalMetadataStore().read(metadataFile!!)
+        assertTrue(beforeRecovery != null)
+        assertEquals(CaptureTaskState.recording, beforeRecovery!!.capture.state)
+        assertTrue("Cancellation must not claim a terminal timestamp", beforeRecovery.endedAt == null)
+
+        journalController.runRecovery(baseDir).join()
+
+        val recovered = JournalMetadataStore().read(metadataFile)
+        assertTrue(recovered != null)
+        assertEquals(CaptureTaskState.abandoned, recovered!!.capture.state)
+        assertTrue("Recovery must not add a terminal timestamp", recovered.endedAt == null)
+        assertEquals(0, encoder.callCount)
+        assertEquals(0, transcriber.callCount)
+        assertEquals(1, output.releaseRouteCount)
+    }
+
     @Test
     fun pressReleaseWritesWavWithSessionSampleRateAndReleasesRoute() = runTest {
         val sco = FakeScoRoute()
@@ -208,18 +304,26 @@ class JournalPttControllerTest {
         }
     }
 
-    private fun journalController(): JournalController = JournalController(
+    private fun journalController(
+        encoder: AudioEncoder = NoopEncoder(),
+        transcriber: PcmTranscriber = NoopTranscriber(),
+    ): JournalController = JournalController(
         scope = CoroutineScope(Dispatchers.Unconfined),
-        encoder = NoopEncoder(),
-        transcriber = NoopTranscriber(),
+        encoder = encoder,
+        transcriber = transcriber,
         dispatcher = Dispatchers.Unconfined,
     )
+
 
     private fun findWavFile(root: File): File? {
         val captureFiles = mutableListOf<File>()
         root.walkTopDown().forEach { if (it.isFile && it.extension == "wav") captureFiles.add(it) }
         return captureFiles.firstOrNull()
     }
+
+    private fun findMetadataFile(root: File): File? =
+        root.walkTopDown().firstOrNull { it.isFile && it.extension == "json" }
+
 
     private class FakeScoRoute : ScoRoute {
         private val _state = MutableStateFlow<ScoState>(ScoState.Inactive)
@@ -256,6 +360,27 @@ class JournalPttControllerTest {
     private class NoopTranscriber : PcmTranscriber {
         override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String = ""
     }
+
+    private class RecordingEncoder : AudioEncoder {
+        var callCount = 0
+
+        override suspend fun encode(pcm: ShortArray, outputFile: File, sampleRate: Int): Result<File> {
+            callCount += 1
+            outputFile.parentFile?.mkdirs()
+            outputFile.writeBytes(byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()))
+            return Result.success(outputFile)
+        }
+    }
+
+    private class RecordingTranscriber(private val result: String) : PcmTranscriber {
+        var callCount = 0
+
+        override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
+            callCount += 1
+            return result
+        }
+    }
+
 
     private class ContinuousFakeSource(
         private val sampleRate: Int = 16_000,

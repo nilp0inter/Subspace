@@ -3,6 +3,7 @@ package dev.nilp0inter.subspace.audio
 import dev.nilp0inter.subspace.model.ScoState
 import kotlin.coroutines.ContinuationInterceptor
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -436,6 +437,117 @@ class CaptureServiceTest {
     }
 
     @Test
+    fun preCommitDrainExcludesPreBeepSamplesFromFramesAndTerminalPcm() = runTest {
+        val service = captureService()
+        val source = BeepBoundarySource(
+            preBeepChunks = listOf(ShortArray(2) { 1 }),
+            postBeepChunks = listOf(ShortArray(2) { 2 }),
+        )
+        val output = GatedReadyBeepOutput(onComplete = source::markBeepComplete)
+        val start = CompletableDeferred<CaptureStartResult>()
+
+        launch {
+            start.complete(service.startSession(source, FakeScoRoute(), output) { true })
+        }
+        runCurrent()
+        output.readyBeepStarted.await()
+
+        // The recorder is already running, but the channel commitment is still
+        // blocked on the ready beep. The pre-commit reader must consume this
+        // chunk before the beep is allowed to complete.
+        advanceTimeBy(SMALL_TICK_MS * 2)
+        runCurrent()
+        assertEquals(1, source.preBeepChunksRead)
+
+        output.completeReadyBeep()
+        val result = start.await()
+        assertTrue("expected Started, got $result", result is CaptureStartResult.Started)
+        val session = (result as CaptureStartResult.Started).session
+
+        val frames = mutableListOf<ShortArray>()
+        val collector = launch { session.frames.toList(frames) }
+        runCurrent()
+        source.allowPostBeepReads()
+        advanceTimeBy(SMALL_TICK_MS * 2)
+        runCurrent()
+
+        val pcm = session.stop()
+        collector.cancel()
+
+        assertEquals(listOf<Short>(2, 2), frames.flatMap { it.asList() })
+        assertEquals(listOf<Short>(2, 2), pcm.samples.asList())
+    }
+
+    @Test
+    fun releaseDuringPreCommitDrainClosesOpenedSourceWithoutVisiblePcm() = runTest {
+        val service = captureService()
+        val source = BeepBoundarySource(preBeepChunks = listOf(ShortArray(2) { 7 }))
+        val output = GatedReadyBeepOutput(onComplete = source::markBeepComplete)
+        var released = false
+        val start = CompletableDeferred<CaptureStartResult>()
+
+        launch {
+            start.complete(service.startSession(source, FakeScoRoute(), output) { !released })
+        }
+        runCurrent()
+        output.readyBeepStarted.await()
+        advanceTimeBy(SMALL_TICK_MS * 2)
+        runCurrent()
+        released = true
+        output.completeReadyBeep()
+
+        val result = start.await()
+        assertEquals(CaptureStartResult.Cancelled, result)
+        assertEquals(1, source.preBeepChunksRead)
+        assertEquals(1, source.closeCount)
+        assertFalse(service.isCapturing.value)
+    }
+
+    @Test
+    fun readyBeepFailureClosesOpenedSourceWithoutVisiblePcm() = runTest {
+        val service = captureService()
+        val source = BeepBoundarySource(preBeepChunks = listOf(ShortArray(2) { 9 }))
+        val output = GatedReadyBeepOutput(
+            onComplete = source::markBeepComplete,
+            failure = IllegalStateException("beep failed"),
+        )
+        val start = CompletableDeferred<CaptureStartResult>()
+
+        launch {
+            start.complete(service.startSession(source, FakeScoRoute(), output) { true })
+        }
+        runCurrent()
+        output.readyBeepStarted.await()
+        advanceTimeBy(SMALL_TICK_MS * 2)
+        runCurrent()
+        output.completeReadyBeep()
+
+        val result = start.await()
+        assertEquals(CaptureStartResult.RecordingFailed, result)
+        assertEquals(1, source.preBeepChunksRead)
+        assertEquals(1, source.closeCount)
+        assertFalse(service.isCapturing.value)
+    }
+
+    @Test
+    fun unknownRecorderSilencingEvidenceDoesNotRejectCapture() = runTest {
+        val service = captureService()
+        val output = FakeOutput()
+        val source = FakeSource(
+            continuous = true,
+            startupEvidence = CaptureStartupEvidence(clientSilenced = null),
+        )
+
+        val result = service.startSession(source, FakeScoRoute(), output) { true }
+
+        assertTrue("expected Started, got $result", result is CaptureStartResult.Started)
+        val evidence = (result as CaptureStartResult.Started).evidence
+        assertEquals(null, evidence.clientSilenced)
+        assertEquals(1, output.readyBeepCount)
+        (result as CaptureStartResult.Started).session.stop()
+    }
+
+    @Test
     fun silencedRecorderIsTypedFailureAndClosesOpenedSource() = runTest {
         val service = captureService()
         val source = FakeSource(
@@ -443,8 +555,9 @@ class CaptureServiceTest {
             startupEvidence = CaptureStartupEvidence(clientSilenced = true),
         )
         val sco = FakeScoRoute()
+        val output = FakeOutput()
 
-        val result = service.startSession(source, sco, FakeOutput()) { true }
+        val result = service.startSession(source, sco, output) { true }
 
         assertTrue(result is CaptureStartResult.RecordingSilenced)
         val evidence = (result as CaptureStartResult.RecordingSilenced).evidence
@@ -453,6 +566,7 @@ class CaptureServiceTest {
         assertEquals(1, source.openCount)
         assertEquals(1, source.lastOpened?.closeCount)
         assertEquals(1, sco.releaseCount)
+        assertEquals(0, output.readyBeepCount)
         assertFalse(service.isCapturing.value)
     }
 
@@ -462,8 +576,7 @@ class CaptureServiceTest {
         service: CaptureService,
         source: FakeSource,
     ): CaptureSession {
-        val result = service.startSession(source, FakeScoRoute(), FakeOutput()) { true }
-        assertTrue("startSession failed: $result", result is CaptureStartResult.Started)
+        val result = service.startSession(source, FakeScoRoute(), FakeOutput(onReadyBeep = source::markBeepComplete)) { true }
         return (result as CaptureStartResult.Started).session
     }
 
@@ -481,6 +594,89 @@ class CaptureServiceTest {
         maxBufferSamplesFactor = maxBufferSamplesFactor,
         clock = clock,
     )
+
+    private class BeepBoundarySource(
+        private val preBeepChunks: List<ShortArray>,
+        private val postBeepChunks: List<ShortArray> = emptyList(),
+    ) : CaptureSource {
+        override val sourceId: CaptureSourceId = CaptureSourceId.VoiceCommunication
+
+
+        private var opened: BoundaryOpened? = null
+
+        override suspend fun open(): OpenedCaptureSource = BoundaryOpened().also { opened = it }
+        @Volatile var preBeepChunksRead: Int = 0
+            private set
+        @Volatile var closeCount: Int = 0
+            private set
+        fun markBeepComplete() {
+            opened?.beepComplete = true
+        }
+
+        fun allowPostBeepReads() {
+            opened?.postBeepReadsEnabled = true
+        }
+
+        private inner class BoundaryOpened : OpenedCaptureSource {
+            override val sampleRate: Int = DEFAULT_RATE
+            override val bufferSizeShorts: Int = DEFAULT_BUFFER_SHORTS
+            override val startupEvidence: CaptureStartupEvidence = CaptureStartupEvidence()
+            private val preQueue = ArrayDeque<ShortArray>().apply { preBeepChunks.forEach(::addLast) }
+            private val postQueue = ArrayDeque<ShortArray>().apply { postBeepChunks.forEach(::addLast) }
+            @Volatile var beepComplete: Boolean = false
+            @Volatile var postBeepReadsEnabled: Boolean = false
+            @Volatile private var closed: Boolean = false
+
+            override fun read(buffer: ShortArray): Int {
+                if (closed) return -1
+                if (!beepComplete) {
+                    val next = preQueue.removeFirstOrNull() ?: return 0
+                    preBeepChunksRead += 1
+                    return copyInto(buffer, next)
+                }
+                if (!postBeepReadsEnabled) return 0
+                val next = preQueue.removeFirstOrNull() ?: postQueue.removeFirstOrNull() ?: return 0
+                return copyInto(buffer, next)
+            }
+
+            private fun copyInto(buffer: ShortArray, source: ShortArray): Int {
+                val n = minOf(buffer.size, source.size)
+                source.copyInto(buffer, 0, 0, n)
+                return n
+            }
+
+            override fun close() {
+                closeCount += 1
+                closed = true
+            }
+        }
+    }
+
+    private class GatedReadyBeepOutput(
+        private val onComplete: () -> Unit = {},
+        private val failure: Throwable? = null,
+    ) : PcmOutput {
+        val readyBeepStarted = CompletableDeferred<Unit>()
+        private val readyBeepGate = CompletableDeferred<Unit>()
+        var readyBeepCount: Int = 0
+            private set
+
+        override suspend fun playReadyBeep(coldStart: Boolean) {
+            readyBeepCount += 1
+            readyBeepStarted.complete(Unit)
+            readyBeepGate.await()
+            onComplete()
+            failure?.let { throw it }
+        }
+
+        fun completeReadyBeep() {
+            readyBeepGate.complete(Unit)
+        }
+
+        override suspend fun playErrorBeep(coldStart: Boolean) = Unit
+
+        override suspend fun play(recording: RecordedPcm) = Unit
+    }
 
     private class FakeSource(
         override val sourceId: CaptureSourceId = CaptureSourceId.VoiceCommunication,
@@ -508,6 +704,10 @@ class CaptureServiceTest {
                 startupEvidence = startupEvidence,
             ).also { lastOpened = it }
         }
+
+        fun markBeepComplete() {
+            lastOpened?.beepComplete = true
+        }
     }
 
     private class Opened(
@@ -518,12 +718,14 @@ class CaptureServiceTest {
         override val startupEvidence: CaptureStartupEvidence,
     ) : OpenedCaptureSource {
         private val queue = ArrayDeque<ShortArray>().apply { scripted.forEach { addLast(it) } }
+        @Volatile var beepComplete: Boolean = false
         @Volatile private var closed: Boolean = false
         var closeCount: Int = 0
             private set
 
         override fun read(buffer: ShortArray): Int {
             if (closed) return -1
+            if (!beepComplete && queue.isNotEmpty()) return 0
             val next = queue.removeFirstOrNull()
                 ?: if (continuousAfter) ShortArray(buffer.size) { 0 }
                 else return 0
@@ -564,13 +766,16 @@ class CaptureServiceTest {
         }
     }
 
-    private class FakeOutput : PcmOutput {
+    private class FakeOutput(
+        private val onReadyBeep: () -> Unit = {},
+    ) : PcmOutput {
         var readyBeepCount: Int = 0; private set
         var errorBeepCount: Int = 0; private set
         var playCount: Int = 0; private set
 
         override suspend fun playReadyBeep(coldStart: Boolean) {
             readyBeepCount += 1
+            onReadyBeep()
         }
 
         override suspend fun playErrorBeep(coldStart: Boolean) {

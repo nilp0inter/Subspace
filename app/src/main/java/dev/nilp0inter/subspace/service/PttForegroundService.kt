@@ -965,9 +965,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
     override fun onTelecomConnectionEnded() {
-        if (pttDispatcher.activePttSession?.source == PttSource.CarTelecom) {
-            pttDispatcher.forceReleaseActivePtt()
-        }
+        pttDispatcher.cancelPending(PttSource.CarTelecom, "Telecom connection ended")
         carTelecomStarter.notifyTelecomDisconnected()
         startIdleTimer()
         updateCarMediaState()

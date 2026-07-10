@@ -75,6 +75,155 @@ class PttAudioSessionManagerTest {
         assertEquals(listOf("started", "cancelled:teardown"), fixture.router.events)
         assertEquals(null, fixture.manager.activeSession)
     }
+    @Test
+    fun normalCarReleaseRemainsTerminalWhenConnectionEndedArrivesBeforeCompletion() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val terminalGate = CompletableDeferred<Unit>()
+        val terminalRecordings = mutableListOf<RecordedPcm>()
+        var cancellationCount = 0
+        val target = object : ChannelInputTarget {
+            override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+            override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+                terminalRecordings += recording
+                terminalGate.await()
+                return ChannelInputResult.None
+            }
+
+            override fun onInputCancelled(reason: String) {
+                cancellationCount += 1
+            }
+
+            override fun onInputFailed(reason: String) = Unit
+        }
+        fixture.router.acceptance = ChannelInputAcceptance.Accepted(target)
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+
+        fixture.manager.release(PttSource.CarTelecom)
+        runCurrent()
+        fixture.manager.cancelActive("connection-ended")
+        runCurrent()
+
+        assertEquals(1, terminalRecordings.size)
+        assertEquals(listOf<Short>(1, 2, 3), terminalRecordings.single().samples.toList())
+        assertEquals(0, cancellationCount)
+        assertEquals(0, route.output.releaseRouteCount)
+
+        terminalGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, terminalRecordings.size)
+        assertEquals(0, cancellationCount)
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun forceCancelDuringResolvedRouteGateReleasesTelecomOutputExactlyOnce() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val gate = CompletableDeferred<RouteGateResult>()
+        route.routeGate = RouteGate("car-readiness") { gate.await() }
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        fixture.manager.cancelActive("connection-ended")
+        gate.complete(RouteGateResult.Success("car route ready"))
+        advanceUntilIdle()
+
+        assertEquals(1, route.output.releaseRouteCount)
+        assertTrue(fixture.router.events.isEmpty())
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun forceCancelDuringRecorderPreflightReleasesTelecomOutputExactlyOnce() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val source = DeferredOpenCaptureSource(shortArrayOf(11, 12))
+        route.source = source
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        assertTrue(source.openStarted.isCompleted)
+
+        fixture.manager.cancelActive("connection-ended")
+        source.allowOpen.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(listOf("cancelled:Cancelled"), fixture.router.events)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun forceCancelDuringReadyBeepReleasesTelecomOutputExactlyOnce() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val beepStarted = CompletableDeferred<Unit>()
+        val allowBeep = CompletableDeferred<Unit>()
+        route.output.readyBeepStarted = beepStarted
+        route.output.readyBeepGate = allowBeep
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        assertTrue(beepStarted.isCompleted)
+
+        fixture.manager.cancelActive("connection-ended")
+        allowBeep.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(listOf("cancelled:Cancelled"), fixture.router.events)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun shortCarPressDuringRecorderPreflightReleasesTelecomOutputOnceWithoutVisiblePcm() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val source = DeferredOpenCaptureSource(shortArrayOf(21, 22))
+        route.source = source
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        fixture.manager.release(PttSource.CarTelecom)
+        source.allowOpen.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, route.output.releaseRouteCount)
+        assertTrue(fixture.router.events.none { it == "started" || it == "released" })
+        assertTrue(fixture.router.liveFrames.isEmpty())
+        assertTrue(fixture.router.recordings.isEmpty())
+    }
+
+    @Test
+    fun shortCarPressDuringReadyBeepReleasesTelecomOutputOnceWithoutVisiblePcm() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val beepStarted = CompletableDeferred<Unit>()
+        val allowBeep = CompletableDeferred<Unit>()
+        route.output.readyBeepStarted = beepStarted
+        route.output.readyBeepGate = allowBeep
+
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        assertTrue(beepStarted.isCompleted)
+
+        fixture.manager.release(PttSource.CarTelecom)
+        allowBeep.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, route.output.releaseRouteCount)
+        assertTrue(fixture.router.events.none { it == "started" || it == "released" })
+        assertTrue(fixture.router.liveFrames.isEmpty())
+        assertTrue(fixture.router.recordings.isEmpty())
+    }
+
+
 
     @Test
     fun wrongSourceReleaseDoesNotClearActiveSession() = runTest {
@@ -437,8 +586,9 @@ class PttAudioSessionManagerTest {
     @Test
     fun phoneCaptureAfterWarmWorkUsesLocalRouteWithoutChannelRoutePayload() = runTest {
         val fixture = Fixture(this)
-        val localSource = CaptureServiceFakes.singleShotSource(
-            shortArrayOf(4, 5, 6),
+        val localSource = ReadyAfterBeepCaptureSource(
+            pcm = shortArrayOf(4, 5, 6),
+            output = fixture.route(InputMode.OnAPinch).output,
             sourceId = CaptureSourceId.Mic,
         )
         fixture.route(InputMode.OnAPinch).source = localSource
@@ -466,11 +616,13 @@ class PttAudioSessionManagerTest {
         val router = RecordingRouter(scope, timeline)
         private val captureService = CaptureServiceFakes.newService(scope)
         private val routes = InputMode.entries.associateWith { mode ->
+            val output = RecordingOutput(timeline, endpointFor(mode))
             TestRoute(
                 sco = RecordingScoRoute(endpointFor(mode)),
-                output = RecordingOutput(timeline, endpointFor(mode)),
-                source = CaptureServiceFakes.singleShotSource(
-                    pcm,
+                output = output,
+                source = ReadyAfterBeepCaptureSource(
+                    pcm = pcm,
+                    output = output,
                     sourceId = if (mode == InputMode.OnAPinch) CaptureSourceId.Mic else CaptureSourceId.VoiceCommunication,
                 ),
             )
@@ -586,9 +738,17 @@ class PttAudioSessionManagerTest {
             private set
         var errorBeepCount = 0
             private set
+        var readyBeepStarted: CompletableDeferred<Unit>? = null
+        var readyBeepGate: CompletableDeferred<Unit>? = null
+        var readyBeepCompleted: Boolean = false
+            private set
         override suspend fun playReadyBeep(coldStart: Boolean) {
             readyBeepCount += 1
+            readyBeepCompleted = false
             timeline += "ready:$endpoint"
+            readyBeepStarted?.complete(Unit)
+            readyBeepGate?.await()
+            readyBeepCompleted = true
         }
         override suspend fun playErrorBeep(coldStart: Boolean) {
             errorBeepCount += 1
@@ -599,6 +759,32 @@ class PttAudioSessionManagerTest {
             releaseRouteCount += 1
         }
     }
+    private class ReadyAfterBeepCaptureSource(
+        private val pcm: ShortArray,
+        private val output: RecordingOutput,
+        override val sourceId: CaptureSourceId,
+    ) : CaptureSource {
+        var openCount: Int = 0
+            private set
+
+        override suspend fun open(): OpenedCaptureSource? {
+            openCount += 1
+            val delegate = CaptureServiceFakes.singleShotSource(
+                pcm,
+                sourceId = sourceId,
+            ).open() ?: return null
+            return object : OpenedCaptureSource {
+                override val sampleRate: Int = delegate.sampleRate
+                override val bufferSizeShorts: Int = delegate.bufferSizeShorts
+
+                override fun read(buffer: ShortArray): Int =
+                    if (output.readyBeepCompleted) delegate.read(buffer) else 0
+
+                override fun close() = delegate.close()
+            }
+        }
+    }
+
 
     private class DeferredOpenCaptureSource(
         private val pcm: ShortArray,

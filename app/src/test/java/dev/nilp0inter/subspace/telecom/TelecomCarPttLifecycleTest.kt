@@ -98,7 +98,7 @@ class TelecomCarPttLifecycleTest {
     }
 
     @Test
-    fun disconnectStopsRecordingAndFinalizes() {
+    fun activeCallDisconnectStopsRecordingBeforeConnectionEnded() {
         val callbacks = RecordingCallbacks()
         val lifecycle = TelecomCarPttLifecycle(callbacks)
 
@@ -107,8 +107,27 @@ class TelecomCarPttLifecycleTest {
         lifecycle.disconnect()
 
         assertEquals(TelecomCarPttLifecycle.State.Released, lifecycle.currentState)
-        assertEquals(listOf("start", "stop", "disconnect"), callbacks.events)
+        assertEquals(
+            listOf("start", "stop", "disconnect"),
+            callbacks.events,
+        )
     }
+
+    @Test
+    fun preCaptureDisconnectCancelsWithoutTerminalRecording() {
+        val callbacks = RecordingCallbacks()
+        val lifecycle = TelecomCarPttLifecycle(callbacks)
+
+        lifecycle.startRequest(nowMs = 1_000)
+        lifecycle.disconnect()
+
+        assertEquals(TelecomCarPttLifecycle.State.Released, lifecycle.currentState)
+        assertEquals(
+            listOf("disconnect"),
+            callbacks.events,
+        )
+    }
+
 
     @Test
     fun abortReleasesActiveCapture() {

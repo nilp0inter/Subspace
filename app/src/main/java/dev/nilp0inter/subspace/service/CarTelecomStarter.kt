@@ -25,6 +25,33 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
+ * Starts voice recognition for one device and reverses that exact start when
+ * the observed HFP audio readiness wait times out.
+ */
+internal suspend fun <D> primeHfpDeviceForTelecom(
+    device: D,
+    startVoiceRecognition: (D) -> Boolean,
+    isAudioConnected: (D) -> Boolean,
+    stopVoiceRecognition: (D) -> Boolean,
+    timeoutMs: Long = 1_500L,
+    pollMs: Long = 50L,
+): Boolean {
+    val started = runCatching { startVoiceRecognition(device) }.getOrDefault(false)
+    if (!started) return false
+    val connected = withTimeoutOrNull(timeoutMs) {
+        while (!runCatching { isAudioConnected(device) }.getOrDefault(false)) {
+            delay(pollMs)
+        }
+        true
+    } == true
+    if (!connected) {
+        runCatching { stopVoiceRecognition(device) }
+        return false
+    }
+    return true
+}
+
+/**
  * Encapsulates the car-telecom PTT lifecycle that was previously inlined in
  * [PttForegroundService].
  *
@@ -198,19 +225,35 @@ internal class CarTelecomStarter(
             "CAR_HFP_PRIME_BEGIN target='${car.name}' audioBefore=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)} " +
                 "current=${audioManager.communicationDevice.routeDebugString()}",
         )
-        val started = runCatching { proxy.startVoiceRecognition(car) }
-            .onFailure {
-                Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_START_THROW target='${car.name}' error=${it.javaClass.simpleName}")
-            }
-            .getOrDefault(false)
+        var started = false
+        val connected = primeHfpDeviceForTelecom(
+            device = car,
+            startVoiceRecognition = { device ->
+                started = runCatching { proxy.startVoiceRecognition(device) }
+                    .onFailure {
+                        Log.d(
+                            ROUTE_LOG_TAG,
+                            "CAR_HFP_PRIME_START_THROW target='${device.name}' error=${it.javaClass.simpleName}",
+                        )
+                    }
+                    .getOrDefault(false)
+                started
+            },
+            isAudioConnected = { device -> runCatching { proxy.isAudioConnected(device) }.getOrDefault(false) },
+            stopVoiceRecognition = { device ->
+                runCatching { proxy.stopVoiceRecognition(device) }
+                    .onFailure {
+                        Log.d(
+                            ROUTE_LOG_TAG,
+                            "CAR_HFP_PRIME_STOP_THROW target='${device.name}' error=${it.javaClass.simpleName}",
+                        )
+                    }
+                    .getOrDefault(false)
+            },
+            timeoutMs = CAR_HFP_PRIME_TIMEOUT_MS,
+            pollMs = CAR_HFP_PRIME_POLL_MS,
+        )
         Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_START target='${car.name}' returned=$started")
-        if (!started) return false
-        val connected = withTimeoutOrNull(CAR_HFP_PRIME_TIMEOUT_MS) {
-            while (!runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)) {
-                delay(CAR_HFP_PRIME_POLL_MS)
-            }
-            true
-        } == true
         Log.d(
             ROUTE_LOG_TAG,
             "CAR_HFP_PRIME_END target='${car.name}' connected=$connected " +

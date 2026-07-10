@@ -5,9 +5,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -15,10 +20,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Identifier for the capture input source the service starts its recorder with.
@@ -211,57 +216,89 @@ class CaptureService(
         if (active != null) return@withLock CaptureStartResult.SessionActive
 
         var opened: OpenedCaptureSource? = null
+        var routeAcquired = false
+        var preCommitDrain: Job? = null
+        suspend fun cleanupSetup() = withContext(NonCancellable) {
+            preCommitDrain?.cancelAndJoin()
+            preCommitDrain = null
+            val sourceToClose = opened
+            opened = null
+            runCatching { sourceToClose?.close() }
+            if (routeAcquired) {
+                routeAcquired = false
+                sco.release()
+            }
+        }
+
+        suspend fun startPreCommitDrain(source: OpenedCaptureSource) {
+            val started = CompletableDeferred<Unit>()
+            preCommitDrain = scope.launch(readDispatcher, start = CoroutineStart.ATOMIC) {
+                started.complete(Unit)
+                val discardBuffer = ShortArray(source.bufferSizeShorts.coerceAtLeast(1))
+                while (currentCoroutineContext().isActive) {
+                    source.read(discardBuffer)
+                    // AudioRecord.read may return no data; this also provides a
+                    // cancellation checkpoint after every discard attempt.
+                    delay(1)
+                }
+            }
+            started.await()
+        }
+
         try {
             if (!sco.acquire()) return@withLock CaptureStartResult.ScoUnavailable
+            routeAcquired = true
 
             // PTT released during SCO acquisition: keep SCO warm, no beep, no record.
             // The service owns the SCO release on this failure branch — controllers
             // MUST NOT also release SCO here (capture-service / sco-audio specs).
             if (!shouldProceed()) {
-                sco.release()
+                cleanupSetup()
                 return@withLock CaptureStartResult.Cancelled
             }
 
-            opened = source.open() ?: run {
-                sco.release()
+            opened = source.open()
+            if (opened == null) {
+                cleanupSetup()
                 return@withLock CaptureStartResult.RecordingFailed
             }
-            val evidence = opened.startupEvidence.copy(
+            val evidence = opened!!.startupEvidence.copy(
                 recorderOpened = true,
                 sourceId = source.sourceId,
-                sampleRate = opened.sampleRate,
+                sampleRate = opened!!.sampleRate,
             )
             if (evidence.clientSilenced == true) {
-                opened.close()
-                sco.release()
-                opened = null
+                cleanupSetup()
                 return@withLock CaptureStartResult.RecordingSilenced(evidence)
             }
 
             // PTT released after capture preflight but before the ready beep:
             // no record, no ready signal, and no channel-visible frames.
             if (!shouldProceed()) {
-                opened.close()
-                sco.release()
-                opened = null
+                cleanupSetup()
                 return@withLock CaptureStartResult.Cancelled
             }
 
+            // AudioRecord is started during open() so startup failures happen before
+            // the user hears readiness. Drain it exclusively until the beep ends.
+            startPreCommitDrain(opened!!)
             output.playReadyBeep(sco.coldStart)
 
+            // Stop and join the discard reader before handing the source to the
+            // channel-visible session. No pre-beep samples can cross this boundary.
+            preCommitDrain?.cancelAndJoin()
+            preCommitDrain = null
+
             // PTT released during the ready beep: no record and no user audio
-            // delivery. The opened recorder is discarded before read-loop
-            // handoff, so any pre-beep frames remain channel-invisible.
+            // delivery. The opened recorder is discarded before read-loop handoff.
             if (!shouldProceed()) {
-                opened.close()
-                sco.release()
-                opened = null
+                cleanupSetup()
                 return@withLock CaptureStartResult.Cancelled
             }
 
             val session = CaptureSessionImpl(
                 scope = scope,
-                opened = opened,
+                opened = opened!!,
                 coldStart = sco.coldStart,
                 readDispatcher = readDispatcher,
                 maxDurationMs = maxDurationMs,
@@ -285,15 +322,15 @@ class CaptureService(
                 },
             )
             opened = null // ownership transferred
+            routeAcquired = false // route lifecycle remains with the caller
             active = session
             _isCapturing.value = true
             CaptureStartResult.Started(session, evidence)
         } catch (cancellation: CancellationException) {
-            opened?.close()
+            cleanupSetup()
             throw cancellation
         } catch (error: Throwable) {
-            opened?.close()
-            sco.release()
+            cleanupSetup()
             CaptureStartResult.RecordingFailed
         }
     }

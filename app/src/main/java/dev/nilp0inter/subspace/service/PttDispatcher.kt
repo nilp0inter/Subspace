@@ -120,6 +120,11 @@ internal class PttDispatcher(
         }
         updateCarMediaState()
     }
+    /** Cancel only a pending/pre-capture session for the requested source. */
+    fun cancelPending(
+        source: PttSource,
+        reason: String = "Telecom connection ended",
+    ): Boolean = audioSessionManager.cancelPending(source, reason)
 
     fun isTerminalCarSource(): Boolean =
         activePttSession?.source == PttSource.CarTelecom
