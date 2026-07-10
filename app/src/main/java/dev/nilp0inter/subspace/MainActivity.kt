@@ -14,11 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -27,12 +23,13 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.InputMode
-import dev.nilp0inter.subspace.model.SetupState
-import dev.nilp0inter.subspace.audio.ModelDownloader
-import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
+import dev.nilp0inter.subspace.ui.BootstrapLoadingScreen
+import dev.nilp0inter.subspace.ui.BootstrapRootSurface
+import dev.nilp0inter.subspace.ui.bootstrapRootSurface
 import dev.nilp0inter.subspace.ui.ConnectionScreen
 import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
 import dev.nilp0inter.subspace.ui.InitialSetupScreen
@@ -76,31 +73,27 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(0f) }
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(false) }
-            var route by remember { mutableStateOf(MainRoute.Setup) }
-            var setupState by remember { mutableStateOf(SetupState()) }
+
+            // Bootstrap state from the service — the authoritative source
+            // for loading, setup, recovery, and dashboard routing.
+            val bootstrapState by currentService?.bootstrapState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(BootstrapState.ConnectingService) }
+            val modelProgress by currentService?.modelAcquisitionProgress
+                ?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(dev.nilp0inter.subspace.model.ModelAcquisitionProgress()) }
+
+            var dashboardRoute by remember { mutableStateOf(DashboardRoute.Main) }
             val scope = rememberCoroutineScope()
 
-            LaunchedEffect(Unit) {
-                val ctx = this@MainActivity
-                val permissionsDone = withContext(Dispatchers.IO) {
-                    RequiredPermissions.missing(ctx).isEmpty()
-                }
-                val modelsDone = withContext(Dispatchers.IO) {
-                    runCatching { ModelVerifier.isComplete(ctx) }.getOrDefault(false)
-                }
-                setupState = setupState.copy(
-                    permissionsDone = permissionsDone,
-                    modelsDone = modelsDone,
-                )
-                if (permissionsDone && modelsDone) {
-                    route = MainRoute.Dashboard
-                }
-            }
+            // Derive the root surface from bootstrap state.
+            val rootSurface = bootstrapRootSurface(bootstrapState)
+
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
-                currentServiceState?.refreshReadiness()
+                // Route permission results to prerequisite refresh.
+                currentServiceState?.refreshBootstrapPrerequisites()
             }
             val directoryLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocumentTree(),
@@ -192,23 +185,23 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun navigateToRsmSetup() {
-                        route = if (currentReadyForMonitor) MainRoute.Monitor else MainRoute.Connection
+                        dashboardRoute = if (currentReadyForMonitor) DashboardRoute.Monitor else DashboardRoute.Connection
                     }
 
                     override fun navigateToJournalConfig() {
-                        route = MainRoute.JournalConfig
+                        dashboardRoute = DashboardRoute.JournalConfig
                     }
 
                     override fun navigateToDebugConfig() {
-                        route = MainRoute.DebugChannelConfig
+                        dashboardRoute = DashboardRoute.DebugChannelConfig
                     }
 
                     override fun navigateToKeyboardConfig() {
-                        route = MainRoute.KeyboardConfig
+                        dashboardRoute = DashboardRoute.KeyboardConfig
                     }
 
                     override fun navigateBack() {
-                        route = MainRoute.Dashboard
+                        dashboardRoute = DashboardRoute.Main
                     }
 
                     override fun setTtsText(text: String) {
@@ -263,69 +256,71 @@ class MainActivity : ComponentActivity() {
 
             SubspaceTheme {
                 Surface {
-                    BackHandler(enabled = route != MainRoute.Dashboard && route != MainRoute.Setup) {
-                        route = MainRoute.Dashboard
-                    }
+                    when (rootSurface) {
+                        BootstrapRootSurface.Loading -> {
+                            val needsSetup = bootstrapState is BootstrapState.NeedsSetup
+                            BackHandler(enabled = false) { }
+                            BootstrapLoadingScreen(
+                                state = bootstrapState,
+                                modelProgress = modelProgress,
+                                onRetry = { currentServiceState?.retryBootstrap() },
+                            )
+                        }
 
-                    when (route) {
-                        MainRoute.Setup -> InitialSetupScreen(
-                            state = setupState,
-                            onGrantPermissions = {
-                                val missing = RequiredPermissions.missing(this@MainActivity)
-                                setupState = setupState.copy(permissionsDone = missing.isEmpty())
-                            },
-                            onStartModelDownload = {
-                                scope.launch {
-                                    setupState = setupState.copy(downloading = true, error = null)
-                                    try {
-                                        val ctx = this@MainActivity
-                                        withContext(Dispatchers.IO) {
-                                            ModelDownloader.ensure(ctx, ModelVerifier.PARAKEET_DIR) { p ->
-                                                setupState = setupState.copy(parakeetProgress = p)
-                                            }
-                                            ModelDownloader.ensure(ctx, ModelVerifier.SUPERTONIC_DIR) { p ->
-                                                setupState = setupState.copy(supertonicProgress = p)
-                                            }
-                                        }
-                                        setupState = setupState.copy(downloading = false, modelsDone = true)
-                                    } catch (e: Exception) {
-                                        setupState = setupState.copy(
-                                            downloading = false,
-                                            error = e.message ?: "Download failed",
-                                        )
-                                    }
-                                }
-                            },
-                            onEnterSubspace = { route = MainRoute.Dashboard },
-                        )
+                        BootstrapRootSurface.Setup -> {
+                            val setup = bootstrapState as BootstrapState.NeedsSetup
+                            BackHandler(enabled = false) { }
+                            InitialSetupScreen(
+                                missingPermissions = setup.missingPermissions,
+                                invalidModelSets = setup.invalidModelSets,
+                                error = setup.error,
+                                onGrantPermissions = {
+                                    permissionLauncher.launch(RequiredPermissions.runtimePermissions())
+                                },
+                                onStartModelDownload = {
+                                    // Move to loading: the coordinator handles
+                                    // acquisition and returns to setup only on
+                                    // failure.
+                                    currentServiceState?.startModelAcquisition()
+                                },
+                            )
+                        }
 
-                        MainRoute.Dashboard -> MainDashboardScreen(
-                            appState = state,
-                            level = level,
-                            isCapturing = isCapturing,
-                            actions = actions,
-                        )
+                        BootstrapRootSurface.Dashboard -> {
+                            BackHandler(enabled = dashboardRoute != DashboardRoute.Main) {
+                                dashboardRoute = DashboardRoute.Main
+                            }
 
-                        MainRoute.Connection -> ConnectionScreen(state.connection, actions)
-                        MainRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                        MainRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
-                            channel = state.journal,
-                            actions = actions,
-                            onBack = { route = MainRoute.Dashboard },
-                        )
-                        MainRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
-                            channel = state.debugChannel,
-                            monitorState = state.monitor,
-                            actions = actions,
-                            onBack = { route = MainRoute.Dashboard },
-                        )
-                        MainRoute.KeyboardConfig -> dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
-                            channel = state.keyboard,
-                            monitorState = state.monitor,
-                            actions = actions,
-                            keymapProfiles = service?.getKeymapProfiles() ?: emptyList(),
-                            onBack = { route = MainRoute.Dashboard },
-                        )
+                            when (dashboardRoute) {
+                                DashboardRoute.Main -> MainDashboardScreen(
+                                    appState = state,
+                                    level = level,
+                                    isCapturing = isCapturing,
+                                    actions = actions,
+                                )
+
+                                DashboardRoute.Connection -> ConnectionScreen(state.connection, actions)
+                                DashboardRoute.Monitor -> MonitorScreen(state.monitor, actions)
+                                DashboardRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
+                                    channel = state.journal,
+                                    actions = actions,
+                                    onBack = { dashboardRoute = DashboardRoute.Main },
+                                )
+                                DashboardRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
+                                    channel = state.debugChannel,
+                                    monitorState = state.monitor,
+                                    actions = actions,
+                                    onBack = { dashboardRoute = DashboardRoute.Main },
+                                )
+                                DashboardRoute.KeyboardConfig -> dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
+                                    channel = state.keyboard,
+                                    monitorState = state.monitor,
+                                    actions = actions,
+                                    keymapProfiles = service?.getKeymapProfiles() ?: emptyList(),
+                                    onBack = { dashboardRoute = DashboardRoute.Main },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -355,5 +350,5 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class MainRoute { Setup, Dashboard, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
+    private enum class DashboardRoute { Main, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
 }

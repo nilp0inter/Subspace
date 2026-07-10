@@ -37,9 +37,13 @@ object ModelDownloader {
 
     /**
      * Ensure the model set named [dirName] is present on disk and return its
-     * directory. If the version marker matches the manifest, the existing
-     * directory is returned unchanged (fast path). Otherwise every file in the
-     * set is (re)downloaded, SHA-256 verified per file, and the marker written.
+     * directory. Performs a full verification: the version marker alone never
+     * bypasses file-presence, nonzero-length, and SHA-256 validation. If any
+     * file fails verification, the set is (re)downloaded, per-file SHA-256
+     * verified, and the marker written only after every file passes.
+     *
+     * The completion marker is committed only after every required file has
+     * been downloaded and verified (see [downloadSet]).
      */
     fun ensure(
         context: Context,
@@ -51,13 +55,36 @@ object ModelDownloader {
         val dir = File(context.filesDir, dirName)
         if (!dir.exists()) dir.mkdirs()
 
-        val marker = File(dir, ModelVerifier.MARKER_NAME)
-        if (marker.exists() && marker.readText().trim() == set.version) {
+        // A matching version marker is a cheap invalidation hint, not proof
+        // of validity. Run the full per-file SHA-256 verification. Only if
+        // every file passes do we skip the download.
+        if (ModelVerifier.status(context, manifest, dirName) == ModelSetStatus.Valid) {
             return dir
         }
 
         downloadSet(set, dir, onProgress)
         return dir
+    }
+
+    /**
+     * Like [ensure] but returns `true` on success and `false` on failure
+     * instead of throwing. The completion marker is committed only after
+     * every required file verifies, and a final full verification is run
+     * before returning `true`.
+     */
+    fun ensureFull(
+        context: Context,
+        dirName: String,
+        onProgress: (DownloadProgress) -> Unit = {},
+    ): Boolean {
+        return try {
+            ensure(context, dirName, onProgress)
+            // Final full verification after download.
+            val manifest = ModelVerifier.loadManifest(context)
+            ModelVerifier.status(context, manifest, dirName) == ModelSetStatus.Valid
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun downloadSet(

@@ -1,10 +1,4 @@
-# Initial Setup
-
-## Purpose
-
-Define the first-launch setup flow that gates access to the main application until required permissions and runtime models are ready.
-
-## Requirements
+## ADDED Requirements
 
 ### Requirement: Setup presents only known user actions
 The system SHALL show the setup surface only after bootstrap has identified a concrete user-resolvable prerequisite: missing runtime permissions or model assets that require explicit download or repair. The system SHALL NOT show setup during passive checking, native speech initialization, controller construction, announcement rendering, or autonomous recovery.
@@ -47,6 +41,8 @@ The system SHALL re-evaluate prerequisites after every setup action and SHALL le
 - **WHEN** user-initiated model acquisition completes and all required model sets pass full verification
 - **THEN** the system continues from loading into core preparation without another setup acknowledgement
 
+## MODIFIED Requirements
+
 ### Requirement: Initial setup screen gates main app
 The system SHALL present a setup screen after passive bootstrap checking on first launch or any subsequent launch where a required permission is missing or a model set requires explicit download or repair. The setup screen SHALL gate the dashboard while a user-resolvable prerequisite remains incomplete, and setup completion SHALL return automatically to passive loading for core preparation.
 
@@ -58,7 +54,7 @@ The system SHALL present a setup screen after passive bootstrap checking on firs
 #### Scenario: All setup steps complete resumes loading
 - **WHEN** all setup steps are completed with permissions granted and model assets fully verified
 - **THEN** the system automatically returns to loading for core initialization
-- **AND** no "Enter Subspace" action is required
+- **AND** no “Enter Subspace” action is required
 
 #### Scenario: Permission revoked on later launch
 - **WHEN** the app is launched and any required runtime permission has been revoked since the previous launch
@@ -73,50 +69,9 @@ The system SHALL present a setup screen after passive bootstrap checking on firs
 - **THEN** the setup screen is skipped
 - **AND** loading continues through core initialization before the dashboard is shown
 
-### Requirement: Setup screen shows step status
+## REMOVED Requirements
 
-The setup screen SHALL display each step with a clear status indicator (pending, in progress, completed, failed).
+### Requirement: "Enter Subspace" button gated on completion
+**Reason**: Setup now exists only while a user-resolvable prerequisite is incomplete. A second acknowledgement after prerequisites complete misleadingly suggests another decision and prevents automatic continuation through core loading.
 
-#### Scenario: Step shows pending initially
-- **WHEN** the setup screen appears and a step has not been started
-- **THEN** the step shows a pending/neutral icon and its action button
-
-#### Scenario: Completed step shows check mark
-- **WHEN** a step has been successfully completed
-- **THEN** the step shows a green check mark and its action button is hidden or disabled
-
-#### Scenario: In-progress step shows progress
-- **WHEN** a step is actively being executed (e.g., downloading models)
-- **THEN** the step shows a progress indicator (spinner for permissions, progress bar with percentage for downloads)
-
-#### Scenario: Failed step shows error
-- **WHEN** a step has failed (e.g., download error, permission denied)
-- **THEN** the step shows an error icon and a retry button
-
-### Requirement: Permissions step requests all runtime permissions
-
-The system SHALL request all required runtime permissions in a single batch when the user taps the permissions action button.
-
-#### Scenario: Grant all permissions
-- **WHEN** the user taps "Grant permissions" on the setup screen
-- **THEN** the system launches Android's runtime permission dialog for BLUETOOTH_CONNECT, BLUETOOTH_SCAN, RECORD_AUDIO, and POST_NOTIFICATIONS simultaneously
-
-#### Scenario: All permissions granted
-- **WHEN** the user grants all requested permissions
-- **THEN** the permissions step shows a green check mark and the model download step becomes actionable
-
-#### Scenario: Some permissions denied
-- **WHEN** the user denies one or more requested permissions
-- **THEN** the permissions step shows which permissions are still missing and the "Grant permissions" button remains available
-
-### Requirement: ConnectionScreen no longer shows permissions
-
-The RSM device setup page (ConnectionScreen) SHALL NOT include any permission-requesting UI elements.
-
-#### Scenario: ConnectionScreen without permissions
-- **WHEN** the user navigates to the RSM setup page
-- **THEN** the page does not show a "Grant permissions" button, a permissions status row, or permissions guidance text
-
-#### Scenario: ConnectionScreen still shows other readiness checks
-- **WHEN** the user navigates to the RSM setup page
-- **THEN** Bluetooth enablement, device presence, SPP state, and headset audio state are still displayed and actionable
+**Migration**: Remove the button and its callback. Drive setup exit from authoritative prerequisite/bootstrap state; after the final setup action, return automatically to loading and enter the dashboard only when core readiness completes.

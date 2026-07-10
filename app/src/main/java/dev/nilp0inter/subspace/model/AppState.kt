@@ -9,7 +9,7 @@ data class AppState(
     val activeChannelId: String = JournalChannel.ID,
     val inputMode: InputMode = InputMode.OnAPinch,
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
-    val setupState: SetupState = SetupState(),
+    // setupState removed: bootstrap state is now owned by BootstrapCoordinator
     val inputModeAvailability: InputModeAvailability = InputModeAvailability(),
 ) {
     val readyForMonitor: Boolean

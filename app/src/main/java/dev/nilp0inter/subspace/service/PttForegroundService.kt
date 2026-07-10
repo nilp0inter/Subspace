@@ -38,7 +38,7 @@ import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
 import dev.nilp0inter.subspace.audio.MediaResponsePcmOutput
 import dev.nilp0inter.subspace.audio.OggEncoder
-import dev.nilp0inter.subspace.audio.ModelDownloader
+import dev.nilp0inter.subspace.audio.ModelAssetRepository
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.PcmTranscriber
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
@@ -74,6 +74,9 @@ import dev.nilp0inter.subspace.channel.JournalEntryPaths
 import dev.nilp0inter.subspace.channel.JournalMetadataStore
 import dev.nilp0inter.subspace.channel.JournalPttController
 import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.model.AnnouncementResult
+import dev.nilp0inter.subspace.model.BootstrapState
+import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.ChannelBrowseEntry
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.InputModeAvailability
@@ -129,11 +132,31 @@ internal fun deriveCarMediaPttState(
     null -> if (onTheRoadAvailable) CarMediaPttState.Ready else CarMediaPttState.NotReady
 }
 
-class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter {
+class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter, CoreInit {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _appState = MutableStateFlow(AppState())
     val appState: StateFlow<AppState> = _appState.asStateFlow()
+
+    /**
+     * Process-scoped model asset repository — the single authoritative
+     * owner of model inspection, acquisition, repair, and progress.
+     */
+    private lateinit var modelRepository: ModelAssetRepository
+
+    /**
+     * Service-owned bootstrap coordinator. Owns the authoritative bootstrap
+     * state that drives loading/setup/recovery/dashboard routing.
+     */
+    private lateinit var bootstrapCoordinator: BootstrapCoordinator
+
+    /** Bootstrap state observed by the activity to decide the root surface. */
+    val bootstrapState: StateFlow<BootstrapState>
+        get() = bootstrapCoordinator.state
+
+    /** Model acquisition progress for loading display. */
+    val modelAcquisitionProgress: StateFlow<dev.nilp0inter.subspace.model.ModelAcquisitionProgress>
+        get() = modelRepository.progress
 
     val isCapturing: StateFlow<Boolean> get() = captureService.isCapturing
     val level: StateFlow<Float> get() = captureService.level
@@ -180,23 +203,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var captureService: CaptureService
     private lateinit var voiceCommunicationSource: AndroidVoiceCommunicationCaptureSource
     private lateinit var echo: EchoController
-    private var sttController: SttController? = null
-    private var sttTranscriber: SttTranscriber? = null
+    override var sttController: SttController? = null
+    override var sttTranscriber: SttTranscriber? = null
     private val sttReady = CompletableDeferred<SttTranscriber?>()
     private var sttModelDir: java.io.File? = null
     private var transcriptionService: TranscriptionService? = null
     private var sttModelStatusJob: Job? = null
-    private var ttsController: TtsController? = null
-    private var ttsSynthesizer: TtsSynthesizer? = null
+    override var ttsController: TtsController? = null
+    override var ttsSynthesizer: TtsSynthesizer? = null
     private var supertonicModelDir: java.io.File? = null
-    private var announcer: SystemAnnouncer? = null
+    override var announcer: SystemAnnouncer? = null
     private var ttsModelStatusJob: Job? = null
-    private var sttTtsController: SttTtsController? = null
-    private var journalPttController: JournalPttController? = null
+    override var sttTtsController: SttTtsController? = null
+    override var journalPttController: JournalPttController? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
     private val keymapDatabase: JsonKeymapDatabase by lazy { JsonKeymapDatabase(resources) }
     private var keyboardProfilesCache: List<Pair<HostProfile, String>>? = null
-    var keyboardController: KeyboardPttController? = null
+    override var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
     private lateinit var localOutput: MediaResponsePcmOutput
@@ -334,15 +357,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             output = pcmOutput,
         )
 
-        val initStartNanos = SystemClock.elapsedRealtimeNanos()
-        initializeStt(audioManager)
-        initializeTts(audioManager)
-        android.util.Log.d(
-            TAG,
-            "onCreate off-main model init launched in " +
-                "${(SystemClock.elapsedRealtimeNanos() - initStartNanos) / 1_000_000}ms",
+        // Initialize the process-scoped model asset repository and bootstrap
+        // coordinator. The coordinator owns the authoritative bootstrap state
+        // and drives native initialization, controller construction, and
+        // announcement rendering through the CoreInit interface.
+        modelRepository = ModelAssetRepository(this, serviceScope)
+        bootstrapCoordinator = BootstrapCoordinator(
+            context = this,
+            scope = serviceScope,
+            modelRepository = modelRepository,
+            coreInit = this,
         )
-        initializeJournal(audioManager)
+        bootstrapCoordinator.startBootstrap()
+
         
         updateActiveControllers()
 
@@ -371,162 +398,252 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
 
-    private fun initializeStt(audioManager: AudioManager) {
-        serviceScope.launch(Dispatchers.IO) {
-            val transcriber = try {
-                val nativeLibDir = applicationInfo.nativeLibraryDir
-                val modelDir = ModelDownloader.ensure(this@PttForegroundService, ModelVerifier.PARAKEET_DIR)
-                sttModelDir = modelDir
-                ParakeetJniTranscriber(
-                    nativeLibDir = nativeLibDir,
-                    modelDir = modelDir.absolutePath,
-                )
-            } catch (err: Throwable) {
-                android.util.Log.w(TAG, "STT transcriber unavailable: ${err.message}")
-                null
+    // ---- CoreInit implementation ----
+
+    override fun constructSttTranscriber(): SttTranscriber? {
+        return try {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val modelDir = java.io.File(filesDir, ModelVerifier.PARAKEET_DIR)
+            sttModelDir = modelDir
+            val transcriber = ParakeetJniTranscriber(
+                nativeLibDir = nativeLibDir,
+                modelDir = modelDir.absolutePath,
+            )
+            sttTranscriber = transcriber
+            transcriber
+        } catch (err: Throwable) {
+            Log.w(TAG, "STT transcriber unavailable: ${err.message}")
+            null
+        }
+    }
+
+    override fun constructTtsSynthesizer(): TtsSynthesizer? {
+        return try {
+            val nativeLibDir = applicationInfo.nativeLibraryDir
+            val modelDir = java.io.File(filesDir, ModelVerifier.SUPERTONIC_DIR)
+            supertonicModelDir = modelDir
+            val synth = SupertonicJniSynthesizer(
+                nativeLibDir = nativeLibDir,
+                modelDir = modelDir.absolutePath,
+            )
+            ttsSynthesizer = synth
+            synth
+        } catch (err: Throwable) {
+            Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
+            null
+        }
+    }
+
+    override fun constructSttController(transcriber: SttTranscriber) {
+        sttReady.complete(transcriber)
+        val transcription = TranscriptionService(transcriber)
+        transcriptionService = transcription
+        sttController = SttController(
+            scope = serviceScope,
+            sco = sco,
+            captureService = captureService,
+            source = voiceCommunicationSource,
+            output = pcmOutput,
+            transcriptionService = transcription,
+        )
+        Log.d(ROUTE_LOG_TAG, "STT_CONTROLLER_INIT sttController set")
+        sttModelStatusJob = serviceScope.launch {
+            var lastStatus: SttModelStatus? = null
+            while (true) {
+                val status = transcriber.modelStatus
+                if (status != lastStatus) {
+                    lastStatus = status
+                    updateMonitor { it.copy(sttModelStatus = status) }
+                }
+                kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
             }
-            sttReady.complete(transcriber)
-            if (transcriber != null) {
-                sttTranscriber = transcriber
-                serviceScope.launch {
-                    val transcription = TranscriptionService(transcriber)
-                    transcriptionService = transcription
-                    sttController = SttController(
-                        scope = serviceScope,
-                        sco = sco,
-                        captureService = captureService,
-                        source = voiceCommunicationSource,
-                        output = pcmOutput,
-                        transcriptionService = transcription,
-                    )
-                    Log.d(ROUTE_LOG_TAG, "STT_CONTROLLER_INIT sttController set")
-                    sttModelStatusJob = serviceScope.launch {
-                        var lastStatus: SttModelStatus? = null
-                        while (true) {
-                            val status = transcriber.modelStatus
-                            if (status != lastStatus) {
-                                lastStatus = status
-                                updateMonitor { it.copy(sttModelStatus = status) }
-                            }
-                            kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
-                        }
-                    }
-                    serviceScope.launch {
-                        sttController?.status?.collect { status ->
-                            if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                            updateMonitor {
-                                val newTranscript = (status as? SttStatus.Transcribed)?.text
-                                    ?: it.sttTranscript
-                                it.copy(sttStatus = status, sttTranscript = newTranscript)
-                            }
-                        }
-                    }
-                    keyboardController = KeyboardPttController(
-                        scope = serviceScope,
-                        sco = sco,
-                        captureService = captureService,
-                        source = voiceCommunicationSource,
-                        output = pcmOutput,
-                        transcriptionService = transcription,
-                        connection = sleepwalkerConnection,
-                        hid = LowLevelHidImpl(),
-                        keymapDatabase = keymapDatabase,
-                        hostProfileProvider = { _appState.value.keyboard.hostProfile },
-                    )
-                    serviceScope.launch {
-                        keyboardController?.status?.collect { status ->
-                            if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                            updateMonitor { it.copy(keyboardStatus = status) }
-                        }
-                    }
-                    updateActiveControllers()
+        }
+        serviceScope.launch {
+            sttController?.status?.collect { status ->
+                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
+                updateMonitor {
+                    val newTranscript = (status as? SttStatus.Transcribed)?.text
+                        ?: it.sttTranscript
+                    it.copy(sttStatus = status, sttTranscript = newTranscript)
+                }
+            }
+        }
+        updateActiveControllers()
+    }
+
+    override fun constructTtsController(synthesizer: TtsSynthesizer) {
+        ttsController = TtsController(
+            scope = serviceScope,
+            sco = sco,
+            output = pcmOutput,
+            synthesizer = synthesizer,
+        )
+        ttsModelStatusJob = serviceScope.launch {
+            var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
+            while (true) {
+                val status = synthesizer.modelStatus
+                if (status != lastStatus) {
+                    lastStatus = status
+                    updateMonitor { it.copy(ttsModelStatus = status) }
+                }
+                kotlinx.coroutines.delay(TTS_MODEL_POLL_MS)
+            }
+        }
+        serviceScope.launch {
+            ttsController?.status?.collect { status ->
+                updateMonitor { it.copy(ttsStatus = status) }
+            }
+        }
+        updateActiveControllers()
+    }
+
+    override fun constructSttTtsController(
+        transcriber: SttTranscriber,
+        synthesizer: TtsSynthesizer,
+    ) {
+        sttTtsController = SttTtsController(
+            scope = serviceScope,
+            sco = sco,
+            captureService = captureService,
+            source = voiceCommunicationSource,
+            output = pcmOutput,
+            transcriber = transcriber,
+            synthesizer = synthesizer,
+        )
+        serviceScope.launch {
+            sttTtsController?.status?.collect { status ->
+                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
+                val transcript = (status as? SttTtsStatus.Transcript)?.text
+                    ?: _appState.value.monitor.sttTtsTranscript
+                updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
+            }
+        }
+        updateActiveControllers()
+    }
+
+    override fun constructJournalPttController() {
+        if (journalPttController != null) return
+        // sttReady is already completed by constructSttController before
+        // this is called, so we can get the transcriber synchronously.
+        val transcriber = sttReady.getCompleted()
+        val pcmTranscriber: PcmTranscriber = if (transcriber != null) {
+            TranscriptionService(transcriber)
+        } else {
+            object : PcmTranscriber {
+                override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
+                    throw IllegalStateException("STT transcriber unavailable")
+                }
+            }
+        }
+        val journalController = JournalController(
+            scope = serviceScope,
+            encoder = OggEncoder(),
+            transcriber = pcmTranscriber,
+        )
+        journalPttController = JournalPttController(
+            scope = serviceScope,
+            sco = sco,
+            output = pcmOutput,
+            captureService = captureService,
+            source = voiceCommunicationSource,
+            journal = journalController,
+            channelProvider = { _appState.value.journal },
+        )
+        // Run journal recovery asynchronously — it's outside the bootstrap
+        // completion predicate.
+        serviceScope.launch {
+            val journal = _appState.value.journal
+            val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
+            if (baseDir != null) {
+                journalController.runRecovery(java.io.File(baseDir))
+            }
+            var lastBaseDir: String? = baseDir
+            _appState.collect { state ->
+                val currentDir = state.journal.baseDirectory?.takeIf { it.isNotBlank() }
+                if (currentDir != null && currentDir != lastBaseDir) {
+                    lastBaseDir = currentDir
+                    journalController.runRecovery(java.io.File(currentDir))
                 }
             }
         }
     }
 
-    private fun initializeTts(audioManager: AudioManager) {
-        serviceScope.launch(Dispatchers.IO) {
-            val synth = try {
-                val nativeLibDir = applicationInfo.nativeLibraryDir
-                val modelDir = ModelDownloader.ensure(this@PttForegroundService, ModelVerifier.SUPERTONIC_DIR)
-                supertonicModelDir = modelDir
-                SupertonicJniSynthesizer(
-                    nativeLibDir = nativeLibDir,
-                    modelDir = modelDir.absolutePath,
-                )
-            } catch (err: Throwable) {
-                android.util.Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
-                null
-            }
-            if (synth != null) {
-                ttsSynthesizer = synth
-                serviceScope.launch {
-                    announcer = SystemAnnouncer(synth)
-                    val vocabulary = mapOf(
-                        "sys.menu.channels" to "Channels",
-                        "chan.${JournalChannel.ID}.name" to "Journal Channel",
-                        "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
-                        "chan.${DebugChannel.ID}.name" to "Debug Channel",
-                        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected",
-                        "chan.${KeyboardChannel.ID}.name" to "Keyboard Channel",
-                        "chan.${KeyboardChannel.ID}.selected" to "Keyboard Channel Selected"
-                    )
-                    val styleDir = supertonicModelDir ?: return@launch
-                    val voiceStylePath = java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
-                    serviceScope.launch {
-                        announcer?.precompute(vocabulary, voiceStylePath, SCO_RATE)
-                    }
-
-                    ttsController = TtsController(
-                        scope = serviceScope,
-                        sco = sco,
-                        output = pcmOutput,
-                        synthesizer = synth,
-                    )
-                    ttsModelStatusJob = serviceScope.launch {
-                        var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
-                        while (true) {
-                            val status = synth.modelStatus
-                            if (status != lastStatus) {
-                                lastStatus = status
-                                updateMonitor { it.copy(ttsModelStatus = status) }
-                            }
-                            kotlinx.coroutines.delay(TTS_MODEL_POLL_MS)
-                        }
-                    }
-                    serviceScope.launch {
-                        ttsController?.status?.collect { status ->
-                            updateMonitor { it.copy(ttsStatus = status) }
-                        }
-                    }
-                    updateActiveControllers()
-                    serviceScope.launch {
-                        val transcriber = sttReady.await()
-                        if (transcriber != null) {
-                            sttTtsController = SttTtsController(
-                                scope = serviceScope,
-                                sco = sco,
-                                captureService = captureService,
-                                source = voiceCommunicationSource,
-                                output = pcmOutput,
-                                transcriber = transcriber,
-                                synthesizer = synth,
-                            )
-                            serviceScope.launch {
-                                sttTtsController?.status?.collect { status ->
-                                    if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                                    val transcript = (status as? SttTtsStatus.Transcript)?.text
-                                        ?: _appState.value.monitor.sttTtsTranscript
-                                    updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
-                                }
-                            }
-                            updateActiveControllers()
-                        }
-                    }
-                }
+    override fun constructKeyboardController(transcriber: SttTranscriber) {
+        val transcription = transcriptionService
+            ?: TranscriptionService(transcriber).also { transcriptionService = it }
+        keyboardController = KeyboardPttController(
+            scope = serviceScope,
+            sco = sco,
+            captureService = captureService,
+            source = voiceCommunicationSource,
+            output = pcmOutput,
+            transcriptionService = transcription,
+            connection = sleepwalkerConnection,
+            hid = LowLevelHidImpl(),
+            keymapDatabase = keymapDatabase,
+            hostProfileProvider = { _appState.value.keyboard.hostProfile },
+        )
+        serviceScope.launch {
+            keyboardController?.status?.collect { status ->
+                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
+                updateMonitor { it.copy(keyboardStatus = status) }
             }
         }
+        updateActiveControllers()
+    }
+
+    override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
+        announcer = SystemAnnouncer(synthesizer)
+    }
+
+    override fun buildVocabulary(): Map<String, String> = mapOf(
+        "sys.menu.channels" to "Channels",
+        "chan.${JournalChannel.ID}.name" to "Journal Channel",
+        "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
+        "chan.${DebugChannel.ID}.name" to "Debug Channel",
+        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected",
+        "chan.${KeyboardChannel.ID}.name" to "Keyboard Channel",
+        "chan.${KeyboardChannel.ID}.selected" to "Keyboard Channel Selected",
+    )
+
+    override fun voiceStylePath(): String {
+        val styleDir = supertonicModelDir ?: java.io.File(filesDir, ModelVerifier.SUPERTONIC_DIR)
+        return java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
+    }
+
+    override fun discardControllers() {
+        sttModelStatusJob?.cancel()
+        sttModelStatusJob = null
+        ttsModelStatusJob?.cancel()
+        ttsModelStatusJob = null
+        sttController?.cancelAndRelease()
+        sttController = null
+        ttsController?.cancelAndRelease()
+        ttsController = null
+        sttTtsController?.cancelAndRelease()
+        sttTtsController = null
+        journalPttController?.cancelAndRelease()
+        journalPttController = null
+        keyboardController?.cancelAndRelease()
+        keyboardController = null
+        announcer = null
+        sttTranscriber = null
+        ttsSynthesizer = null
+        transcriptionService = null
+    }
+
+    // ---- Binder commands for bootstrap ----
+
+    fun refreshBootstrapPrerequisites() {
+        bootstrapCoordinator.refreshPrerequisites()
+    }
+
+    fun startModelAcquisition() {
+        bootstrapCoordinator.startModelAcquisition()
+    }
+
+    fun retryBootstrap() {
+        bootstrapCoordinator.retry()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -539,6 +656,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun onDestroy() {
+        bootstrapCoordinator.cancelAttempt()
         pttDispatcher.forceReleaseActivePtt()
         keyboardController?.cancelAndRelease()
         sleepwalkerConnection.disconnect()
@@ -608,6 +726,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
 
 
+    /**
+     * Initialize journal recovery. The [JournalPttController] is now
+     * constructed by the bootstrap coordinator via [constructJournalPttController].
+     * This method handles only journal recovery and base-directory watching,
+     * which are outside the bootstrap completion predicate.
+     */
     private fun initializeJournal(audioManager: AudioManager) {
         serviceScope.launch {
             val sttTranscriber = sttReady.await()
@@ -624,15 +748,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 scope = serviceScope,
                 encoder = OggEncoder(),
                 transcriber = transcriber,
-            )
-            journalPttController = JournalPttController(
-                scope = serviceScope,
-                sco = sco,
-                output = pcmOutput,
-                captureService = captureService,
-                source = voiceCommunicationSource,
-                journal = journalController,
-                channelProvider = { _appState.value.journal },
             )
 
             val journal = _appState.value.journal
