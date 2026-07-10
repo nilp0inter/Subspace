@@ -6,18 +6,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-10
+
+### Added
+
+- Added a launch bootstrap screen that reports initialization progress, exposes recoverable startup failures, and offers retry before the dashboard opens.
+- Added mandatory first-run setup for permissions and on-device speech-model acquisition, including per-file download progress and resumption after interrupted downloads. The app returns to setup when required permissions are revoked or model assets fail verification.
+
 ### Changed
 
+- Reduced the installed APK by removing bundled Parakeet and Supertonic models; verified speech models now download to app storage during setup.
+- Moved model downloads from Hugging Face to the project's Cloudflare R2 mirror.
+- Coordinated model verification and acquisition, native STT/TTS initialization, controller creation, and announcement preparation under one readiness flow; setup no longer requires a separate dashboard-entry action.
+- Cached the system-announcement vocabulary after bootstrap to avoid repeated synthesis work.
 - Hardened PTT session ownership so normal release, cancellation, setup failure, and stale callbacks cannot race or clean the same route twice.
-- Added production recorder liveness proof, one same-route recorder retry, exact-device HFP-to-Telecom handoff, and stable active Bluetooth-route acceptance before car capture readiness.
+- Improved recorder and car-route readiness with liveness validation, one same-route retry, exact-device HFP-to-Telecom handoff, and stable Bluetooth-route acceptance before car capture begins.
 
 ### Fixed
 
-- Fixed normal car hang finalization so accepted Journal captures receive terminal PCM, metadata, derived OGG/transcription processing, Markdown regeneration, and route cleanup.
+- Fixed normal car-hang finalization so accepted Journal captures receive terminal PCM, metadata, OGG/transcription processing, Markdown regeneration, and route cleanup.
 - Fixed ready beeps preceding unusable zero-only capture and prevented pre-beep PCM from entering channel-visible recordings.
-- Fixed Android Auto PTT state/control ordering across Recording, Finalizing, terminal completion, and the 30-second idle-retention window.
+- Fixed Android Auto PTT state/control ordering through Recording, Finalizing, terminal completion, and the 30-second idle-retention window.
 - Fixed phone-initiated recorded responses becoming inaudible on connected car media routes by waiting for stable normal-media routing and transient audio focus.
-
+- Fixed On The Road PTT from placing a second Telecom call while a session is active or proceeding when the selected channel is not ready.
+- Fixed STT-controller initialization racing route setup and ensured a timed-out Telecom route is released.
+- Fixed an app-startup crash caused by collecting the keyboard bridge state before PTT dispatch initialization.
+- Avoided unnecessary audio-route selection when there is no recorded response to play.
 ## [0.4.0] - 2026-07-07
 
 ### Added
@@ -90,7 +104,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Fixed release workflow `apksigner` lookup by using the full Android build-tools path.
 - Fixed release build-type configuration for Android Gradle Plugin pre-created build types.
 
-[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/nilp0inter/Subspace/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nilp0inter/Subspace/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/nilp0inter/Subspace/releases/tag/v0.2.0
