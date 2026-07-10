@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Hardened PTT session ownership so normal release, cancellation, setup failure, and stale callbacks cannot race or clean the same route twice.
+- Added production recorder liveness proof, one same-route recorder retry, exact-device HFP-to-Telecom handoff, and stable active Bluetooth-route acceptance before car capture readiness.
+
+### Fixed
+
+- Fixed normal car hang finalization so accepted Journal captures receive terminal PCM, metadata, derived OGG/transcription processing, Markdown regeneration, and route cleanup.
+- Fixed ready beeps preceding unusable zero-only capture and prevented pre-beep PCM from entering channel-visible recordings.
+- Fixed Android Auto PTT state/control ordering across Recording, Finalizing, terminal completion, and the 30-second idle-retention window.
+- Fixed phone-initiated recorded responses becoming inaudible on connected car media routes by waiting for stable normal-media routing and transient audio focus.
+
 ## [0.4.0] - 2026-07-07
 
 ### Added

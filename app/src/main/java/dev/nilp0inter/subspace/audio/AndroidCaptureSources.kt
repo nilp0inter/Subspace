@@ -58,14 +58,18 @@ abstract class AndroidCaptureSource(
             override val sampleRate: Int = selectedRate
             override val bufferSizeShorts: Int = minBuffer / Short.SIZE_BYTES
 
+            override val requiresPreCommitSignal: Boolean = true
+            override val preCommitSignalAttempts: Int = 2
+
             override val startupEvidence: CaptureStartupEvidence = CaptureStartupEvidence(
                 clientSilenced = activeConfiguration?.isClientSilenced,
                 inputDeviceName = record.routedDevice?.routeDebugString(),
             )
 
             override fun read(buffer: ShortArray): Int =
-                // Non-blocking reads make pre-commit drain cancellation/join
-                // deterministic without closing the source under the reader.
+                record.read(buffer, 0, buffer.size)
+
+            override fun readNonBlocking(buffer: ShortArray): Int =
                 record.read(buffer, 0, buffer.size, AudioRecord.READ_NON_BLOCKING)
 
             override fun close() {

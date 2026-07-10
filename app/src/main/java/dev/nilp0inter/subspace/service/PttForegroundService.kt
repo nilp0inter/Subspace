@@ -36,6 +36,7 @@ import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
+import dev.nilp0inter.subspace.audio.MediaResponsePcmOutput
 import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ModelDownloader
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
@@ -119,6 +120,15 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
+internal fun deriveCarMediaPttState(
+    phase: PttAudioSessionManager.SessionPhase?,
+    onTheRoadAvailable: Boolean,
+): CarMediaPttState = when (phase) {
+    PttAudioSessionManager.SessionPhase.PttHeld -> CarMediaPttState.Recording
+    PttAudioSessionManager.SessionPhase.TerminalWork -> CarMediaPttState.Finalizing
+    null -> if (onTheRoadAvailable) CarMediaPttState.Ready else CarMediaPttState.NotReady
+}
+
 class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -189,7 +199,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
-    private lateinit var localOutput: LocalPcmOutput
+    private lateinit var localOutput: MediaResponsePcmOutput
     private lateinit var micSource: AndroidMicCaptureSource
     private lateinit var telecomRegistrar: SubspacePhoneAccountRegistrar
     private lateinit var mediaResponsePlayer: MediaResponsePlayer
@@ -254,18 +264,20 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         )
         pcmOutput = AndroidPcmOutput(audioManager, sco::selectedCommunicationDevice)
         telecomCaptureOutput = AndroidPcmOutput(audioManager, requireActiveScoCommunicationDevice = false)
-        localOutput = LocalPcmOutput()
+        val rawLocalOutput = LocalPcmOutput()
         micSource = AndroidMicCaptureSource()
         captureService = CaptureService(serviceScope)
         voiceCommunicationSource = AndroidVoiceCommunicationCaptureSource()
         telecomRegistrar = SubspacePhoneAccountRegistrar(this)
         telecomRegistrar.register()
-        mediaResponsePlayer = MediaResponsePlayer(audioManager, localOutput)
+        mediaResponsePlayer = MediaResponsePlayer(audioManager, rawLocalOutput)
+        localOutput = MediaResponsePcmOutput(rawLocalOutput, mediaResponsePlayer)
         audioSessionManager = PttAudioSessionManager(
             scope = serviceScope,
             captureService = captureService,
             channelRouter = this,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
+            onTerminalCompleted = ::onAudioSessionTerminalCompleted,
         )
         carTelecomStarter = CarTelecomStarter(
             context = this,
@@ -278,8 +290,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             telecomRegistrar = telecomRegistrar,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
-            cancelIdleTimer = ::cancelIdleTimer,
-            startIdleTimer = ::startIdleTimer,
             isActivePttSession = { pttDispatcher.activePttSession != null },
             decidePttDispatch = { decidePttDispatch(_appState.value) },
             reservePendingCarPtt = { channelId ->
@@ -299,7 +309,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
             cancelIdleTimer = ::cancelIdleTimer,
-            startIdleTimer = ::startIdleTimer,
             decidePttDispatch = ::decidePttDispatch,
             appStateProvider = { _appState.value },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
@@ -924,11 +933,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
 
+    private fun onAudioSessionTerminalCompleted(
+        completion: PttAudioSessionManager.TerminalCompletion,
+    ) {
+        if (completion.mode == InputMode.OnTheRoad) startIdleTimer()
+        updateCarMediaState()
+    }
+
     private fun startIdleTimer() {
         idleTimerJob?.cancel()
         idleTimerJob = serviceScope.launch {
             delay(IDLE_TIMEOUT_MS)
-            cleanupOnTheRoadSession()
+            idleTimerJob = null
+            updateCarMediaState()
         }
     }
 
@@ -937,11 +954,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         idleTimerJob = null
     }
 
-    private fun cleanupOnTheRoadSession() {
-        updateCarMediaState()
-    }
 
     override fun onCarPttStart() {
+        cancelIdleTimer()
         carTelecomStarter.startTelecomCarPtt()
     }
 
@@ -967,7 +982,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override fun onTelecomConnectionEnded() {
         pttDispatcher.cancelPending(PttSource.CarTelecom, "Telecom connection ended")
         carTelecomStarter.notifyTelecomDisconnected()
-        startIdleTimer()
         updateCarMediaState()
     }
 
@@ -1134,7 +1148,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             releaseStaleWorkRoute = { reason -> sco.releaseImmediately(reason) },
             releaseTelecomCaptureRoute = {
                 dev.nilp0inter.subspace.service.releaseTelecomCaptureRoute(
-                    audioManager, carTelecomStarter::stopPrimedCarHfp, ::logAudioRouteSnapshot,
+                    audioManager, ::logAudioRouteSnapshot,
                 )
             },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
@@ -1142,22 +1156,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun releaseTelecomCaptureRoute() =
         dev.nilp0inter.subspace.service.releaseTelecomCaptureRoute(
-            audioManager, carTelecomStarter::stopPrimedCarHfp, ::logAudioRouteSnapshot,
+            audioManager, ::logAudioRouteSnapshot,
         )
 
 
 
     private fun updateCarMediaState() {
-        val activeReady = decidePttDispatch(_appState.value) is PttDispatchDecision.Dispatch
-        val onTheRoadAvailable = inputModeController.availability.onTheRoad
-        val state = when {
-            pttDispatcher.activePttSession != null -> CarMediaPttState.Recording
-            idleTimerJob?.isActive == true -> CarMediaPttState.Finalizing
-            activeReady && onTheRoadAvailable -> CarMediaPttState.Ready
-            onTheRoadAvailable -> CarMediaPttState.Ready
-            else -> CarMediaPttState.NotReady
-        }
-        CarMediaStateBus.update(state)
+        CarMediaStateBus.update(
+            deriveCarMediaPttState(
+                phase = pttDispatcher.activePttSession?.phase,
+                onTheRoadAvailable = inputModeController.availability.onTheRoad,
+            ),
+        )
     }
 
     private fun isTerminalCarStatus(status: EchoStatus): Boolean = pttDispatcher.isTerminalCarSource() &&

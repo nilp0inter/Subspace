@@ -27,7 +27,6 @@ internal class PttDispatcher(
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
     private val cancelIdleTimer: () -> Unit,
-    private val startIdleTimer: () -> Unit,
     private val decidePttDispatch: (AppState) -> PttDispatchDecision?,
     private val appStateProvider: () -> AppState,
     private val logAudioRouteSnapshot: (String) -> Unit,
@@ -104,9 +103,6 @@ internal class PttDispatcher(
         val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
         audioSessionManager.release(source)
 
-        if (inputModeController.mode == InputMode.OnTheRoad) {
-            startIdleTimer()
-        }
         updateCarMediaState()
     }
 

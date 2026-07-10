@@ -1,6 +1,8 @@
 package dev.nilp0inter.subspace.channel
 
 import dev.nilp0inter.subspace.audio.AudioEncoder
+import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.CaptureService
 import dev.nilp0inter.subspace.audio.CaptureServiceFakes
 import dev.nilp0inter.subspace.audio.PcmTranscriber
@@ -15,17 +17,23 @@ import java.io.File
 import kotlin.coroutines.coroutineContext
 import kotlin.io.path.createTempDirectory
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -95,6 +103,77 @@ class JournalPttControllerTest {
         assertEquals(1, markdownFiles.size)
         assertTrue(markdownFiles.single().readText().contains("car hang transcript"))
         assertEquals(1, output.releaseRouteCount)
+    }
+
+    @Test
+    fun inputReleaseDoesNotCompleteUntilDerivedProcessingFinishes() = runTest {
+        val samples = ShortArray(160) { it.toShort() }
+        val encoder = SuspendingEncoder()
+        val transcript = "derived before terminal completion"
+        val journalController = JournalController(
+            scope = backgroundScope,
+            encoder = encoder,
+            transcriber = RecordingTranscriber(transcript),
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        val channel = JournalChannel(baseDirectory = baseDir.absolutePath)
+        val controller = JournalPttController(
+            scope = this,
+            sco = FakeScoRoute(),
+            output = FakeOutput(),
+            captureService = CaptureServiceFakes.newService(this),
+            source = ContinuousFakeSource(sampleRate = 16_000),
+            journal = journalController,
+            channelProvider = { channel },
+        )
+        val acceptance = controller.prepareInput()
+        assertTrue(acceptance is ChannelInputAcceptance.Accepted)
+        val target = (acceptance as ChannelInputAcceptance.Accepted).target
+        target.onInputStarted(object : ChannelAudioInputSession {
+            override val frames = flowOf(samples)
+            override val sampleRate: Int = 16_000
+        })
+        runCurrent()
+
+        // UNDISPATCHED makes the hard-coded Dispatchers.IO context identical to
+        // the caller context, so release deterministically runs through the
+        // processCaptureFile call before this Deferred is returned to the test.
+        val release = async(Dispatchers.IO, start = CoroutineStart.UNDISPATCHED) {
+            target.onInputReleased(RecordedPcm(samples, 16_000))
+        }
+
+        assertFalse(
+            "Release must wait for the processCaptureFile Job rather than only starting it",
+            release.isCompleted,
+        )
+        runCurrent()
+        assertTrue("Derived encoding must have reached the controlled suspension", encoder.started.isCompleted)
+        assertFalse("Release must remain incomplete while encoding is suspended", release.isCompleted)
+
+        val metadataFile = findMetadataFile(baseDir)
+        assertTrue("Terminal metadata must exist before derived processing", metadataFile != null)
+        val processingMetadata = JournalMetadataStore().read(metadataFile!!)
+        assertTrue(processingMetadata != null)
+        assertEquals(DerivedTaskStatus.running, processingMetadata!!.encoding?.state)
+        assertEquals(DerivedTaskStatus.pending, processingMetadata.transcription?.state)
+        assertTrue(
+            "Markdown must not expose the entry before derived processing finishes",
+            baseDir.walkTopDown().none { it.isFile && it.extension == "md" },
+        )
+
+        encoder.allowCompletion.complete(Unit)
+        runCurrent()
+        release.await()
+
+        val finishedMetadata = JournalMetadataStore().read(metadataFile)
+        assertTrue(finishedMetadata != null)
+        assertEquals(CaptureTaskState.deleted, finishedMetadata!!.capture.state)
+        assertEquals(DerivedTaskStatus.finished, finishedMetadata.encoding?.state)
+        assertEquals(DerivedTaskStatus.finished, finishedMetadata.transcription?.state)
+        assertEquals(transcript, finishedMetadata.transcription?.text)
+        val markdown = baseDir.walkTopDown().single { it.isFile && it.extension == "md" }.readText()
+        assertTrue(markdown.contains(transcript))
+        assertTrue(markdown.contains(".ogg"))
     }
 
     @Test
@@ -366,6 +445,19 @@ class JournalPttControllerTest {
 
         override suspend fun encode(pcm: ShortArray, outputFile: File, sampleRate: Int): Result<File> {
             callCount += 1
+            outputFile.parentFile?.mkdirs()
+            outputFile.writeBytes(byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()))
+            return Result.success(outputFile)
+        }
+    }
+
+    private class SuspendingEncoder : AudioEncoder {
+        val started = CompletableDeferred<Unit>()
+        val allowCompletion = CompletableDeferred<Unit>()
+
+        override suspend fun encode(pcm: ShortArray, outputFile: File, sampleRate: Int): Result<File> {
+            started.complete(Unit)
+            allowCompletion.await()
             outputFile.parentFile?.mkdirs()
             outputFile.writeBytes(byteArrayOf('O'.code.toByte(), 'g'.code.toByte(), 'g'.code.toByte(), 'S'.code.toByte()))
             return Result.success(outputFile)

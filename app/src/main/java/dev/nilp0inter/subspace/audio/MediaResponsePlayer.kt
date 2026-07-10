@@ -5,10 +5,71 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
+import android.os.SystemClock
 import kotlinx.coroutines.delay
+
+private const val MEDIA_ROUTE_STABILITY_MS = 500L
+private const val MEDIA_ROUTE_POLL_MS = 50L
+private const val MEDIA_ROUTE_TIMEOUT_MS = 3_000L
+
+internal suspend fun awaitStableMediaRoute(
+    isReady: () -> Boolean,
+    nowMs: () -> Long,
+    delayMs: suspend (Long) -> Unit,
+    stableForMs: Long = MEDIA_ROUTE_STABILITY_MS,
+    pollMs: Long = MEDIA_ROUTE_POLL_MS,
+    timeoutMs: Long = MEDIA_ROUTE_TIMEOUT_MS,
+): Boolean {
+    val deadlineMs = nowMs() + timeoutMs
+    var stableSinceMs: Long? = null
+    while (true) {
+        val now = nowMs()
+        if (isReady()) {
+            if (stableSinceMs == null) stableSinceMs = now
+            if (now - stableSinceMs >= stableForMs) return true
+        } else {
+            stableSinceMs = null
+        }
+        if (now >= deadlineMs) return false
+        delayMs(minOf(pollMs, deadlineMs - now))
+    }
+}
+
+internal class MediaRoutePlaybackGate(
+    private val awaitRouteReady: suspend () -> Boolean,
+    private val requestFocus: () -> Boolean,
+    private val abandonFocus: () -> Unit,
+) {
+    suspend fun play(recording: RecordedPcm, output: PcmOutput): Boolean {
+        if (!awaitRouteReady() || !requestFocus()) return false
+        return try {
+            output.play(recording)
+            true
+        } finally {
+            abandonFocus()
+        }
+    }
+}
 
 interface ResponsePlayer {
     suspend fun play(recording: RecordedPcm)
+}
+
+internal class MediaResponsePcmOutput(
+    private val localOutput: PcmOutput,
+    private val responsePlayer: ResponsePlayer,
+) : PcmOutput {
+    override suspend fun playReadyBeep(coldStart: Boolean) {
+        localOutput.playReadyBeep(coldStart)
+    }
+
+    override suspend fun playErrorBeep(coldStart: Boolean) {
+        localOutput.playErrorBeep(coldStart)
+    }
+
+    override suspend fun play(recording: RecordedPcm) {
+        responsePlayer.play(recording)
+    }
 }
 
 class MediaResponsePlayer(
@@ -16,29 +77,27 @@ class MediaResponsePlayer(
     private val output: PcmOutput,
 ) : ResponsePlayer {
     private var focusRequest: AudioFocusRequest? = null
+    private val playbackGate = MediaRoutePlaybackGate(
+        awaitRouteReady = ::waitForMediaRoute,
+        requestFocus = ::requestFocus,
+        abandonFocus = ::abandonFocus,
+    )
 
     override suspend fun play(recording: RecordedPcm) {
         if (recording.isEmpty) return
-        waitForMediaRoute()
-        if (!requestFocus()) return
-        try {
-            output.play(recording)
-        } finally {
-            abandonFocus()
-        }
+        playbackGate.play(recording, output)
     }
 
-    private suspend fun waitForMediaRoute() {
-        repeat(60) {
-            val communicationDevice = audioManager.communicationDevice
-            if (audioManager.mode == AudioManager.MODE_NORMAL && communicationDevice?.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-                return
-            }
-            delay(50)
-        }
-        audioManager.clearCommunicationDevice()
-        audioManager.mode = AudioManager.MODE_NORMAL
-    }
+    private suspend fun waitForMediaRoute(): Boolean =
+        awaitStableMediaRoute(
+            isReady = {
+                val communicationDevice = audioManager.communicationDevice
+                audioManager.mode == AudioManager.MODE_NORMAL &&
+                    communicationDevice?.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            },
+            nowMs = SystemClock::elapsedRealtime,
+            delayMs = { delay(it) },
+        )
 
     private fun requestFocus(): Boolean {
         return if (Build.VERSION.SDK_INT >= 26) {

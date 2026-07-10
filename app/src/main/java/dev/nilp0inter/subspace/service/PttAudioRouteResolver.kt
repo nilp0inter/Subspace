@@ -88,10 +88,8 @@ internal fun resolvePttAudioRoute(
  */
 internal fun releaseTelecomCaptureRoute(
     audioManager: AudioManager,
-    stopPrimedCarHfp: (String) -> Unit,
     logAudioRouteSnapshot: (String) -> Unit,
 ) {
-    stopPrimedCarHfp("telecom-release")
     logAudioRouteSnapshot("telecom-release-before")
     audioManager.clearCommunicationDevice()
     audioManager.mode = AudioManager.MODE_NORMAL

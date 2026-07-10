@@ -24,6 +24,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+private const val PRE_COMMIT_SIGNAL_TIMEOUT_MS = 500L
 
 /**
  * Identifier for the capture input source the service starts its recorder with.
@@ -67,16 +70,31 @@ interface OpenedCaptureSource {
     /** Suggested read buffer size in samples (typ. `minBuffer / 2`). */
     val bufferSizeShorts: Int
 
+    /** Whether production preflight must observe nonzero PCM before the ready beep. */
+    val requiresPreCommitSignal: Boolean
+        get() = false
+
+    /** Maximum recorder opens allowed while proving pre-commit signal. */
+    val preCommitSignalAttempts: Int
+        get() = 1
+
     /** Internal startup facts used by the audio input subsystem before channel handoff. */
     val startupEvidence: CaptureStartupEvidence
         get() = CaptureStartupEvidence()
 
     /**
-     * Read up to [buffer.size] samples into [buffer]. Returns the number of
-     * samples read, or a value `<= 0` to indicate "no data right now"
-     * (the read loop will retry).
+     * Read up to [buffer.size] committed samples into [buffer]. Implementations
+     * may block until data is available. Returns the number of samples read,
+     * or a value `<= 0` when no data was read.
      */
     fun read(buffer: ShortArray): Int
+
+    /**
+     * Attempt to read and discard up to [buffer.size] pre-commit samples
+     * without waiting for data. Sources with a blocking [read] must override
+     * this; the default preserves compatibility for non-blocking fakes.
+     */
+    fun readNonBlocking(buffer: ShortArray): Int = read(buffer)
 
     /** Stop and release underlying resources. Idempotent. */
     fun close()
@@ -230,19 +248,27 @@ class CaptureService(
             }
         }
 
-        suspend fun startPreCommitDrain(source: OpenedCaptureSource) {
+        suspend fun startPreCommitDrain(source: OpenedCaptureSource): Deferred<Unit>? {
             val started = CompletableDeferred<Unit>()
+            val signalObserved = if (source.requiresPreCommitSignal) CompletableDeferred<Unit>() else null
             preCommitDrain = scope.launch(readDispatcher, start = CoroutineStart.ATOMIC) {
                 started.complete(Unit)
                 val discardBuffer = ShortArray(source.bufferSizeShorts.coerceAtLeast(1))
                 while (currentCoroutineContext().isActive) {
-                    source.read(discardBuffer)
-                    // AudioRecord.read may return no data; this also provides a
-                    // cancellation checkpoint after every discard attempt.
+                    val samplesRead = source.readNonBlocking(discardBuffer)
+                    if (samplesRead > 0 && signalObserved?.isCompleted == false) {
+                        var index = 0
+                        val limit = samplesRead.coerceAtMost(discardBuffer.size)
+                        while (index < limit && discardBuffer[index].toInt() == 0) index += 1
+                        if (index < limit) signalObserved.complete(Unit)
+                    }
+                    // Non-blocking reads may return no data; this also provides
+                    // a cancellation checkpoint after every discard attempt.
                     delay(1)
                 }
             }
             started.await()
+            return signalObserved
         }
 
         try {
@@ -257,31 +283,69 @@ class CaptureService(
                 return@withLock CaptureStartResult.Cancelled
             }
 
-            opened = source.open()
-            if (opened == null) {
-                cleanupSetup()
-                return@withLock CaptureStartResult.RecordingFailed
-            }
-            val evidence = opened!!.startupEvidence.copy(
-                recorderOpened = true,
-                sourceId = source.sourceId,
-                sampleRate = opened!!.sampleRate,
-            )
-            if (evidence.clientSilenced == true) {
-                cleanupSetup()
-                return@withLock CaptureStartResult.RecordingSilenced(evidence)
-            }
+            lateinit var evidence: CaptureStartupEvidence
+            var maxSignalAttempts = 1
+            val signalRetryDelayMs = 100L
+            var signalAttempt = 0
+            while (true) {
+                opened = source.open()
+                if (opened == null) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingFailed
+                }
+                if (signalAttempt == 0) {
+                    maxSignalAttempts = opened!!.preCommitSignalAttempts.coerceAtLeast(1)
+                }
+                val attemptEvidence = opened!!.startupEvidence.copy(
+                    recorderOpened = true,
+                    sourceId = source.sourceId,
+                    sampleRate = opened!!.sampleRate,
+                )
+                if (attemptEvidence.clientSilenced == true) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingSilenced(attemptEvidence)
+                }
 
-            // PTT released after capture preflight but before the ready beep:
-            // no record, no ready signal, and no channel-visible frames.
-            if (!shouldProceed()) {
-                cleanupSetup()
-                return@withLock CaptureStartResult.Cancelled
-            }
+                // PTT released after capture preflight but before the ready beep:
+                // no record, no ready signal, and no channel-visible frames.
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
 
-            // AudioRecord is started during open() so startup failures happen before
-            // the user hears readiness. Drain it exclusively until the beep ends.
-            startPreCommitDrain(opened!!)
+                // AudioRecord is started during open() so startup failures happen before
+                // the user hears readiness. Drain it exclusively until the beep ends.
+                val signalObserved = startPreCommitDrain(opened!!)
+                val signalReady = signalObserved == null ||
+                    withTimeoutOrNull(PRE_COMMIT_SIGNAL_TIMEOUT_MS) {
+                        signalObserved.await()
+                        true
+                    } == true
+                if (signalReady) {
+                    evidence = attemptEvidence
+                    break
+                }
+
+                preCommitDrain?.cancelAndJoin()
+                preCommitDrain = null
+                val silentSource = opened
+                opened = null
+                runCatching { silentSource?.close() }
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
+                signalAttempt += 1
+                if (signalAttempt >= maxSignalAttempts) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingFailed
+                }
+                delay(signalRetryDelayMs)
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
+            }
             output.playReadyBeep(sco.coldStart)
 
             // Stop and join the discard reader before handing the source to the

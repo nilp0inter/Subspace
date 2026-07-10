@@ -26,6 +26,7 @@ internal class PttAudioSessionManager(
     private val captureService: CaptureService,
     private val channelRouter: ChannelRouter,
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
+    private val onTerminalCompleted: (TerminalCompletion) -> Unit = {},
 ) {
     private var nextSessionId = 1L
     private var active: ActiveSession? = null
@@ -246,6 +247,7 @@ internal class PttAudioSessionManager(
             val played = when (val result = target?.onInputReleased(recording) ?: ChannelInputResult.None) {
                 ChannelInputResult.None -> false
                 is ChannelInputResult.Playback -> {
+                    if (session.route?.endpoint == AudioRouteEndpoint.Car) releaseRouteOnce(session)
                     session.route?.output?.play(result.recording)
                     true
                 }
@@ -292,7 +294,10 @@ internal class PttAudioSessionManager(
     }
 
     private fun clearIfActive(session: ActiveSession) {
-        if (active === session) active = null
+        if (active !== session) return
+        val completion = session.terminalCompletion()
+        active = null
+        onTerminalCompleted(completion)
     }
 
     data class SessionSnapshot(
@@ -300,7 +305,17 @@ internal class PttAudioSessionManager(
         val source: PttSource,
         val channelId: String,
         val mode: InputMode,
+        val phase: SessionPhase,
     )
+
+    data class TerminalCompletion(
+        val sessionId: Long,
+        val source: PttSource,
+        val channelId: String,
+        val mode: InputMode,
+    )
+
+    enum class SessionPhase { PttHeld, TerminalWork }
 
     private enum class TerminalClaim {
         None,
@@ -324,6 +339,19 @@ internal class PttAudioSessionManager(
         var terminalClaim: TerminalClaim = TerminalClaim.None,
         var routeReleased: Boolean = false,
     ) {
-        fun snapshot(): SessionSnapshot = SessionSnapshot(id, source, channelId, mode)
+        fun snapshot(): SessionSnapshot = SessionSnapshot(
+            id = id,
+            source = source,
+            channelId = channelId,
+            mode = mode,
+            phase = if (terminalClaim == TerminalClaim.None) SessionPhase.PttHeld else SessionPhase.TerminalWork,
+        )
+
+        fun terminalCompletion(): TerminalCompletion = TerminalCompletion(
+            sessionId = id,
+            source = source,
+            channelId = channelId,
+            mode = mode,
+        )
     }
 }

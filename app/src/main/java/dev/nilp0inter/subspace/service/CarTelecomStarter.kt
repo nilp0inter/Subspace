@@ -25,8 +25,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Starts voice recognition for one device and reverses that exact start when
- * the observed HFP audio readiness wait times out.
+ * Pulses voice recognition on one device, then fully relinquishes that HFP
+ * audio route before Telecom takes ownership of it.
  */
 internal suspend fun <D> primeHfpDeviceForTelecom(
     device: D,
@@ -38,25 +38,35 @@ internal suspend fun <D> primeHfpDeviceForTelecom(
 ): Boolean {
     val started = runCatching { startVoiceRecognition(device) }.getOrDefault(false)
     if (!started) return false
-    val connected = withTimeoutOrNull(timeoutMs) {
-        while (!runCatching { isAudioConnected(device) }.getOrDefault(false)) {
-            delay(pollMs)
-        }
-        true
-    } == true
-    if (!connected) {
+
+    var stopAttempted = false
+    return try {
+        val connected = withTimeoutOrNull(timeoutMs) {
+            while (!runCatching { isAudioConnected(device) }.getOrDefault(false)) {
+                delay(pollMs)
+            }
+            true
+        } == true
+        if (!connected) return false
+
+        stopAttempted = true
         runCatching { stopVoiceRecognition(device) }
-        return false
+        withTimeoutOrNull(timeoutMs) {
+            while (runCatching { isAudioConnected(device) }.getOrDefault(true)) {
+                delay(pollMs)
+            }
+            true
+        } == true
+    } finally {
+        if (!stopAttempted) runCatching { stopVoiceRecognition(device) }
     }
-    return true
 }
 
 /**
  * Encapsulates the car-telecom PTT lifecycle that was previously inlined in
  * [PttForegroundService].
  *
- * Owns [telecomDisconnected] and [primedCarHfpDevice] state formerly on
- * the service.
+ * Owns [telecomDisconnected] state formerly on the service.
  */
 internal class CarTelecomStarter(
     private val context: Context,
@@ -70,8 +80,6 @@ internal class CarTelecomStarter(
     private val telecomRegistrar: SubspacePhoneAccountRegistrar,
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
-    private val cancelIdleTimer: () -> Unit,
-    private val startIdleTimer: () -> Unit,
     private val isActivePttSession: () -> Boolean,
     private val decidePttDispatch: () -> PttDispatchDecision?,
     private val reservePendingCarPtt: (String) -> Boolean,
@@ -83,7 +91,6 @@ internal class CarTelecomStarter(
     var telecomDisconnected = CompletableDeferred<Unit>().apply { complete(Unit) }
         private set
 
-    private var primedCarHfpDevice: BluetoothDevice? = null
     private var lastDisconnectTime = 0L
 
     /** Launches the car-PTT coroutine. */
@@ -141,7 +148,6 @@ internal class CarTelecomStarter(
             return
         }
         publishInputMode()
-        cancelIdleTimer()
         val decision = decidePttDispatch() ?: return
         if (decision is PttDispatchDecision.ErrorBeep) {
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_ERROR_BEEP reason=dispatch-decision mode=${inputModeController.mode}")
@@ -153,6 +159,7 @@ internal class CarTelecomStarter(
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=pending-reservation-rejected")
             return
         }
+        updateCarMediaState()
         when (val releaseResult = sco.releaseImmediately("car-ptt-start")) {
             is RouteGateResult.Success -> Unit
             is RouteGateResult.Failure,
@@ -226,7 +233,7 @@ internal class CarTelecomStarter(
                 "current=${audioManager.communicationDevice.routeDebugString()}",
         )
         var started = false
-        val connected = primeHfpDeviceForTelecom(
+        val handedOff = primeHfpDeviceForTelecom(
             device = car,
             startVoiceRecognition = { device ->
                 started = runCatching { proxy.startVoiceRecognition(device) }
@@ -256,29 +263,13 @@ internal class CarTelecomStarter(
         Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_START target='${car.name}' returned=$started")
         Log.d(
             ROUTE_LOG_TAG,
-            "CAR_HFP_PRIME_END target='${car.name}' connected=$connected " +
+            "CAR_HFP_PRIME_END target='${car.name}' handedOff=$handedOff " +
+                "audioConnected=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)} " +
                 "current=${audioManager.communicationDevice.routeDebugString()}",
         )
-        if (connected) primedCarHfpDevice = car
-        return connected
+        return handedOff
     }
 
-    @SuppressLint("MissingPermission")
-    fun stopPrimedCarHfp(reason: String) {
-        val proxy = headsetProxyProvider() ?: return
-        val car = primedCarHfpDevice ?: return
-        val stopped = runCatching { proxy.stopVoiceRecognition(car) }
-            .onFailure {
-                Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_STOP_THROW target='${car.name}' error=${it.javaClass.simpleName}")
-            }
-            .getOrDefault(false)
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CAR_HFP_PRIME_STOP target='${car.name}' returned=$stopped reason=$reason " +
-                "audioAfter=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)}",
-        )
-        primedCarHfpDevice = null
-    }
 
     companion object {
         private const val CAR_HFP_PRIME_TIMEOUT_MS = 1_500L

@@ -7,8 +7,8 @@ An accepted Journal capture that terminates because its active On-the-road Telec
 - **WHEN** an accepted Journal target receives terminal PCM after an active car call is hung up
 - **THEN** it SHALL finalize the WAV writer after joining the frames collector
 - **AND** write `endedAt`, final capture state, duration, sample rate, channel count, encoding, and capture path to metadata
-- **AND** run configured OGG encoding and transcription processing
-- **AND** regenerate the affected daily Markdown journal from updated metadata
+- **AND** await configured OGG encoding and transcription processing to complete
+- **AND** regenerate the affected daily Markdown journal from updated metadata before terminal channel handling returns
 
 #### Scenario: Car capture is cancelled before terminal recording
 - **WHEN** a car session is cancelled before terminal PCM is available

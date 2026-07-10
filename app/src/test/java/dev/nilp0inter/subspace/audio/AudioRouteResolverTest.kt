@@ -130,7 +130,7 @@ class AudioRouteResolverTest {
     }
 
     @Test
-    fun telecomOutputReleasesCallRouteBeforeMediaResponsePlayback() = runTest {
+    fun telecomOutputPlayDelegatesOnlyToMediaResponsePlayer() = runTest {
         val events = mutableListOf<String>()
         val output = TelecomCapturePcmOutput(
             captureOutput = RecordingOutput(AudioRouteEndpoint.Car),
@@ -141,7 +141,7 @@ class AudioRouteResolverTest {
 
         output.play(RecordedPcm(shortArrayOf(1), 16_000))
 
-        assertEquals(listOf("release", "disconnected", "media"), events)
+        assertEquals(listOf("media"), events)
     }
 
     @Test

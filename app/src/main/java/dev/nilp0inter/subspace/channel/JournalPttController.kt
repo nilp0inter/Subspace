@@ -113,7 +113,7 @@ class JournalPttController(
             fJob?.cancelAndJoin()
             writer.finalize()
             writeTerminalMetadata(paths, channel)
-            journal.processCaptureFile(paths)
+            journal.processCaptureFile(paths).join()
         }
         return ChannelInputResult.None
     }

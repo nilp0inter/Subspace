@@ -15,6 +15,8 @@ import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.RouteGate
 import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.ScoRoute
+import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
+import dev.nilp0inter.subspace.audio.ResponsePlayer
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.model.ScoState
@@ -76,7 +78,7 @@ class PttAudioSessionManagerTest {
         assertEquals(null, fixture.manager.activeSession)
     }
     @Test
-    fun normalCarReleaseRemainsTerminalWhenConnectionEndedArrivesBeforeCompletion() = runTest {
+    fun normalCarReleaseNotifiesCompletionAfterCleanupWhenConnectionEndedArrivesEarly() = runTest {
         val fixture = Fixture(this)
         val route = fixture.route(InputMode.OnTheRoad)
         val terminalGate = CompletableDeferred<Unit>()
@@ -101,16 +103,25 @@ class PttAudioSessionManagerTest {
 
         assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
         runCurrent()
+        assertEquals(
+            PttAudioSessionManager.SessionPhase.PttHeld,
+            fixture.manager.activeSession?.phase,
+        )
 
         fixture.manager.release(PttSource.CarTelecom)
         runCurrent()
         fixture.manager.cancelActive("connection-ended")
         runCurrent()
+        assertEquals(
+            PttAudioSessionManager.SessionPhase.TerminalWork,
+            fixture.manager.activeSession?.phase,
+        )
 
         assertEquals(1, terminalRecordings.size)
         assertEquals(listOf<Short>(1, 2, 3), terminalRecordings.single().samples.toList())
         assertEquals(0, cancellationCount)
         assertEquals(0, route.output.releaseRouteCount)
+        assertTrue(fixture.terminalCompletionObservations.isEmpty())
 
         terminalGate.complete(Unit)
         advanceUntilIdle()
@@ -119,6 +130,10 @@ class PttAudioSessionManagerTest {
         assertEquals(0, cancellationCount)
         assertEquals(1, route.output.releaseRouteCount)
         assertEquals(null, fixture.manager.activeSession)
+        val completion = fixture.terminalCompletionObservations.single()
+        assertEquals(InputMode.OnTheRoad, completion.mode)
+        assertEquals(null, completion.activeSession)
+        assertEquals(1, completion.routeReleaseCount)
     }
 
     @Test
@@ -608,11 +623,95 @@ class PttAudioSessionManagerTest {
         assertEquals(listOf<Short>(4, 5, 6), fixture.router.recordings.last().samples.toList())
         assertEquals(0, fixture.route(InputMode.OnTheRoad).sco.acquireCount)
     }
+    @Test
+    fun activeCarPlaybackReleasesTelecomRouteOnceBeforeMediaPlayback() = runTest {
+        val events = mutableListOf<String>()
+        val captureOutput = RecordingOutput(mutableListOf(), AudioRouteEndpoint.Car)
+        val telecomOutput = TelecomCapturePcmOutput(
+            captureOutput = captureOutput,
+            mediaResponsePlayer = object : ResponsePlayer {
+                override suspend fun play(recording: RecordedPcm) {
+                    events += "media-playback"
+                }
+            },
+            releaseCaptureRoute = { events += "telecom-release" },
+            awaitTelecomDisconnected = { events += "disconnect-wait" },
+        )
+        val target = object : ChannelInputTarget {
+            override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+            override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+                events += "channel-release"
+                return ChannelInputResult.Playback(recording)
+            }
+
+            override fun onInputPlaybackCompleted() {
+                events += "channel-playback-complete"
+            }
+
+            override fun onInputCancelled(reason: String) {
+                events += "channel-cancelled"
+            }
+
+            override fun onInputFailed(reason: String) {
+                events += "channel-failed"
+            }
+        }
+        val manager = PttAudioSessionManager(
+            scope = this,
+            captureService = CaptureServiceFakes.newService(this),
+            channelRouter = object : ChannelRouter {
+                override fun prepareInput(channelId: String): ChannelInputAcceptance =
+                    ChannelInputAcceptance.Accepted(target)
+            },
+            resolvePttAudioRoute = {
+                ResolvedAudioRoute(
+                    sco = RecordingScoRoute(AudioRouteEndpoint.Car),
+                    output = telecomOutput,
+                    source = ReadyAfterBeepCaptureSource(
+                        pcm = shortArrayOf(31, 32),
+                        output = captureOutput,
+                        sourceId = CaptureSourceId.VoiceCommunication,
+                    ),
+                    endpoint = AudioRouteEndpoint.Car,
+                )
+            },
+            onTerminalCompleted = { events += "manager-terminal" },
+        )
+
+        assertTrue(manager.start(PttSource.CarTelecom, "echo", InputMode.OnTheRoad))
+        runCurrent()
+        assertEquals(PttAudioSessionManager.SessionPhase.PttHeld, manager.activeSession?.phase)
+
+        manager.release(PttSource.CarTelecom)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                "channel-release",
+                "telecom-release",
+                "disconnect-wait",
+                "media-playback",
+                "channel-playback-complete",
+                "manager-terminal",
+            ),
+            events,
+        )
+        assertEquals(null, manager.activeSession)
+    }
+
+    private data class TerminalCompletionObservation(
+        val activeSession: PttAudioSessionManager.SessionSnapshot?,
+        val routeReleaseCount: Int,
+        val mode: InputMode,
+    )
+
     private class Fixture(
         scope: kotlinx.coroutines.test.TestScope,
         pcm: ShortArray = shortArrayOf(1, 2, 3),
     ) {
         val timeline = mutableListOf<String>()
+        val terminalCompletionObservations = mutableListOf<TerminalCompletionObservation>()
         val router = RecordingRouter(scope, timeline)
         private val captureService = CaptureServiceFakes.newService(scope)
         private val routes = InputMode.entries.associateWith { mode ->
@@ -627,12 +726,24 @@ class PttAudioSessionManagerTest {
                 ),
             )
         }
-        val manager = PttAudioSessionManager(
-            scope = scope,
-            captureService = captureService,
-            channelRouter = router,
-            resolvePttAudioRoute = { mode -> route(mode).resolved },
-        )
+        lateinit var manager: PttAudioSessionManager
+            private set
+
+        init {
+            manager = PttAudioSessionManager(
+                scope = scope,
+                captureService = captureService,
+                channelRouter = router,
+                resolvePttAudioRoute = { mode -> route(mode).resolved },
+                onTerminalCompleted = { completion ->
+                    terminalCompletionObservations += TerminalCompletionObservation(
+                        activeSession = manager.activeSession,
+                        mode = completion.mode,
+                        routeReleaseCount = route(completion.mode).output.releaseRouteCount,
+                    )
+                },
+            )
+        }
 
         fun route(mode: InputMode): TestRoute = routes.getValue(mode)
     }
