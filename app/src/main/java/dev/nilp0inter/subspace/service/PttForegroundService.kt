@@ -48,6 +48,9 @@ import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
+import dev.nilp0inter.subspace.audio.AnnouncementPcmCache
+import dev.nilp0inter.subspace.audio.AnnouncementCacheIdentity
+import android.content.pm.PackageManager
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
@@ -593,7 +596,36 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
-        announcer = SystemAnnouncer(synthesizer)
+        val lastUpdateTime = try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.getPackageInfo(packageName, 0)
+            }.lastUpdateTime
+        } catch (e: Exception) {
+            0L
+        }
+
+        val persistentCache = try {
+            if (lastUpdateTime > 0L) {
+                val manifest = ModelVerifier.loadManifest(this)
+                val supertonicModelHash = manifest.set(ModelVerifier.SUPERTONIC_DIR)
+                val identity = AnnouncementCacheIdentity.build(lastUpdateTime, supertonicModelHash)
+                if (identity != AnnouncementCacheIdentity.DISABLED) {
+                    val cacheDir = java.io.File(noBackupFilesDir, "announcement-cache")
+                    AnnouncementPcmCache(cacheDir, identity)
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            null
+        }
+
+        announcer = SystemAnnouncer(synthesizer, persistentCache)
     }
 
     override fun buildVocabulary(): Map<String, String> = mapOf(

@@ -19,6 +19,7 @@ import dev.nilp0inter.subspace.model.TtsModelStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -59,6 +60,7 @@ class BootstrapCoordinator(
      * Per-attempt bootstrap job. Cancelled on retry.
      */
     private var attemptJob: Job? = null
+    private var retryJob: Job? = null
 
     /**
      * Test-injectable finite timeouts per stage.
@@ -66,6 +68,22 @@ class BootstrapCoordinator(
     var sttTimeoutMs: Long = 60_000L
     var ttsTimeoutMs: Long = 60_000L
     var announcementTimeoutMs: Long = 120_000L
+
+    private fun launchAttempt() {
+        if (attemptJob?.isActive == true || retryJob?.isActive == true) {
+            return
+        }
+        attemptJob = scope.launch {
+            val currentJob = coroutineContext[Job]
+            try {
+                runAttempt()
+            } finally {
+                if (attemptJob === currentJob) {
+                    attemptJob = null
+                }
+            }
+        }
+    }
 
     /**
      * Called by the service after binding to start bootstrap.
@@ -76,7 +94,7 @@ class BootstrapCoordinator(
         if (_state.value is BootstrapState.ConnectingService ||
             _state.value is BootstrapState.Failed
         ) {
-            checkPrerequisites()
+            launchAttempt()
         }
     }
 
@@ -85,7 +103,7 @@ class BootstrapCoordinator(
      * assets. Used after a permission result or a model-acquisition retry.
      */
     fun refreshPrerequisites() {
-        checkPrerequisites()
+        launchAttempt()
     }
 
     /**
@@ -100,7 +118,7 @@ class BootstrapCoordinator(
             )
             val ready = modelRepository.ensureAllReady()
             if (ready) {
-                checkPrerequisites()
+                launchAttempt()
             } else {
                 val results = modelRepository.inspectAll()
                 val failedSets = results.filterIsInstance<ModelAssetResult.Failed>()
@@ -121,9 +139,30 @@ class BootstrapCoordinator(
      * checking.
      */
     fun retry() {
-        cancelAttempt()
-        coreInit.discardControllers()
-        checkPrerequisites()
+        if (retryJob?.isActive == true) {
+            return
+        }
+        val prior = attemptJob
+
+        val replacement = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            val currentJob = coroutineContext[Job]
+            try {
+                prior?.cancelAndJoin()
+                coreInit.discardControllers()
+                runAttempt()
+            } finally {
+                if (retryJob === currentJob) {
+                    retryJob = null
+                }
+                if (attemptJob === currentJob) {
+                    attemptJob = null
+                }
+            }
+        }
+
+        retryJob = replacement
+        attemptJob = replacement
+        replacement.start()
     }
 
     /**
@@ -132,96 +171,82 @@ class BootstrapCoordinator(
      */
     fun cancelAttempt() {
         attemptJob?.cancel()
+        retryJob?.cancel()
         attemptJob = null
+        retryJob = null
     }
 
-    private fun checkPrerequisites() {
-        scope.launch {
-            _state.value = BootstrapState.CheckingPrerequisites(
-                BootstrapStage.CheckingPermissions,
-            )
-            val missingPermissions = withContext(Dispatchers.IO) {
-                RequiredPermissions.missing(context)
-            }
-            if (missingPermissions.isNotEmpty()) {
-                _state.value = BootstrapState.NeedsSetup(
-                    missingPermissions = missingPermissions,
-                )
-                return@launch
-            }
-
-            _state.value = BootstrapState.CheckingPrerequisites(
-                BootstrapStage.CheckingModels,
-            )
-            val results = modelRepository.inspectAll()
-            val invalidSets = results.filterIsInstance<ModelAssetResult.UserActionRequired>()
-                .map { it.dirName }
-            if (invalidSets.isNotEmpty()) {
-                _state.value = BootstrapState.NeedsSetup(
-                    invalidModelSets = invalidSets,
-                )
-                return@launch
-            }
-
-            // All prerequisites pass — proceed to core preparation.
-            prepareCore()
+    private suspend fun runAttempt() {
+        _state.value = BootstrapState.CheckingPrerequisites(
+            BootstrapStage.CheckingPermissions,
+        )
+        val missingPermissions = withContext(Dispatchers.IO) {
+            RequiredPermissions.missing(context)
         }
-    }
-
-    /**
-     * Core preparation: start STT and TTS native initialization branches
-     * concurrently, wait for Ready/Failed/timeout, construct controllers,
-     * render announcements, and publish Ready when all conditions complete.
-     */
-    private fun prepareCore() {
-        attemptJob = scope.launch {
-            _state.value = BootstrapState.PreparingCore(
-                BootstrapStage.InitializingStt,
+        if (missingPermissions.isNotEmpty()) {
+            _state.value = BootstrapState.NeedsSetup(
+                missingPermissions = missingPermissions,
             )
+            return
+        }
 
-            // Start STT and TTS branches concurrently.
-            val sttDeferred = scope.async(Dispatchers.IO) {
+        _state.value = BootstrapState.CheckingPrerequisites(
+            BootstrapStage.CheckingModels,
+        )
+        val results = modelRepository.inspectAll()
+        val invalidSets = results.filterIsInstance<ModelAssetResult.UserActionRequired>()
+            .map { it.dirName }
+        if (invalidSets.isNotEmpty()) {
+            _state.value = BootstrapState.NeedsSetup(
+                invalidModelSets = invalidSets,
+            )
+            return
+        }
+
+        _state.value = BootstrapState.PreparingCore(
+            BootstrapStage.InitializingStt,
+        )
+
+        kotlinx.coroutines.coroutineScope {
+            val sttDeferred = async(Dispatchers.IO) {
                 prepareStt()
             }
-            val ttsDeferred = scope.async(Dispatchers.IO) {
+            val ttsDeferred = async(Dispatchers.IO) {
                 prepareTts()
             }
 
-            // Wait for both with timeout.
             val sttResult = withTimeoutOrNull(sttTimeoutMs) { sttDeferred.await() }
             val ttsResult = withTimeoutOrNull(ttsTimeoutMs) { ttsDeferred.await() }
 
-            // Check for failures.
             if (sttResult is PrepareResult.Failed) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingStt,
                     sttResult.reason,
                 )
-                return@launch
+                return@coroutineScope
             }
             if (ttsResult is PrepareResult.Failed) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingTts,
                     ttsResult.reason,
                 )
-                return@launch
+                return@coroutineScope
             }
             if (sttResult == null) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingStt,
                     "STT initialization timed out after ${sttTimeoutMs}ms",
                 )
-                return@launch
+                return@coroutineScope
             }
             if (ttsResult == null) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingTts,
                     "TTS initialization timed out after ${ttsTimeoutMs}ms",
                 )
-                return@launch
+                return@coroutineScope
             }
 
-            // Both native engines are ready. Construct remaining controllers.
             _state.value = BootstrapState.PreparingCore(
                 BootstrapStage.ConstructingControllers,
             )
@@ -230,7 +255,6 @@ class BootstrapCoordinator(
             coreInit.constructSttTtsController(transcriber, synthesizer)
             coreInit.constructJournalPttController()
 
-            // Run announcement rendering after TTS readiness.
             _state.value = BootstrapState.PreparingCore(
                 BootstrapStage.RenderingAnnouncements,
             )
@@ -248,26 +272,25 @@ class BootstrapCoordinator(
                             BootstrapStage.RenderingAnnouncements,
                             "Announcement '${announceResult.failedKey}' failed: ${announceResult.reason}",
                         )
-                        return@launch
+                        return@coroutineScope
                     }
                     null -> {
                         _state.value = BootstrapState.Failed(
                             BootstrapStage.RenderingAnnouncements,
                             "Announcement rendering timed out after ${announcementTimeoutMs}ms",
                         )
-                        return@launch
+                        return@coroutineScope
                     }
                     else -> {
                         _state.value = BootstrapState.Failed(
                             BootstrapStage.RenderingAnnouncements,
                             "Announcement rendering did not complete: $announceResult",
                         )
-                        return@launch
+                        return@coroutineScope
                     }
                 }
             }
 
-            // Verify readiness and publish Ready.
             _state.value = BootstrapState.PreparingCore(
                 BootstrapStage.VerifyingReadiness,
             )
@@ -275,7 +298,11 @@ class BootstrapCoordinator(
                 _state.value = BootstrapState.Ready
             } else {
                 val diag = isCoreReadyDiagnostic()
-                android.util.Log.w("BootstrapCoordinator", "Core readiness failed: $diag")
+                try {
+                    android.util.Log.w("BootstrapCoordinator", "Core readiness failed: $diag")
+                } catch (e: Throwable) {
+                    println("[BootstrapCoordinator] Core readiness failed: $diag")
+                }
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.VerifyingReadiness,
                     "Core readiness verification failed: $diag",
@@ -283,6 +310,7 @@ class BootstrapCoordinator(
             }
         }
     }
+
 
     /**
      * Core readiness predicate: verified model assets, ready native STT and
