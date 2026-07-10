@@ -8,6 +8,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -186,10 +187,89 @@ class CarTelecomStarterTest {
         assertSame(car, stoppedDevices.single())
     }
 
+    @Test
+    fun selectUnambiguousCarHfpDeviceExcludesExactTargetRsmAndReturnsSoleCar() {
+        val targetRsm = TestDevice(address = "rsm-address", name = "shared-name")
+        val connectedRsm = TestDevice(address = "rsm-address", name = "renamed-rsm")
+        val car = TestDevice(address = "car-address", name = "shared-name")
+
+        val selected = selectUnambiguousCarHfpDevice(
+            connectedDevices = listOf(connectedRsm, car),
+            targetRsm = targetRsm,
+            isConnected = { true },
+        )
+
+        assertSame(car, selected)
+    }
+
+    @Test
+    fun selectUnambiguousCarHfpDeviceReturnsNullWhenTargetRsmIdentityIsUnavailableAndTwoDevicesAreConnected() {
+        val firstDevice = TestDevice(address = "first-address", name = "shared-name")
+        val secondDevice = TestDevice(address = "second-address", name = "shared-name")
+
+        val selected = selectUnambiguousCarHfpDevice(
+            connectedDevices = listOf(firstDevice, secondDevice),
+            targetRsm = null,
+            isConnected = { true },
+        )
+
+        assertNull(selected)
+    }
+
+    @Test
+    fun selectUnambiguousCarHfpDeviceReturnsNullForMultipleNonRsmCandidates() {
+        val targetRsm = TestDevice("rsm")
+        val firstCar = TestDevice("first-car")
+        val secondCar = TestDevice("second-car")
+
+        val selected = selectUnambiguousCarHfpDevice(
+            connectedDevices = listOf(targetRsm, firstCar, secondCar),
+            targetRsm = targetRsm,
+            isConnected = { true },
+        )
+
+        assertNull(selected)
+    }
+
+    @Test
+    fun selectUnambiguousCarHfpDeviceIgnoresDisconnectedNonRsmCandidates() {
+        val connectedCar = TestDevice(address = "connected-address", name = "shared-name")
+        val disconnectedCar = TestDevice(address = "disconnected-address", name = "shared-name")
+
+        val selected = selectUnambiguousCarHfpDevice(
+            connectedDevices = listOf(connectedCar, disconnectedCar),
+            targetRsm = null,
+            isConnected = { device -> device === connectedCar },
+        )
+
+        assertSame(connectedCar, selected)
+    }
+
+    @Test
+    fun selectUnambiguousCarHfpDeviceReturnsLoneConnectedCar() {
+        val car = TestDevice("car")
+
+        val selected = selectUnambiguousCarHfpDevice(
+            connectedDevices = listOf(car),
+            targetRsm = null,
+            isConnected = { true },
+        )
+
+        assertSame(car, selected)
+    }
+
     private companion object {
         const val TIMEOUT_MS = 100L
         const val POLL_MS = 10L
     }
 
-    private data class TestDevice(val name: String)
+    private class TestDevice(
+        val address: String,
+        val name: String = address,
+    ) {
+        override fun equals(other: Any?): Boolean =
+            other is TestDevice && address == other.address
+
+        override fun hashCode(): Int = address.hashCode()
+    }
 }

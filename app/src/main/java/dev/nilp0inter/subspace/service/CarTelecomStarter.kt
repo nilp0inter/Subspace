@@ -16,8 +16,8 @@ import dev.nilp0inter.subspace.audio.routeDebugString
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
-import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
+import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
@@ -60,6 +60,20 @@ internal suspend fun <D> primeHfpDeviceForTelecom(
     } finally {
         if (!stopAttempted) runCatching { stopVoiceRecognition(device) }
     }
+}
+
+internal fun <D : Any> selectUnambiguousCarHfpDevice(
+    connectedDevices: List<D>,
+    targetRsm: D?,
+    isConnected: (D) -> Boolean,
+): D? {
+    var car: D? = null
+    for (device in connectedDevices) {
+        if (!isConnected(device) || device == targetRsm) continue
+        if (car != null) return null
+        car = device
+    }
+    return car
 }
 
 /**
@@ -171,7 +185,8 @@ internal class CarTelecomStarter(
                 return
             }
         }
-        if (!primeCarHfpForTelecom()) {
+        val car = primeCarHfpForTelecom()
+        if (car == null) {
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=car-hfp-prime-failed")
             cancelPendingCarPtt("car-hfp-prime-failed")
             playCarErrorBeep()
@@ -188,6 +203,11 @@ internal class CarTelecomStarter(
             cancelPendingCarPtt("telecom-manager-unavailable")
             return
         }
+        if (!TelecomCarPttCoordinator.prepareConnection(car)) {
+            cancelPendingCarPtt("telecom-connection-prepare-failed")
+            playCarErrorBeep()
+            return
+        }
         val extras = Bundle().apply {
             putParcelable(
                 android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE,
@@ -198,8 +218,7 @@ internal class CarTelecomStarter(
             resetTelecomDisconnected()
             telecom.placeCall(telecomRegistrar.callAddress(), extras)
         }.onFailure {
-            if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
-            cancelPendingCarPtt("place-call-failed")
+            TelecomCarPttCoordinator.forceAbort()
             playCarErrorBeep()
         }
     }
@@ -213,19 +232,25 @@ internal class CarTelecomStarter(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun primeCarHfpForTelecom(): Boolean {
-        val proxy = headsetProxyProvider() ?: return true
+    private suspend fun primeCarHfpForTelecom(): BluetoothDevice? {
+        val proxy = headsetProxyProvider() ?: return null
         val rsm = targetRsm()
-        val car = runCatching {
-            proxy.connectedDevices.firstOrNull { device ->
-                device != rsm &&
-                    device.name?.contains(TARGET_DEVICE_NAME, ignoreCase = true) != true &&
-                    proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED
-            }
-        }.getOrNull()
+        val connectedDevices = runCatching { proxy.connectedDevices }.getOrNull() ?: return null
+        val car = selectUnambiguousCarHfpDevice(
+            connectedDevices = connectedDevices,
+            targetRsm = rsm,
+            isConnected = { device ->
+                runCatching { proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED }
+                    .getOrDefault(false)
+            },
+        )
         if (car == null) {
-            Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_SKIP reason=no-non-rsm-hfp-device")
-            return true
+            Log.d(
+                ROUTE_LOG_TAG,
+                "CAR_HFP_PRIME_SKIP reason=no-unambiguous-car-hfp-device " +
+                    "connected=${connectedDevices.size} rsmKnown=${rsm != null}",
+            )
+            return null
         }
         Log.d(
             ROUTE_LOG_TAG,
@@ -267,7 +292,7 @@ internal class CarTelecomStarter(
                 "audioConnected=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)} " +
                 "current=${audioManager.communicationDevice.routeDebugString()}",
         )
-        return handedOff
+        return car.takeIf { handedOff }
     }
 
 

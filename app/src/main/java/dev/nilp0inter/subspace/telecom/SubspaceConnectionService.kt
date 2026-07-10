@@ -18,8 +18,17 @@ class SubspaceConnectionService : ConnectionService() {
         }
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent) else startService(serviceIntent)
 
-        val connection = SubspaceConnection()
+        val expectedBluetoothDevice = TelecomCarPttCoordinator.claimExpectedBluetoothDevice()
+            ?: run {
+                TelecomCarPttCoordinator.forceAbort()
+                return Connection.createFailedConnection(
+                    DisconnectCause(DisconnectCause.ERROR, "Missing expected car Bluetooth route"),
+                )
+            }
+
+        val connection = SubspaceConnection(expectedBluetoothDevice)
         if (!TelecomCarPttCoordinator.attachConnection(connection)) {
+            TelecomCarPttCoordinator.forceAbort()
             return Connection.createFailedConnection(DisconnectCause(DisconnectCause.BUSY))
         }
         return connection

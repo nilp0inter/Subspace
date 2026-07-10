@@ -1,7 +1,6 @@
 package dev.nilp0inter.subspace.telecom
 
 import android.telecom.CallAudioState
-import dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -67,42 +66,31 @@ class TelecomCaptureRouteStabilizerTest {
     }
 
     @Test
-    fun captureRoutePredicateRequiresActiveNonRsmBluetoothRoute() {
+    fun captureRoutePredicateRequiresBluetoothRouteAndExpectedDeviceIdentity() {
         data class Case(
             val name: String,
             val route: Int,
-            val activeBluetoothDevicePresent: Boolean,
-            val activeBluetoothDeviceName: String?,
+            val activeBluetoothDeviceMatchesExpected: Boolean,
             val expected: Boolean,
         )
 
         val cases = listOf(
             Case(
-                name = "Bluetooth device present but call route is not Bluetooth",
+                name = "Expected device is active but call route is not Bluetooth",
                 route = CallAudioState.ROUTE_EARPIECE,
-                activeBluetoothDevicePresent = true,
-                activeBluetoothDeviceName = "Vehicle HFP",
+                activeBluetoothDeviceMatchesExpected = true,
                 expected = false,
             ),
             Case(
-                name = "Bluetooth call route has no active Bluetooth device",
+                name = "Bluetooth call route uses a different active device",
                 route = CallAudioState.ROUTE_BLUETOOTH,
-                activeBluetoothDevicePresent = false,
-                activeBluetoothDeviceName = "Vehicle HFP",
+                activeBluetoothDeviceMatchesExpected = false,
                 expected = false,
             ),
             Case(
-                name = "Bluetooth call route targets the RSM",
+                name = "Bluetooth call route uses the exact expected device",
                 route = CallAudioState.ROUTE_BLUETOOTH,
-                activeBluetoothDevicePresent = true,
-                activeBluetoothDeviceName = "Cabin $TARGET_DEVICE_NAME",
-                expected = false,
-            ),
-            Case(
-                name = "Bluetooth call route uses the active car device",
-                route = CallAudioState.ROUTE_BLUETOOTH,
-                activeBluetoothDevicePresent = true,
-                activeBluetoothDeviceName = "Vehicle HFP",
+                activeBluetoothDeviceMatchesExpected = true,
                 expected = true,
             ),
         )
@@ -113,12 +101,270 @@ class TelecomCaptureRouteStabilizerTest {
                 case.expected,
                 isAcceptableTelecomCaptureRoute(
                     route = case.route,
-                    activeBluetoothDevicePresent = case.activeBluetoothDevicePresent,
-                    activeBluetoothDeviceName = case.activeBluetoothDeviceName,
+                    activeBluetoothDeviceMatchesExpected = case.activeBluetoothDeviceMatchesExpected,
                 ),
             )
         }
     }
+
+    @Test
+    fun differentActiveBluetoothDeviceIsRejectedRegardlessOfDeviceName() {
+        data class Case(
+            val name: String,
+            val expectedDeviceName: String?,
+            val activeDeviceName: String?,
+        )
+
+        val cases = listOf(
+            Case(
+                name = "Different devices expose the same name",
+                expectedDeviceName = "Shared HFP name",
+                activeDeviceName = "Shared HFP name",
+            ),
+            Case(
+                name = "Different active device name is unreadable",
+                expectedDeviceName = "Vehicle HFP",
+                activeDeviceName = null,
+            ),
+        )
+
+        cases.forEach { case ->
+            val expectedDevice = TestBluetoothDevice(case.expectedDeviceName)
+            val activeDevice = TestBluetoothDevice(case.activeDeviceName)
+            val requestedDevices = mutableListOf<TestBluetoothDevice>()
+            val routeChanges = mutableListOf<Boolean>()
+            val scheduler = ManualScheduler()
+            val controller = createRouteController(
+                expectedDevice = expectedDevice,
+                scheduler = scheduler,
+                requestedDevices = requestedDevices,
+                routeChanges = routeChanges,
+            )
+
+            controller.routeChanged(
+                route = CallAudioState.ROUTE_BLUETOOTH,
+                activeDevice = activeDevice,
+                supportedDevices = listOf(expectedDevice, activeDevice),
+            )
+
+            assertEquals(case.name, listOf(expectedDevice), requestedDevices)
+            assertEquals(case.name, listOf(false), routeChanges)
+            assertEquals(case.name, 1, scheduler.pendingCount)
+        }
+    }
+
+    @Test
+    fun unsupportedExpectedDeviceFailsClosedWithoutRequestingAnotherDevice() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(otherDevice),
+        )
+
+        assertEquals(emptyList<TestBluetoothDevice>(), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+    }
+
+    @Test
+    fun ignoredExactCarRequestIsRetriedAfterConfiguredDelay() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(expectedDevice, otherDevice),
+        )
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(1, scheduler.pendingCount)
+
+        scheduler.advanceBy(ROUTE_RETRY_DELAY_MS - 1)
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(1, scheduler.pendingCount)
+
+        scheduler.advanceBy(1)
+
+        assertEquals(listOf(expectedDevice, expectedDevice), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(1, scheduler.pendingCount)
+    }
+
+    @Test
+    fun exactCarActivationCancelsPendingRetries() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(expectedDevice, otherDevice),
+        )
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = expectedDevice,
+            supportedDevices = listOf(expectedDevice, otherDevice),
+        )
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false, true), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+
+        scheduler.advanceBy(ROUTE_RETRY_DELAY_MS * 2)
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false, true), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+    }
+
+    @Test
+    fun expectedDeviceRemovalCancelsRetriesWithoutRequestingSubstitute() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(expectedDevice, otherDevice),
+        )
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(otherDevice),
+        )
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false, false), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+
+        scheduler.advanceBy(ROUTE_RETRY_DELAY_MS * 2)
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false, false), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+    }
+
+    @Test
+    fun repeatedWrongRouteCallbacksKeepSingleRetryLoop() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        repeat(3) {
+            controller.routeChanged(
+                route = CallAudioState.ROUTE_BLUETOOTH,
+                activeDevice = otherDevice,
+                supportedDevices = listOf(expectedDevice, otherDevice),
+            )
+        }
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false, false, false), routeChanges)
+        assertEquals(1, scheduler.pendingCount)
+
+        scheduler.advanceBy(ROUTE_RETRY_DELAY_MS)
+
+        assertEquals(listOf(expectedDevice, expectedDevice), requestedDevices)
+        assertEquals(listOf(false, false, false), routeChanges)
+        assertEquals(1, scheduler.pendingCount)
+    }
+
+    @Test
+    fun cancelStopsAllFutureRouteRequests() {
+        val expectedDevice = TestBluetoothDevice("Vehicle HFP")
+        val otherDevice = TestBluetoothDevice("RSM")
+        val requestedDevices = mutableListOf<TestBluetoothDevice>()
+        val routeChanges = mutableListOf<Boolean>()
+        val scheduler = ManualScheduler()
+        val controller = createRouteController(
+            expectedDevice = expectedDevice,
+            scheduler = scheduler,
+            requestedDevices = requestedDevices,
+            routeChanges = routeChanges,
+        )
+
+        controller.routeChanged(
+            route = CallAudioState.ROUTE_BLUETOOTH,
+            activeDevice = otherDevice,
+            supportedDevices = listOf(expectedDevice, otherDevice),
+        )
+        controller.cancel()
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+
+        scheduler.advanceBy(ROUTE_RETRY_DELAY_MS * 3)
+
+        assertEquals(listOf(expectedDevice), requestedDevices)
+        assertEquals(listOf(false), routeChanges)
+        assertEquals(0, scheduler.pendingCount)
+    }
+
+    private fun createRouteController(
+        expectedDevice: TestBluetoothDevice,
+        scheduler: ManualScheduler,
+        requestedDevices: MutableList<TestBluetoothDevice>,
+        routeChanges: MutableList<Boolean>,
+    ) = TelecomBluetoothRouteController(
+        expectedDevice = expectedDevice,
+        requestBluetoothAudio = requestedDevices::add,
+        retryDelayMs = ROUTE_RETRY_DELAY_MS,
+        postDelayed = scheduler::postDelayed,
+        removeCallbacks = scheduler::removeCallbacks,
+        onRouteChanged = routeChanges::add,
+    )
 
     private fun createStabilizer(
         scheduler: ManualScheduler,
@@ -128,6 +374,10 @@ class TelecomCaptureRouteStabilizerTest {
         postDelayed = scheduler::postDelayed,
         removeCallbacks = scheduler::removeCallbacks,
         onRouteChanged = routeChanges::add,
+    )
+
+    private class TestBluetoothDevice(
+        val name: String?,
     )
 
     private class ManualScheduler {
@@ -167,5 +417,6 @@ class TelecomCaptureRouteStabilizerTest {
 
     private companion object {
         const val STABILITY_DELAY_MS = 200L
+        const val ROUTE_RETRY_DELAY_MS = 250L
     }
 }
