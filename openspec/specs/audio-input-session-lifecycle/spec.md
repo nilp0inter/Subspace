@@ -156,3 +156,84 @@ The audio input subsystem SHALL play On-a-pinch channel responses through Androi
 - **AND** the normal non-SCO media route does not remain stable before the readiness timeout
 - **THEN** the subsystem SHALL NOT request media focus
 - **AND** SHALL NOT start response output
+
+### Requirement: Audio route gates use observed OS state
+The audio input subsystem SHALL treat route transition success as satisfied only by observed route/capture facts reported by Android APIs or subsystem-owned capture results. Elapsed time SHALL only bound waiting and SHALL NOT by itself prove that a route is ready, released, or safe for capture.
+
+#### Scenario: Timeout fails a route transition
+- **WHEN** an audio input session is waiting for a route acquisition, route release, or capture-readiness gate
+- **AND** the configured timeout expires before the required observed facts are true
+- **THEN** the audio input subsystem SHALL fail or cancel the pending session
+- **AND** SHALL NOT deliver a channel input started event
+- **AND** SHALL release any route resources owned by that session exactly once
+
+#### Scenario: Observed route facts satisfy a transition
+- **WHEN** an audio input session is waiting for a route transition
+- **AND** the subsystem observes all required route facts for the selected input mode
+- **THEN** the session may proceed to the next setup phase
+- **AND** the selected channel remains unaware of the route facts used to make that decision
+
+### Requirement: Channel start follows capture-readiness proof
+The audio input subsystem SHALL deliver channel input start only after route readiness and capture startup have both succeeded for the active session. A route that is only partially ready SHALL result in cancellation or failure rather than a channel-visible capture session.
+
+#### Scenario: Route readiness succeeds but capture startup fails
+- **WHEN** the selected route reports readiness
+- **AND** the capture source cannot be opened, is silenced by Android, or otherwise cannot be proven usable by the subsystem
+- **THEN** the audio input subsystem SHALL report channel input failure or cancellation
+- **AND** SHALL release the active session route exactly once
+- **AND** SHALL NOT deliver `Started` to the selected channel
+
+#### Scenario: Capture is ready before channel handoff
+- **WHEN** the route gate succeeds
+- **AND** the capture service returns a running capture session for the active session
+- **THEN** the audio input subsystem SHALL deliver a channel input session to the channel selected at session start
+- **AND** the channel input session SHALL expose only stream/sample-rate data allowed by the channel input contract
+
+
+### Requirement: Ready beep commits selected-channel delivery
+The audio input subsystem SHALL treat the ready beep as a mandatory commit signal. After the ready beep completes for a PTT, audio captured from that PTT SHALL be delivered through the channel input contract to the channel target selected at PTT start and accepted before the beep. The ready beep SHALL NOT be played for a PTT that has not been accepted by that selected channel.
+
+#### Scenario: Ready beep follows channel commitment
+- **WHEN** a PTT source requests capture
+- **AND** the selected channel accepts the input request
+- **AND** route and capture preflight succeed for the selected input mode
+- **THEN** the audio input subsystem SHALL play the ready beep exactly once before accepting user speech for channel delivery
+- **AND** audio captured after the ready beep SHALL reach the committed channel target
+
+#### Scenario: Channel cannot accept input
+- **WHEN** a PTT source requests capture
+- **AND** the selected channel is unavailable, unconfigured, uninitialized, or otherwise refuses the input request before commitment
+- **THEN** the audio input subsystem SHALL NOT play the ready beep
+- **AND** SHALL NOT report a committed channel input session
+- **AND** SHALL provide problem feedback when possible
+
+#### Scenario: Setup fails after route readiness but before commitment
+- **WHEN** route readiness succeeds
+- **AND** capture preflight, ready beep playback, or selected-channel commitment fails before the ready beep contract is satisfied
+- **THEN** the audio input subsystem SHALL release session-owned route resources exactly once
+- **AND** SHALL NOT deliver a channel-visible started event
+- **AND** SHALL provide problem feedback when possible
+
+### Requirement: Problem beep marks uncommitted PTT
+The audio input subsystem SHALL treat the problem beep as user-visible feedback that a user-visible PTT attempt will not reach the selected channel. Problem beep SHALL NOT imply that the audio route is unusable; it only means the selected channel will not process this PTT audio.
+
+#### Scenario: Pre-commit failure produces problem feedback
+- **WHEN** a user-visible PTT attempt fails before ready beep due to route validation, Telecom timeout, capture preflight, channel refusal, stale session, wrong source, or cancellation
+- **THEN** the audio input subsystem SHALL play the problem beep when a safe feedback route is available
+- **AND** SHALL NOT play the ready beep
+- **AND** SHALL leave no active committed channel input behind
+
+#### Scenario: Problem beep is best effort
+- **WHEN** the input subsystem cannot safely play the problem beep on the failed route
+- **THEN** the system SHALL still fail closed and clean up the route/session state
+- **AND** SHALL NOT reinterpret the failure as a ready state
+
+### Requirement: Session target remains immutable after commitment
+The audio input subsystem SHALL bind a committed input session to the channel target accepted before ready beep. Subsequent active-channel or debug-mode changes SHALL NOT redirect start, release, cancellation, failure, terminal PCM, or playback-completion events for that active session.
+
+#### Scenario: Channel selection changes during active PTT
+- **WHEN** a PTT session has committed to a channel target
+- **AND** the user changes the active channel before release
+- **THEN** terminal input events for that session SHALL still be delivered to the committed target
+- **AND** route cleanup SHALL remain owned by the audio input subsystem
+

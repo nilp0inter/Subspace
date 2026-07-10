@@ -5,21 +5,35 @@ TBD. Defines self-managed Telecom VoIP-based car PTT capture through Subspace's 
 ## Requirements
 
 ### Requirement: Telecom-backed car PTT capture session
-The system SHALL represent each in-car PTT capture interval as a self-managed Telecom VoIP call owned by Subspace. Each PTT cycle SHALL be a complete call lifecycle: place call, acquire SCO, capture, release on hang-up, and perform a mandatory route switch.
+The system SHALL represent each in-car PTT capture interval as a self-managed Telecom VoIP call owned by Subspace. Each PTT cycle SHALL be a complete call lifecycle: place call, acquire a verified car capture route, commit the selected channel target, play the mandatory ready beep through the active call route, capture post-beep audio, release on hang-up, and perform a mandatory route switch. Telecom call audio state is a required input to readiness, but SHALL NOT by itself prove that the ready beep or channel capture path is committed.
 
 #### Scenario: Start car PTT through Telecom
 - **WHEN** the driver invokes the car PTT start action while the active channel is ready and the mode is `OnTheRoad`
 - **THEN** the system SHALL place a self-managed Telecom call using Subspace's registered `PhoneAccount`
 - **AND** create a Subspace-owned `Connection` for the capture interval
+- **AND** keep the pending On-the-road request owned by the audio input subsystem
 
-#### Scenario: Do not start capture before call audio route is ready
+#### Scenario: Do not play ready beep before call audio route is ready
 - **WHEN** a Subspace Telecom car PTT connection is created
-- **THEN** the system SHALL wait for Telecom call audio state to report an acceptable capture route before starting microphone recording
+- **THEN** the system SHALL wait for Telecom call audio state or call endpoint callbacks to report an acceptable car capture route before playing the ready beep
+- **AND** SHALL also require the audio input subsystem's non-Telecom route facts to be compatible with car capture
+- **AND** SHALL NOT use `AudioManager.communicationDevice` as the sole hard proof that the car call route can carry the ready beep
 
-#### Scenario: Bluetooth call audio route starts capture
-- **WHEN** the active Subspace Telecom car PTT connection reports Bluetooth call audio as active
-- **THEN** the system SHALL start microphone capture for the active channel
+#### Scenario: Bluetooth call audio route starts committed capture
+- **WHEN** the active Subspace Telecom car PTT connection reports Bluetooth call audio as active for a non-RSM endpoint
+- **AND** the audio input subsystem has observed that stale Work/RSM communication routing is not active
+- **AND** the selected channel target has accepted the input request
+- **AND** capture startup succeeds for the active route
+- **THEN** the system SHALL play the mandatory ready beep through the active call route
+- **AND** SHALL deliver post-beep microphone capture to the committed channel target
 - **AND** mark the car PTT session as recording
+
+#### Scenario: Ready beep cannot be played through car call route
+- **WHEN** Telecom reports an acceptable car call route
+- **BUT** the audio input subsystem cannot play the ready beep through the active call route before the configured bound
+- **THEN** the system SHALL NOT start committed channel capture
+- **AND** SHALL provide problem feedback when possible
+- **AND** SHALL release the pending Telecom route/session state exactly once
 
 ### Requirement: End-call action stops car PTT and triggers route switch
 The system SHALL treat Telecom disconnect callbacks as the authoritative stop signal for an active car PTT capture. After stopping capture, the system SHALL trigger a mandatory route switch that releases SCO and ends the call before allowing the next PTT cycle.
@@ -85,22 +99,27 @@ The system SHALL start a 30-second idle timer after the route switch completes. 
 - **THEN** the system SHALL cancel the idle timer and start a new PTT cycle
 
 ### Requirement: Pending Telecom route is an audio input session state
-The system SHALL represent an On-the-road Telecom PTT request as an active audio input session while it is waiting for an acceptable Bluetooth call audio route. The session SHALL become capturing only after Telecom route readiness is confirmed, and SHALL be released if route acquisition fails, times out, or is cancelled.
+The system SHALL represent an On-the-road Telecom PTT request as an active audio input session while it is waiting for an acceptable Bluetooth call audio route, channel commitment, route/capture preflight, and mandatory ready-beep completion. The session SHALL become committed capture only after the ready beep contract is satisfied, and SHALL be released if route acquisition, route validation, channel commitment, ready beep, timeout, or cancellation fails.
 
 #### Scenario: Pending Telecom route reserves session ownership
 - **WHEN** the driver starts car PTT and Subspace begins placing or attaching a self-managed Telecom call
 - **THEN** the audio input subsystem records an active pending On-the-road session
-- **AND** phone and RSM PTT requests are ignored or rejected until the pending session starts capture or terminates
+- **AND** phone and RSM PTT requests are ignored or rejected until the pending session commits capture or terminates
 
-#### Scenario: Telecom route becomes ready
+#### Scenario: Telecom route becomes committed capture
 - **WHEN** the pending Telecom session receives an acceptable Bluetooth call audio route
-- **THEN** the audio input subsystem transitions the pending session to active capture
-- **AND** delivers channel input through the normal channel input contract
+- **AND** the audio input subsystem observes that stale Work/RSM route state does not own the communication path
+- **AND** the selected channel target accepts the input request
+- **AND** the audio input subsystem confirms capture preflight for the On-the-road route
+- **AND** the ready beep completes through the call route
+- **THEN** the audio input subsystem transitions the pending session to active committed capture
+- **AND** delivers post-beep channel input to the committed target through the normal channel input contract
 
-#### Scenario: Telecom route fails before capture
-- **WHEN** the pending Telecom session times out, disconnects, aborts, or fails before capture starts
-- **THEN** the audio input subsystem releases the pending session
+#### Scenario: Telecom route fails before commitment
+- **WHEN** the pending Telecom session times out, disconnects, aborts, fails route validation, fails channel commitment, fails ready beep playback, or fails capture preflight before commitment
+- **THEN** the audio input subsystem releases the pending session and the route associated with that session exactly once
 - **AND** leaves no active capture session or route lease behind
+- **AND** provides problem feedback when possible
 
 ### Requirement: Telecom route switch is triggered by session release
 The mandatory On-the-road route switch SHALL be triggered by the audio input session owner when the session ends or is cancelled. Channels SHALL NOT trigger Telecom route switching directly.
@@ -147,7 +166,7 @@ When car HFP voice recognition was requested for On-the-road setup and its obser
 - **AND** SHALL not place or retain a Telecom PTT route for that attempt
 
 ### Requirement: Car HFP selection and priming hand exact ownership to Telecom
-On-the-road setup SHALL select the car HFP endpoint by `BluetoothDevice` identity, not display name. Selection SHALL exclude the exact target RSM and SHALL succeed only when exactly one connected non-RSM HFP candidate remains. Successful priming SHALL be a bounded pulse on that exact car device: observe its HFP audio connect, stop voice recognition on the same device, observe its HFP audio disconnect, and reserve that device as the expected Telecom route before placing the call. The priming route SHALL NOT remain concurrently owned while Telecom acquires call audio.
+On-the-road setup SHALL select the car HFP endpoint by `BluetoothDevice` identity, not display name. Selection SHALL exclude the exact target RSM and SHALL succeed only when exactly one connected non-RSM HFP candidate remains. Successful priming SHALL be a bounded pulse on that exact car device: observe its HFP audio connect, stop voice recognition on the same device, observe its HFP audio disconnect, and reserve that device as the expected Telecom route before placing the call. The priming route SHALL NOT remain concurrently owned while Telecom acquires call audio. A failed or timed-out prime SHALL NOT be ignored when deciding whether the car capture route is ready.
 
 #### Scenario: Exact target RSM is excluded from car selection
 - **WHEN** the target RSM identity is known
@@ -185,7 +204,7 @@ On-the-road setup SHALL select the car HFP endpoint by `BluetoothDevice` identit
 - **AND** SHALL preserve a single owner rather than overwrite the existing reservation
 
 ### Requirement: Telecom capture acquires and stabilizes the exact primed car route
-Before `placeCall`, the coordinator SHALL reserve the exact car `BluetoothDevice` selected and primed by On-the-road setup. The outgoing `ConnectionService` SHALL claim that reservation exactly once and construct the Subspace connection with it; a missing or duplicate claim SHALL fail closed. Capture-route readiness SHALL require both an active Bluetooth call route and `CallAudioState.activeBluetoothDevice` identity equal to the reserved car. Display names SHALL be diagnostic only: a same-name device, a differently named device, or an unreadable name SHALL NOT substitute for identity. Bluetooth support in the route mask alone SHALL NOT establish readiness.
+Before `placeCall`, the coordinator SHALL reserve the exact car `BluetoothDevice` selected and primed by On-the-road setup. The outgoing `ConnectionService` SHALL claim that reservation exactly once and construct the Subspace connection with it; a missing or duplicate claim SHALL fail closed. Capture-route readiness SHALL require both an active Bluetooth call route and `CallAudioState.activeBluetoothDevice` identity equal to the reserved car, and SHALL require that the target RSM is neither the active HFP audio path nor the selected communication route. Display names SHALL be diagnostic only: a same-name device, a differently named device, or an unreadable name SHALL NOT substitute for identity. Bluetooth support in the route mask alone SHALL NOT establish readiness.
 
 While the reserved car remains in `supportedBluetoothDevices` but is not the active Bluetooth call device, the connection SHALL request Bluetooth audio for that exact car immediately and retry through one serialized delayed loop until the exact route becomes active or ownership terminates. It SHALL NOT request any substitute device. The exact acceptable predicate SHALL then remain continuously true for the configured stability window before capture starts.
 
@@ -233,6 +252,12 @@ While the reserved car remains in `supportedBluetoothDevices` but is not the act
 - **THEN** pending exact-device route retries SHALL stop
 - **AND** the exact acceptable predicate SHALL remain continuously true for the full stability window
 - **AND** the connection SHALL then publish capture-route readiness once
+
+#### Scenario: Stale RSM route conflicts with car readiness
+- **WHEN** Telecom reports an acceptable car call audio route
+- **BUT** Android still reports the target RSM as the active HFP audio path or selected communication route
+- **THEN** the audio input subsystem SHALL NOT deliver channel input start for the car session
+- **AND** SHALL fail or continue waiting according to the active route gate
 
 #### Scenario: Route becomes unacceptable during stabilization
 - **WHEN** the exact car route becomes inactive or another device becomes active before the stability window completes

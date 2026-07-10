@@ -55,5 +55,5 @@
 - [x] 7.3 Run targeted capture service sequencing tests
 - [x] 7.4 Run targeted Telecom car PTT tests
 - [x] 7.5 Run focused Gradle test command through the Nix devshell for modified tests
-- [ ] 7.6 Perform manual car validation: On-the-road ready beep is audible through the call and Journal creates an entry
-- [ ] 7.7 Perform manual regression checks for Work/RSM and On-a-pinch ready/problem beep behavior
+- [x] 7.6 Perform manual car validation: On-the-road ready beep is audible through the call and Journal creates an entry
+- [x] 7.7 Perform manual regression checks for Work/RSM and On-a-pinch ready/problem beep behavior

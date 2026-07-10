@@ -104,33 +104,44 @@ hardcoded value.
 
 ### Requirement: Recording starts only after the ready beep completes
 
-The production recorder MAY be opened and started before the ready beep for startup, silencing, and PCM-liveness preflight. The capture service SHALL keep that recorder behind an exclusive discard reader until beep completion. Channel-visible recording—live frames, VU updates, terminal PCM, and the running `CaptureSession`—SHALL start only after the ready beep completes and the discard reader has stopped and joined. The capture service SHALL release the SCO route on every `startSession` outcome that acquired SCO and did not hand off a running session (`Cancelled`, `RecordingFailed`, or `RecordingSilenced`); channel controllers SHALL NOT release the same route again.
+The production recorder MAY be opened and started before the ready beep for startup, silencing, and PCM-liveness preflight. The capture service SHALL keep that recorder behind an exclusive discard reader until beep completion. Channel-visible recording—live frames, VU updates, terminal PCM, and the running `CaptureSession`—SHALL start only after the ready beep completes, the discard reader has stopped and joined, and delivery is committed to the selected accepted channel target. The capture/audio input lifecycle SHALL release every route acquired by the session exactly once on every `startSession` outcome that does not hand off a committed running session; for SCO, the capture service SHALL release the route for `Cancelled`, `RecordingFailed`, or `RecordingSilenced` outcomes, preserving the 30-second warmup retention window. Channel controllers SHALL NOT release the same route again. When capture preflight fails before the ready beep contract is satisfied, the system SHALL provide problem feedback when possible.
 
 #### Scenario: Channel-visible recording starts after beep completion
-- **WHEN** recorder preflight succeeds, the ready beep finishes, and PTT is still held
+- **WHEN** the selected channel target has accepted input, recorder preflight succeeds, the ready beep finishes, and PTT is still held
 - **THEN** the capture service SHALL stop and join the pre-commit discard reader
-- **AND** create the running capture session with the opened source as its sole reader
-- **AND** only post-beep samples SHALL reach live frames, VU updates, or terminal PCM
+- **AND** create the committed running capture session with the opened source as its sole reader
+- **AND** only post-beep samples SHALL reach live frames, VU updates, or terminal PCM for the committed channel target
 
 #### Scenario: PTT released during the ready beep
 - **WHEN** the ready beep is playing and the user releases PTT before the beep completes
 - **THEN** the system SHALL discard and close the preflighted source without channel-visible audio
-- **AND** cancel setup
-- **AND** release the SCO route through the capture service, triggering the 30-second warmup retention window
-- **AND** the channel controller SHALL NOT additionally release the SCO route
+- **AND** cancel setup and release every acquired session route exactly once
+- **AND** for SCO, the capture service release SHALL trigger the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the route
 
-#### Scenario: PTT released during SCO acquisition
-- **WHEN** SCO is being acquired and the user releases PTT before SCO becomes active
-- **THEN** the system SHALL continue SCO acquisition to completion
-- **AND** SHALL NOT open the recorder or play the ready beep
-- **AND** the capture service SHALL release the SCO route, triggering the 30-second warmup retention window
-- **AND** the channel controller SHALL NOT additionally release the SCO route
+#### Scenario: PTT released during route acquisition or capture preflight
+- **WHEN** route acquisition or capture preflight is in progress
+- **AND** the user releases PTT before the ready beep completes
+- **THEN** the system SHALL NOT open a recorder or play the ready beep when the applicable setup stage has not yet begun
+- **AND** SHALL NOT deliver channel-visible user audio
+- **AND** the audio input subsystem SHALL cancel the session and release acquired route resources exactly once
+- **AND** when SCO acquisition is in progress, the capture service SHALL complete and release SCO, triggering the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the route
 
-#### Scenario: Source open fails during preflight
-- **WHEN** the route is acquired, PTT remains held, and the capture source cannot be opened before the ready beep
-- **THEN** the system SHALL NOT play the ready beep or create a running capture session
-- **AND** the capture service SHALL release the SCO route, triggering the 30-second warmup retention window
-- **AND** the channel controller SHALL NOT additionally release the SCO route
+#### Scenario: Source preflight fails before ready beep
+- **WHEN** the route is acquired, PTT remains held, and the capture source cannot be opened or proven usable before the ready beep
+- **THEN** the system SHALL NOT play the ready beep or create a committed running capture session
+- **AND** SHALL provide problem feedback when possible
+- **AND** the capture/audio input lifecycle SHALL release the acquired session route exactly once
+- **AND** for SCO, the capture service release SHALL trigger the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the route
+
+#### Scenario: Source fails after ready beep
+- **WHEN** the ready beep completes and channel-visible capture has been committed
+- **AND** the capture source subsequently fails
+- **THEN** the system SHALL report failure or cancellation to the committed channel target
+- **AND** SHALL release route resources exactly once
+
 
 ### Requirement: Maximum capture duration
 
@@ -192,23 +203,40 @@ Output format is a property of the consuming pipeline, not of capture.
 - **AND** it does not construct a private recorder
 
 ### Requirement: Capture service is called by the audio input subsystem
-The capture service SHALL remain the low-level owner of the active `AudioRecord`, live frames, terminal PCM, and ready-beep-before-record sequencing. Higher-level PTT source, input-mode, route, and channel lifecycle orchestration SHALL be owned by the audio input subsystem.
+The capture service SHALL remain the low-level owner of the active `AudioRecord`, live frames, terminal PCM, and ready-beep-before-user-speech sequencing. Higher-level PTT source, input-mode, route, channel commitment, and session route lifecycle orchestration SHALL be owned by the audio input subsystem. Capture startup outcomes SHALL give the audio input subsystem enough information to withhold ready beep, fail closed, and release the session route when committed user audio cannot be delivered.
 
-#### Scenario: Subsystem starts capture
-- **WHEN** the audio input subsystem has resolved and acquired the selected input route
-- **THEN** it calls the capture service to run ready-beep and recording setup
-- **AND** the capture service returns either a running capture session or a typed setup failure
+#### Scenario: Subsystem starts capture preflight
+- **WHEN** the audio input subsystem has resolved and validated the selected input route
+- **AND** the selected channel target has accepted the input request
+- **THEN** it calls the capture service to perform capture preflight, ready-beep sequencing, and recording setup
+- **AND** the capture service returns either a committed running capture session or a typed setup failure
 
 #### Scenario: Setup fails before handoff
-- **WHEN** capture setup fails before a running capture session is handed to the audio input subsystem
-- **THEN** the capture service performs its existing setup-failure route cleanup contract
+- **WHEN** capture setup fails before a committed running capture session is handed to the audio input subsystem
+- **THEN** the capture service closes any low-level recorder resources it opened
 - **AND** the audio input subsystem marks the audio input session failed or cancelled
+- **AND** the audio input subsystem releases the route associated with that session exactly once
 - **AND** the selected channel does not release the route
 
 #### Scenario: Running capture is handed off
-- **WHEN** the capture service returns a running capture session
+- **WHEN** the capture service returns a committed running capture session
 - **THEN** the audio input subsystem owns when to stop or cancel that session
-- **AND** the audio input subsystem delivers live frames and terminal PCM to the selected channel through the channel input contract
+- **AND** the audio input subsystem delivers post-beep live frames and terminal PCM to the committed channel target through the channel input contract
+
+### Requirement: Capture startup exposes internal readiness evidence
+The capture layer SHALL expose internal startup evidence needed by the audio input subsystem to decide whether capture may be reported as started. This evidence MAY include recorder open success, negotiated sample rate, active recording configuration, reported input device, and Android silencing status when those facts are available. The evidence SHALL remain internal to the audio input subsystem and SHALL NOT be exposed to channels.
+
+#### Scenario: Android reports recorder silenced
+- **WHEN** the capture source opens an `AudioRecord`
+- **AND** Android reports the active recording configuration for that recorder is silenced
+- **THEN** the audio input subsystem SHALL fail or cancel capture setup before delivering channel input start
+- **AND** SHALL release the active session route exactly once
+
+#### Scenario: Recording configuration is unavailable
+- **WHEN** the capture source opens an `AudioRecord`
+- **AND** Android does not provide enough recording configuration detail to identify the physical input device
+- **THEN** the system SHALL use the required route facts that are available
+- **AND** SHALL keep missing best-effort recording configuration facts as diagnostics rather than leaking them to channels
 
 ### Requirement: Capture cancellation during setup is route-safe
 If the audio input session is cancelled while capture setup is suspended after route acquisition and before a running capture session is handed off, the system SHALL release the acquired route exactly once.

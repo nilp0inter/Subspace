@@ -56,5 +56,5 @@
 - [x] 7.3 Run targeted Telecom car PTT lifecycle tests
 - [x] 7.4 Run targeted capture service/source tests
 - [x] 7.5 Run focused Gradle test command through the Nix devshell for modified tests
-- [ ] 7.6 Perform manual device check for RSM warm → car PTT capture on `B02PTT-FF01`
-- [ ] 7.7 Perform manual regression checks for RSM warm → RSM reuse and RSM warm → phone local capture
+- [x] 7.6 Perform manual device check for RSM warm → car PTT capture on `B02PTT-FF01`
+- [x] 7.7 Perform manual regression checks for RSM warm → RSM reuse and RSM warm → phone local capture
