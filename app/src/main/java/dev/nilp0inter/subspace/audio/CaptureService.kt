@@ -5,9 +5,14 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -15,10 +20,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+private const val PRE_COMMIT_SIGNAL_TIMEOUT_MS = 500L
 
 /**
  * Identifier for the capture input source the service starts its recorder with.
@@ -62,12 +70,31 @@ interface OpenedCaptureSource {
     /** Suggested read buffer size in samples (typ. `minBuffer / 2`). */
     val bufferSizeShorts: Int
 
+    /** Whether production preflight must observe nonzero PCM before the ready beep. */
+    val requiresPreCommitSignal: Boolean
+        get() = false
+
+    /** Maximum recorder opens allowed while proving pre-commit signal. */
+    val preCommitSignalAttempts: Int
+        get() = 1
+
+    /** Internal startup facts used by the audio input subsystem before channel handoff. */
+    val startupEvidence: CaptureStartupEvidence
+        get() = CaptureStartupEvidence()
+
     /**
-     * Read up to [buffer.size] samples into [buffer]. Returns the number of
-     * samples read, or a value `<= 0` to indicate "no data right now"
-     * (the read loop will retry).
+     * Read up to [buffer.size] committed samples into [buffer]. Implementations
+     * may block until data is available. Returns the number of samples read,
+     * or a value `<= 0` when no data was read.
      */
     fun read(buffer: ShortArray): Int
+
+    /**
+     * Attempt to read and discard up to [buffer.size] pre-commit samples
+     * without waiting for data. Sources with a blocking [read] must override
+     * this; the default preserves compatibility for non-blocking fakes.
+     */
+    fun readNonBlocking(buffer: ShortArray): Int = read(buffer)
 
     /** Stop and release underlying resources. Idempotent. */
     fun close()
@@ -81,7 +108,10 @@ interface OpenedCaptureSource {
  */
 sealed interface CaptureStartResult {
     /** A new capture session is running. Hold [session] and call [CaptureSession.stop] on release. */
-    data class Started(val session: CaptureSession) : CaptureStartResult
+    data class Started(
+        val session: CaptureSession,
+        val evidence: CaptureStartupEvidence,
+    ) : CaptureStartResult
 
     /** Rejected: another session is already active. */
     data object SessionActive : CaptureStartResult
@@ -98,6 +128,9 @@ sealed interface CaptureStartResult {
 
     /** The selected [CaptureSource] could not be opened. */
     data object RecordingFailed : CaptureStartResult
+
+    /** Android reported that the opened recorder is silenced before channel handoff. */
+    data class RecordingSilenced(val evidence: CaptureStartupEvidence) : CaptureStartResult
 }
 
 /**
@@ -178,18 +211,18 @@ class CaptureService(
     val level: StateFlow<Float> = _level.asStateFlow()
 
     private val mutex = Mutex()
-    private var active: ActiveSession? = null
+    private var active: CaptureSessionImpl? = null
 
     /**
      * Start a capture session.
      *
      * Performs: single-session assertion → acquire [sco] → check [shouldProceed]
-     * → play ready beep on [output] (cold-start priming from [ScoRoute.coldStart])
-     * → open [source] → start the read loop.
+     * → open [source] for capture preflight → play ready beep on [output]
+     * (cold-start priming from [ScoRoute.coldStart]) → start the read loop.
      *
      * The caller-supplied [shouldProceed] predicate is checked after SCO
-     * acquisition and after the beep — returning false in either place
-     * produces [CaptureStartResult.Cancelled] (short-tap-during-beep /
+     * acquisition, after capture preflight, and after the beep — returning
+     * false produces [CaptureStartResult.Cancelled] (short-tap-during-beep /
      * release-during-sco-acquisition per `sco-audio` spec).
      */
     suspend fun startSession(
@@ -201,37 +234,135 @@ class CaptureService(
         if (active != null) return@withLock CaptureStartResult.SessionActive
 
         var opened: OpenedCaptureSource? = null
+        var routeAcquired = false
+        var preCommitDrain: Job? = null
+        suspend fun cleanupSetup() = withContext(NonCancellable) {
+            preCommitDrain?.cancelAndJoin()
+            preCommitDrain = null
+            val sourceToClose = opened
+            opened = null
+            runCatching { sourceToClose?.close() }
+            if (routeAcquired) {
+                routeAcquired = false
+                sco.release()
+            }
+        }
+
+        suspend fun startPreCommitDrain(source: OpenedCaptureSource): Deferred<Unit>? {
+            val started = CompletableDeferred<Unit>()
+            val signalObserved = if (source.requiresPreCommitSignal) CompletableDeferred<Unit>() else null
+            preCommitDrain = scope.launch(readDispatcher, start = CoroutineStart.ATOMIC) {
+                started.complete(Unit)
+                val discardBuffer = ShortArray(source.bufferSizeShorts.coerceAtLeast(1))
+                while (currentCoroutineContext().isActive) {
+                    val samplesRead = source.readNonBlocking(discardBuffer)
+                    if (samplesRead > 0 && signalObserved?.isCompleted == false) {
+                        var index = 0
+                        val limit = samplesRead.coerceAtMost(discardBuffer.size)
+                        while (index < limit && discardBuffer[index].toInt() == 0) index += 1
+                        if (index < limit) signalObserved.complete(Unit)
+                    }
+                    // Non-blocking reads may return no data; this also provides
+                    // a cancellation checkpoint after every discard attempt.
+                    delay(1)
+                }
+            }
+            started.await()
+            return signalObserved
+        }
+
         try {
             if (!sco.acquire()) return@withLock CaptureStartResult.ScoUnavailable
+            routeAcquired = true
 
             // PTT released during SCO acquisition: keep SCO warm, no beep, no record.
             // The service owns the SCO release on this failure branch — controllers
             // MUST NOT also release SCO here (capture-service / sco-audio specs).
             if (!shouldProceed()) {
-                sco.release()
+                cleanupSetup()
                 return@withLock CaptureStartResult.Cancelled
             }
 
+            lateinit var evidence: CaptureStartupEvidence
+            var maxSignalAttempts = 1
+            val signalRetryDelayMs = 100L
+            var signalAttempt = 0
+            while (true) {
+                opened = source.open()
+                if (opened == null) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingFailed
+                }
+                if (signalAttempt == 0) {
+                    maxSignalAttempts = opened!!.preCommitSignalAttempts.coerceAtLeast(1)
+                }
+                val attemptEvidence = opened!!.startupEvidence.copy(
+                    recorderOpened = true,
+                    sourceId = source.sourceId,
+                    sampleRate = opened!!.sampleRate,
+                )
+                if (attemptEvidence.clientSilenced == true) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingSilenced(attemptEvidence)
+                }
+
+                // PTT released after capture preflight but before the ready beep:
+                // no record, no ready signal, and no channel-visible frames.
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
+
+                // AudioRecord is started during open() so startup failures happen before
+                // the user hears readiness. Drain it exclusively until the beep ends.
+                val signalObserved = startPreCommitDrain(opened!!)
+                val signalReady = signalObserved == null ||
+                    withTimeoutOrNull(PRE_COMMIT_SIGNAL_TIMEOUT_MS) {
+                        signalObserved.await()
+                        true
+                    } == true
+                if (signalReady) {
+                    evidence = attemptEvidence
+                    break
+                }
+
+                preCommitDrain?.cancelAndJoin()
+                preCommitDrain = null
+                val silentSource = opened
+                opened = null
+                runCatching { silentSource?.close() }
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
+                signalAttempt += 1
+                if (signalAttempt >= maxSignalAttempts) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.RecordingFailed
+                }
+                delay(signalRetryDelayMs)
+                if (!shouldProceed()) {
+                    cleanupSetup()
+                    return@withLock CaptureStartResult.Cancelled
+                }
+            }
             output.playReadyBeep(sco.coldStart)
 
-            // PTT released during the ready beep: no record, retain warm SCO.
-            // Service-owned release; controllers MUST NOT release SCO here.
+            // Stop and join the discard reader before handing the source to the
+            // channel-visible session. No pre-beep samples can cross this boundary.
+            preCommitDrain?.cancelAndJoin()
+            preCommitDrain = null
+
+            // PTT released during the ready beep: no record and no user audio
+            // delivery. The opened recorder is discarded before read-loop handoff.
             if (!shouldProceed()) {
-                sco.release()
+                cleanupSetup()
                 return@withLock CaptureStartResult.Cancelled
             }
 
-            opened = source.open() ?: run {
-                // Source open failed after the beep — service releases the SCO
-                // reference it acquired above so the warmup window starts and
-                // the route is not leaked for the rest of the session.
-                sco.release()
-                return@withLock CaptureStartResult.RecordingFailed
-            }
-
-            val session = ActiveSession(
+            val session = CaptureSessionImpl(
                 scope = scope,
-                opened = opened,
+                opened = opened!!,
                 coldStart = sco.coldStart,
                 readDispatcher = readDispatcher,
                 maxDurationMs = maxDurationMs,
@@ -255,12 +386,16 @@ class CaptureService(
                 },
             )
             opened = null // ownership transferred
+            routeAcquired = false // route lifecycle remains with the caller
             active = session
             _isCapturing.value = true
-            CaptureStartResult.Started(session)
+            CaptureStartResult.Started(session, evidence)
         } catch (cancellation: CancellationException) {
-            opened?.close()
+            cleanupSetup()
             throw cancellation
+        } catch (error: Throwable) {
+            cleanupSetup()
+            CaptureStartResult.RecordingFailed
         }
     }
 
@@ -274,7 +409,7 @@ class CaptureService(
      * Returns the captured PCM (or an empty result if no session was active).
      */
     suspend fun cancelSession(session: CaptureSession): RecordedPcm {
-        val pcm = (session as? ActiveSession)?.cancel() ?: RecordedPcm(shortArrayOf(), DEFAULT_SAMPLE_RATE)
+        val pcm = (session as? CaptureSessionImpl)?.cancel() ?: RecordedPcm(shortArrayOf(), DEFAULT_SAMPLE_RATE)
         return pcm
     }
 
@@ -289,133 +424,6 @@ class CaptureService(
         _isCapturing.value = false
         _level.value = 0f
         return pcm
-    }
-
-    private class ActiveSession(
-        private val scope: CoroutineScope,
-        private val opened: OpenedCaptureSource,
-        private val coldStart: Boolean,
-        private val readDispatcher: CoroutineDispatcher,
-        private val maxDurationMs: Long,
-        private val maxBufferSamplesFactor: Int,
-        private val clock: () -> Long,
-        private val onCaptureSignalChange: (Boolean) -> Unit,
-        private val onLevelUpdate: (Float) -> Unit,
-        private val onFinalize: (ActiveSession) -> Unit,
-    ) : CaptureSession {
-        override val frames: SharedFlow<ShortArray>
-        override val completion: Deferred<CaptureCompletion>
-        override val sampleRate: Int = opened.sampleRate
-
-        private val buffer = mutableListOf<Short>()
-        private val bufferLock = Any()
-        private val finalizeLock = Any()
-        @Volatile private var finalized: RecordedPcm? = null
-        private val _completion = CompletableDeferred<CaptureCompletion>()
-
-        private val readJob: Job
-
-        init {
-            val mutableFrames = MutableSharedFlow<ShortArray>(
-                replay = 0,
-                // DROP_OLDEST requires a positive buffer; one slot keeps the
-                // most recent chunk available to a slow subscriber without
-                // ever backpressuring the read loop.
-                extraBufferCapacity = 1,
-                onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-            )
-            frames = mutableFrames.asSharedFlow()
-            completion = _completion
-            val sampleRate = opened.sampleRate
-            val maxBufferSamples = sampleRate * maxBufferSamplesFactor
-            readJob = scope.launch(readDispatcher) {
-                readLoop(mutableFrames, maxBufferSamples)
-            }
-        }
-
-        private suspend fun readLoop(
-            emitter: MutableSharedFlow<ShortArray>,
-            maxBufferSamples: Int,
-        ) {
-            val readBuffer = ShortArray(opened.bufferSizeShorts.coerceAtLeast(1))
-            val startedAt = clock()
-            try {
-                while (scope.isActive && finalized == null) {
-                    if (clock() - startedAt >= maxDurationMs) {
-                        finalize(CaptureCompletion.MaxDuration(readFinalPcm()))
-                        return
-                    }
-                    val read = opened.read(readBuffer)
-                    if (read > 0) {
-                        val chunk = readBuffer.copyOfRange(0, read)
-                        accumulate(chunk, maxBufferSamples)
-                        emitter.tryEmit(chunk)
-                        onLevelUpdate(computeRms(chunk))
-                    }
-                    // Tick virtual time forward so test dispatchers can drive
-                    // the loop and the max-duration check deterministically.
-                    // In production this is a no-op-ish 1ms pause between
-                    // chunks; [android.media.AudioRecord.read] already blocks
-                    // the IO thread until the next chunk is available.
-                    delay(1)
-                }
-            } finally {
-                opened.close()
-            }
-        }
-
-        private fun accumulate(chunk: ShortArray, maxBufferSamples: Int) {
-            synchronized(bufferLock) {
-                val remaining = maxBufferSamples - buffer.size
-                if (remaining <= 0) return
-                val toCopy = minOf(chunk.size, remaining)
-                for (i in 0 until toCopy) buffer += chunk[i]
-            }
-        }
-
-        private fun computeRms(samples: ShortArray): Float {
-            if (samples.isEmpty()) return 0f
-            var sum = 0.0
-            for (s in samples) {
-                val n = s.toDouble() / Short.MAX_VALUE
-                sum += n * n
-            }
-            return sqrt(sum / samples.size).toFloat()
-        }
-
-        private fun readFinalPcm(): RecordedPcm = synchronized(bufferLock) {
-            RecordedPcm(buffer.toShortArray(), opened.sampleRate)
-        }
-
-        private fun finalize(reason: CaptureCompletion): RecordedPcm {
-            val pcm = reason.recordedPcm
-            synchronized(finalizeLock) {
-                if (finalized != null) return finalized!!
-                finalized = pcm
-                onFinalize(this)
-                onCaptureSignalChange(false)
-                _completion.complete(reason)
-            }
-            readJob.cancel()
-            return pcm
-        }
-
-        override suspend fun stop(): RecordedPcm {
-            val existing = finalized
-            if (existing != null) return existing
-            return finalize(CaptureCompletion.Stopped(readFinalPcm())).also {
-                // Ensure the read loop has unwound before returning so the
-                // caller observes a quiescent source (matches the legacy
-                // recorder's synchronous stop semantics).
-                runCatching { readJob.join() }
-            }
-        }
-
-        fun cancel(): RecordedPcm {
-            val existing = finalized
-            if (existing != null) return existing
-            return finalize(CaptureCompletion.Cancelled(readFinalPcm()))
-        }
     }
 
     companion object {

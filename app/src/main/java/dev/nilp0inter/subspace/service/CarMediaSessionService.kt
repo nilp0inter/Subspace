@@ -254,6 +254,8 @@ class CarMediaSessionService : MediaBrowserService() {
         .setActions(
             PlaybackState.ACTION_PLAY or
                 PlaybackState.ACTION_PLAY_PAUSE or
+                PlaybackState.ACTION_PAUSE or
+                PlaybackState.ACTION_STOP or
                 PlaybackState.ACTION_SKIP_TO_NEXT or
                 PlaybackState.ACTION_SKIP_TO_PREVIOUS,
         )
@@ -263,6 +265,14 @@ class CarMediaSessionService : MediaBrowserService() {
     private val callback = object : MediaSession.Callback() {
         override fun onPlay() {
             CarPttCommandBus.startTelecomCapture()
+        }
+
+        override fun onPause() {
+            CarPttCommandBus.release()
+        }
+
+        override fun onStop() {
+            CarPttCommandBus.release()
         }
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
@@ -285,9 +295,17 @@ class CarMediaSessionService : MediaBrowserService() {
             val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
             if (event?.action != KeyEvent.ACTION_DOWN) return true
             when (event.keyCode) {
-                KeyEvent.KEYCODE_MEDIA_PLAY,
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-                -> CarPttCommandBus.startTelecomCapture()
+                KeyEvent.KEYCODE_MEDIA_PLAY -> CarPttCommandBus.startTelecomCapture()
+                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    if (lastKnownState == CarMediaPttState.Recording) {
+                        CarPttCommandBus.release()
+                    } else {
+                        CarPttCommandBus.startTelecomCapture()
+                    }
+                }
+                KeyEvent.KEYCODE_MEDIA_PAUSE,
+                KeyEvent.KEYCODE_MEDIA_STOP,
+                -> CarPttCommandBus.release()
                 KeyEvent.KEYCODE_MEDIA_NEXT -> dispatchSkip(next = true)
                 KeyEvent.KEYCODE_MEDIA_PREVIOUS -> dispatchSkip(next = false)
             }

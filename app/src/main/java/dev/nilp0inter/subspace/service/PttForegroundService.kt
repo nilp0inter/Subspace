@@ -14,7 +14,6 @@ import android.bluetooth.BluetoothProfile
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
-import android.os.Bundle
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -29,9 +28,15 @@ import dev.nilp0inter.subspace.audio.AndroidVoiceCommunicationCaptureSource
 import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
+import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.ChannelInputTarget
+import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
+import dev.nilp0inter.subspace.audio.MediaResponsePcmOutput
 import dev.nilp0inter.subspace.audio.OggEncoder
 import dev.nilp0inter.subspace.audio.ModelDownloader
 import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
@@ -115,7 +120,16 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
-class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener {
+internal fun deriveCarMediaPttState(
+    phase: PttAudioSessionManager.SessionPhase?,
+    onTheRoadAvailable: Boolean,
+): CarMediaPttState = when (phase) {
+    PttAudioSessionManager.SessionPhase.PttHeld -> CarMediaPttState.Recording
+    PttAudioSessionManager.SessionPhase.TerminalWork -> CarMediaPttState.Finalizing
+    null -> if (onTheRoadAvailable) CarMediaPttState.Ready else CarMediaPttState.NotReady
+}
+
+class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val _appState = MutableStateFlow(AppState())
@@ -185,17 +199,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
 
-    private lateinit var localOutput: LocalPcmOutput
+    private lateinit var localOutput: MediaResponsePcmOutput
     private lateinit var micSource: AndroidMicCaptureSource
     private lateinit var telecomRegistrar: SubspacePhoneAccountRegistrar
     private lateinit var mediaResponsePlayer: MediaResponsePlayer
-    private var telecomDisconnected = CompletableDeferred<Unit>().apply { complete(Unit) }
-    private var activePttSession: PttSession? = null
+    private lateinit var carTelecomStarter: CarTelecomStarter
+    private lateinit var audioSessionManager: PttAudioSessionManager
+    private lateinit var pttDispatcher: PttDispatcher
+    private lateinit var controllerRegistry: PttControllerRegistry
     private val inputModeController = InputModeController()
     private var idleTimerJob: Job? = null
 
+    private lateinit var readinessProbe: ReadinessProbe
     private var targetDevice: BluetoothDevice? = null
-    private var primedCarHfpDevice: BluetoothDevice? = null
     private var sppClient: SppClient? = null
     private var serialJob: Job? = null
     private var sppStateJob: Job? = null
@@ -204,11 +220,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var readinessRefreshJob: Job? = null
     private var foreground = false
 
-    private data class PttSession(
-        val source: PttSource,
-        val channelId: String,
-        val route: ResolvedAudioRoute,
-    )
 
     @SuppressLint("MissingPermission")
     private fun logAudioRouteSnapshot(event: String) {
@@ -221,9 +232,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         )
     }
 
-    private fun ResolvedAudioRoute.routeDebugString(): String =
-        "endpoint=$endpoint sco=${sco.javaClass.simpleName} output=${output.javaClass.simpleName} " +
-            "source=${source.sourceId}"
 
     inner class LocalBinder : Binder() {
         fun service(): PttForegroundService = this@PttForegroundService
@@ -233,18 +241,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         super.onCreate()
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
+        readinessProbe = ReadinessProbe(this, scanner, bluetoothAdapter, { headsetProxy })
         bluetoothAdapter?.getProfileProxy(this, headsetServiceListener, BluetoothProfile.HEADSET)
         sleepwalkerConnection = SleepwalkerBleConnection()
-        serviceScope.launch {
-            sleepwalkerConnection.connectionState.collect { state ->
-                updateMonitor { it.copy(keyboardConnectionState = state) }
-                val currentKeyboard = _appState.value.keyboard
-                _appState.value = _appState.value.copy(
-                    keyboard = currentKeyboard.copy()
-                )
-                refreshReadiness()
-            }
-        }
         channelRepository = ChannelRepository(applicationContext)
         _appState.value = _appState.value.copy(
             journal = channelRepository.loadJournal(),
@@ -264,14 +263,67 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             isTargetRsmHfpAudioConnected = ::isTargetRsmHfpAudioConnected,
         )
         pcmOutput = AndroidPcmOutput(audioManager, sco::selectedCommunicationDevice)
-        telecomCaptureOutput = AndroidPcmOutput(audioManager)
-        localOutput = LocalPcmOutput()
+        telecomCaptureOutput = AndroidPcmOutput(audioManager, requireActiveScoCommunicationDevice = false)
+        val rawLocalOutput = LocalPcmOutput()
         micSource = AndroidMicCaptureSource()
         captureService = CaptureService(serviceScope)
         voiceCommunicationSource = AndroidVoiceCommunicationCaptureSource()
         telecomRegistrar = SubspacePhoneAccountRegistrar(this)
         telecomRegistrar.register()
-        mediaResponsePlayer = MediaResponsePlayer(audioManager, localOutput)
+        mediaResponsePlayer = MediaResponsePlayer(audioManager, rawLocalOutput)
+        localOutput = MediaResponsePcmOutput(rawLocalOutput, mediaResponsePlayer)
+        audioSessionManager = PttAudioSessionManager(
+            scope = serviceScope,
+            captureService = captureService,
+            channelRouter = this,
+            resolvePttAudioRoute = ::resolvePttAudioRoute,
+            onTerminalCompleted = ::onAudioSessionTerminalCompleted,
+        )
+        carTelecomStarter = CarTelecomStarter(
+            context = this,
+            serviceScope = serviceScope,
+            sco = sco,
+            audioManager = audioManager,
+            headsetProxyProvider = { headsetProxy },
+            targetRsm = ::targetRsm,
+            inputModeController = inputModeController,
+            telecomRegistrar = telecomRegistrar,
+            resolvePttAudioRoute = ::resolvePttAudioRoute,
+            publishInputMode = ::publishInputMode,
+            isActivePttSession = { pttDispatcher.activePttSession != null },
+            decidePttDispatch = { decidePttDispatch(_appState.value) },
+            reservePendingCarPtt = { channelId ->
+                pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId)
+            },
+            cancelPendingCarPtt = {
+                pttDispatcher.forceReleaseActivePtt()
+            },
+            logAudioRouteSnapshot = ::logAudioRouteSnapshot,
+            updateCarMediaState = ::updateCarMediaState,
+        )
+        pttDispatcher = PttDispatcher(
+            serviceScope = serviceScope,
+            sco = sco,
+            inputModeController = inputModeController,
+            audioSessionManager = audioSessionManager,
+            resolvePttAudioRoute = ::resolvePttAudioRoute,
+            publishInputMode = ::publishInputMode,
+            cancelIdleTimer = ::cancelIdleTimer,
+            decidePttDispatch = ::decidePttDispatch,
+            appStateProvider = { _appState.value },
+            logAudioRouteSnapshot = ::logAudioRouteSnapshot,
+            updateCarMediaState = ::updateCarMediaState,
+        )
+        serviceScope.launch {
+            sleepwalkerConnection.connectionState.collect { state ->
+                updateMonitor { it.copy(keyboardConnectionState = state) }
+                val currentKeyboard = _appState.value.keyboard
+                _appState.value = _appState.value.copy(
+                    keyboard = currentKeyboard.copy()
+                )
+                refreshReadiness()
+            }
+        }
         CarPttCommandBus.setListener(this)
         TelecomCarPttCoordinator.setListener(this)
         echo = EchoController(
@@ -301,7 +353,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
         serviceScope.launch {
             echo.status.collect { status ->
-                if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
                 updateMonitor { it.copy(echoStatus = status) }
             }
         }
@@ -312,6 +364,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         refreshReadiness()
         updateInputMode()
+        controllerRegistry = PttControllerRegistry(
+            echo = echo,
+        )
+
         updateCarMediaState()
     }
 
@@ -343,6 +399,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         output = pcmOutput,
                         transcriptionService = transcription,
                     )
+                    Log.d(ROUTE_LOG_TAG, "STT_CONTROLLER_INIT sttController set")
                     sttModelStatusJob = serviceScope.launch {
                         var lastStatus: SttModelStatus? = null
                         while (true) {
@@ -356,7 +413,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     }
                     serviceScope.launch {
                         sttController?.status?.collect { status ->
-                            if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                            if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
                             updateMonitor {
                                 val newTranscript = (status as? SttStatus.Transcribed)?.text
                                     ?: it.sttTranscript
@@ -378,10 +435,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     )
                     serviceScope.launch {
                         keyboardController?.status?.collect { status ->
-                            if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                            if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
                             updateMonitor { it.copy(keyboardStatus = status) }
                         }
                     }
+                    updateActiveControllers()
                 }
             }
         }
@@ -442,6 +500,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                             updateMonitor { it.copy(ttsStatus = status) }
                         }
                     }
+                    updateActiveControllers()
                     serviceScope.launch {
                         val transcriber = sttReady.await()
                         if (transcriber != null) {
@@ -456,12 +515,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                             )
                             serviceScope.launch {
                                 sttTtsController?.status?.collect { status ->
-                                    if (isTerminalCarStatus(status)) forceReleaseActivePtt()
+                                    if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
                                     val transcript = (status as? SttTtsStatus.Transcript)?.text
                                         ?: _appState.value.monitor.sttTtsTranscript
                                     updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
                                 }
                             }
+                            updateActiveControllers()
                         }
                     }
                 }
@@ -479,7 +539,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun onDestroy() {
-        forceReleaseActivePtt()
+        pttDispatcher.forceReleaseActivePtt()
         keyboardController?.cancelAndRelease()
         sleepwalkerConnection.disconnect()
         CarPttCommandBus.setListener(null)
@@ -515,13 +575,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun targetRsmName(): String? = targetRsm()?.name
 
     @SuppressLint("MissingPermission")
-    private fun isRsmHfpConnected(): Boolean {
-        val proxy = headsetProxy ?: return false
-        val rsm = targetRsm() ?: return false
-        return runCatching {
-            proxy.getConnectionState(rsm) == BluetoothProfile.STATE_CONNECTED
-        }.getOrDefault(false)
-    }
+    private fun isRsmHfpConnected(): Boolean = readinessProbe.isRsmHfpConnected()
 
     @SuppressLint("MissingPermission")
     private fun startTargetRsmHfpAudio(): Boolean {
@@ -552,64 +606,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         return runCatching { proxy.isAudioConnected(rsm) }.getOrDefault(false)
     }
 
-    @SuppressLint("MissingPermission")
-    private suspend fun primeCarHfpForTelecom(): Boolean {
-        val proxy = headsetProxy ?: return true
-        val rsm = targetRsm()
-        val car = runCatching {
-            proxy.connectedDevices.firstOrNull { device ->
-                device != rsm &&
-                    device.name?.contains(dev.nilp0inter.subspace.model.TARGET_DEVICE_NAME, ignoreCase = true) != true &&
-                    proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED
-            }
-        }.getOrNull()
-        if (car == null) {
-            Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_SKIP reason=no-non-rsm-hfp-device")
-            return true
-        }
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CAR_HFP_PRIME_BEGIN target='${car.name}' audioBefore=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)} " +
-                "current=${audioManager.communicationDevice.routeDebugString()}",
-        )
-        val started = runCatching { proxy.startVoiceRecognition(car) }
-            .onFailure {
-                Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_START_THROW target='${car.name}' error=${it.javaClass.simpleName}")
-            }
-            .getOrDefault(false)
-        Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_START target='${car.name}' returned=$started")
-        if (!started) return false
-        val connected = withTimeoutOrNull(CAR_HFP_PRIME_TIMEOUT_MS) {
-            while (!runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)) {
-                delay(CAR_HFP_PRIME_POLL_MS)
-            }
-            true
-        } == true
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CAR_HFP_PRIME_END target='${car.name}' connected=$connected " +
-                "current=${audioManager.communicationDevice.routeDebugString()}",
-        )
-        if (connected) primedCarHfpDevice = car
-        return connected
-    }
 
-    @SuppressLint("MissingPermission")
-    private fun stopPrimedCarHfp(reason: String) {
-        val proxy = headsetProxy ?: return
-        val car = primedCarHfpDevice ?: return
-        val stopped = runCatching { proxy.stopVoiceRecognition(car) }
-            .onFailure {
-                Log.d(ROUTE_LOG_TAG, "CAR_HFP_PRIME_STOP_THROW target='${car.name}' error=${it.javaClass.simpleName}")
-            }
-            .getOrDefault(false)
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CAR_HFP_PRIME_STOP target='${car.name}' returned=$stopped reason=$reason " +
-                "audioAfter=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)}",
-        )
-        primedCarHfpDevice = null
-    }
 
     private fun initializeJournal(audioManager: AudioManager) {
         serviceScope.launch {
@@ -668,6 +665,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             updateMonitor { it.copy(echoStatus = EchoStatus.Idle) }
         }
 
+        Log.d(ROUTE_LOG_TAG, "UPDATE_CONTROLLERS isDebugActive=$isDebugActive mode=$mode sttController=${sttController != null} setting=${isDebugActive && mode == DebugMode.STT}")
         sttController?.setEnabled(isDebugActive && mode == DebugMode.STT)
         if (!(isDebugActive && mode == DebugMode.STT)) {
             sttController?.cancelAndRelease()
@@ -699,44 +697,16 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     @SuppressLint("MissingPermission")
     fun refreshReadiness() {
-        val missing = RequiredPermissions.missing(this)
-        val permissions = if (missing.isEmpty()) PermissionState.Granted else PermissionState.Missing
-        val canInspectBluetooth = RequiredPermissions.hasBluetoothConnect(this)
-        val bluetoothEnabled = runCatching { bluetoothAdapter?.isEnabled == true }.getOrDefault(false)
-
-        val bonded = if (canInspectBluetooth && bluetoothEnabled) {
-            runCatching { scanner.bondedTarget() }.getOrNull()
-        } else {
-            null
-        }
-        if (bonded != null) targetDevice = bonded
-
-        val previousConnection = _appState.value.connection
-        val devicePresence = when {
-            bonded != null -> DevicePresence.Bonded
-            targetDevice?.bondState == BluetoothDevice.BOND_BONDED -> DevicePresence.Bonded
-            previousConnection.devicePresence in setOf(
-                DevicePresence.Scanning,
-                DevicePresence.Found,
-                DevicePresence.Pairing,
-                DevicePresence.PairingFailed,
-            ) -> previousConnection.devicePresence
-            else -> DevicePresence.NotFound
-        }
-
-        val headsetAudio = if (permissions == PermissionState.Granted && bluetoothEnabled) {
-            if (isRsmHfpConnected()) HeadsetAudioState.Available else HeadsetAudioState.Unavailable
-        } else {
-            HeadsetAudioState.Unavailable
-        }
-
+        val previous = _appState.value.connection
+        val snapshot = readinessProbe.refresh(previous.devicePresence, targetDevice)
+        if (snapshot.bondedDevice != null) targetDevice = snapshot.bondedDevice
         updateConnection {
             it.copy(
-                permissions = permissions,
-                missingPermissions = missing,
-                bluetoothEnabled = bluetoothEnabled,
-                devicePresence = devicePresence,
-                headsetAudio = headsetAudio,
+                permissions = snapshot.permissions,
+                missingPermissions = snapshot.missingPermissions,
+                bluetoothEnabled = snapshot.bluetoothEnabled,
+                devicePresence = snapshot.devicePresence,
+                headsetAudio = snapshot.headsetAudio,
             )
         }
         updateInputMode()
@@ -805,7 +775,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     fun disconnectSerial() {
-        forceReleaseActivePtt()
+        pttDispatcher.forceReleaseActivePtt()
         keyboardController?.cancelAndRelease()
         sleepwalkerConnection.disconnect()
         reconnectPolicy.clearMonitoring()
@@ -931,11 +901,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         Log.d(ROUTE_LOG_TAG, "PHONE_PTT_PRESSED channel=$channelId")
         logAudioRouteSnapshot("phone-ptt-pressed")
         setActiveChannelId(channelId)
-        dispatchPttPressed(PttSource.Phone)
+        pttDispatcher.dispatchPttPressed(PttSource.Phone)
     }
 
     fun phonePttReleased(channelId: String) {
-        dispatchPttReleased(PttSource.Phone)
+        pttDispatcher.dispatchPttReleased(PttSource.Phone)
     }
 
     fun setInputMode(mode: InputMode): Boolean = setInputMode(mode, InputModeSelection.User)
@@ -962,23 +932,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
 
-    private fun forceReleaseActivePtt() {
-        val session = activePttSession ?: return
-        activePttSession = null
-        cancelIdleTimer()
-        when (session.channelId) {
-            JournalChannel.ID -> journalPttController?.cancelAndRelease()
-            KeyboardChannel.ID -> keyboardController?.cancelAndRelease()
-            DebugChannel.ID -> {
-                when (_appState.value.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.cancelAndRelease()
-                    DebugMode.STT -> sttController?.cancelAndRelease()
-                    DebugMode.TTS -> ttsController?.cancelAndRelease()
-                    DebugMode.STT_TTS -> sttTtsController?.cancelAndRelease()
-                }
-            }
-        }
-        TelecomCarPttCoordinator.forceAbort()
+
+    private fun onAudioSessionTerminalCompleted(
+        completion: PttAudioSessionManager.TerminalCompletion,
+    ) {
+        if (completion.mode == InputMode.OnTheRoad) startIdleTimer()
         updateCarMediaState()
     }
 
@@ -986,7 +944,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         idleTimerJob?.cancel()
         idleTimerJob = serviceScope.launch {
             delay(IDLE_TIMEOUT_MS)
-            cleanupOnTheRoadSession()
+            idleTimerJob = null
+            updateCarMediaState()
         }
     }
 
@@ -995,12 +954,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         idleTimerJob = null
     }
 
-    private fun cleanupOnTheRoadSession() {
-        updateCarMediaState()
-    }
 
     override fun onCarPttStart() {
-        startTelecomCarPtt()
+        cancelIdleTimer()
+        carTelecomStarter.startTelecomCarPtt()
     }
 
     override fun onCarPttRelease() {
@@ -1008,23 +965,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun onTelecomCaptureStart() {
-        dispatchPttPressed(PttSource.CarTelecom)
+        pttDispatcher.dispatchPttPressed(PttSource.CarTelecom)
         updateCarMediaState()
     }
 
     override fun onTelecomCaptureStop() {
-        dispatchPttReleased(PttSource.CarTelecom)
+        pttDispatcher.dispatchPttReleased(PttSource.CarTelecom)
         updateCarMediaState()
     }
-
     override fun onTelecomRouteTimeout() {
-        playCarErrorBeep()
+        pttDispatcher.forceReleaseActivePtt()
+        carTelecomStarter.playCarErrorBeep()
+        carTelecomStarter.notifyTelecomDisconnected()
         updateCarMediaState()
     }
-
     override fun onTelecomConnectionEnded() {
-        if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
-        startIdleTimer()
+        pttDispatcher.cancelPending(PttSource.CarTelecom, "Telecom connection ended")
+        carTelecomStarter.notifyTelecomDisconnected()
         updateCarMediaState()
     }
 
@@ -1126,74 +1083,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         replayLastHeard()
     }
 
-    private fun startTelecomCarPtt() {
-        serviceScope.launch {
-            startTelecomCarPttAfterRouteRelease()
-        }
-    }
-
-    private suspend fun startTelecomCarPttAfterRouteRelease() {
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CAR_PTT_START activeSession=${activePttSession != null} modeBefore=${inputModeController.mode} " +
-                "availability=${inputModeController.availability}",
-        )
-        logAudioRouteSnapshot("car-ptt-start")
-        if (!telecomDisconnected.isCompleted) {
-            Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=telecom-disconnect-pending")
-            return
-        }
-        if (activePttSession != null) {
-            Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=active-session")
-            return
-        }
-        val transitioned = inputModeController.autoTransitionFor(PttSource.CarTelecom)
-        Log.d(
-            ROUTE_LOG_TAG,
-            "PTT_AUTO_TRANSITION source=${PttSource.CarTelecom} ok=$transitioned modeAfter=${inputModeController.mode}",
-        )
-        logAudioRouteSnapshot("car-ptt-after-transition")
-        if (!transitioned) {
-            playCarErrorBeep()
-            return
-        }
-        publishInputMode()
-        cancelIdleTimer()
-        val decision = decidePttDispatch(_appState.value) ?: return
-        if (decision is PttDispatchDecision.ErrorBeep) {
-            Log.d(ROUTE_LOG_TAG, "CAR_PTT_ERROR_BEEP reason=dispatch-decision mode=${inputModeController.mode}")
-            playCarErrorBeep()
-            return
-        }
-        sco.releaseImmediately("car-ptt-start")
-        primeCarHfpForTelecom()
-        telecomRegistrar.register()
-        if (!telecomRegistrar.isEnabled()) {
-            startActivity(telecomRegistrar.setupIntent())
-            return
-        }
-
-        val telecom = getSystemService(android.telecom.TelecomManager::class.java) ?: return
-        val extras = Bundle().apply {
-            putParcelable(android.telecom.TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, telecomRegistrar.handle)
-        }
-        runCatching {
-            telecomDisconnected = CompletableDeferred()
-            telecom.placeCall(telecomRegistrar.callAddress(), extras)
-        }.onFailure {
-            if (!telecomDisconnected.isCompleted) telecomDisconnected.complete(Unit)
-            playCarErrorBeep()
-        }
-    }
-
-    private fun playCarErrorBeep() {
-        Log.d(ROUTE_LOG_TAG, "CAR_ERROR_BEEP mode=${inputModeController.mode}")
-        val route = resolvePttAudioRoute(inputModeController.mode)
-        serviceScope.launch {
-            playRouteErrorBeepIfAcquired(route)
-        }
-    }
-
     private fun handleRawButtonEvent(event: RawButtonEvent) {
         val previousMode = _appState.value.monitor.hardwareMode
         val snapshot = buttonStateMachine.apply(event, SystemClock.elapsedRealtime())
@@ -1230,10 +1119,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         announcer?.announce("chan.${_appState.value.activeChannelId}.selected", sco, pcmOutput)
                     }
                 } else {
-                    dispatchPttPressed()
+                    pttDispatcher.dispatchPttPressed(PttSource.Rsm)
                 }
             }
-            RawButtonEvent.PttReleased -> dispatchPttReleased()
+            RawButtonEvent.PttReleased -> pttDispatcher.dispatchPttReleased(PttSource.Rsm)
             RawButtonEvent.SosPressed -> {
                 if (_appState.value.activeChannelId == KeyboardChannel.ID) {
                     keyboardController?.sendEnter()
@@ -1243,194 +1132,56 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
 
-    private fun dispatchPttPressed() {
-        dispatchPttPressed(PttSource.Rsm)
-    }
 
-    private fun dispatchPttPressed(source: PttSource): Boolean {
-        Log.d(
-            ROUTE_LOG_TAG,
-            "PTT_PRESS_BEGIN source=$source activeSession=${activePttSession != null} " +
-                "modeBefore=${inputModeController.mode} availability=${inputModeController.availability}",
-        )
-        logAudioRouteSnapshot("ptt-press-begin-$source")
-        if (activePttSession != null) {
-            Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=active-session")
-            return false
-        }
-        val transitioned = inputModeController.autoTransitionFor(source)
-        Log.d(ROUTE_LOG_TAG, "PTT_AUTO_TRANSITION source=$source ok=$transitioned modeAfter=${inputModeController.mode}")
-        logAudioRouteSnapshot("ptt-after-transition-$source")
-        if (!transitioned) {
-            Log.d(
-                ROUTE_LOG_TAG,
-                "PTT_ERROR_BEEP_SKIP source=$source reason=transition-failed mode=${inputModeController.mode}",
-            )
-            return false
-        }
-        publishInputMode()
-        if (inputModeController.mode != InputMode.Work) {
-            sco.requestImmediateRelease("mode-switch-${inputModeController.mode}")
-        }
-        cancelIdleTimer()
 
-        val appState = _appState.value
-        val decision = decidePttDispatch(appState) ?: return false
-        val activeChannelId = decision.channelId
-
-        val route = resolvePttAudioRoute(inputModeController.mode)
-
-        if (decision is PttDispatchDecision.ErrorBeep) {
-            Log.d(ROUTE_LOG_TAG, "PTT_ERROR_BEEP source=$source reason=dispatch-decision route=${route.routeDebugString()}")
-            serviceScope.launch {
-                playRouteErrorBeepIfAcquired(route)
-            }
-            return false
-        }
-
-        activePttSession = PttSession(
-            source = source,
-            channelId = activeChannelId,
-            route = route,
+    private fun resolvePttAudioRoute(mode: InputMode): ResolvedAudioRoute =
+        dev.nilp0inter.subspace.service.resolvePttAudioRoute(
+            mode = mode,
+            sco = sco,
+            telecomCaptureOutput = telecomCaptureOutput,
+            mediaResponsePlayer = mediaResponsePlayer,
+            voiceCommunicationSource = voiceCommunicationSource,
+            localOutput = localOutput,
+            micSource = micSource,
+            pcmOutput = pcmOutput,
+            awaitTelecomDisconnected = { withTimeoutOrNull(POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS) { carTelecomStarter.telecomDisconnected.await() } },
+            releaseStaleWorkRoute = { reason -> sco.releaseImmediately(reason) },
+            releaseTelecomCaptureRoute = {
+                dev.nilp0inter.subspace.service.releaseTelecomCaptureRoute(
+                    audioManager, ::logAudioRouteSnapshot,
+                )
+            },
+            logAudioRouteSnapshot = ::logAudioRouteSnapshot,
         )
 
-        when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttPressed(route)
-            KeyboardChannel.ID -> keyboardController?.onPttPressed(route)
-            DebugChannel.ID -> {
-                when (appState.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttPressed(route)
-                    DebugMode.STT -> sttController?.onPttPressed(route)
-                    DebugMode.TTS -> {
-                        val monitor = appState.monitor
-                        val tts = ttsController
-                        val modelDir = supertonicModelDir
-                        if (tts != null && modelDir != null) {
-                            tts.onPttPressed(
-                                route = route,
-                                text = monitor.ttsText,
-                                voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath,
-                                lang = monitor.ttsLang,
-                                totalSteps = monitor.ttsTotalSteps,
-                                speed = monitor.ttsSpeed,
-                                scoRate = SCO_RATE,
-                            )
-                        }
-                    }
-                    DebugMode.STT_TTS -> sttTtsController?.onPttPressed(route)
-                }
-            }
-        }
-        updateCarMediaState()
-        return true
-    }
+    private fun releaseTelecomCaptureRoute() =
+        dev.nilp0inter.subspace.service.releaseTelecomCaptureRoute(
+            audioManager, ::logAudioRouteSnapshot,
+        )
 
-    private fun resolvePttAudioRoute(mode: InputMode): ResolvedAudioRoute {
-        val route = when (mode) {
-            InputMode.OnTheRoad -> ResolvedAudioRoute(
-                sco = TelecomCallScoRoute(TelecomCarPttCoordinator::isCaptureRouteReady),
-                output = TelecomCapturePcmOutput(
-                    captureOutput = telecomCaptureOutput,
-                    mediaResponsePlayer = mediaResponsePlayer,
-                    releaseCaptureRoute = { releaseTelecomCaptureRoute() },
-                    awaitTelecomDisconnected = { withTimeoutOrNull(POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS) { telecomDisconnected.await() } },
-                ),
-                source = voiceCommunicationSource,
-                endpoint = AudioRouteEndpoint.Car,
-            )
-            InputMode.Work -> resolveScoAudioRoute(
-                scoRoute = sco,
-                scoOutput = pcmOutput,
-                scoSource = voiceCommunicationSource,
-                endpoint = AudioRouteEndpoint.Rsm,
-            )
-            InputMode.OnAPinch -> {
-                logAudioRouteSnapshot("route-resolve-local-before")
-                resolveLocalAudioRoute(localOutput, micSource)
-            }
-        }
-        Log.d(ROUTE_LOG_TAG, "ROUTE_RESOLVE mode=$mode ${route.routeDebugString()}")
-        return route
-    }
 
-    private fun releaseTelecomCaptureRoute() {
-        stopPrimedCarHfp("telecom-release")
-        logAudioRouteSnapshot("telecom-release-before")
-        audioManager.clearCommunicationDevice()
-        audioManager.mode = AudioManager.MODE_NORMAL
-        logAudioRouteSnapshot("telecom-release-after")
-    }
-
-    private fun dispatchPttReleased() {
-        dispatchPttReleased(PttSource.Rsm)
-    }
-
-    private fun dispatchPttReleased(source: PttSource) {
-        val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
-        activePttSession = null
-        val appState = _appState.value
-        val activeChannelId = session.channelId
-
-        val route = session.route
-
-        when (activeChannelId) {
-            JournalChannel.ID -> journalPttController?.onPttReleased(route)
-            KeyboardChannel.ID -> keyboardController?.onPttReleased(route)
-            DebugChannel.ID -> {
-                when (appState.debugChannel.mode) {
-                    DebugMode.ECHO -> echo.onPttReleased(route)
-                    DebugMode.STT -> sttController?.onPttReleased(route)
-                    DebugMode.TTS -> ttsController?.onPttReleased()
-                    DebugMode.STT_TTS -> {
-                        val monitor = appState.monitor
-                        val sttTts = sttTtsController
-                        val modelDir = supertonicModelDir
-                        if (sttTts != null && modelDir != null) {
-                            sttTts.onPttReleased(
-                                route,
-                                voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath,
-                                lang = monitor.sttTtsLang,
-                                totalSteps = monitor.sttTtsTotalSteps,
-                                speed = monitor.sttTtsSpeed,
-                                scoRate = SCO_RATE,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        if (inputModeController.mode == InputMode.OnTheRoad) {
-            startIdleTimer()
-        }
-        updateCarMediaState()
-    }
 
     private fun updateCarMediaState() {
-        val activeReady = decidePttDispatch(_appState.value) is PttDispatchDecision.Dispatch
-        val onTheRoadAvailable = inputModeController.availability.onTheRoad
-        val state = when {
-            activePttSession != null -> CarMediaPttState.Recording
-            idleTimerJob?.isActive == true -> CarMediaPttState.Finalizing
-            activeReady && onTheRoadAvailable -> CarMediaPttState.Ready
-            onTheRoadAvailable -> CarMediaPttState.Ready
-            else -> CarMediaPttState.NotReady
-        }
-        CarMediaStateBus.update(state)
+        CarMediaStateBus.update(
+            deriveCarMediaPttState(
+                phase = pttDispatcher.activePttSession?.phase,
+                onTheRoadAvailable = inputModeController.availability.onTheRoad,
+            ),
+        )
     }
 
-    private fun isTerminalCarStatus(status: EchoStatus): Boolean = isTerminalCarSource() &&
+    private fun isTerminalCarStatus(status: EchoStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
         (status is EchoStatus.Error || status == EchoStatus.MaxDurationReached)
 
-    private fun isTerminalCarStatus(status: SttStatus): Boolean = isTerminalCarSource() &&
+    private fun isTerminalCarStatus(status: SttStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
         (status is SttStatus.Error || status == SttStatus.MaxDurationReached)
 
-    private fun isTerminalCarStatus(status: SttTtsStatus): Boolean = isTerminalCarSource() &&
+    private fun isTerminalCarStatus(status: SttTtsStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
         (status is SttTtsStatus.Error || status == SttTtsStatus.MaxDurationReached)
 
-    private fun isTerminalCarStatus(status: KeyboardStatus): Boolean = isTerminalCarSource() &&
+    private fun isTerminalCarStatus(status: KeyboardStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
         (status is KeyboardStatus.Error || status == KeyboardStatus.MaxDurationReached)
 
-    private fun isTerminalCarSource(): Boolean = activePttSession?.source == PttSource.CarTelecom
 
     @SuppressLint("MissingPermission")
     private fun resolveManualSerialTarget(): BluetoothDevice? {
@@ -1501,7 +1252,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
-        forceReleaseActivePtt()
+        pttDispatcher.forceReleaseActivePtt()
         keyboardController?.cancelAndRelease()
         echo.cancelAndRelease("SPP disconnected")
         sttController?.cancelAndRelease()
@@ -1700,6 +1451,171 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             .build()
     }
 
+
+    // -- ChannelRouter implementation --------------------------------------------------
+
+    override fun prepareInput(channelId: String): ChannelInputAcceptance {
+        Log.d(
+            ROUTE_LOG_TAG,
+            "CHANNEL_INPUT_PREPARE channel=$channelId mode=${_appState.value.debugChannel.mode} " +
+                "stt=${sttController != null}(e=${sttController?.enabled}) " +
+                "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
+                "tts=${ttsController != null}(e=${ttsController?.enabled})",
+        )
+        return when (channelId) {
+            JournalChannel.ID -> {
+                journalPttController?.prepareInput()
+                    ?: ChannelInputAcceptance.Unavailable("Journal controller unavailable")
+            }
+            KeyboardChannel.ID -> {
+                val keyboard = keyboardController
+                    ?: return ChannelInputAcceptance.Unavailable("Keyboard controller unavailable")
+                if (!keyboard.enabled) {
+                    ChannelInputAcceptance.Refused("Keyboard channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            keyboard.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            keyboard.onInputReleased(recording)
+
+                        override fun onInputCancelled(reason: String) {
+                            keyboard.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            keyboard.onInputFailed(reason)
+                        }
+                    })
+                }
+            }
+            DebugChannel.ID -> prepareDebugInput()
+            else -> ChannelInputAcceptance.Unavailable("Unknown channel: $channelId")
+        }
+    }
+
+    private fun prepareDebugInput(): ChannelInputAcceptance {
+        val monitor = _appState.value.monitor
+        return when (_appState.value.debugChannel.mode) {
+            DebugMode.ECHO -> {
+                if (!echo.enabled) {
+                    ChannelInputAcceptance.Refused("Echo debug channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            echo.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            echo.onInputReleased(recording)
+
+                        override fun onInputPlaybackCompleted() {
+                            echo.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            echo.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            echo.onInputFailed(reason)
+                        }
+                    })
+                }
+            }
+            DebugMode.STT -> {
+                val stt = sttController
+                    ?: return ChannelInputAcceptance.Unavailable("STT controller unavailable")
+                if (!stt.enabled) {
+                    ChannelInputAcceptance.Refused("STT debug channel disabled")
+                } else {
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            stt.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            stt.onInputReleased(recording)
+
+                        override fun onInputCancelled(reason: String) {
+                            stt.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            stt.onInputFailed(reason)
+                        }
+                    })
+                }
+            }
+            DebugMode.TTS -> {
+                val tts = ttsController
+                    ?: return ChannelInputAcceptance.Unavailable("TTS controller unavailable")
+                val modelDir = supertonicModelDir
+                    ?: return ChannelInputAcceptance.Unavailable("TTS model directory unavailable")
+                if (!tts.enabled) {
+                    ChannelInputAcceptance.Refused("TTS debug channel disabled")
+                } else {
+                    val text = monitor.ttsText
+                    val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath
+                    val lang = monitor.ttsLang
+                    val totalSteps = monitor.ttsTotalSteps
+                    val speed = monitor.ttsSpeed
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            tts.onInputReleased(text, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
+
+                        override fun onInputPlaybackCompleted() {
+                            tts.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            tts.cancelAndRelease()
+                        }
+
+                        override fun onInputFailed(reason: String) = Unit
+                    })
+                }
+            }
+            DebugMode.STT_TTS -> {
+                val sttTts = sttTtsController
+                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS controller unavailable")
+                val modelDir = supertonicModelDir
+                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS model directory unavailable")
+                if (!sttTts.enabled) {
+                    ChannelInputAcceptance.Refused("STT/TTS debug channel disabled")
+                } else {
+                    val voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath
+                    val lang = monitor.sttTtsLang
+                    val totalSteps = monitor.sttTtsTotalSteps
+                    val speed = monitor.sttTtsSpeed
+                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                        override fun onInputStarted(session: ChannelAudioInputSession) {
+                            sttTts.onInputStarted(session)
+                        }
+
+                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
+                            sttTts.onInputReleased(recording, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
+
+                        override fun onInputPlaybackCompleted() {
+                            sttTts.onInputPlaybackCompleted()
+                        }
+
+                        override fun onInputCancelled(reason: String) {
+                            sttTts.onInputCancelled(reason)
+                        }
+
+                        override fun onInputFailed(reason: String) {
+                            sttTts.onInputFailed(reason)
+                        }
+                    })
+                }
+            }
+        }
+    }
     companion object {
         const val ACTION_START_MONITORING = "dev.nilp0inter.subspace.START_MONITORING"
 
@@ -1712,8 +1628,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         private const val READINESS_REFRESH_INTERVAL_MS = 5_000L
         private const val SCO_RATE = 16_000
         private const val POST_TELECOM_PLAYBACK_GATE_TIMEOUT_MS = 3_000L
-        private const val CAR_HFP_PRIME_TIMEOUT_MS = 1_500L
-        private const val CAR_HFP_PRIME_POLL_MS = 50L
         private const val IDLE_TIMEOUT_MS = 30_000L
     }
 }

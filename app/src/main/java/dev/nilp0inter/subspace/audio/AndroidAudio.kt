@@ -14,9 +14,10 @@ import kotlin.math.sin
 class AndroidPcmOutput(
     private val audioManager: AudioManager,
     private val communicationDevice: () -> AudioDeviceInfo? = { audioManager.communicationDevice },
+    private val requireActiveScoCommunicationDevice: Boolean = true,
 ) : PcmOutput {
     override suspend fun playReadyBeep(coldStart: Boolean) {
-        val device = requireScoDevice()
+        val device = communicationDeviceForPlayback()
         val sampleRate = 16_000
         var samples = generateSinePcm16(
             frequencyHz = 880.0,
@@ -38,7 +39,7 @@ class AndroidPcmOutput(
     }
 
     override suspend fun playErrorBeep(coldStart: Boolean) {
-        val device = requireScoDevice()
+        val device = communicationDeviceForPlayback()
         val sampleRate = 16_000
         val tone1 = generateSinePcm16(
             frequencyHz = 400.0,
@@ -67,8 +68,8 @@ class AndroidPcmOutput(
     }
 
     override suspend fun play(recording: RecordedPcm) {
-        val device = requireScoDevice()
         if (recording.isEmpty) return
+        val device = communicationDeviceForPlayback()
         playStaticPcm(
             samples = recording.samples,
             sampleRate = recording.sampleRate,
@@ -77,8 +78,11 @@ class AndroidPcmOutput(
         )
     }
 
-    private fun requireScoDevice(): AudioDeviceInfo {
+    private fun communicationDeviceForPlayback(): AudioDeviceInfo? {
         val device = communicationDevice()
+        if (!requireActiveScoCommunicationDevice) {
+            return device?.takeIf { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
+        }
         check(device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
             "Bluetooth SCO route is not active"
         }

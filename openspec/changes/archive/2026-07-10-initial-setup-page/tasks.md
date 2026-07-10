@@ -33,6 +33,6 @@
 - [x] 5.1 Run `nix develop --no-write-lock-file -c gradle build` — APK builds successfully without model assets
 - [x] 5.2 Verify APK contains `model-hashes.json` and does NOT contain `.onnx` files: `jar tf app/build/outputs/apk/debug/app-debug.apk | grep -E '\.onnx$|model-hashes\.json'`
 - [x] 5.3 Run `nix develop --no-write-lock-file -c gradle test` — all existing tests pass
-- [ ] 5.4 Manual device test: fresh install → setup page shown → grant permissions → models download → "Enter Subspace" → dashboard loads
-- [ ] 5.5 Manual device test: revoke permissions via system settings → next launch → setup page re-shown
-- [ ] 5.6 Manual device test: corrupt a model file on disk → next launch → setup page shows re-download
+- [x] 5.4 Manual device test: fresh install → setup page shown → grant permissions → models download → "Enter Subspace" → dashboard loads
+- [x] 5.5 Manual device test: revoke permissions via system settings → next launch → setup page re-shown
+- [x] 5.6 Manual device test: corrupt a model file on disk → next launch → setup page shows re-download

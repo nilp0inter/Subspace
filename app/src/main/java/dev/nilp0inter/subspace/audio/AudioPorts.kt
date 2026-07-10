@@ -32,11 +32,63 @@ interface PcmOutput {
     suspend fun releaseRoute() {}
 }
 
+sealed interface RouteGateResult {
+    val reason: String
+
+    data class Success(
+        override val reason: String,
+        val facts: List<String> = emptyList(),
+    ) : RouteGateResult
+
+    data class Failure(
+        override val reason: String,
+        val facts: List<String> = emptyList(),
+    ) : RouteGateResult
+
+    data class Cancellation(
+        override val reason: String,
+        val facts: List<String> = emptyList(),
+    ) : RouteGateResult
+
+    data class Timeout(
+        override val reason: String,
+        val facts: List<String> = emptyList(),
+    ) : RouteGateResult
+
+    val isSuccess: Boolean
+        get() = this is Success
+}
+
+
+data class CaptureStartupEvidence(
+    val recorderOpened: Boolean = false,
+    val sourceId: CaptureSourceId? = null,
+    val sampleRate: Int? = null,
+    val clientSilenced: Boolean? = null,
+    val inputDeviceName: String? = null,
+)
+
+data class RouteGate(
+    val name: String,
+    val await: suspend () -> RouteGateResult,
+)
+
+fun openRouteGate(name: String = "open-route"): RouteGate =
+    RouteGate(name) { RouteGateResult.Success(name, listOf("no route gate required")) }
+
+fun releaseWorkRouteGate(
+    name: String,
+    release: suspend (String) -> RouteGateResult,
+): RouteGate =
+    RouteGate(name) { release(name) }
+
+
 data class ResolvedAudioRoute(
     val sco: ScoRoute,
     val output: PcmOutput,
     val source: CaptureSource,
     val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Unspecified,
+    val routeGate: RouteGate = openRouteGate(),
 )
 
 object NoopCaptureSource : CaptureSource {
@@ -84,9 +136,11 @@ fun resolveScoAudioRoute(
 fun resolveLocalAudioRoute(
     localOutput: PcmOutput,
     localSource: CaptureSource,
+    routeGate: RouteGate = openRouteGate("local-open-route"),
 ): ResolvedAudioRoute = ResolvedAudioRoute(
     sco = NoopScoRoute(),
     output = ScopedPcmOutput(localOutput) { },
     source = localSource,
     endpoint = AudioRouteEndpoint.Local,
+    routeGate = routeGate,
 )

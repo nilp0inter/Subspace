@@ -9,3 +9,4 @@ rust/target/
 .omo
 release.keystore
 *.keystore
+.wrangler/

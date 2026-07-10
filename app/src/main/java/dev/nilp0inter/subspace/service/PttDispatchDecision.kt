@@ -19,7 +19,6 @@ internal fun decidePttDispatch(appState: AppState): PttDispatchDecision? {
         KeyboardChannel.ID -> appState.keyboard
         else -> return null
     }
-
     return if (channel.isReady) {
         PttDispatchDecision.Dispatch(channel.id)
     } else {

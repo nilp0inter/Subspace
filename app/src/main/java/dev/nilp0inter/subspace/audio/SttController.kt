@@ -1,4 +1,5 @@
 package dev.nilp0inter.subspace.audio
+import android.util.Log
 
 import dev.nilp0inter.subspace.model.SttStatus
 import kotlinx.coroutines.CancellationException
@@ -31,6 +32,7 @@ class SttController(
     private var transcribeJob: Job? = null
 
     fun setEnabled(value: Boolean) {
+        logD("SubspaceStt", "setEnabled value=$value was=$enabled activeSession=${activeSession != null} setupJobActive=${setupJob?.isActive}")
         enabled = value
         if (!value && activeSession == null && setupJob?.isActive != true) {
             _status.value = SttStatus.Idle
@@ -43,13 +45,14 @@ class SttController(
 
     fun onPttPressed(route: ResolvedAudioRoute) {
         pttDown = true
+        logD("SubspaceStt", "onPttPressed this=${System.identityHashCode(this)} enabled=$enabled setupJobActive=${setupJob?.isActive} activeSession=${activeSession != null}")
         if (!enabled) return
         if (setupJob?.isActive == true || activeSession != null) return
-
         transcribeJob?.cancel()
         transcribeJob = null
         retainedAfterMaxDuration = null
         setupJob = scope.launch { startSession(route) }
+        logD("SubspaceStt", "setupJob launched")
     }
 
     fun onPttReleased() {
@@ -76,15 +79,59 @@ class SttController(
         _status.value = SttStatus.Idle
     }
 
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        pttDown = true
+        transcribeJob?.cancel()
+        transcribeJob = null
+        retainedAfterMaxDuration = null
+        if (enabled) _status.value = SttStatus.Recording
+    }
+
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+        pttDown = false
+        retainedAfterMaxDuration = null
+        if (recording.isEmpty) {
+            _status.value = SttStatus.EmptyAudio
+            return ChannelInputResult.None
+        }
+        _status.value = SttStatus.Transcribing
+        runCatching { transcriptionService.transcribe(recording.samples, recording.sampleRate) }
+            .onSuccess { text ->
+                _status.value = SttStatus.Transcribed(text)
+            }
+            .onFailure { error ->
+                if (error is CancellationException) throw error
+                _status.value = when (error) {
+                    TranscriptionException.EmptyInput -> SttStatus.EmptyAudio
+                    is TranscriptionException.Failed -> SttStatus.Error(error.reason)
+                    TranscriptionException.ModelNotReady -> SttStatus.Error("STT model not ready")
+                    else -> SttStatus.Error(error.message ?: "Transcription failed")
+                }
+            }
+        return ChannelInputResult.None
+    }
+
+    fun onInputCancelled(reason: String? = null) {
+        transcribeJob?.cancel()
+        retainedAfterMaxDuration = null
+        _status.value = if (reason == null) SttStatus.Cancelled else SttStatus.Error(reason)
+    }
+
+    fun onInputFailed(reason: String) {
+        _status.value = SttStatus.Error(reason)
+    }
+
     private suspend fun startSession(route: ResolvedAudioRoute) {
+        logD("SubspaceStt", "startSession entered, pttDown=$pttDown route source=${route.source.sourceId}")
         runCatching {
             _status.value = SttStatus.WaitingForAudio
             val result = captureService.startSession(
                 source = route.source,
                 sco = route.sco,
                 output = route.output,
-                shouldProceed = { pttDown },
+                shouldProceed = { logD("SubspaceStt", "shouldProceed pttDown=$pttDown"); pttDown },
             )
+            logD("SubspaceStt", "captureService.startSession result=$result")
             when (result) {
                 CaptureStartResult.SessionActive -> {
                     _status.value = SttStatus.Error("Capture session already active")
@@ -99,6 +146,9 @@ class SttController(
                 CaptureStartResult.RecordingFailed -> {
                     // Service already released SCO on this branch.
                     _status.value = SttStatus.Error("Recording failed")
+                }
+                is CaptureStartResult.RecordingSilenced -> {
+                    _status.value = SttStatus.Error("Recording silenced")
                 }
                 is CaptureStartResult.Started -> {
                     activeSession = result.session
@@ -143,14 +193,13 @@ class SttController(
 
         if (recording.isEmpty) {
             if (session == null) {
-                // Setup still in flight or already failed; the service owns
-                // SCO release on Cancelled / RecordingFailed. Do not release
-                // the route here.
+                // Setup still in flight or already failed
                 if (_status.value != SttStatus.Idle && _status.value !is SttStatus.Error) {
                     _status.value = SttStatus.Cancelled
                 }
                 setupJob?.cancel()
                 setupJob = null
+                scope.launch { route.output.releaseRoute() }
             } else {
                 if (enabled || _status.value != SttStatus.Idle) cancelSession(route)
                 _status.value = SttStatus.EmptyAudio
@@ -195,5 +244,13 @@ class SttController(
 
     private companion object {
         const val DEFAULT_RATE = 16_000
+    }
+}
+
+private fun logD(tag: String, msg: String) {
+    try {
+        android.util.Log.d(tag, msg)
+    } catch (e: Throwable) {
+        println("[$tag] $msg")
     }
 }

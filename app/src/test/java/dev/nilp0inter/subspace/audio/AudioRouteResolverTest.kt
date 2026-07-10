@@ -130,7 +130,7 @@ class AudioRouteResolverTest {
     }
 
     @Test
-    fun telecomOutputReleasesCallRouteBeforeMediaResponsePlayback() = runTest {
+    fun telecomOutputPlayDelegatesOnlyToMediaResponsePlayer() = runTest {
         val events = mutableListOf<String>()
         val output = TelecomCapturePcmOutput(
             captureOutput = RecordingOutput(AudioRouteEndpoint.Car),
@@ -141,7 +141,7 @@ class AudioRouteResolverTest {
 
         output.play(RecordedPcm(shortArrayOf(1), 16_000))
 
-        assertEquals(listOf("release", "disconnected", "media"), events)
+        assertEquals(listOf("media"), events)
     }
 
     @Test
@@ -157,6 +157,64 @@ class AudioRouteResolverTest {
         output.releaseRoute()
 
         assertEquals(listOf("release", "disconnected"), events)
+    }
+
+    @Test
+    fun workScoRouteUsesOpenRouteGateWithoutReleasingWarmWorkRoute() = runTest {
+        val scoRoute = RecordingFakeScoRoute(endpoint = AudioRouteEndpoint.Rsm, hasDevice = true)
+        val resolved = resolveScoAudioRoute(
+            scoRoute = scoRoute,
+            scoOutput = RecordingOutput(AudioRouteEndpoint.Rsm),
+            scoSource = CaptureServiceFakes.singleShotSource(shortArrayOf(1)),
+            endpoint = AudioRouteEndpoint.Rsm,
+        )
+
+        val result = resolved.routeGate.await()
+
+        assertTrue(result is RouteGateResult.Success)
+        assertEquals("open-route", resolved.routeGate.name)
+        assertEquals(0, scoRoute.releaseCount)
+    }
+
+    @Test
+    fun workReleaseGatePropagatesTimeoutInsteadOfTreatingElapsedTimeAsSuccess() = runTest {
+        val gate = releaseWorkRouteGate("release-work-before-car") { name ->
+            RouteGateResult.Timeout(
+                reason = "Timed out waiting for target RSM route release",
+                facts = listOf("gate=$name", "rsmHfpAudioConnected=true"),
+            )
+        }
+
+        val result = gate.await()
+
+        assertTrue(result is RouteGateResult.Timeout)
+        assertFalse(result.isSuccess)
+        assertEquals("Timed out waiting for target RSM route release", result.reason)
+    }
+
+    @Test
+    fun localRouteCarriesWorkReleaseGateWithoutOwningScoRouteObjects() = runTest {
+        val releaseReasons = mutableListOf<String>()
+        val localSource = CaptureServiceFakes.singleShotSource(
+            shortArrayOf(2),
+            sourceId = CaptureSourceId.Mic,
+        )
+        val resolved = resolveLocalAudioRoute(
+            localOutput = RecordingOutput(AudioRouteEndpoint.Local),
+            localSource = localSource,
+            routeGate = releaseWorkRouteGate("release-work-before-local") { reason ->
+                releaseReasons += reason
+                RouteGateResult.Success(reason, listOf("rsm released"))
+            },
+        )
+
+        val result = resolved.routeGate.await()
+
+        assertTrue(result is RouteGateResult.Success)
+        assertEquals(AudioRouteEndpoint.Local, resolved.endpoint)
+        assertTrue(resolved.sco is NoopScoRoute)
+        assertEquals(localSource, resolved.source)
+        assertEquals(listOf("release-work-before-local"), releaseReasons)
     }
 
     private class RecordingFakeScoRoute(

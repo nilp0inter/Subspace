@@ -115,6 +115,50 @@ class KeyboardPttController(
         _status.value = KeyboardStatus.Idle
     }
 
+    fun onInputStarted(session: ChannelAudioInputSession) {
+        pttDown = true
+        transcribeJob?.cancel()
+        transcribeJob = null
+        typingJob?.cancel()
+        typingJob = null
+        retainedAfterMaxDuration = null
+        if (enabled) _status.value = KeyboardStatus.Recording
+    }
+
+    suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+        pttDown = false
+        retainedAfterMaxDuration = null
+        if (recording.isEmpty) {
+            _status.value = KeyboardStatus.EmptyAudio
+            return ChannelInputResult.None
+        }
+        _status.value = KeyboardStatus.Transcribing
+        try {
+            val text = transcriptionService.transcribe(recording.samples, recording.sampleRate)
+            startTyping(text)
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            _status.value = when (error) {
+                TranscriptionException.EmptyInput -> KeyboardStatus.EmptyAudio
+                is TranscriptionException.Failed -> KeyboardStatus.Error(error.reason)
+                TranscriptionException.ModelNotReady -> KeyboardStatus.Error("STT model not ready")
+                else -> KeyboardStatus.Error(error.message ?: "Transcription failed")
+            }
+        }
+        return ChannelInputResult.None
+    }
+
+    fun onInputCancelled(reason: String? = null) {
+        transcribeJob?.cancel()
+        typingJob?.cancel()
+        retainedAfterMaxDuration = null
+        _status.value = if (reason == null) KeyboardStatus.Cancelled else KeyboardStatus.Error(reason)
+    }
+
+    fun onInputFailed(reason: String) {
+        _status.value = KeyboardStatus.Error(reason)
+    }
+
     fun sendEnter() {
         scope.launch {
             try {
@@ -148,6 +192,9 @@ class KeyboardPttController(
                 }
                 CaptureStartResult.RecordingFailed -> {
                     _status.value = KeyboardStatus.Error("Recording failed")
+                }
+                is CaptureStartResult.RecordingSilenced -> {
+                    _status.value = KeyboardStatus.Error("Recording silenced")
                 }
                 is CaptureStartResult.Started -> {
                     activeSession = result.session

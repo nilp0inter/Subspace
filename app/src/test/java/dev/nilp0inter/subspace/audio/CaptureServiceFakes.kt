@@ -71,6 +71,8 @@ private class SingleShotOpenedSource(
 
     override val bufferSizeShorts: Int = pcm.size.coerceAtLeast(1)
 
+    override fun readNonBlocking(buffer: ShortArray): Int = 0
+
     override fun read(buffer: ShortArray): Int {
         if (delivered || pcm.isEmpty()) return 0
         delivered = true
