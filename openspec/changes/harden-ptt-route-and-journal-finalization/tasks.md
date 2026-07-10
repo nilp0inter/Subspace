@@ -55,9 +55,12 @@
 - [x] 8.1 Split production pre-commit nonblocking reads from committed blocking reads and require bounded nonzero PCM proof before readiness.
 - [x] 8.2 Reopen one zero-only production recorder on the already acquired route, fail closed after two attempts, and preserve cancellation cleanup.
 - [x] 8.3 Convert car HFP priming into an exact-device connect/stop/disconnect handoff completed before Telecom placement.
-- [x] 8.4 Require the active Telecom Bluetooth route to exclude a readably identified target RSM and remain continuously acceptable before capture readiness.
+- [x] 8.4 Carry the primed car identity across Telecom connection creation, actively reacquire only that device when Android selects another endpoint, and require the exact route to remain continuously acceptable before capture readiness.
 - [x] 8.5 Derive Android Auto Recording/Finalizing/Ready from manager-owned phases, start the 30-second idle timer only from terminal completion, cancel it on new car PTT, and make Pause/Stop/recording Play-Pause release PTT.
 - [x] 8.6 Add focused recorder-recovery, HFP-handoff, route-acceptability, manager terminal-callback ordering, terminal-media-state, and consecutive-call regressions, then verify the corrected flows on device.
 - [x] 8.7 Await Journal's configured derived-processing job before terminal channel completion and add deterministic ordering coverage.
 - [x] 8.8 Make the audio session manager own the single Telecom release before car response media playback and suppress duplicate final cleanup.
 - [x] 8.9 Recheck PTT cancellation after the final recorder liveness window before reporting exhausted-attempt failure, with focused regression coverage.
+- [x] 8.10 Select the car as the sole connected non-RSM HFP candidate by exact device identity and fail closed when target ownership is unknown or ambiguous.
+- [x] 8.11 Reserve the primed car identity before `placeCall`, claim it exactly once during outgoing connection creation, and reject missing, duplicate, or overlapping handoffs.
+- [x] 8.12 Reacquire only the reserved car through one serialized exact-device retry loop, cancel it on success/support loss/teardown, add identity and retry regressions, and verify the fresh-RSM-power-cycle failure sequence on device.

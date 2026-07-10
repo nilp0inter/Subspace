@@ -4,7 +4,7 @@ The central PTT manager now accepts a channel target before its ready beep and o
 
 The same ownership gap leaves `TelecomCapturePcmOutput.releaseRoute()` uncalled when cancellation occurs during setup or a short car press. Separately, starting `AudioRecord` before the ready beep allows pre-beep data to accumulate in its buffer, while recorder-silencing evidence is only supplied by tests. The current Work-route gate is also bypassed by the error-feedback path, and a timed-out car HFP prime can leave voice recognition enabled.
 
-Physical car validation exposed four additional ownership boundaries in the same flow. A production `AudioRecord` can open successfully yet deliver only digital zero; reopening it inside the same dead Telecom/HFP ownership interval is insufficient unless the primed car route is fully handed off before the call. Telecom can also advertise Bluetooth support before the exact car route is active and stable. Finally, Android Auto media state and phone-initiated response playback must follow terminal ownership and normal-media focus rather than callback timing or an unowned communication route.
+Physical car validation exposed five additional ownership boundaries in the same flow. A production `AudioRecord` can open successfully yet deliver only digital zero; reopening it inside the same dead Telecom/HFP ownership interval is insufficient unless the primed car route is fully handed off before the call. Telecom can advertise Bluetooth support before the exact car route is active and stable, and can reselect a late-connected RSM after an earlier exact-car request succeeded. Finally, Android Auto media state and phone-initiated response playback must follow terminal ownership and normal-media focus rather than callback timing or an unowned communication route.
 
 Constraints: preserve the existing channel boundary; no Android hidden APIs; no new dependencies; retain Work's 30-second warm route and local route's no-op cleanup; retain the established ready-beep-before-channel-visible-audio promise.
 
@@ -19,7 +19,7 @@ Constraints: preserve the existing channel boundary; no Android hidden APIs; no 
 - Reject Android-reported silenced recorders before the ready beep and channel start.
 - Route non-Work problem feedback only after the appropriate Work-release gate and fully hand car HFP priming to Telecom before call ownership.
 - Prove production PCM liveness before the ready beep, with one same-route recorder reopen when the first recorder remains digital zero.
-- Require Telecom's active Bluetooth route to exclude a readably identified target RSM and remain continuously acceptable before capture starts.
+- Select one unambiguous car by exact Bluetooth identity, carry that identity through Telecom connection creation, reacquire only that exact route when Android overrides it, and stabilize the identity match before capture starts.
 - Publish Android Auto Recording/Finalizing/Ready from owned session phases and route On-a-pinch responses through stable focused media playback.
 
 **Non-Goals:**
@@ -76,11 +76,15 @@ The error-feedback helper awaits the resolved route's gate before acquiring or p
 
 Alternative: retain eager Work release in the dispatcher. Rejected: it duplicates route ownership outside the route-gate model and does not compose with typed gate outcomes.
 
-### Decision 7: Stabilize the acceptable active Telecom route before capture
+### Decision 7: Bind Telecom acquisition and readiness to the exact primed car
 
-`SubspaceConnection` accepts readiness only when `CallAudioState.route` is Bluetooth, `activeBluetoothDevice` is present, and any readable active-device name does not contain the target RSM name. A null or unreadable name remains acceptable because Android does not consistently provide device metadata. `supportedRouteMask` is capability information and does not prove the current route. The acceptable Boolean predicate must remain continuously true for 500 ms before readiness is published; a false observation cancels the pending publication and resets the full window. Switching between still-acceptable devices is not distinguishable through this predicate and does not reset the window.
+`CarTelecomStarter` selects the car from connected HFP devices by identity: exclude the exact target RSM and require exactly one connected non-RSM candidate. Unknown RSM identity with multiple candidates, or multiple candidates after exclusion, fails closed rather than choosing the first endpoint or comparing display names. After the selected car completes the connect/stop/disconnect priming pulse, `TelecomCarPttCoordinator.prepareConnection()` reserves that exact `BluetoothDevice` before `placeCall`. The outgoing `ConnectionService` claims the reservation once and constructs `SubspaceConnection` with it; missing, duplicate, or overlapping claims abort connection creation.
 
-Alternative: accept the first callback that supports Bluetooth. Rejected: hardware validation showed supported and transient routes can precede a usable car call path. Threading the primed `BluetoothDevice` identity through Telecom was also rejected for this change because Android may omit the active-device name and the stable non-RSM predicate is the compatibility boundary proven on the target hardware.
+`SubspaceConnection` accepts readiness only when `CallAudioState.route` is Bluetooth and `activeBluetoothDevice == expectedBluetoothDevice`. Device names are diagnostic only; duplicate, changed, or unreadable names cannot establish ownership. While the expected car remains in `supportedBluetoothDevices` but is not active, the connection calls the public `requestBluetoothAudio(expectedDevice)` API immediately and retries every 250 ms through one serialized pending loop. The loop stops when the exact car becomes active, disappears from supported devices, or the connection disconnects, aborts, is destroyed, or times out. No substitute Bluetooth device is ever requested.
+
+The exact identity predicate must remain continuously true for 500 ms before readiness is published. Any wrong route or device cancels the pending publication and requires a new full window. This composes route correction with stabilization: retries acquire the intended endpoint, while stabilization proves Android kept it long enough to begin capture.
+
+Alternative: accept any active non-RSM name, including an unreadable name. Rejected after physical validation: a late-connected RSM can become active after Telecom startup, display names are not identity, and an unreadable wrong endpoint would be accepted. Alternative: send one exact-device request. Rejected: Android acknowledged the transition and then selected the RSM again during later call-state processing. Alternative: pass the device through `ConnectionRequest.extras`. Rejected on the target build because Android did not preserve the custom `BluetoothDevice` parcelable into connection creation; the process-local one-shot coordinator reservation retains explicit ownership without hidden APIs.
 
 ### Decision 8: Derive Android Auto state from manager-owned phases
 
@@ -96,6 +100,15 @@ On-a-pinch retains endpoint-local ready and problem beeps, but recorded channel 
 
 Alternative: write the response directly to an unpinned media track. Rejected: Android Auto can accept PCM into its remote submix without rendering it audibly when the application bypasses media-focus arbitration.
 
+## Physical Validation Learnings
+
+- Successful HFP preflight does not prove Telecom will retain that route. With car and a freshly reconnected RSM both present, Android can move HFP from RSM to car for preflight, move it back to the RSM during Telecom startup, and only then honor a repeated exact-car request.
+- `requestBluetoothAudio(device)` is a request, not an ownership grant. Correctness requires observing `CallAudioState.activeBluetoothDevice`, retrying only while the exact car remains supported, and bounding all retries by the existing connection lifecycle and route-acquisition timeout.
+- `BluetoothDevice` equality is the usable public identity boundary. Names can be duplicated, changed, or unreadable; they remain useful only in diagnostics.
+- The asynchronous `placeCall` → `ConnectionService` boundary needs a one-shot in-process reservation. The attempted custom `ConnectionRequest.extras` handoff was not preserved by the target Android build and caused fail-closed connection creation before lifecycle attachment.
+- Repeated wrong-route callbacks must not create repeated timers. One serialized retry loop prevents callback amplification, and every disconnect/abort/destroy/timeout path must cancel both retry and stabilization callbacks.
+- The decisive device test starts from a fresh RSM power cycle with the RSM visibly owning HFP before car PTT. The passing trace showed preflight selecting the car, Telecom briefly reselecting `B02PTT-FF01`, the retry restoring `CAR MULTIMEDIA`, stable car SCO through capture, no RSM buzz, normal call release, `MODE_NORMAL`, and Android Auto Ready/paused afterward.
+
 ## Risks / Trade-offs
 
 - Terminal claiming can keep a session reserved longer while `stop()` or route cleanup suspends. → This is intentional: concurrent PTT must remain rejected until the owner finishes.
@@ -108,13 +121,15 @@ Alternative: write the response directly to an unpinned media track. Rejected: A
 - HFP handoff adds connect and disconnect waits before Telecom placement. → Both waits are bounded; failure closes setup rather than entering an overlapping SCO ownership race.
 - Route stabilization adds 500 ms before the ready beep. → The delay is intentional because an advertised or transient Bluetooth route is not usable evidence.
 - Normal-media playback can be skipped when route stability or focus is unavailable. → Fail-closed silence is preferable to playback through the wrong endpoint.
+- Exact-device selection intentionally fails closed when multiple non-RSM HFP candidates remain or target-RSM identity is unavailable with multiple candidates. → Selecting an arbitrary endpoint would recreate the cross-device capture defect.
+- Repeated exact-car route requests can increase Bluetooth control traffic while Android reports the wrong active device. → There is one 250 ms retry loop, it runs only while the expected car remains supported, and connection timeout/teardown cancels it.
 
 ## Migration Plan
 
 1. Add deterministic manager, Telecom, capture, Journal, media-state, and playback-gate regressions before production edits.
 2. Implement terminal claiming and setup/Telecom cleanup, then wire lifecycle callback classification.
 3. Implement split pre-commit/committed reads, silencing evidence, bounded PCM liveness proof, and same-route recorder retry.
-4. Gate error feedback, fully hand off car HFP priming, and stabilize the acceptable active Telecom Bluetooth predicate.
+4. Gate error feedback, select and fully hand off one exact car HFP device, reserve it across Telecom connection creation, reacquire only that route through a bounded serialized retry loop, and stabilize the exact identity match.
 5. Derive Android Auto state from terminal phases and converge local responses on stable focused media playback.
 6. Run focused unit tests, build/install the debug APK, and validate car capture, Journal finalization, Work transitions, consecutive PTT, Android Auto pause/re-press, and phone-initiated playback on `B02PTT-FF01`.
 

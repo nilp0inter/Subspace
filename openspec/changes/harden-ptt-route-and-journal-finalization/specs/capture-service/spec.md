@@ -69,3 +69,34 @@ Production capture sources SHALL use cancellable nonblocking reads only for the 
 - **THEN** the pre-commit nonblocking discard reader SHALL stop and join
 - **AND** the committed session SHALL become the recorder's sole reader
 - **AND** committed live frames, VU updates, and terminal PCM SHALL use blocking reads
+
+## MODIFIED Requirements
+
+### Requirement: Recording starts only after the ready beep completes
+The production recorder MAY be opened and started before the ready beep for startup, silencing, and PCM-liveness preflight. The capture service SHALL keep that recorder behind an exclusive discard reader until beep completion. Channel-visible recording—live frames, VU updates, terminal PCM, and the running `CaptureSession`—SHALL start only after the ready beep completes and the discard reader has stopped and joined. The capture service SHALL release the SCO route on every `startSession` outcome that acquired SCO and did not hand off a running session (`Cancelled`, `RecordingFailed`, or `RecordingSilenced`); channel controllers SHALL NOT release the same route again.
+
+#### Scenario: Channel-visible recording starts after beep completion
+- **WHEN** recorder preflight succeeds, the ready beep finishes, and PTT is still held
+- **THEN** the capture service SHALL stop and join the pre-commit discard reader
+- **AND** create the running capture session with the opened source as its sole reader
+- **AND** only post-beep samples SHALL reach live frames, VU updates, or terminal PCM
+
+#### Scenario: PTT released during the ready beep
+- **WHEN** the ready beep is playing and the user releases PTT before the beep completes
+- **THEN** the system SHALL discard and close the preflighted source without channel-visible audio
+- **AND** cancel setup
+- **AND** release the SCO route through the capture service, triggering the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the SCO route
+
+#### Scenario: PTT released during SCO acquisition
+- **WHEN** SCO is being acquired and the user releases PTT before SCO becomes active
+- **THEN** the system SHALL continue SCO acquisition to completion
+- **AND** SHALL NOT open the recorder or play the ready beep
+- **AND** the capture service SHALL release the SCO route, triggering the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the SCO route
+
+#### Scenario: Source open fails during preflight
+- **WHEN** the route is acquired, PTT remains held, and the capture source cannot be opened before the ready beep
+- **THEN** the system SHALL NOT play the ready beep or create a running capture session
+- **AND** the capture service SHALL release the SCO route, triggering the 30-second warmup retention window
+- **AND** the channel controller SHALL NOT additionally release the SCO route

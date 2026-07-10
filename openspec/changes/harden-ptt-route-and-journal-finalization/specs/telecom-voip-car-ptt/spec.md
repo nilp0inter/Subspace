@@ -31,14 +31,26 @@ When car HFP voice recognition was requested for On-the-road setup and its obser
 - **THEN** the system SHALL call `stopVoiceRecognition(car)` before abandoning setup
 - **AND** SHALL not place or retain a Telecom PTT route for that attempt
 
-### Requirement: Car HFP priming fully hands ownership to Telecom
-Successful On-the-road HFP priming SHALL be a bounded pulse on the exact non-RSM car device. The system SHALL observe that device's HFP audio connect, stop voice recognition on the same device, and observe its HFP audio disconnect before placing the Telecom call. The priming route SHALL NOT remain concurrently owned while Telecom acquires call audio.
+### Requirement: Car HFP selection and priming hand exact ownership to Telecom
+On-the-road setup SHALL select the car HFP endpoint by `BluetoothDevice` identity, not display name. Selection SHALL exclude the exact target RSM and SHALL succeed only when exactly one connected non-RSM HFP candidate remains. Successful priming SHALL be a bounded pulse on that exact car device: observe its HFP audio connect, stop voice recognition on the same device, observe its HFP audio disconnect, and reserve that device as the expected Telecom route before placing the call. The priming route SHALL NOT remain concurrently owned while Telecom acquires call audio.
+
+#### Scenario: Exact target RSM is excluded from car selection
+- **WHEN** the target RSM identity is known
+- **AND** the connected HFP set contains that RSM and exactly one other connected device
+- **THEN** the system SHALL select the other device as the car regardless of either device's display name
+
+#### Scenario: Car HFP selection is ambiguous
+- **WHEN** target RSM identity is unavailable while multiple HFP devices are connected
+- **OR** more than one connected non-RSM HFP candidate remains after excluding the exact target RSM
+- **THEN** the system SHALL fail car PTT setup before priming or Telecom placement
+- **AND** SHALL NOT choose the first device or infer ownership from display names
 
 #### Scenario: Car HFP prime becomes connected
-- **WHEN** `startVoiceRecognition(car)` succeeds
+- **WHEN** `startVoiceRecognition(car)` succeeds for the selected exact car
 - **AND** HFP audio becomes connected for that same car device
 - **THEN** the system SHALL call `stopVoiceRecognition(car)`
 - **AND** wait until HFP audio is disconnected for that device
+- **AND** reserve that exact car as the expected Telecom Bluetooth route
 - **AND** only then place the self-managed Telecom call
 
 #### Scenario: Car HFP handoff does not disconnect
@@ -50,31 +62,79 @@ Successful On-the-road HFP priming SHALL be a bounded pulse on the exact non-RSM
 #### Scenario: Car HFP priming is cancelled
 - **WHEN** the priming operation is cancelled after voice recognition starts
 - **THEN** the system SHALL stop voice recognition on the exact started device
-- **AND** SHALL NOT retain a priming route for later Telecom cleanup
+- **AND** SHALL NOT retain a priming route or expected-device reservation for later Telecom cleanup
 
-### Requirement: Telecom capture requires a stable acceptable active Bluetooth route
-The self-managed Telecom connection SHALL report capture-route readiness only while the active call route is Bluetooth, an active Bluetooth device is present, and any readable active-device name does not identify the target RSM. An absent or unreadable device name SHALL remain acceptable because Android does not consistently expose that metadata. Bluetooth support in the route mask alone SHALL NOT establish readiness. The acceptable predicate SHALL remain continuously true for the configured stability window before capture starts.
+#### Scenario: Expected-device reservation cannot be created
+- **WHEN** a previous Telecom connection or expected-device reservation still owns the coordinator
+- **THEN** the system SHALL fail the new car PTT setup before `placeCall`
+- **AND** SHALL preserve a single owner rather than overwrite the existing reservation
 
-#### Scenario: Bluetooth is supported but not active
+### Requirement: Telecom capture acquires and stabilizes the exact primed car route
+Before `placeCall`, the coordinator SHALL reserve the exact car `BluetoothDevice` selected and primed by On-the-road setup. The outgoing `ConnectionService` SHALL claim that reservation exactly once and construct the Subspace connection with it; a missing or duplicate claim SHALL fail closed. Capture-route readiness SHALL require both an active Bluetooth call route and `CallAudioState.activeBluetoothDevice` identity equal to the reserved car. Display names SHALL be diagnostic only: a same-name device, a differently named device, or an unreadable name SHALL NOT substitute for identity. Bluetooth support in the route mask alone SHALL NOT establish readiness.
+
+While the reserved car remains in `supportedBluetoothDevices` but is not the active Bluetooth call device, the connection SHALL request Bluetooth audio for that exact car immediately and retry through one serialized delayed loop until the exact route becomes active or ownership terminates. It SHALL NOT request any substitute device. The exact acceptable predicate SHALL then remain continuously true for the configured stability window before capture starts.
+
+#### Scenario: Outgoing connection claims the reserved car
+- **WHEN** On-the-road setup has reserved an exact primed car before `placeCall`
+- **AND** Android creates the outgoing Subspace connection
+- **THEN** the connection service SHALL claim that exact device once
+- **AND** bind route acquisition and readiness to that device for the connection lifetime
+
+#### Scenario: Expected car reservation is missing or already claimed
+- **WHEN** Android creates an outgoing Subspace connection without an unclaimed expected-car reservation
+- **THEN** connection creation SHALL fail
+- **AND** the coordinator SHALL abort the pending lifecycle and clear its ownership
+
+#### Scenario: Outgoing connection attachment collides
+- **WHEN** the expected car was claimed but another connection owns the coordinator or its lifecycle is no longer waiting for route acquisition
+- **THEN** connection creation SHALL fail as busy
+- **AND** the coordinator SHALL abort the pending lifecycle rather than attach ambiguously
+
+#### Scenario: Bluetooth is supported but the exact car is not active
 - **WHEN** the supported route mask includes Bluetooth
-- **AND** the active call route is not Bluetooth or has no active Bluetooth device
+- **AND** the active call route is not Bluetooth or its active Bluetooth device is not the reserved car
 - **THEN** the connection SHALL report the capture route as unavailable
+- **AND** SHALL NOT start route stabilization
 
-#### Scenario: Active Bluetooth route is identified as the RSM
+#### Scenario: Wrong Bluetooth device has the same or unreadable name
 - **WHEN** the active call route is Bluetooth
-- **AND** the readable active Bluetooth device name identifies the target RSM
+- **AND** its active device is not the reserved car by identity
+- **AND** its display name equals the car name or cannot be read
 - **THEN** the connection SHALL report the car capture route as unavailable
 
-#### Scenario: Acceptable active Bluetooth route remains stable
-- **WHEN** the active call route has an active Bluetooth device
-- **AND** its readable name does not identify the target RSM, or its name is unavailable
-- **AND** that acceptable predicate remains continuously true for the stability window
-- **THEN** the connection SHALL publish capture-route readiness once
+#### Scenario: Supported exact car is not selected
+- **WHEN** the reserved car remains in `supportedBluetoothDevices`
+- **AND** the active call route does not use that car
+- **THEN** the connection SHALL request Bluetooth audio for the reserved car immediately
+- **AND** SHALL retry that same exact-device request at the configured interval through no more than one pending retry loop
+
+#### Scenario: Repeated wrong-route callbacks do not multiply retries
+- **WHEN** Android repeatedly reports an unacceptable route before a scheduled exact-car retry runs
+- **THEN** the system SHALL retain only one scheduled retry loop
+- **AND** SHALL NOT create parallel request sequences
+
+#### Scenario: Exact car activation becomes stable
+- **WHEN** the active call route is Bluetooth on the reserved car
+- **THEN** pending exact-device route retries SHALL stop
+- **AND** the exact acceptable predicate SHALL remain continuously true for the full stability window
+- **AND** the connection SHALL then publish capture-route readiness once
 
 #### Scenario: Route becomes unacceptable during stabilization
-- **WHEN** an otherwise acceptable Bluetooth route becomes unacceptable before the stability window completes
+- **WHEN** the exact car route becomes inactive or another device becomes active before the stability window completes
 - **THEN** the pending readiness publication SHALL be cancelled
-- **AND** a later acceptable route SHALL begin a new full stability window
+- **AND** later activation of the exact car SHALL begin a new full stability window
+
+#### Scenario: Reserved car disappears from supported devices
+- **WHEN** the reserved car is not active
+- **AND** it is no longer present in `supportedBluetoothDevices`
+- **THEN** exact-device retries SHALL stop
+- **AND** the system SHALL NOT request another Bluetooth device
+- **AND** route acquisition SHALL remain unavailable until normal timeout or termination
+
+#### Scenario: Telecom ownership terminates during route acquisition
+- **WHEN** the connection disconnects, aborts, is destroyed, times out, or otherwise relinquishes ownership
+- **THEN** all pending stability and exact-device retry callbacks SHALL be cancelled
+- **AND** no later route request SHALL be emitted for that connection
 
 ### Requirement: Car media state follows owned PTT terminal phases
 The Android Auto media session SHALL derive its PTT presentation from the audio session manager's owned phase. A held PTT session SHALL publish Recording/playing, claimed terminal processing SHALL publish Finalizing/buffering, and only terminal completion SHALL publish Ready/paused when On-the-road remains available. Connection callbacks SHALL NOT publish Ready while terminal work is still owned.
