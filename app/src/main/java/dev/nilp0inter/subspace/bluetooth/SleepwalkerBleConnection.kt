@@ -14,7 +14,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 import dev.nilp0inter.subspace.model.KeyboardConnectionState
 import io.sleepwalker.core.ble.BleUuids
 import io.sleepwalker.core.ble.BleWriter

@@ -18,7 +18,6 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import dev.nilp0inter.subspace.MainActivity
 import dev.nilp0inter.subspace.R
@@ -275,13 +274,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     @SuppressLint("MissingPermission")
     private fun logAudioRouteSnapshot(event: String) {
-        Log.d(
-            ROUTE_LOG_TAG,
-            "SNAPSHOT event=$event mode=${inputModeController.mode} selectedBy=${inputModeController.selectedBy} " +
-                "availability=${inputModeController.availability} audioMode=${audioManager.mode.audioModeDebugString()} " +
-                "current=${audioManager.communicationDevice.routeDebugString()} " +
-                "devices=${audioManager.availableCommunicationDevices.routeDebugString()}",
-        )
+        SubspaceLogger.d(ROUTE_LOG_TAG,
+        "SNAPSHOT event=$event mode=${inputModeController.mode} selectedBy=${inputModeController.selectedBy} " +
+            "availability=${inputModeController.availability} audioMode=${audioManager.mode.audioModeDebugString()} " +
+            "current=${audioManager.communicationDevice.routeDebugString()} " +
+            "devices=${audioManager.availableCommunicationDevices.routeDebugString()}",)
     }
 
 
@@ -291,8 +288,30 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     val repository: ChannelRepository
         get() = channelRepository
 
+    val logEntries: StateFlow<List<LogEntry>>
+        get() = SubspaceLogger.entries
+
+    val globalLogLevelFlow: StateFlow<LogLevel>
+        get() = SubspaceLogger.globalLevelFlow
+
+    val tagLogLevelsFlow: StateFlow<Map<String, LogLevel>>
+        get() = SubspaceLogger.perTagLevelFlow
+
+    fun clearLogs() = SubspaceLogger.clear()
+
+    fun setGlobalLogLevel(level: LogLevel) = SubspaceLogger.setGlobalLevel(level)
+
+    fun setTagLogLevel(tag: String, level: LogLevel) = SubspaceLogger.setTagLevel(tag, level)
+
+    fun clearTagLogLevel(tag: String) = SubspaceLogger.clearTagLevel(tag)
+
+    fun tagLogLevels(): Map<String, LogLevel> = SubspaceLogger.tagLevels()
+
+    fun globalLogLevel(): LogLevel = SubspaceLogger.globalLevel()
+
     override fun onCreate() {
         super.onCreate()
+        SubspaceLogger.initialize(cacheDir)
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         readinessProbe = ReadinessProbe(this, scanner, bluetoothAdapter, { headsetProxy })
@@ -523,7 +542,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             }
             transcriber
         } catch (err: Throwable) {
-            Log.w(TAG, "STT transcriber unavailable: ${err.message}")
+            SubspaceLogger.w(TAG, "STT transcriber unavailable: ${err.message}")
             null
         }
     }
@@ -540,7 +559,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             ttsSynthesizer = synth
             synth
         } catch (err: Throwable) {
-            Log.w(TAG, "TTS synthesizer unavailable: ${err.message}")
+            SubspaceLogger.w(TAG, "TTS synthesizer unavailable: ${err.message}")
             null
         }
     }
@@ -739,13 +758,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val proxy = headsetProxy ?: return false
         val rsm = targetRsm() ?: return false
         val connectionState = runCatching { proxy.getConnectionState(rsm) }.getOrDefault(-1)
-        Log.d(
-            ROUTE_LOG_TAG,
-            "RSM_HFP_START_REQUEST target='${rsm.name}' connectionState=$connectionState " +
-                "audioBefore=${runCatching { proxy.isAudioConnected(rsm) }.getOrDefault(false)} " +
-                "current=${audioManager.communicationDevice.routeDebugString()} " +
-                "devices=${audioManager.availableCommunicationDevices.routeDebugString()}",
-        )
+        SubspaceLogger.d(ROUTE_LOG_TAG,
+        "RSM_HFP_START_REQUEST target='${rsm.name}' connectionState=$connectionState " +
+            "audioBefore=${runCatching { proxy.isAudioConnected(rsm) }.getOrDefault(false)} " +
+            "current=${audioManager.communicationDevice.routeDebugString()} " +
+            "devices=${audioManager.availableCommunicationDevices.routeDebugString()}",)
         return runCatching { proxy.startVoiceRecognition(rsm) }.getOrDefault(false)
     }
 
@@ -914,11 +931,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val previousId = channelRepository.catalogueState.value.activeChannelId
         val result = channelRepository.selectChannel(id)
         val selected = result is dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult.Success
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CHANNEL_SELECT requested=$id previous=$previousId selected=$selected " +
-                "active=${channelRepository.catalogueState.value.activeChannelId}",
-        )
+        SubspaceLogger.d(ROUTE_LOG_TAG,
+        "CHANNEL_SELECT requested=$id previous=$previousId selected=$selected " +
+            "active=${channelRepository.catalogueState.value.activeChannelId}",)
         return selected
     }
 
@@ -960,7 +975,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun startPhonePtt(channelId: String): Boolean {
         if (!selectChannel(channelId)) return false
-        Log.d(ROUTE_LOG_TAG, "PHONE_PTT_PRESSED channel=$channelId")
+        SubspaceLogger.d(ROUTE_LOG_TAG, "PHONE_PTT_PRESSED channel=$channelId")
         logAudioRouteSnapshot("phone-ptt-pressed")
         return pttDispatcher.dispatchPttPressed(PttSource.Phone)
     }
@@ -1497,7 +1512,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     // -- ChannelRouter implementation --------------------------------------------------
 
     override suspend fun prepareInput(channelId: String): ChannelInputAcceptance {
-        Log.d(ROUTE_LOG_TAG, "CHANNEL_INPUT_PREPARE channel=$channelId")
+        SubspaceLogger.d(ROUTE_LOG_TAG, "CHANNEL_INPUT_PREPARE channel=$channelId")
         return runtimeRegistry.prepareInput(channelId)
     }
     companion object {

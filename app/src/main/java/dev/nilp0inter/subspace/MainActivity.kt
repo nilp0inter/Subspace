@@ -35,6 +35,7 @@ import dev.nilp0inter.subspace.ui.DirectorySelection
 import dev.nilp0inter.subspace.ui.InitialSetupScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
+import dev.nilp0inter.subspace.ui.LogAnalysisScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
 import dev.nilp0inter.subspace.ui.bootstrapRootSurface
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
@@ -78,6 +79,12 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(dev.nilp0inter.subspace.model.ModelAcquisitionProgress()) }
             val providerDescriptors by currentService?.channelDescriptors?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(emptyList()) }
+            val logEntries by currentService?.logEntries?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(emptyList()) }
+            val currentGlobalLevel by currentService?.globalLogLevelFlow?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(dev.nilp0inter.subspace.service.LogLevel.Debug) }
+            val currentTagLevels by currentService?.tagLogLevelsFlow?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(emptyMap()) }
 
             var dashboardRoute by rememberSaveable { mutableStateOf(DashboardRoute.Main) }
             var configuredChannelId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -193,6 +200,10 @@ class MainActivity : ComponentActivity() {
                         configuredChannelId = null
                         creatingImplementationId = null
                         dashboardRoute = DashboardRoute.Main
+                    }
+
+                    override fun navigateToLogAnalysis() {
+                        dashboardRoute = DashboardRoute.LogAnalysis
                     }
 
                     override fun phonePttPressed(channelId: String) {
@@ -327,6 +338,24 @@ class MainActivity : ComponentActivity() {
                                         )
                                     }
                                 }
+
+                                DashboardRoute.LogAnalysis -> {
+                                    LogAnalysisScreen(
+                                        entries = logEntries,
+                                        onClear = { currentServiceState?.clearLogs() },
+                                        onSetGlobalLevel = { level ->
+                                            currentServiceState?.setGlobalLogLevel(level)
+                                        },
+                                        onSetTagLevel = { tag, level ->
+                                            currentServiceState?.setTagLogLevel(tag, level)
+                                        },
+                                        onClearTagLevel = { tag ->
+                                            currentServiceState?.clearTagLogLevel(tag)
+                                        },
+                                        currentGlobalLevel = currentGlobalLevel,
+                                        tagLevels = currentTagLevels,
+                                    )
+                                }
                             }
                         }
                     }
@@ -363,7 +392,7 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation }
+    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation, LogAnalysis }
 }
 
 internal fun ChannelRepositoryMutationResult?.failureMessage(): String? = when (this) {

@@ -1,7 +1,7 @@
 package dev.nilp0inter.subspace.channel.capability
 
 import android.os.SystemClock
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 
 import dev.nilp0inter.subspace.audio.PcmTranscriber
 import dev.nilp0inter.subspace.audio.RecordedPcm

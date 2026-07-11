@@ -104,3 +104,10 @@ The channel panel SHALL discover creatable implementations and their labels, sum
 - **WHEN** the dashboard renders the channel panel
 - **THEN** every channel card SHALL correspond to a persisted catalogue instance
 - **AND** the dashboard SHALL NOT render the Command Uplink preview as a channel card
+
+### Requirement: Dashboard title long-press shortcut
+The dashboard SHALL support a developer shortcut where long-pressing the application title in the header navigates the user/developer directly to the Log Analysis view.
+
+#### Scenario: Long-pressing title navigates to logs
+- **WHEN** the user long-presses the application title ("SUBSPACE") in the dashboard header
+- **THEN** the system SHALL navigate to the Log Analysis screen

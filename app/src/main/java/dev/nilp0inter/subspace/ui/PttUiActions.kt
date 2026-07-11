@@ -21,6 +21,7 @@ interface PttUiActions {
     fun navigateToChannelConfiguration(channelId: String)
     fun navigateToChannelCreation(implementationId: ChannelImplementationId, displayName: String)
     fun navigateBack()
+    fun navigateToLogAnalysis()
     fun phonePttPressed(channelId: String)
     fun phonePttReleased(channelId: String)
     fun createChannel(

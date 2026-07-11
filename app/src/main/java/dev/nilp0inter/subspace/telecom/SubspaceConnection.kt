@@ -5,7 +5,7 @@ import android.bluetooth.BluetoothDevice
 import android.os.Handler
 import android.os.Looper
 import android.telecom.CallAudioState
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import android.telecom.Connection
 import android.telecom.DisconnectCause

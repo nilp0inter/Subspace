@@ -1,6 +1,8 @@
 package dev.nilp0inter.subspace.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -154,9 +156,20 @@ private fun StatusRow(label: String, value: String) {
     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun TerminalHeader(title: String, subtitle: String) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+fun TerminalHeader(title: String, subtitle: String, onLongPress: (() -> Unit)? = null) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = if (onLongPress != null) {
+            Modifier.combinedClickable(
+                onClick = {},
+                onLongClick = onLongPress,
+            )
+        } else {
+            Modifier
+        },
+    ) {
         Text(title, style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary)
         Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }

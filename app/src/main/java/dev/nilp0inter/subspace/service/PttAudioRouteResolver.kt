@@ -1,7 +1,7 @@
 package dev.nilp0inter.subspace.service
 
 import android.media.AudioManager
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 import dev.nilp0inter.subspace.audio.AudioRouteEndpoint
 import dev.nilp0inter.subspace.audio.CaptureSource
 import dev.nilp0inter.subspace.audio.PcmOutput

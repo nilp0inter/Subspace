@@ -1,6 +1,6 @@
 package dev.nilp0inter.subspace.service
 
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.routeDebugString

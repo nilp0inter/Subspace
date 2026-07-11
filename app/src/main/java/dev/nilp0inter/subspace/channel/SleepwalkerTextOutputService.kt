@@ -1,6 +1,6 @@
 package dev.nilp0inter.subspace.channel
 
-import android.util.Log
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerBleConnection
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerConnectionResult

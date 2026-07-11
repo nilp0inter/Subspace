@@ -122,6 +122,7 @@ fun MainDashboardScreen(
         TerminalHeader(
             title = "SUBSPACE",
             subtitle = "Field operations console",
+            onLongPress = { actions.navigateToLogAnalysis() },
         )
 
         VuMeter(level = level, isCapturing = isCapturing)
