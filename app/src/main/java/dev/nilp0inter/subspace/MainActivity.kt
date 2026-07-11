@@ -388,6 +388,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, PttForegroundService::class.java)
+                .setAction(PttForegroundService.ACTION_START_MONITORING),
+        )
         bindService(
             Intent(this, PttForegroundService::class.java),
             serviceConnection,

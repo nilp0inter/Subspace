@@ -152,6 +152,9 @@ internal fun rsmChannelOffset(event: RawButtonEvent): Int? = when (event) {
     else -> null
 }
 
+internal fun shouldRetainMonitoringService(reason: ReconnectBlockReason): Boolean =
+    reason != ReconnectBlockReason.MonitoringNotRequested
+
 class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter, CoreInit {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -728,7 +731,15 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_START_MONITORING) {
-            ensureForeground()
+            if (reconnectPolicy.monitoringRequested) {
+                ensureForeground()
+            } else {
+                // A startForegroundService request must still be acknowledged
+                // before terminally suppressing this service-lifetime restart.
+                ensureForeground()
+                stopForegroundIfNeeded()
+                stopSelf(startId)
+            }
         }
         return START_NOT_STICKY
     }
@@ -1451,8 +1462,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     updateConnection { it.copy(devicePresence = DevicePresence.NotFound) }
                 }
                 refreshReadiness()
-                stopForegroundIfNeeded()
-                stopSelf()
+                if (!shouldRetainMonitoringService(decision.reason)) {
+                    stopForegroundIfNeeded()
+                    stopSelf()
+                }
             }
         }
     }
