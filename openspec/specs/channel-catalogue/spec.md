@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Defines the persisted ordered channel catalogue, its active selection, and the mutations that maintain its validity.
+
+## Requirements
 
 ### Requirement: Channel catalogue is the authoritative ordered source
 The system SHALL maintain one persisted, nonempty, ordered catalogue of channel definitions and exactly one active channel instance whose ID exists in that catalogue. Each definition SHALL contain a stable opaque instance ID, display name, supported channel kind, enabled state, configuration schema version, and kind-specific configuration. Instance IDs SHALL NOT change when a channel is renamed or reordered and SHALL NOT be derived from display name or list position.
@@ -12,6 +16,11 @@ The system SHALL maintain one persisted, nonempty, ordered catalogue of channel 
 - **WHEN** two channel definitions use the same supported built-in kind
 - **THEN** each definition SHALL retain an independent instance ID and configuration
 - **AND** both SHALL appear independently in the ordered catalogue
+
+#### Scenario: Same-kind configuration update is isolated
+- **WHEN** one of multiple same-kind instances receives a configuration update addressed by its instance ID
+- **THEN** only that definition SHALL change
+- **AND** every sibling definition, catalogue order, and active ID SHALL remain unchanged
 
 #### Scenario: Invalid catalogue is rejected
 - **WHEN** a persisted catalogue has an unsupported schema version, duplicate or blank IDs, unsupported kind, invalid configuration, no definitions, or an active ID outside the definition list
@@ -38,6 +47,11 @@ The system SHALL allow the user to create an instance of any supported built-in 
 - **WHEN** the user creates a channel using a supported built-in kind and valid configuration
 - **THEN** the system SHALL append a new definition to the catalogue
 - **AND** the new definition SHALL have an ID distinct from every existing definition
+
+#### Scenario: Removed seeded kind can be recreated
+- **WHEN** the migrated seed instance of a supported built-in kind is removed
+- **THEN** the user SHALL remain able to create another instance of that kind with a new opaque ID
+- **AND** existing instances of that kind SHALL NOT prevent additional instances
 
 #### Scenario: Rename a channel
 - **WHEN** the user changes a channel instance's display name

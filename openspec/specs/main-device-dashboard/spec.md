@@ -85,50 +85,78 @@ The system SHALL keep the dashboard as the home surface and treat the legacy con
 - **THEN** the system returns to the dashboard instead of switching directly between legacy screens
 
 ### Requirement: Dashboard shows channels
-The system SHALL show a channel panel on the dashboard. Real channels like Captain's Log and Debug Channel SHALL appear as functional cards that act as mutually exclusive activation zones and phone-side PTT zones. The cards SHALL display their current readiness state. Functional cards SHALL also display phone PTT hold, lock-direction, locked, and stop feedback while a phone-originated PTT session is active from that card. Dedicated configuration controls SHALL remain outside the phone PTT gesture surface.
+The system SHALL render one functional card per channel instance in the authoritative catalogue order. Each card SHALL use the instance's stable ID, display name, readiness, execution status, active state, and kind-specific summary. Functional cards SHALL remain mutually exclusive activation zones and phone-side PTT zones. Dedicated configuration and catalogue-management controls SHALL remain outside the phone PTT gesture surface.
+
+The channel panel SHALL provide access to add supported built-in instances, rename instances, reorder instances, and remove instances subject to catalogue invariants. Kind-specific configuration surfaces SHALL be addressed by instance ID rather than fixed singleton routes. The dashboard SHALL NOT render nonfunctional mock channel cards as catalogue entries.
+
+#### Scenario: Ordered catalogue renders
+- **WHEN** the dashboard receives an ordered runtime snapshot containing channel instances
+- **THEN** it SHALL render exactly one functional card per instance
+- **AND** card order SHALL match the catalogue order
 
 #### Scenario: Channel selected for activation
 - **WHEN** the user taps the main surface area of a functional channel card
-- **THEN** the system SHALL set that channel as the single active channel
+- **THEN** the system SHALL set that card's stable instance ID as the single active channel
 
 #### Scenario: Channel long-pressed for PTT
 - **WHEN** the user long-presses the main surface area of a functional channel card
-- **THEN** the system SHALL set that channel as the single active channel
-- **AND** start a phone-originated PTT session for that channel
-- **AND** show held-recording feedback on that channel card
+- **THEN** the system SHALL set that card's instance ID as active
+- **AND** start a phone-originated PTT session for that instance
+- **AND** show held-recording feedback on that card
 
 #### Scenario: Held phone PTT shows lock direction
-- **WHEN** a phone-originated PTT session is active from a functional channel card
-- **AND** the session is not locked
+- **WHEN** a phone-originated PTT session is active from a functional channel card and is not locked
 - **THEN** the dashboard SHALL show a lock instruction on that card
-- **AND** the instruction SHALL point right when the initial press started on the left side of the card's PTT surface
-- **AND** the instruction SHALL point left when the initial press started on the right side of the card's PTT surface
+- **AND** the instruction SHALL point inward from the initial press side
 
 #### Scenario: Locked phone PTT shows stop affordance
 - **WHEN** a phone-originated PTT session from a functional channel card has been slide-locked
 - **THEN** the dashboard SHALL show that the PTT session is locked on that card
-- **AND** the dashboard SHALL show an explicit stop affordance for ending the locked PTT session
+- **AND** it SHALL show an explicit stop affordance
 
-#### Scenario: Captain's Log not configured
-- **WHEN** the dashboard is visible and the Captain's Log has no directory selected
-- **THEN** the system SHALL show the Captain's Log channel card with a prompt to configure it
-
-#### Scenario: Channel configured and active
-- **WHEN** the dashboard is visible and a channel (e.g. Captain's Log or Debug Channel) is configured and active
-- **THEN** the system SHALL show the channel card as active with its current configuration state
+#### Scenario: Unready instance is visible
+- **WHEN** a catalogue instance lacks valid configuration or a required live dependency
+- **THEN** its card SHALL remain visible at its catalogue position
+- **AND** it SHALL display its not-ready state and configuration access
 
 #### Scenario: Channel configured but inactive
-- **WHEN** the dashboard is visible and a channel is configured but another channel is active
-- **THEN** the system SHALL show the channel card as visually inactive (Standby/Ready)
-
-#### Scenario: Mock channels still shown
-- **WHEN** the dashboard is visible
-- **THEN** the system SHALL continue to show non-functional mock channel entries for Command Uplink
+- **WHEN** a ready instance is not the active channel
+- **THEN** its card SHALL display a visually inactive Ready or Standby state
 
 #### Scenario: Channel card opens configuration
-- **WHEN** the user taps the dedicated "Config" button on a functional channel card
-- **THEN** the system SHALL show the respective channel configuration surface without altering the channel's active state
-- **AND** the system SHALL NOT start, lock, stop, or release a phone-originated PTT session from that config-button tap
+- **WHEN** the user activates the dedicated configuration control on a functional channel card
+- **THEN** the system SHALL open the configuration surface for that instance ID and kind
+- **AND** it SHALL preserve the active selection
+- **AND** it SHALL NOT start, lock, stop, or release phone PTT
+
+#### Scenario: Add channel instance
+- **WHEN** the user chooses a supported built-in kind and submits valid initial configuration
+- **THEN** the dashboard SHALL request creation of a new catalogue instance
+- **AND** the new card SHALL appear at the resulting catalogue position
+
+#### Scenario: Every supported kind remains reachable
+- **WHEN** the catalogue-management form is rendered at the minimum supported phone width
+- **THEN** the creation control for every supported production kind SHALL remain visible and actionable
+- **AND** the presence or absence of an existing instance of that kind SHALL NOT hide or disable creation
+
+#### Scenario: Reorder channel instance
+- **WHEN** the user moves an instance through the catalogue-management surface
+- **THEN** the dashboard SHALL render the committed order
+- **AND** the active instance SHALL remain active
+
+#### Scenario: Remove channel instance
+- **WHEN** the user confirms removal of a removable instance
+- **THEN** the dashboard SHALL remove its card after the catalogue mutation commits
+- **AND** it SHALL render any active-selection repair from the same committed snapshot
+
+#### Scenario: Final channel cannot be removed
+- **WHEN** the catalogue contains one instance
+- **THEN** the dashboard SHALL prevent or reject removal of that final instance
+
+#### Scenario: No mock catalogue entries
+- **WHEN** the dashboard renders the channel panel
+- **THEN** every channel card SHALL correspond to a functional catalogue instance
+- **AND** the dashboard SHALL NOT render the Command Uplink preview as a channel card
 
 ### Requirement: Dashboard renders the VU meter during capture
 

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Defines the host-owned runtime registry that reconciles persisted channel definitions into live runtime instances while preserving committed PTT input targets.
+
+## Requirements
 
 ### Requirement: Runtime registry resolves channel instances by ID
 The system SHALL maintain a host-owned runtime registry keyed by channel instance ID. Every published catalogue definition SHALL have one corresponding live runtime entry created by the factory registered for its kind, and input preparation SHALL resolve the selected instance through that registry without exhaustive built-in ID branches.
@@ -40,6 +44,7 @@ The registry SHALL reconcile each committed catalogue snapshot with its runtime 
 #### Scenario: Reorder preserves runtime
 - **WHEN** a catalogue snapshot changes only list order
 - **THEN** the registry SHALL preserve the runtime entries and their domain state
+- **AND** the ordered runtime projection SHALL immediately match the reordered catalogue snapshot
 
 #### Scenario: Configuration replacement
 - **WHEN** a definition change cannot be safely applied in place

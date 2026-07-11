@@ -5,46 +5,60 @@ Defines how the Android Auto Media session's `MediaBrowserService` exposes each 
 ## Requirements
 
 ### Requirement: Media browse tree lists each Subspace channel as a playable media item
-The system SHALL expose each Subspace channel as a distinct playable Media item in the Android Auto Media browse tree, with the channel's display name as the item title and a per-channel status subtitle. Selecting the item from the head unit SHALL set that channel as the single active Subspace channel.
+The system SHALL expose every instance in the authoritative ordered channel catalogue as a distinct playable Media item in the Android Auto Media browse tree. Each item SHALL use the instance's stable ID as `mediaId`, display name as title, and runtime status as subtitle. Selecting an item SHALL set that instance as the single active channel.
 
-#### Scenario: Browse lists each configured channel
-- **WHEN** an Android Auto Media browser client subscribes to the Subspace root
-- **AND** the channel list contains Captain's Log configured and Debug Channel configured
-- **THEN** the system SHALL return a Media item per configured channel
-- **AND** each item's mediaId SHALL be the channel's stable identifier
-- **AND** each item's title SHALL be the channel's display name
-- **AND** each item's subtitle SHALL encode the per-channel status (ACTIVE, READY, or STANDBY)
+#### Scenario: Browse lists each catalogue instance
+- **WHEN** an Android Auto Media browser subscribes to the Subspace root
+- **THEN** the system SHALL return one Media item per catalogue instance in catalogue order
+- **AND** each item's mediaId SHALL be the instance's stable identifier
+- **AND** each item's title SHALL be the instance's display name
+- **AND** each item's subtitle SHALL encode ACTIVE, READY, or STANDBY status
+
+#### Scenario: Multiple instances share a kind
+- **WHEN** the catalogue contains multiple instances of the same channel kind
+- **THEN** Android Auto SHALL expose each as a separate Media item using its instance ID and display name
 
 #### Scenario: Selecting a browse item sets the active channel
-- **WHEN** the user selects a channel media item from the head unit while that channel is not active
-- **THEN** the system SHALL set that channel as the single active Subspace channel via the existing active-channel selection path
-- **AND** the previously active channel SHALL become inactive
-- **AND** the now-playing card SHALL reflect the newly active channel
+- **WHEN** the user selects a nonactive channel Media item
+- **THEN** the system SHALL select that instance through the shared active-channel path
+- **AND** the previously active instance SHALL become inactive
+- **AND** the now-playing card SHALL reflect the newly active instance
 
-#### Scenario: Channel list updates propagate to the head unit
-- **WHEN** the channel list changes (a channel becomes configured, ready, or standby)
-- **THEN** the system SHALL call `notifyChildrenChanged` on the open Media browse subscription
-- **AND** the next `onLoadChildren` SHALL return the updated list
+#### Scenario: Channel addition propagates
+- **WHEN** a channel instance is added while a browser client is subscribed
+- **THEN** the system SHALL call `notifyChildrenChanged`
+- **AND** the next load SHALL include the new instance at its catalogue position
+
+#### Scenario: Channel removal and active repair propagate together
+- **WHEN** a channel instance is removed and the catalogue repairs active selection
+- **THEN** the system SHALL call `notifyChildrenChanged`
+- **AND** the next browse result SHALL omit the removed instance
+- **AND** now-playing metadata SHALL reflect the repaired active instance
+
+#### Scenario: Channel reorder propagates
+- **WHEN** catalogue order changes while a browser client is subscribed
+- **THEN** the system SHALL call `notifyChildrenChanged`
+- **AND** the next browse result SHALL match the new catalogue order
+
+#### Scenario: Channel rename or status change propagates
+- **WHEN** an instance's display name, readiness, active state, or execution status changes
+- **THEN** the system SHALL call `notifyChildrenChanged`
+- **AND** the next browse result SHALL reflect the updated projection
 
 #### Scenario: Channel with non-zero pending count
-- **WHEN** the channel list returns a channel whose pending unheard count is greater than zero
-- **THEN** the system SHALL include the count in that channel's browse subtitle in a compact form
-- **AND** the count SHALL NOT appear in the subtitle when zero
+- **WHEN** a channel projection reports a pending unheard count greater than zero
+- **THEN** the system SHALL include the count in that channel's browse subtitle in compact form
+- **AND** the count SHALL NOT appear when zero
 
 #### Scenario: Channel ordering is stable across surfaces
-- **WHEN** the same set of channels is rendered on both the phone dashboard and the Android Auto Media browse tree
-- **THEN** the ordering SHALL be identical on both surfaces
-- **AND** the ordering SHALL emanate solely from the channel repository
+- **WHEN** the same catalogue snapshot is rendered on the phone dashboard and Android Auto
+- **THEN** ordering SHALL be identical on both surfaces
+- **AND** ordering SHALL emanate solely from the persisted catalogue
 
-#### Scenario: Browse list when no channels are ready
-- **WHEN** no channels are configured or ready
-- **THEN** the system SHALL return an empty Media browse list (or an explicit not-ready marker when the platform requires non-empty results)
-- **AND** the now-playing card SHALL reflect NotReady state
-
-#### Scenario: Legacy single-row browse contract removed
-- **WHEN** an Android Auto Media browser client subscribes to the Subspace root
-- **THEN** the system SHALL NOT return the legacy single item with `mediaId = "subspace-car-ptt"`
-- **AND** external consumers (tests included) SHALL enumerate channel items instead
+#### Scenario: Legacy single-row browse contract remains removed
+- **WHEN** an Android Auto Media browser subscribes to the Subspace root
+- **THEN** the system SHALL NOT return the legacy item with `mediaId = "subspace-car-ptt"`
+- **AND** consumers SHALL enumerate catalogue channel items
 
 ### Requirement: Now-playing card surfaces the active channel and live state
 The system SHALL produce the MediaSession now-playing metadata for the Android Auto Media template from the currently active Subspace channel and the live PTT state.

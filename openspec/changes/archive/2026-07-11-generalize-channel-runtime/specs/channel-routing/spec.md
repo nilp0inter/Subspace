@@ -27,6 +27,11 @@ For a Keyboard instance, readiness SHALL be true only when its host profile is c
 - **THEN** its runtime readiness SHALL be false
 - **AND** readiness of other instances SHALL be evaluated independently
 
+#### Scenario: Inactive Debug instance retains dependency readiness
+- **WHEN** an enabled Debug instance has valid configuration and all dependencies for its configured mode but is not active
+- **THEN** its runtime readiness SHALL remain true
+- **AND** shared-controller activation state SHALL NOT be treated as dependency availability
+
 #### Scenario: Keyboard bridge disconnected
 - **WHEN** a Keyboard instance has a host profile but the Sleepwalker BLE bridge is disconnected
 - **THEN** that Keyboard runtime SHALL be not ready

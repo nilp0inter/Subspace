@@ -5,63 +5,79 @@ TBD. Defines the active channel routing, mutual exclusivity, and readiness evalu
 ## Requirements
 
 ### Requirement: Active channel mutual exclusivity
-The system SHALL maintain a single `activeChannelId` to represent the selected communication channel, replacing independent channel enablement states.
+The system SHALL maintain a single valid `activeChannelId` selected from the persisted ordered channel catalogue. Activating a channel instance SHALL inherently make every other instance inactive. Catalogue mutation SHALL preserve or atomically repair this invariant.
 
 #### Scenario: Switching active channel
-- **WHEN** the user taps a channel card on the main dashboard
-- **THEN** that channel SHALL become the active channel and all others SHALL become inactive
+- **WHEN** the user selects a different catalogue instance from any supported surface
+- **THEN** the system SHALL set that instance ID as the active channel
+- **AND** all other instances SHALL become inactive
+
+#### Scenario: Unknown channel selected
+- **WHEN** a selection request references an ID absent from the current catalogue
+- **THEN** the system SHALL reject the request
+- **AND** it SHALL preserve the existing valid active channel ID
 
 ### Requirement: Channel readiness state
-The system SHALL require channels to provide a computed `isReady` state indicating if they have all necessary configuration to handle PTT broadcasts.
-For `KeyboardChannel`, `isReady` SHALL be `true` if and only if a host profile
-is configured AND the sleepwalker BLE bridge is connected.
+The system SHALL obtain readiness from the runtime entry associated with each channel instance. Readiness SHALL include valid enabled configuration plus live dependencies required by that instance's kind. Readiness evaluation SHALL be instance-specific even when multiple instances share a kind.
 
-#### Scenario: Fully configured keyboard channel with bridge connected
-- **WHEN** the keyboard channel has a host profile set
-- **AND** the sleepwalker BLE bridge reports `Connected`
-- **THEN** its `isReady` state SHALL evaluate to `true`
+For a Keyboard instance, readiness SHALL be true only when its host profile is configured and the Sleepwalker BLE bridge is connected. For a Journal instance, readiness SHALL be true only when its output directory is valid and at least one save option is enabled. A Debug instance SHALL additionally require the resources needed by its configured debug mode.
 
-#### Scenario: Keyboard channel bridge disconnected
-- **WHEN** the keyboard channel has a host profile set
-- **AND** the sleepwalker BLE bridge is not connected
-- **THEN** its `isReady` state SHALL evaluate to `false`
+#### Scenario: Ready instance
+- **WHEN** an enabled channel instance has valid configuration and every live dependency required by its kind
+- **THEN** its runtime readiness SHALL be true
 
-#### Scenario: Fully configured journal channel
-- **WHEN** the Journal channel has a valid output directory and at least one
-  save toggle enabled
-- **THEN** its `isReady` state SHALL evaluate to `true`
+#### Scenario: Instance dependency unavailable
+- **WHEN** a channel instance lacks valid configuration or a required live dependency becomes unavailable
+- **THEN** its runtime readiness SHALL be false
+- **AND** readiness of other instances SHALL be evaluated independently
 
-#### Scenario: Incompletely configured journal channel
-- **WHEN** the Journal channel has no output directory selected
-- **THEN** its `isReady` state SHALL evaluate to `false`
+#### Scenario: Inactive Debug instance retains dependency readiness
+- **WHEN** an enabled Debug instance has valid configuration and all dependencies for its configured mode but is not active
+- **THEN** its runtime readiness SHALL remain true
+- **AND** shared-controller activation state SHALL NOT be treated as dependency availability
+
+#### Scenario: Keyboard bridge disconnected
+- **WHEN** a Keyboard instance has a host profile but the Sleepwalker BLE bridge is disconnected
+- **THEN** that Keyboard runtime SHALL be not ready
+
 ### Requirement: PTT routing respects readiness
-The system SHALL evaluate the target channel's readiness state before
-dispatching a PTT capture, regardless of which input mode or actuator initiated
-the PTT. Route resolution SHALL be based on the active `InputMode`, not on the
-`PttSource`. When the active channel is `KeyboardChannel`, the system SHALL
-dispatch press, release, and cancel to `KeyboardPttController`.
+The system SHALL evaluate the active catalogue instance's runtime readiness before dispatching a PTT capture, regardless of which input mode or actuator initiated PTT. Route resolution SHALL remain based on active `InputMode`, not `PttSource`. Ready input SHALL be prepared through the ID-keyed runtime registry rather than fixed built-in ID branches.
 
-#### Scenario: PTT pressed on ready keyboard channel
-- **WHEN** the keyboard channel is active and ready
-- **AND** a PTT press is dispatched from any source
-- **THEN** the system SHALL call `KeyboardPttController.onPttPressed(route)`
-  with the resolved audio route
+#### Scenario: PTT on a ready active instance in Work mode
+- **WHEN** PTT is pressed while `Work` is active and the selected runtime is ready
+- **THEN** the system SHALL resolve the Work audio route
+- **AND** request a committed input target from the runtime associated with the active instance ID
 
-#### Scenario: PTT released on keyboard channel
-- **WHEN** the keyboard channel is active
-- **AND** a PTT release is dispatched
-- **THEN** the system SHALL call `KeyboardPttController.onPttReleased(route)`
+#### Scenario: PTT on a ready active instance in On-the-road mode
+- **WHEN** PTT is pressed while `OnTheRoad` is active and the selected runtime is ready
+- **THEN** the system SHALL resolve the Telecom audio route
+- **AND** request a committed input target from the same ID-keyed runtime registry
 
-#### Scenario: Active PTT cancelled on keyboard channel
-- **WHEN** the keyboard channel is active
-- **AND** the active PTT session is cancelled (SPP disconnect, car terminal
-  status, or channel switch)
-- **THEN** the system SHALL call `KeyboardPttController.cancelAndRelease()`
+#### Scenario: PTT on a ready active instance in On-a-pinch mode
+- **WHEN** PTT is pressed while `OnAPinch` is active and the selected runtime is ready
+- **THEN** the system SHALL resolve the local audio route
+- **AND** request a committed input target from the same ID-keyed runtime registry
 
-#### Scenario: Keyboard channel deactivated
-- **WHEN** the user switches the active channel away from the keyboard channel
-- **THEN** the system SHALL call `KeyboardPttController.cancelAndRelease()`
-- **AND** SHALL NOT keep the keyboard controller enabled
+#### Scenario: Phone PTT selects an instance
+- **WHEN** the user starts phone PTT from a ready functional channel card
+- **THEN** the system SHALL transition to `OnAPinch`
+- **AND** set that card's instance ID as active
+- **AND** route capture through the matching runtime entry
+
+#### Scenario: RSM PTT auto-transitions to Work mode
+- **WHEN** RSM PTT is pressed while Work mode is available
+- **THEN** the system SHALL transition to `Work`
+- **AND** route capture to the active runtime instance
+
+#### Scenario: Android Auto PTT auto-transitions to On-the-road mode
+- **WHEN** Android Auto PTT is initiated while On-the-road mode is available
+- **THEN** the system SHALL transition to `OnTheRoad`
+- **AND** route capture to the active runtime instance
+
+#### Scenario: Runtime refuses preparation
+- **WHEN** the active runtime becomes unavailable or refuses input after route gating but before capture starts
+- **THEN** the system SHALL NOT start capture
+- **AND** host-owned error feedback and route cleanup SHALL follow the existing audio session policy
 
 ### Requirement: Work SCO endpoint ownership is proven by target RSM HFP
 The system SHALL prove Work/RSM SCO ownership with the target `B02PTT-FF01` `BluetoothDevice` in the `BluetoothHeadset` profile before treating any generic `TYPE_BLUETOOTH_SCO` `AudioDeviceInfo` as the Work transport.
@@ -143,23 +159,3 @@ The system SHALL emit a characteristic two-tone error beep over the resolved aud
 - **AND** set that channel as the active channel
 - **AND** play a two-tone error beep on the On-a-pinch mode audio route
 - **AND** drop the PTT capture without routing to a controller
-
-### Requirement: Keyboard channel ordering
-The system SHALL assign `KeyboardChannel` a stable `orderIndex` of 2, after
-`JournalChannel` (0) and `DebugChannel` (1), so that channel ordering is stable
-across the phone dashboard and the Android Auto browse tree.
-
-#### Scenario: Channels ordered on dashboard
-- **WHEN** the dashboard renders the channel list
-- **THEN** the keyboard channel SHALL appear after the journal and debug
-  channels
-
-### Requirement: Keyboard channel in channel repository
-`ChannelRepository.loadChannels()` SHALL include the persisted
-`KeyboardChannel` in its returned list, and SHALL provide `loadKeyboard()` and
-`saveKeyboard(channel)` methods.
-
-#### Scenario: Load all channels
-- **WHEN** `loadChannels()` is called
-- **THEN** the returned list SHALL contain the journal, debug, and keyboard
-  channels, ordered by `orderIndex` ascending

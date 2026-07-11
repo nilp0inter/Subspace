@@ -25,6 +25,11 @@ The system SHALL persist the ordered channel definitions and kind-specific confi
 - **THEN** the new configuration SHALL take effect for the next PTT preparation for that instance
 - **AND** the current committed target, if any, SHALL retain its accepted configuration snapshot
 
+#### Scenario: Configuration action targets one instance
+- **WHEN** a kind-specific editor changes a definition while another instance shares that kind
+- **THEN** the action SHALL retain the editor's instance ID through navigation and persistence
+- **AND** it SHALL NOT read or mutate a same-kind definition selected by list position or legacy singleton ID
+
 ### Requirement: Channels do not silently drop committed input
 A channel target that has accepted input SHALL either consume the input events for that session or report failure or cancellation through the channel input contract. It SHALL NOT silently ignore a committed input start because selection, order, configuration, catalogue membership, or mutable runtime state changed after acceptance.
 

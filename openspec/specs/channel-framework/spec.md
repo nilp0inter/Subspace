@@ -5,20 +5,17 @@ TBD. Defines channel identity, selection, routing, and persisted configuration.
 ## Requirements
 
 ### Requirement: Active channel selection
-The system SHALL maintain exactly one active channel at any time, identified by
-a unique ID. The active channel is the intended destination for PTT audio
-captures, subject to readiness evaluation. The set of channels SHALL include
-`JournalChannel`, `DebugChannel`, and `KeyboardChannel`.
+The system SHALL maintain exactly one active channel instance at any time, identified by a stable ID present in the persisted ordered channel catalogue. The active channel instance is the intended destination for PTT audio captures, subject to its runtime readiness evaluation. The migrated default catalogue SHALL include Journal, Debug, and Keyboard instances, while the runtime SHALL support catalogue additions, removals, and multiple instances of a supported kind.
 
-#### Scenario: One channel is active
-- **WHEN** a channel is selected as active
-- **THEN** PTT captures SHALL be evaluated against that channel's readiness
-  state
+#### Scenario: One channel instance is active
+- **WHEN** a channel instance is selected as active
+- **THEN** PTT captures SHALL be evaluated against that instance's runtime readiness state
+- **AND** every other catalogue instance SHALL be inactive
 
-#### Scenario: Keyboard channel selected as active
-- **WHEN** the user activates the keyboard channel
-- **THEN** it SHALL become the sole active channel
-- **AND** PTT captures SHALL be routed to it, provided it is ready
+#### Scenario: Multiple instances share a kind
+- **WHEN** the catalogue contains two instances of the same supported channel kind
+- **THEN** either instance SHALL be independently selectable by its stable instance ID
+- **AND** selection SHALL NOT be inferred from channel kind
 
 ### Requirement: Channel activation mutual exclusion
 The system SHALL ensure that activating a channel inherently establishes it as the sole active channel.
@@ -29,21 +26,21 @@ The system SHALL ensure that activating a channel inherently establishes it as t
 - **AND** PTT captures SHALL be routed to Channel B, provided it is ready
 
 ### Requirement: Channel configuration persistence
-The system SHALL persist channel configuration across app restarts for all
-channels, including `KeyboardChannel`. Configuration changes SHALL take effect
-immediately without requiring a service restart.
+The system SHALL persist the ordered channel definitions and kind-specific configuration across app restarts, including every Journal, Debug, and Keyboard instance. Configuration changes SHALL be addressed by stable instance ID and take effect for subsequent PTT preparation without requiring a service restart. A configuration change SHALL NOT alter the target already committed to an active PTT session.
 
-#### Scenario: App restarted after keyboard channel configuration
-- **WHEN** the user configures the keyboard channel's host profile and the app
-  is killed and restarted
-- **THEN** the keyboard channel configuration SHALL be restored to the
-  previously saved state
+#### Scenario: App restarted after instance configuration
+- **WHEN** the user configures a channel instance and the app is killed and restarted
+- **THEN** that instance's ID, kind, name, position, enabled state, and kind-specific configuration SHALL be restored
 
-#### Scenario: Keyboard host profile changed at runtime
-- **WHEN** the user changes the keyboard channel's host profile while the
-  service is running
-- **THEN** the new profile SHALL take effect for the next PTT capture without
-  restarting the service
+#### Scenario: Built-in configuration changed at runtime
+- **WHEN** the user changes a built-in channel instance's valid configuration while the service is running
+- **THEN** the new configuration SHALL take effect for the next PTT preparation for that instance
+- **AND** the current committed target, if any, SHALL retain its accepted configuration snapshot
+
+#### Scenario: Configuration action targets one instance
+- **WHEN** a kind-specific editor changes a definition while another instance shares that kind
+- **THEN** the action SHALL retain the editor's instance ID through navigation and persistence
+- **AND** it SHALL NOT read or mutate a same-kind definition selected by list position or legacy singleton ID
 
 ### Requirement: Channels consume audio input events
 Channels SHALL consume PTT input through channel-level events and audio data supplied by the audio input subsystem. Channels SHALL expose whether they can accept a candidate input before the audio input subsystem plays the ready beep. Channels SHALL NOT receive `ResolvedAudioRoute`, `ScoRoute`, `PcmOutput`, `CaptureSource`, `InputMode`, Android audio route objects, Bluetooth HFP state, Telecom endpoint state, route-gate status, or recorder diagnostic objects.
@@ -79,14 +76,24 @@ Channels SHALL consume PTT input through channel-level events and audio data sup
 - **AND** the channel does not receive Android route objects or route-gate internals
 
 ### Requirement: Channels do not silently drop committed input
-A channel target that has accepted input SHALL either consume the input events for that session or report failure/cancellation through the channel input contract. It SHALL NOT silently ignore a committed input start due to mutable channel state that changed after acceptance.
+A channel target that has accepted input SHALL either consume the input events for that session or report failure or cancellation through the channel input contract. It SHALL NOT silently ignore a committed input start because selection, order, configuration, catalogue membership, or mutable runtime state changed after acceptance.
+
+#### Scenario: Committed target snapshots required definition state
+- **WHEN** a runtime accepts a PTT input request
+- **THEN** the target SHALL bind the instance ID and all configuration and domain resources required for that session before the ready beep is played
+- **AND** subsequent catalogue mutations SHALL NOT redirect the committed session
 
 #### Scenario: Journal input target commits paths before ready beep
-- **WHEN** Journal accepts a PTT input request
+- **WHEN** a Journal instance accepts a PTT input request
 - **THEN** Journal SHALL have the base directory and entry paths needed to process the input before the ready beep is played
-- **AND** the committed session uses those paths for live-frame writing and terminal metadata
+- **AND** the committed session SHALL use those paths for live-frame writing and terminal metadata
 
 #### Scenario: Debug input target snapshots mode before ready beep
-- **WHEN** Debug accepts a PTT input request
-- **THEN** Debug SHALL bind the current debug mode/controller target for that session before the ready beep is played
+- **WHEN** a Debug instance accepts a PTT input request
+- **THEN** Debug SHALL bind the current debug mode and controller target for that session before the ready beep is played
 - **AND** release for that session SHALL use the same committed debug target
+
+#### Scenario: Instance removed after commitment
+- **WHEN** a channel instance is removed after its target has accepted an input request
+- **THEN** the target SHALL continue to receive the terminal event for that session
+- **AND** the removed instance SHALL refuse subsequent input preparation

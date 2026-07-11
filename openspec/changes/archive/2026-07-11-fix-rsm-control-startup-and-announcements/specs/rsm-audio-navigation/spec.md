@@ -1,9 +1,4 @@
-# Capability: rsm-audio-navigation
-
-## Purpose
-TBD.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: RSM Control Mode Navigation
 The system SHALL map the `B02PTT-FF01` physical Group button, Volume Up button, Volume Down button, and PTT button to drive a system-level navigation menu. Channel traversal SHALL follow the visual catalogue direction and SHALL saturate without wrapping.
@@ -60,10 +55,3 @@ The system SHALL play zero-latency audio announcements over the headset to confi
 #### Scenario: Fallback audio
 - **WHEN** an announcement is triggered but the pre-computed TTS cache is missing or the model is not ready
 - **THEN** the system SHALL fall back to playing a distinct ready beep over the SCO headset route
-
-### Requirement: Synchronized UI Highlighting
-The system SHALL automatically synchronize the visual state of the Main Dashboard with the hardware-driven channel selection.
-
-#### Scenario: Hardware scrolls channel list
-- **WHEN** the user switches channels via the RSM buttons
-- **THEN** the Main Dashboard channel cards SHALL instantly visually reflect the new active channel selection

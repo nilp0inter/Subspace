@@ -15,6 +15,7 @@ Channels are currently represented as three compile-time singleton types whose i
 - Reconcile runtime creation, definition updates, removal, and service shutdown without interrupting a target already committed to an active PTT session.
 - Remove obsolete fixed-channel state, type-based ordering, typed controller registry slots, and duplicate controller-owned PTT capture paths after all callers migrate.
 - Add generic per-instance readiness and execution status projections while retaining type-specific configuration editors for the existing built-ins.
+- Enforce catalogue order and stable instance identity through runtime projection, configuration navigation, per-instance mutation, and repeated creation of every supported built-in kind.
 - Exclude Lua execution, scripting APIs, generic inbound/outbound message history, pending-message backlog, network-defined channels, and a universal configuration renderer from this change.
 
 ## Capabilities

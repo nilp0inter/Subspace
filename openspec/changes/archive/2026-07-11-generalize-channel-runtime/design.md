@@ -73,11 +73,15 @@ The repository rejects removal of the final remaining definition. Removing the a
 
 `AppState` carries the ordered runtime snapshots plus active ID instead of one typed field per built-in. Kind-specific editors load/update typed definition configuration by instance ID through service actions; they do not own catalogue state.
 
+Configuration navigation and mutations retain the selected instance ID end to end, including asynchronous directory selection. A mutation replaces only the addressed definition; same-kind siblings retain their configuration and position. Runtime readiness represents valid configuration plus available dependencies, not whether a shared controller is currently activated for the selected instance.
+
 **Alternatives considered:** storing readiness inside definitions was rejected because readiness depends on live resources such as model and BLE state.
 
 ### D5: Construct runtimes through kind factories and resolve them by instance ID
 
 A `ChannelRuntimeFactory` is registered for each supported kind. The host-owned `ChannelRuntimeRegistry` reconciles the catalogue into `Map<ChannelId, ChannelRuntimeEntry>` and implements `ChannelRouter` by looking up the selected instance and asking its runtime to prepare input.
+
+The registry tracks catalogue order explicitly rather than relying on runtime-map insertion order. Pure reorder reconciliation preserves runtime objects while immediately publishing snapshots in the latest catalogue order.
 
 A runtime owns only channel-domain state and a structured child scope. Its contract covers readiness/status observation, definition updates, input preparation, and idempotent close. It does not receive route objects or own the recorder. Built-in-specific dependencies are supplied by their factories at the composition root.
 
@@ -102,6 +106,8 @@ Optional playback remains a validated `ChannelInputResult` executed by the sessi
 ### D8: Project every channel surface from one ordered snapshot
 
 The phone dashboard repeats a generic channel card over the ordered runtime snapshots. Each card preserves tap activation, phone PTT, readiness/status, and a dedicated configuration action. A catalogue-management surface reachable from the channel panel supplies add, move, rename, and remove actions; kind-specific editors remain separate and are addressed by instance ID.
+
+The management form exposes every supported production kind using controls that remain reachable at constrained phone widths. Built-in kinds are repeatable: removing a migrated seed instance does not remove that kind from creation or reserve its legacy ID as a singleton.
 
 Android Auto browse entries and hardware offset selection consume the same ordered snapshot. Catalogue changes trigger browse invalidation. Fixed visual ordinals and the nonfunctional Command Uplink mock are removed.
 

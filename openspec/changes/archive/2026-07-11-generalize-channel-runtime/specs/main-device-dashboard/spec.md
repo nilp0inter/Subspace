@@ -50,6 +50,11 @@ The channel panel SHALL provide access to add supported built-in instances, rena
 - **THEN** the dashboard SHALL request creation of a new catalogue instance
 - **AND** the new card SHALL appear at the resulting catalogue position
 
+#### Scenario: Every supported kind remains reachable
+- **WHEN** the catalogue-management form is rendered at the minimum supported phone width
+- **THEN** the creation control for every supported production kind SHALL remain visible and actionable
+- **AND** the presence or absence of an existing instance of that kind SHALL NOT hide or disable creation
+
 #### Scenario: Reorder channel instance
 - **WHEN** the user moves an instance through the catalogue-management surface
 - **THEN** the dashboard SHALL render the committed order
