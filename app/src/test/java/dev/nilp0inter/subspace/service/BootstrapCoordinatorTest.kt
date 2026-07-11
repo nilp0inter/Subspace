@@ -14,6 +14,7 @@ import io.mockk.verify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -32,6 +33,7 @@ import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.KeyboardPttController
+import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.SttModelStatus
@@ -239,10 +241,18 @@ class BootstrapCoordinatorTest {
 
         val sttTranscriber1 = mockk<SttTranscriber>(relaxed = true)
         var transcriber1Status: SttModelStatus = SttModelStatus.Loading
-        every { sttTranscriber1.modelStatus } answers { transcriber1Status }
+        val firstTranscriberWaiting = CompletableDeferred<Unit>()
+        every { sttTranscriber1.modelStatus } answers {
+            firstTranscriberWaiting.complete(Unit)
+            transcriber1Status
+        }
 
         val sttTranscriber2 = mockk<SttTranscriber>(relaxed = true)
-        every { sttTranscriber2.modelStatus } returns SttModelStatus.Loading
+        val replacementTranscriberWaiting = CompletableDeferred<Unit>()
+        every { sttTranscriber2.modelStatus } answers {
+            replacementTranscriberWaiting.complete(Unit)
+            SttModelStatus.Loading
+        }
 
         val coreInit = mockk<CoreInit>(relaxed = true)
 
@@ -262,31 +272,23 @@ class BootstrapCoordinatorTest {
 
         try {
             coordinator.startBootstrap()
-            // Let it run and wait on transcriber1
-            delay(100)
-            Thread.sleep(50)
+            firstTranscriberWaiting.await()
 
-            // Trigger retry
             coordinator.retry()
-            // Let it run and wait on transcriber2
-            delay(100)
-            Thread.sleep(50)
+            replacementTranscriberWaiting.await()
 
-            // Now simulate late/stale transcriber1 becoming Ready!
+            // The replacement cannot begin until retry has cancelled and joined the stale attempt.
             transcriber1Status = SttModelStatus.Ready
-
-            // Wait to see if transcriber1 is processed
-            delay(500)
-            Thread.sleep(250)
 
             // Verify that coreInit.constructSttController was never called with transcriber1!
             verify(exactly = 0) { coreInit.constructSttController(sttTranscriber1) }
 
             // State should still be PreparingCore (InitializingStt) for the replacement attempt
-            assertTrue(
-                "State should remain PreparingCore and not progress or fail due to stale attempt",
-                coordinator.state.value is BootstrapState.PreparingCore
+            assertEquals(
+                BootstrapState.PreparingCore(BootstrapStage.InitializingStt),
+                coordinator.state.value,
             )
+
         } finally {
             coordinator.cancelAttempt()
         }
