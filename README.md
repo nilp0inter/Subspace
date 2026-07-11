@@ -37,10 +37,10 @@ channel/history navigation are not implemented yet.
 
 ## Build
 
-Use the repository Nix devshell. Do not install Android tooling globally.
+Run development tools directly from the repository devshell. See `AGENTS.md` for tool availability.
 
 ```sh
-nix develop --no-write-lock-file -c gradle test assembleDebug
+gradle test assembleDebug
 ```
 
 The debug APK is produced under `app/build/outputs/apk/debug/`.
@@ -49,8 +49,8 @@ The debug APK is produced under `app/build/outputs/apk/debug/`.
 
 ```sh
 nix flake check --no-write-lock-file
-nix develop --no-write-lock-file -c gradle test
-nix develop --no-write-lock-file -c gradle assembleDebug
+gradle test
+gradle assembleDebug
 ```
 
 ## Continuous Integration
@@ -62,10 +62,10 @@ standalone Android, Java, or Gradle setup actions are used.
 CI runs these commands in order:
 
 1. `nix flake check --no-write-lock-file`
-2. `nix develop --no-write-lock-file -c gradle --version`
+2. `gradle --version`
 3. Provision the debug keystore from the `ANDROID_DEBUG_KEYSTORE_BASE64` repository secret to `.android/debug.keystore`
-4. `nix develop --no-write-lock-file -c gradle test`
-5. `nix develop --no-write-lock-file -c gradle assembleDebug`
+4. `gradle test`
+5. `gradle assembleDebug`
 
 The debug APK is published as a workflow artifact named `subspace-debug-apk`,
 sourced from `app/build/outputs/apk/debug/*.apk` with 14-day retention.

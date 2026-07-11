@@ -53,6 +53,7 @@
       {
         devShells.default = pkgs.mkShell {
           packages = [
+            pkgs.rtk
             androidSdk
             pkgs.gradle
             pkgs.jdk17

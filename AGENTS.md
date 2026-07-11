@@ -2,16 +2,12 @@
 
 ## Development Environment
 
-Use the repository flake for all development tooling.
+Work inside the repository devshell and run development tools directly.
+
+If a required command is unavailable, run it ephemerally with Nix:
 
 ```sh
-nix develop
-```
-
-For one-off commands, prefer:
-
-```sh
-nix develop -c <command>
+nix run nixpkgs#<package> -- <arguments>
 ```
 
 Do not install Android, Gradle, Kotlin, Java, or build tooling globally. Do not use `brew`, `apt`, SDKMAN, or manually downloaded SDKs for this repository.
@@ -57,24 +53,24 @@ Validate the flake:
 nix flake check --no-write-lock-file
 ```
 
-Verify the devshell toolchain:
+Verify the Gradle toolchain:
 
 ```sh
-nix develop --no-write-lock-file -c gradle --version
+gradle --version
 ```
 
-Run future Gradle project commands through the devshell:
+Run Gradle project commands:
 
 ```sh
-nix develop -c gradle build
-nix develop -c gradle test
+gradle build
+gradle test
 ```
 
-If the project later adds a Gradle wrapper, prefer the wrapper inside the devshell:
+If the project later adds a Gradle wrapper, prefer it:
 
 ```sh
-nix develop -c ./gradlew build
-nix develop -c ./gradlew test
+./gradlew build
+./gradlew test
 ```
 
 ## Releases
@@ -99,7 +95,7 @@ Use a physical Android 12+ device with USB debugging enabled. The target hardwar
 Check that ADB can see the device:
 
 ```sh
-nix develop --no-write-lock-file -c adb devices
+adb devices
 ```
 
 The expected state is `<serial>    device`. If the state is `unauthorized`, accept the USB debugging prompt on the phone.
@@ -107,13 +103,13 @@ The expected state is `<serial>    device`. If the state is `unauthorized`, acce
 Install the debug build:
 
 ```sh
-nix develop --no-write-lock-file -c gradle installDebug
+gradle installDebug
 ```
 
 Launch the app:
 
 ```sh
-nix develop --no-write-lock-file -c adb shell am start -n dev.nilp0inter.subspace/.MainActivity
+adb shell am start -n dev.nilp0inter.subspace/.MainActivity
 ```
 
 In-app test flow:

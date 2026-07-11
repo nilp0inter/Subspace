@@ -124,7 +124,7 @@ A top-level `RELEASE_SIGNING.md` file SHALL document: keystore location (the Git
 
 - **WHEN** a new operator (or the existing operator after a long gap) follows the release-cutting checklist in `RELEASE_SIGNING.md`
 - **THEN** the steps are sufficient to produce a published release without consulting external documentation
-- **AND** every command in the checklist uses `nix develop -c` for tools provided by the flake (no global installs)
+- **AND** every development-tool command in the checklist runs directly in the repository devshell; unavailable tools are invoked ephemerally with Nix rather than installed globally.
 
 ### Requirement: The release workflow SHALL NOT enable minification or resource shrinking
 

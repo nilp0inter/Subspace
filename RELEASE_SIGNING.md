@@ -158,7 +158,7 @@ To rotate the GPG signing key (e.g., new Yubikey, new subkey):
 10. Verify the APK signature locally:
     ```sh
     gh release download v<versionName> --pattern '*.apk' --dir /tmp/release-check
-    nix develop -c apksigner verify --verbose /tmp/release-check/*.apk
+    apksigner verify --verbose /tmp/release-check/*.apk
     ```
 11. Smoke-test on `B02PTT-FF01` per the `AGENTS.md` manual acceptance
     flow: PTT press/release, Group → Control mode, Volume Up/Down in

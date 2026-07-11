@@ -60,7 +60,7 @@ Subspace releases are tag-triggered. A GPG-signed annotated `v*` tag starts `.gi
    Run:
 
    ```sh
-   nix develop --no-write-lock-file -c gradle test
+   gradle test
    ```
 
    If a known flaky test fails, rerun the exact failing test once to distinguish flake from deterministic failure, then rerun full `gradle test`. Do not tag if full tests are still red.
