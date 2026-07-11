@@ -5,6 +5,7 @@ import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
+import dev.nilp0inter.subspace.bluetooth.SleepwalkerConnectionResult
 import dev.nilp0inter.subspace.model.ChannelDefinition
 import dev.nilp0inter.subspace.model.KeyboardConfig
 import io.sleepwalker.core.keymap.HostProfile
@@ -23,10 +24,17 @@ import kotlinx.coroutines.launch
 class KeyboardRuntimeFactory(
     private val scope: CoroutineScope,
     private val controllerProvider: () -> KeyboardPttController?,
-    private val bridgeConnectedFlow: StateFlow<Boolean>
+    private val bridgeConnectedFlow: StateFlow<Boolean>,
+    private val ensureBridgeConnected: suspend () -> SleepwalkerConnectionResult,
 ) : ChannelRuntimeFactory {
     override fun create(definition: ChannelDefinition): ChannelRuntime {
-        return KeyboardRuntime(scope, definition, controllerProvider, bridgeConnectedFlow)
+        return KeyboardRuntime(
+            scope,
+            definition,
+            controllerProvider,
+            bridgeConnectedFlow,
+            ensureBridgeConnected,
+        )
     }
 }
 
@@ -34,7 +42,8 @@ class KeyboardRuntime(
     parentScope: CoroutineScope,
     override var definition: ChannelDefinition,
     private val controllerProvider: () -> KeyboardPttController?,
-    private val bridgeConnectedFlow: StateFlow<Boolean>
+    private val bridgeConnectedFlow: StateFlow<Boolean>,
+    private val ensureBridgeConnected: suspend () -> SleepwalkerConnectionResult,
 ) : ChannelRuntime {
 
     private val runtimeScope = CoroutineScope(parentScope.coroutineContext + Job())
@@ -81,14 +90,29 @@ class KeyboardRuntime(
         )
     }
 
-    override fun prepareInput(): ChannelInputAcceptance {
-        if (!evaluateReadiness(definition)) {
-            return ChannelInputAcceptance.Refused("Keyboard channel is not ready")
+    override suspend fun prepareInput(): ChannelInputAcceptance {
+        if (!definition.enabled) {
+            return ChannelInputAcceptance.Refused("Keyboard channel is disabled")
+        }
+        if (definition.config !is KeyboardConfig) {
+            return ChannelInputAcceptance.Unavailable("Invalid Keyboard configuration")
+        }
+        if (!bridgeConnectedFlow.value) {
+            when (val result = ensureBridgeConnected()) {
+                SleepwalkerConnectionResult.Connected -> Unit
+                is SleepwalkerConnectionResult.Failed ->
+                    return ChannelInputAcceptance.Refused(result.reason)
+                SleepwalkerConnectionResult.TimedOut ->
+                    return ChannelInputAcceptance.Refused("Sleepwalker connection timed out")
+            }
+        }
+        if (!definition.enabled) {
+            return ChannelInputAcceptance.Refused("Keyboard channel is disabled")
         }
         val controller = controllerProvider()
             ?: return ChannelInputAcceptance.Unavailable("Keyboard controller not initialized")
-            
-        controller.setEnabled(definition.enabled)
+
+        controller.setEnabled(true)
         return ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
             override fun onInputStarted(session: ChannelAudioInputSession) {
                 _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)

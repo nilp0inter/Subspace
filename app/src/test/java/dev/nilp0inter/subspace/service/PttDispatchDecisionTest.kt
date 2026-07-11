@@ -7,60 +7,51 @@ import org.junit.Test
 
 class PttDispatchDecisionTest {
 
-    private fun mockState(activeChannelId: String, isReady: Boolean = true): AppState {
+    private fun mockState(
+        activeChannelId: String,
+        isReady: Boolean,
+        kind: ChannelKind,
+        enabled: Boolean,
+    ): AppState {
         val snapshot = ChannelRuntimeSnapshot(
             id = activeChannelId,
             name = "Test Channel",
-            kind = ChannelKind.DEBUG,
-            enabled = true,
+            kind = kind,
+            enabled = enabled,
             isReady = isReady,
-            executionStatus = ChannelExecutionStatus.IDLE
+            executionStatus = ChannelExecutionStatus.IDLE,
         )
         return AppState(
             channels = listOf(snapshot),
-            activeChannelId = activeChannelId
+            activeChannelId = activeChannelId,
         )
     }
 
     @Test
-    fun readyActivePhoneTargetDispatchesToSelectedChannel() {
-        val state = mockState("debug-channel", isReady = true)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.Dispatch("debug-channel"), decision)
+    fun readyActiveChannelDispatchesToSelectedChannel() {
+        val state = mockState("debug-channel", isReady = true, kind = ChannelKind.DEBUG, enabled = true)
+
+        assertEquals(PttDispatchDecision.Dispatch("debug-channel"), decidePttDispatch(state))
     }
 
     @Test
-    fun notReadyActivePhoneTargetPlaysErrorBeepInsteadOfDispatching() {
-        val state = mockState("captains-log", isReady = false)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.ErrorBeep("captains-log"), decision)
+    fun disconnectedEnabledKeyboardDispatchesForRecovery() {
+        val state = mockState("keyboard-channel", isReady = false, kind = ChannelKind.KEYBOARD, enabled = true)
+
+        assertEquals(PttDispatchDecision.Dispatch("keyboard-channel"), decidePttDispatch(state))
     }
 
     @Test
-    fun readyActiveCarTargetDispatchesToSelectedChannel() {
-        val state = mockState("debug-channel", isReady = true)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.Dispatch("debug-channel"), decision)
+    fun disconnectedDisabledKeyboardUsesImmediateProblemFeedback() {
+        val state = mockState("keyboard-channel", isReady = false, kind = ChannelKind.KEYBOARD, enabled = false)
+
+        assertEquals(PttDispatchDecision.ErrorBeep("keyboard-channel"), decidePttDispatch(state))
     }
 
     @Test
-    fun notReadyActiveCarTargetPlaysErrorBeepInsteadOfDispatching() {
-        val state = mockState("captains-log", isReady = false)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.ErrorBeep("captains-log"), decision)
-    }
+    fun notReadyNonKeyboardUsesImmediateProblemFeedback() {
+        val state = mockState("journal-channel", isReady = false, kind = ChannelKind.JOURNAL, enabled = true)
 
-    @Test
-    fun readyActiveKeyboardChannelDispatchesToKeyboard() {
-        val state = mockState("keyboard-channel", isReady = true)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.Dispatch("keyboard-channel"), decision)
-    }
-
-    @Test
-    fun notReadyActiveKeyboardChannelPlaysErrorBeep() {
-        val state = mockState("keyboard-channel", isReady = false)
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.ErrorBeep("keyboard-channel"), decision)
+        assertEquals(PttDispatchDecision.ErrorBeep("journal-channel"), decidePttDispatch(state))
     }
 }

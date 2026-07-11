@@ -405,6 +405,134 @@ class PttAudioSessionManagerTest {
     }
 
     @Test
+    fun pendingKeyboardRecoveryExcludesOtherPttUntilAcceptedThenStartsOnce() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(9))
+        fixture.router.preparationGate = CompletableDeferred()
+        fixture.router.preparationStarted = CompletableDeferred()
+        route.source = source
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnTheRoad))
+        runCurrent()
+
+        assertTrue(fixture.router.preparationStarted?.isCompleted == true)
+        assertEquals(PttAudioSessionManager.SessionPhase.PttHeld, fixture.manager.activeSession?.phase)
+        assertEquals(1, fixture.router.prepareCallCount)
+        assertEquals(0, source.openCount)
+        assertEquals(0, route.output.readyBeepCount)
+        assertEquals(0, route.output.errorBeepCount)
+        assertFalse(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnTheRoad))
+        assertFalse(fixture.manager.start(PttSource.Rsm, "journal", InputMode.Work))
+        assertEquals(1, fixture.router.prepareCallCount)
+
+        fixture.router.preparationGate?.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("prepare:keyboard", "ready:Car", "started:keyboard"),
+            fixture.timeline,
+        )
+        assertEquals(1, source.openCount)
+        assertEquals(1, route.output.readyBeepCount)
+        assertEquals(0, route.output.errorBeepCount)
+
+        fixture.manager.release(PttSource.Phone)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun recoveryRefusalOrTimeoutPlaysProblemBeepWithoutCaptureOrReadyBeep() = runTest {
+        for (reason in listOf("Sleepwalker connection failed", "Sleepwalker connection timed out")) {
+            val fixture = Fixture(this)
+            val route = fixture.route(InputMode.OnTheRoad)
+            val source = CaptureServiceFakes.singleShotSource(shortArrayOf(9))
+            fixture.router.preparationGate = CompletableDeferred()
+            fixture.router.preparationStarted = CompletableDeferred()
+            fixture.router.acceptance = ChannelInputAcceptance.Refused(reason)
+            route.source = source
+
+            assertTrue(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnTheRoad))
+            runCurrent()
+
+            assertTrue(fixture.router.preparationStarted?.isCompleted == true)
+            assertEquals(0, source.openCount)
+            assertEquals(0, route.output.readyBeepCount)
+            assertEquals(0, route.output.errorBeepCount)
+
+            fixture.router.preparationGate?.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf("prepare:keyboard", "problem:Car"), fixture.timeline)
+            assertTrue(fixture.router.events.isEmpty())
+            assertEquals(0, source.openCount)
+            assertEquals(0, route.output.readyBeepCount)
+            assertEquals(1, route.output.errorBeepCount)
+            assertEquals(1, route.output.releaseRouteCount)
+            assertEquals(null, fixture.manager.activeSession)
+        }
+    }
+
+    @Test
+    fun releaseDuringKeyboardRecoveryCannotReviveCaptureAfterAcceptance() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(9))
+        fixture.router.preparationGate = CompletableDeferred()
+        fixture.router.preparationStarted = CompletableDeferred()
+        route.source = source
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnTheRoad))
+        runCurrent()
+        assertTrue(fixture.router.preparationStarted?.isCompleted == true)
+
+        fixture.manager.release(PttSource.Phone)
+        assertEquals(PttAudioSessionManager.SessionPhase.TerminalWork, fixture.manager.activeSession?.phase)
+        assertFalse(fixture.manager.start(PttSource.Rsm, "journal", InputMode.Work))
+
+        fixture.router.preparationGate?.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf("cancelled:Released"), fixture.router.events)
+        assertEquals(0, source.openCount)
+        assertEquals(0, route.output.readyBeepCount)
+        assertEquals(0, route.output.errorBeepCount)
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(1, fixture.terminalCompletionObservations.size)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun cancellationDuringKeyboardRecoveryCannotReviveCaptureAfterAcceptance() = runTest {
+        val fixture = Fixture(this)
+        val route = fixture.route(InputMode.OnTheRoad)
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(9))
+        fixture.router.preparationGate = CompletableDeferred()
+        fixture.router.preparationStarted = CompletableDeferred()
+        route.source = source
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnTheRoad))
+        runCurrent()
+        assertTrue(fixture.router.preparationStarted?.isCompleted == true)
+
+        assertTrue(fixture.manager.cancelPending(PttSource.Phone, "source lost"))
+        assertFalse(fixture.manager.cancelPending(PttSource.Phone, "source lost"))
+        fixture.manager.release(PttSource.Phone)
+        assertEquals(PttAudioSessionManager.SessionPhase.TerminalWork, fixture.manager.activeSession?.phase)
+
+        fixture.router.preparationGate?.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf("cancelled:Released"), fixture.router.events)
+        assertEquals(0, source.openCount)
+        assertEquals(0, route.output.readyBeepCount)
+        assertEquals(0, route.output.errorBeepCount)
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(1, fixture.terminalCompletionObservations.size)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
     fun channelRefusalPlaysProblemBeepWithoutReadyBeepOrCapture() = runTest {
         val fixture = Fixture(this)
         val route = fixture.route(InputMode.OnTheRoad)
@@ -661,7 +789,7 @@ class PttAudioSessionManagerTest {
             scope = this,
             captureService = CaptureServiceFakes.newService(this),
             channelRouter = object : ChannelRouter {
-                override fun prepareInput(channelId: String): ChannelInputAcceptance =
+                override suspend fun prepareInput(channelId: String): ChannelInputAcceptance =
                     ChannelInputAcceptance.Accepted(target)
             },
             resolvePttAudioRoute = {
@@ -759,9 +887,15 @@ class PttAudioSessionManagerTest {
         private val liveJobs = mutableListOf<Job>()
         var acceptance: ChannelInputAcceptance? = null
         var includeChannelIds: Boolean = false
+        var preparationGate: CompletableDeferred<Unit>? = null
+        var preparationStarted: CompletableDeferred<Unit>? = null
+        var prepareCallCount: Int = 0
 
-        override fun prepareInput(channelId: String): ChannelInputAcceptance {
+        override suspend fun prepareInput(channelId: String): ChannelInputAcceptance {
+            prepareCallCount += 1
             timeline += "prepare:$channelId"
+            preparationStarted?.complete(Unit)
+            preparationGate?.await()
             return acceptance ?: ChannelInputAcceptance.Accepted(RecordingTarget(channelId))
         }
 

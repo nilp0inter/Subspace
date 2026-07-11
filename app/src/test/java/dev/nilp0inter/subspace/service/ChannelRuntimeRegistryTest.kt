@@ -14,9 +14,14 @@ import dev.nilp0inter.subspace.model.JournalConfig
 import dev.nilp0inter.subspace.model.KeyboardConfig
 import dev.nilp0inter.subspace.model.TestFourthConfig
 import io.sleepwalker.core.keymap.HostProfile
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -25,6 +30,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class ChannelRuntimeRegistryTest {
 
     @Test
@@ -113,7 +119,7 @@ class ChannelRuntimeRegistryTest {
     }
 
     @Test
-    fun committedLeasesDeclineCloseUntilReleased() {
+    fun committedLeasesDeclineCloseUntilReleased() = runTest {
         val fJournal = FakeRuntimeFactory()
         val registry = ChannelRuntimeRegistry(mapOf(
             ChannelKind.JOURNAL to fJournal
@@ -150,7 +156,7 @@ class ChannelRuntimeRegistryTest {
     }
 
     @Test
-    fun registryShutdownClearsAllRuntimesAndCancelsSession() {
+    fun registryShutdownClearsAllRuntimesAndCancelsSession() = runTest {
         val fJournal = FakeRuntimeFactory()
         var cancelRequested = false
         val registry = ChannelRuntimeRegistry(
@@ -174,7 +180,7 @@ class ChannelRuntimeRegistryTest {
     }
 
     @Test
-    fun testOnlyFourthRuntimeKindIntegration() {
+    fun testOnlyFourthRuntimeKindIntegration() = runTest {
         val fFourth = FakeRuntimeFactory()
         val registry = ChannelRuntimeRegistry(mapOf(
             ChannelKind.TEST_FOURTH to fFourth
@@ -213,6 +219,76 @@ class ChannelRuntimeRegistryTest {
         assertTrue(prep is ChannelInputAcceptance.Accepted)
     }
 
+    @Test
+    fun refusedPreparationReleasesRetiredRuntimeAfterSuspension() = runTest {
+        val factory = FakeRuntimeFactory()
+        val registry = ChannelRuntimeRegistry(mapOf(ChannelKind.JOURNAL to factory))
+        val definition = ChannelDefinition("c1", "Journal", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), "c1"))
+        val runtime = factory.instances.single()
+        runtime.nextAcceptance = ChannelInputAcceptance.Refused("Sleepwalker connection failed")
+        runtime.preparationGate = CompletableDeferred()
+        runtime.preparationStarted = CompletableDeferred()
+
+        val preparation = async { registry.prepareInput("c1") }
+        runCurrent()
+        assertTrue(runtime.preparationStarted?.isCompleted == true)
+
+        registry.reconcile(
+            ChannelCatalogueSnapshot(
+                listOf(definition.copy(config = JournalConfig("/replaced", true, true))),
+                "c1",
+            ),
+        )
+        assertFalse(runtime.isClosed)
+
+        runtime.preparationGate?.complete(Unit)
+        assertEquals(ChannelInputAcceptance.Refused("Sleepwalker connection failed"), preparation.await())
+        assertTrue(runtime.isClosed)
+        assertEquals(1, runtime.closeCount.get())
+    }
+
+    @Test
+    fun acceptedPreparationForRetiredRuntimeIsCancelledAndRejected() = runTest {
+        val factory = FakeRuntimeFactory()
+        val registry = ChannelRuntimeRegistry(mapOf(ChannelKind.JOURNAL to factory))
+        val definition = ChannelDefinition("c1", "Journal", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), "c1"))
+        val runtime = factory.instances.single()
+        val targetEvents = mutableListOf<String>()
+        runtime.nextAcceptance = ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+            override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+            override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult = ChannelInputResult.None
+            override fun onInputCancelled(reason: String) {
+                targetEvents += "cancelled:$reason"
+            }
+            override fun onInputFailed(reason: String) = Unit
+        })
+        runtime.preparationGate = CompletableDeferred()
+        runtime.preparationStarted = CompletableDeferred()
+
+        val preparation = async { registry.prepareInput("c1") }
+        runCurrent()
+        assertTrue(runtime.preparationStarted?.isCompleted == true)
+
+        registry.reconcile(
+            ChannelCatalogueSnapshot(
+                listOf(definition.copy(config = JournalConfig("/replaced", true, true))),
+                "c1",
+            ),
+        )
+        assertFalse(runtime.isClosed)
+
+        runtime.preparationGate?.complete(Unit)
+        assertEquals(
+            ChannelInputAcceptance.Unavailable("Channel c1 is unavailable"),
+            preparation.await(),
+        )
+        assertEquals(listOf("cancelled:Channel c1 changed during preparation"), targetEvents)
+        assertTrue(runtime.isClosed)
+        assertEquals(1, runtime.closeCount.get())
+    }
+
     private class FakeRuntime(
         override val definition: ChannelDefinition
     ) : ChannelRuntime {
@@ -233,6 +309,8 @@ class ChannelRuntimeRegistryTest {
         var isClosed = false
         val closeCount = AtomicInteger(0)
         var nextAcceptance: ChannelInputAcceptance = ChannelInputAcceptance.Refused("No input configured")
+        var preparationGate: CompletableDeferred<Unit>? = null
+        var preparationStarted: CompletableDeferred<Unit>? = null
 
         override fun updateDefinition(definition: ChannelDefinition) {
             _snapshot.value = _snapshot.value.copy(
@@ -241,7 +319,11 @@ class ChannelRuntimeRegistryTest {
             )
         }
 
-        override fun prepareInput(): ChannelInputAcceptance = nextAcceptance
+        override suspend fun prepareInput(): ChannelInputAcceptance {
+            preparationStarted?.complete(Unit)
+            preparationGate?.await()
+            return nextAcceptance
+        }
 
         override fun close() {
             isClosed = true

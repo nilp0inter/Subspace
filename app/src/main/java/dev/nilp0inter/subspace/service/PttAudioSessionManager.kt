@@ -149,7 +149,10 @@ internal class PttAudioSessionManager(
                     return
                 }
             }
-            if (active !== session) return
+            if (active !== session) {
+                target.onInputCancelled("Stale audio input session")
+                return
+            }
             session.channelTarget = target
             if (completeClaimedSetup(session, "Released")) return
             val result = captureService.startSession(

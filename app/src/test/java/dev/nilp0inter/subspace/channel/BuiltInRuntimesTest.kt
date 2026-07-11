@@ -9,6 +9,8 @@ import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.model.ScoState
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.CaptureServiceFakes
+import dev.nilp0inter.subspace.bluetooth.FakeSleepwalkerBleConnection
+import dev.nilp0inter.subspace.bluetooth.SleepwalkerConnectionResult
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.ChannelDefinition
 import dev.nilp0inter.subspace.model.ChannelKind
@@ -17,19 +19,24 @@ import dev.nilp0inter.subspace.model.DebugConfig
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.KeyboardConfig
 import io.sleepwalker.core.keymap.HostProfile
+import io.sleepwalker.core.hid.LowLevelHidImpl
+import io.sleepwalker.core.keymap.SeedKeymapDatabase
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
 import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 import dev.nilp0inter.subspace.service.DebugRuntime
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class BuiltInRuntimesTest {
 
     @Test
@@ -144,23 +151,66 @@ class BuiltInRuntimesTest {
     }
 
     @Test
-    fun keyboardRuntimeChecksReadinessRefusal() = runTest {
-        val config = KeyboardConfig(HostProfile.LINUX_US)
-        val def = ChannelDefinition("c3", "Keyboard", ChannelKind.KEYBOARD, true, 1, config)
-
-        val bridgeConnected = false
-        val runtime = KeyboardRuntime(
-            parentScope = this,
-            definition = def,
-            controllerProvider = { null },
-            bridgeConnectedFlow = MutableStateFlow(bridgeConnected)
+    fun keyboardRuntimeRecoversBeforeAcceptingAndKeepsReadinessPassive() = runTest {
+        val definition = ChannelDefinition(
+            "keyboard",
+            "Keyboard",
+            ChannelKind.KEYBOARD,
+            true,
+            1,
+            KeyboardConfig(HostProfile.LINUX_US),
         )
+        val bridgeConnected = MutableStateFlow(false)
+        var recoveryCalls = 0
+        var recoveryResult: SleepwalkerConnectionResult = SleepwalkerConnectionResult.Connected
+        val controller = KeyboardPttController(
+            scope = this,
+            sco = FakeSco(),
+            captureService = CaptureServiceFakes.newService(this),
+            source = CaptureServiceFakes.emptySource(),
+            output = FakeOutput(),
+            transcriptionService = object : dev.nilp0inter.subspace.audio.PcmTranscriber {
+                override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String = "unused"
+            },
+            connection = FakeSleepwalkerBleConnection(),
+            hid = LowLevelHidImpl(),
+            keymapDatabase = SeedKeymapDatabase,
+            hostProfileProvider = { HostProfile.LINUX_US },
+        )
+        val runtime = KeyboardRuntimeFactory(
+            scope = this,
+            controllerProvider = { controller },
+            bridgeConnectedFlow = bridgeConnected,
+            ensureBridgeConnected = {
+                recoveryCalls += 1
+                recoveryResult
+            },
+        ).create(definition)
 
-        // Initial connection state disconnected -> not ready
+        assertFalse(runtime.snapshot.value.isReady)
+        assertTrue(runtime.prepareInput() is ChannelInputAcceptance.Accepted)
+        assertEquals(1, recoveryCalls)
         assertFalse(runtime.snapshot.value.isReady)
 
-        val acceptance = runtime.prepareInput()
-        assertTrue(acceptance is ChannelInputAcceptance.Refused)
+        bridgeConnected.value = true
+        runCurrent()
+        assertTrue(runtime.snapshot.value.isReady)
+        assertTrue(runtime.prepareInput() is ChannelInputAcceptance.Accepted)
+        assertEquals(1, recoveryCalls)
+
+        bridgeConnected.value = false
+        runCurrent()
+        recoveryResult = SleepwalkerConnectionResult.Failed("Sleepwalker connection failed")
+        assertEquals(
+            ChannelInputAcceptance.Refused("Sleepwalker connection failed"),
+            runtime.prepareInput(),
+        )
+        recoveryResult = SleepwalkerConnectionResult.TimedOut
+        assertEquals(
+            ChannelInputAcceptance.Refused("Sleepwalker connection timed out"),
+            runtime.prepareInput(),
+        )
+        assertEquals(3, recoveryCalls)
 
         runtime.close()
     }

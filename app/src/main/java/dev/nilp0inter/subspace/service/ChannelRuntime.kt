@@ -26,7 +26,7 @@ interface ChannelRuntime {
     val snapshot: StateFlow<ChannelRuntimeSnapshot>
     
     fun updateDefinition(definition: ChannelDefinition)
-    fun prepareInput(): ChannelInputAcceptance
+    suspend fun prepareInput(): ChannelInputAcceptance
     fun handleSos() {}
     fun refreshReadiness() {}
     fun close()

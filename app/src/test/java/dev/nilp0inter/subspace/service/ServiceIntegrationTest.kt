@@ -162,7 +162,7 @@ class ServiceIntegrationTest {
             )
         }
 
-        override fun prepareInput(): ChannelInputAcceptance = nextAcceptance
+        override suspend fun prepareInput(): ChannelInputAcceptance = nextAcceptance
 
         override fun close() {
             isClosed = true

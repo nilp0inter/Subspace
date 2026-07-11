@@ -91,7 +91,7 @@ class DebugRuntime(
             isReady = evaluateReadiness(definition)
         )
     }
-    override fun prepareInput(): ChannelInputAcceptance {
+    override suspend fun prepareInput(): ChannelInputAcceptance {
         val config = definition.config as? DebugConfig
             ?: return ChannelInputAcceptance.Unavailable("Invalid configuration")
         if (!evaluateReadiness(definition)) {

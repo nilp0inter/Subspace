@@ -83,24 +83,40 @@ class ChannelRuntimeRegistry(
         }
     }
 
-    override fun prepareInput(channelId: String): ChannelInputAcceptance {
-        synchronized(lock) {
+    override suspend fun prepareInput(channelId: String): ChannelInputAcceptance {
+        val entry = synchronized(lock) {
             if (isShutdown) {
                 return ChannelInputAcceptance.Unavailable("Registry is shut down")
             }
-            val entry = entries[channelId] ?: return ChannelInputAcceptance.Unavailable("Channel $channelId not found")
-            if (!entry.runtime.definition.enabled) {
+            val selected = entries[channelId]
+                ?: return ChannelInputAcceptance.Unavailable("Channel $channelId not found")
+            if (!selected.runtime.definition.enabled) {
                 return ChannelInputAcceptance.Refused("Channel $channelId is disabled")
             }
-            
+            selected.activeLeases++
+            selected
+        }
+
+        var leaseTransferred = false
+        try {
             val acceptance = entry.runtime.prepareInput()
-            if (acceptance is ChannelInputAcceptance.Accepted) {
-                entry.activeLeases++
-                val originalTarget = acceptance.target
-                val wrappedTarget = LeaseWrappingTarget(entry, originalTarget)
-                return ChannelInputAcceptance.Accepted(wrappedTarget)
+            if (acceptance !is ChannelInputAcceptance.Accepted) return acceptance
+            val canCommit = synchronized(lock) {
+                !isShutdown &&
+                    !entry.closed &&
+                    !entry.retired &&
+                    entries[channelId] === entry
             }
-            return acceptance
+            if (!canCommit) {
+                acceptance.target.onInputCancelled("Channel $channelId changed during preparation")
+                return ChannelInputAcceptance.Unavailable("Channel $channelId is unavailable")
+            }
+            leaseTransferred = true
+            return ChannelInputAcceptance.Accepted(
+                LeaseWrappingTarget(entry, acceptance.target),
+            )
+        } finally {
+            if (!leaseTransferred) releaseLease(entry)
         }
     }
 

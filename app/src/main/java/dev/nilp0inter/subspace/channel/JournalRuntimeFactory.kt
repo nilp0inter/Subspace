@@ -76,7 +76,7 @@ class JournalRuntime(
         )
     }
 
-    override fun prepareInput(): ChannelInputAcceptance {
+    override suspend fun prepareInput(): ChannelInputAcceptance {
         val config = definition.config as? JournalConfig
             ?: return ChannelInputAcceptance.Unavailable("Invalid configuration")
         if (!evaluateReadiness(definition)) {

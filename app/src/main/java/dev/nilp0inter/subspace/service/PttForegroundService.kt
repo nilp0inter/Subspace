@@ -394,7 +394,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             ChannelKind.KEYBOARD to KeyboardRuntimeFactory(
                 scope = serviceScope,
                 controllerProvider = { keyboardController },
-                bridgeConnectedFlow = bridgeConnectedFlow
+                bridgeConnectedFlow = bridgeConnectedFlow,
+                ensureBridgeConnected = {
+                    sleepwalkerConnection.ensureConnected(
+                        bluetoothAdapter,
+                        this@PttForegroundService,
+                    )
+                },
             )
         )
         runtimeRegistry = ChannelRuntimeRegistry(factories, onPttSessionCancelRequested = {
@@ -1649,7 +1655,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     // -- ChannelRouter implementation --------------------------------------------------
 
-    override fun prepareInput(channelId: String): ChannelInputAcceptance {
+    override suspend fun prepareInput(channelId: String): ChannelInputAcceptance {
         Log.d(ROUTE_LOG_TAG, "CHANNEL_INPUT_PREPARE channel=$channelId")
         return runtimeRegistry.prepareInput(channelId)
     }
