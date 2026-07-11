@@ -1,76 +1,66 @@
 package dev.nilp0inter.subspace.service
 
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.DebugChannel
-import dev.nilp0inter.subspace.model.JournalChannel
-import dev.nilp0inter.subspace.model.KeyboardChannel
+import dev.nilp0inter.subspace.model.ChannelKind
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class PttDispatchDecisionTest {
+
+    private fun mockState(activeChannelId: String, isReady: Boolean = true): AppState {
+        val snapshot = ChannelRuntimeSnapshot(
+            id = activeChannelId,
+            name = "Test Channel",
+            kind = ChannelKind.DEBUG,
+            enabled = true,
+            isReady = isReady,
+            executionStatus = ChannelExecutionStatus.IDLE
+        )
+        return AppState(
+            channels = listOf(snapshot),
+            activeChannelId = activeChannelId
+        )
+    }
+
     @Test
     fun readyActivePhoneTargetDispatchesToSelectedChannel() {
-        val state = AppState(activeChannelId = DebugChannel.ID)
-
+        val state = mockState("debug-channel", isReady = true)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.Dispatch(DebugChannel.ID), decision)
+        assertEquals(PttDispatchDecision.Dispatch("debug-channel"), decision)
     }
 
     @Test
     fun notReadyActivePhoneTargetPlaysErrorBeepInsteadOfDispatching() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = null),
-            activeChannelId = JournalChannel.ID,
-        )
-
+        val state = mockState("captains-log", isReady = false)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.ErrorBeep(JournalChannel.ID), decision)
+        assertEquals(PttDispatchDecision.ErrorBeep("captains-log"), decision)
     }
 
     @Test
     fun readyActiveCarTargetDispatchesToSelectedChannel() {
-        val state = AppState(activeChannelId = DebugChannel.ID)
-
+        val state = mockState("debug-channel", isReady = true)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.Dispatch(DebugChannel.ID), decision)
+        assertEquals(PttDispatchDecision.Dispatch("debug-channel"), decision)
     }
 
     @Test
     fun notReadyActiveCarTargetPlaysErrorBeepInsteadOfDispatching() {
-        val state = AppState(
-            journal = JournalChannel(baseDirectory = null),
-            activeChannelId = JournalChannel.ID,
-        )
-
+        val state = mockState("captains-log", isReady = false)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.ErrorBeep(JournalChannel.ID), decision)
+        assertEquals(PttDispatchDecision.ErrorBeep("captains-log"), decision)
     }
 
     @Test
     fun readyActiveKeyboardChannelDispatchesToKeyboard() {
-        val state = AppState(
-            keyboard = KeyboardChannel(bridgeConnectedProvider = { true }),
-            activeChannelId = KeyboardChannel.ID
-        )
-
+        val state = mockState("keyboard-channel", isReady = true)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.Dispatch(KeyboardChannel.ID), decision)
+        assertEquals(PttDispatchDecision.Dispatch("keyboard-channel"), decision)
     }
 
     @Test
     fun notReadyActiveKeyboardChannelPlaysErrorBeep() {
-        val state = AppState(
-            keyboard = KeyboardChannel(bridgeConnectedProvider = { false }),
-            activeChannelId = KeyboardChannel.ID
-        )
-
+        val state = mockState("keyboard-channel", isReady = false)
         val decision = decidePttDispatch(state)
-
-        assertEquals(PttDispatchDecision.ErrorBeep(KeyboardChannel.ID), decision)
+        assertEquals(PttDispatchDecision.ErrorBeep("keyboard-channel"), decision)
     }
 }

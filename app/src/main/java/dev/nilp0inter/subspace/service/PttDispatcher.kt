@@ -125,6 +125,10 @@ internal class PttDispatcher(
     fun isTerminalCarSource(): Boolean =
         activePttSession?.source == PttSource.CarTelecom
 
-    fun isKeyguardSession(): Boolean =
-        activePttSession?.channelId == KeyboardChannel.ID
+    fun isKeyguardSession(): Boolean {
+        val session = activePttSession ?: return false
+        val state = appStateProvider()
+        val channel = state.channels.find { it.id == session.channelId } ?: return false
+        return channel.kind == dev.nilp0inter.subspace.model.ChannelKind.KEYBOARD
+    }
 }

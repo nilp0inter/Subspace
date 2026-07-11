@@ -29,16 +29,6 @@ enum class ChannelStatusKind { Active, Ready, Standby }
  * stable across surfaces"). Defaults give [JournalChannel] index 0 and
  * [DebugChannel] index 1.
  */
-val Channel.orderIndex: Int
-    get() = when (this) {
-        is JournalChannel -> JOURNAL_ORDER_INDEX
-        is DebugChannel -> DEBUG_ORDER_INDEX
-        is KeyboardChannel -> KEYBOARD_ORDER_INDEX
-    }
-
-private const val JOURNAL_ORDER_INDEX = 0
-private const val DEBUG_ORDER_INDEX = 1
-private const val KEYBOARD_ORDER_INDEX = 2
 
 /**
  * Pure projection from [AppState] to a [ChannelBrowseEntry] list ordered by
@@ -56,21 +46,18 @@ fun projectChannelBrowseEntries(
     appState: AppState,
     pendingCounts: Map<String, Int> = emptyMap(),
 ): List<ChannelBrowseEntry> {
-    val channels = listOf(appState.journal, appState.debugChannel, appState.keyboard)
-    return channels
-        .sortedBy { it.orderIndex }
-        .map { channel ->
-            ChannelBrowseEntry(
-                id = channel.id,
-                name = channel.name,
-                statusKind = when {
-                    appState.activeChannelId == channel.id -> ChannelStatusKind.Active
-                    channel.isReady -> ChannelStatusKind.Ready
-                    else -> ChannelStatusKind.Standby
-                },
-                pendingCount = pendingCounts[channel.id] ?: 0,
-            )
-        }
+    return appState.channels.map { channel ->
+        ChannelBrowseEntry(
+            id = channel.id,
+            name = channel.name,
+            statusKind = when {
+                appState.activeChannelId == channel.id -> ChannelStatusKind.Active
+                channel.isReady -> ChannelStatusKind.Ready
+                else -> ChannelStatusKind.Standby
+            },
+            pendingCount = pendingCounts[channel.id] ?: 0,
+        )
+    }
 }
 
 /**

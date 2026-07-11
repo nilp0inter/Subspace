@@ -46,6 +46,8 @@ class SystemAnnouncerTest {
     private class RecordingPcmOutput : PcmOutput {
         var beepCount = 0
             private set
+        var errorBeepCount = 0
+            private set
         var playbackCount = 0
             private set
         var lastPlayed: RecordedPcm? = null
@@ -55,7 +57,9 @@ class SystemAnnouncerTest {
             beepCount += 1
         }
 
-        override suspend fun playErrorBeep(coldStart: Boolean) {}
+        override suspend fun playErrorBeep(coldStart: Boolean) {
+            errorBeepCount += 1
+        }
 
         override suspend fun play(recording: RecordedPcm) {
             playbackCount += 1
@@ -270,6 +274,17 @@ class SystemAnnouncerTest {
 
         // The precompute state remains Failed.
         assertTrue(announcer.precomputeState.value is AnnouncementResult.Failed)
+    }
+
+    @Test
+    fun playErrorBeepAcquiresScoAndReleasesRoute() = runTest {
+        val announcer = SystemAnnouncer(FakeTtsSynthesizer())
+        val sco = FakeScoRoute()
+        val output = RecordingPcmOutput()
+        announcer.playErrorBeep(sco, output)
+        advanceUntilIdle()
+        assertEquals(1, output.errorBeepCount)
+        assertEquals(1, sco.releaseCount)
     }
 
     @Test
@@ -656,5 +671,20 @@ class SystemAnnouncerTest {
         } finally {
             unmockkStatic(android.util.Log::class)
         }
+    }
+    // -- Announcement precompute uses four diffusion steps -----------------
+
+    @Test
+    fun precomputeRendersAnnouncementsWithFourSteps() = runTest {
+        val synth = FakeTtsSynthesizer()
+        val announcer = SystemAnnouncer(synth)
+        val vocab = linkedMapOf("a" to "alpha")
+
+        val result = announcer.precompute(vocab, "/tmp/M1.json", 16_000)
+        advanceUntilIdle()
+
+        assertTrue("expected Ready, got $result", result is AnnouncementResult.Ready)
+        assertEquals(1, synth.callCount)
+        assertEquals(4, synth.lastRequest?.totalSteps)
     }
 }

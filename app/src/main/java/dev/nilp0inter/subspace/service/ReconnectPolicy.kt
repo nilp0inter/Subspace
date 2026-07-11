@@ -44,6 +44,11 @@ class ReconnectPolicy(
         nextAttemptAtMillis = null
     }
 
+    fun scheduleInitialConnection(
+        nowMillis: Long,
+        prerequisites: ReconnectPrerequisites,
+    ): ReconnectDecision = scheduleAt(nowMillis, prerequisites)
+
     fun scheduleAfterUnexpectedLoss(
         nowMillis: Long,
         prerequisites: ReconnectPrerequisites,

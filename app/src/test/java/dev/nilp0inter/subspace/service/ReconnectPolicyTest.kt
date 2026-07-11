@@ -83,6 +83,20 @@ class ReconnectPolicyTest {
         assertEquals(ReconnectDecision.StartAttempt, policy.beginAttempt(nowMillis = 6_000, prerequisites = prerequisites()))
     }
 
+    @Test
+    fun initialMonitoringSchedulesImmediateConnectionWithoutPriorSession() {
+        val now = 1_000L
+        val policy = ReconnectPolicy()
+        policy.startMonitoring()
+
+        val decision = policy.scheduleInitialConnection(nowMillis = now, prerequisites = prerequisites())
+
+        assertEquals(ReconnectDecision.Schedule(attemptAtMillis = now), decision)
+        assertTrue(policy.monitoringRequested)
+        assertEquals(now, policy.nextAttemptAtMillis)
+        assertEquals(ReconnectDecision.StartAttempt, policy.beginAttempt(nowMillis = now, prerequisites = prerequisites()))
+    }
+
     private fun prerequisites(
         permissionsGranted: Boolean = true,
         bluetoothEnabled: Boolean = true,

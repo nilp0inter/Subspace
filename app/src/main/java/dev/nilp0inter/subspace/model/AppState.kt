@@ -1,12 +1,11 @@
 package dev.nilp0inter.subspace.model
 
+import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 data class AppState(
     val connection: ConnectionState = ConnectionState(),
     val monitor: MonitorState = MonitorState(),
-    val journal: JournalChannel = JournalChannel(),
-    val debugChannel: DebugChannel = DebugChannel(),
-    val keyboard: KeyboardChannel = KeyboardChannel(),
-    val activeChannelId: String = JournalChannel.ID,
+    val channels: List<ChannelRuntimeSnapshot> = emptyList(),
+    val activeChannelId: String = "captains-log",
     val inputMode: InputMode = InputMode.OnAPinch,
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
     // setupState removed: bootstrap state is now owned by BootstrapCoordinator

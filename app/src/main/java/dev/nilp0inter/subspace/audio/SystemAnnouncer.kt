@@ -17,6 +17,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException
 
+private const val ANNOUNCEMENT_TOTAL_STEPS = 4
+
 class SystemAnnouncer(
     private val synthesizer: TtsSynthesizer,
     private val persistentCache: AnnouncementPcmCache? = null
@@ -56,7 +58,7 @@ class SystemAnnouncer(
         try {
             cache.clear()
             if (vocabulary.isEmpty()) {
-                val settings = AnnouncementRenderSettings("", "en", 20, 1.2f, scoRate)
+                val settings = AnnouncementRenderSettings("", "en", ANNOUNCEMENT_TOTAL_STEPS, 1.2f, scoRate)
                 val commitResult = persistentCache?.commit(emptyMap(), settings, emptyMap())
                 commitStr = when (commitResult) {
                     AnnouncementCacheCommitResult.Unchanged -> "unchanged"
@@ -91,7 +93,7 @@ class SystemAnnouncer(
             val settings = AnnouncementRenderSettings(
                 voiceStylePath = voiceStylePath,
                 lang = "en",
-                totalSteps = 20,
+                totalSteps = ANNOUNCEMENT_TOTAL_STEPS,
                 speed = 1.2f,
                 scoRate = scoRate
             )
@@ -143,7 +145,7 @@ class SystemAnnouncer(
                         text = text,
                         voiceStylePath = voiceStylePath,
                         lang = "en",
-                        totalSteps = 20,
+                        totalSteps = ANNOUNCEMENT_TOTAL_STEPS,
                         speed = 1.2f
                     )
 
@@ -258,20 +260,29 @@ class SystemAnnouncer(
         }
     }
 
-    suspend fun announce(key: String, sco: ScoRoute, output: PcmOutput) = coroutineScope {
+    suspend fun announce(key: String, sco: ScoRoute, output: PcmOutput) {
+        playSerialized(sco) {
+            val pcm = cache[key]
+            if (pcm != null && !pcm.isEmpty) {
+                output.play(pcm)
+            } else {
+                output.playReadyBeep(coldStart = sco.coldStart)
+            }
+        }
+    }
+
+    suspend fun playErrorBeep(sco: ScoRoute, output: PcmOutput) {
+        playSerialized(sco) {
+            output.playErrorBeep(coldStart = sco.coldStart)
+        }
+    }
+
+    private suspend fun playSerialized(sco: ScoRoute, playback: suspend () -> Unit) = coroutineScope {
         jobMutex.withLock {
             val oldJob = activeJob
             val myJob = launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
                 try {
-                    val acquired = sco.acquire()
-                    if (acquired) {
-                        val pcm = cache[key]
-                        if (pcm != null && !pcm.isEmpty) {
-                            output.play(pcm)
-                        } else {
-                            output.playReadyBeep(coldStart = sco.coldStart)
-                        }
-                    }
+                    if (sco.acquire()) playback()
                 } finally {
                     if (activeJob == coroutineContext[Job]) {
                         sco.release()

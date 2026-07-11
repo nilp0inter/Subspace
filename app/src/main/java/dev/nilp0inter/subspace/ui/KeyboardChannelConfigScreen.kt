@@ -93,7 +93,7 @@ fun KeyboardChannelConfigScreen(
                     HostProfileDropdown(
                         selected = channel.hostProfile,
                         options = keymapProfiles,
-                        onSelect = { actions.setKeyboardHostProfile(it) },
+                        onSelect = { actions.setKeyboardHostProfile(channel.id, it) },
                     )
                 }
             }

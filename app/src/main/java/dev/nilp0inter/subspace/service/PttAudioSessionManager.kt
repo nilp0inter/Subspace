@@ -240,22 +240,47 @@ internal class PttAudioSessionManager(
         cancelled: Boolean,
     ) {
         if (active !== session) return
-        if (cancelled) {
-            session.channelTarget?.onInputCancelled("Cancelled")
-        } else {
-            val target = session.channelTarget
-            val played = when (val result = target?.onInputReleased(recording) ?: ChannelInputResult.None) {
-                ChannelInputResult.None -> false
-                is ChannelInputResult.Playback -> {
-                    if (session.route?.endpoint == AudioRouteEndpoint.Car) releaseRouteOnce(session)
-                    session.route?.output?.play(result.recording)
-                    true
+        try {
+            if (cancelled) {
+                try {
+                    session.channelTarget?.onInputCancelled("Cancelled")
+                } catch (cancellation: CancellationException) {
+                    throw cancellation
+                } catch (error: Throwable) {
+                    // ignore non-cancellation errors on cancelled callback
+                }
+            } else {
+                val target = session.channelTarget
+                val played = try {
+                    when (val result = target?.onInputReleased(recording) ?: ChannelInputResult.None) {
+                        ChannelInputResult.None -> false
+                        is ChannelInputResult.Playback -> {
+                            if (session.route?.endpoint == AudioRouteEndpoint.Car) releaseRouteOnce(session)
+                            session.route?.output?.play(result.recording)
+                            true
+                        }
+                    }
+                } catch (cancellation: CancellationException) {
+                    try { target?.onInputCancelled("Cancelled") } catch (e: Throwable) {}
+                    false
+                } catch (error: Throwable) {
+                    try { target?.onInputFailed(error.message ?: "Runtime failure") } catch (e: Throwable) {}
+                    false
+                }
+                if (played) {
+                    try {
+                        target?.onInputPlaybackCompleted()
+                    } catch (cancellation: CancellationException) {
+                        throw cancellation
+                    } catch (error: Throwable) {
+                        // ignore playback completed callback failures
+                    }
                 }
             }
-            if (played) target?.onInputPlaybackCompleted()
+        } finally {
+            releaseRouteOnce(session)
+            clearIfActive(session)
         }
-        releaseRouteOnce(session)
-        clearIfActive(session)
     }
 
 

@@ -73,7 +73,10 @@ fun JournalConfigScreen(
                 OutlinedButton(onClick = actions::requestManageExternalStorage, modifier = Modifier.fillMaxWidth()) {
                     Text("Grant all-files access")
                 }
-                OutlinedButton(onClick = actions::pickJournalDirectory, modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { actions.pickJournalDirectory(channel.id) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Text(if (configured) "Change directory" else "Select directory")
                 }
             }
@@ -89,7 +92,9 @@ fun JournalConfigScreen(
                         Switch(
                             checked = channel.saveVoice,
                             onCheckedChange = { enabled ->
-                                if (enabled || channel.saveText) actions.setJournalSaveVoice(enabled)
+                                if (enabled || channel.saveText) {
+                                    actions.setJournalSaveVoice(channel.id, enabled)
+                                }
                             },
                         )
                     }
@@ -110,7 +115,9 @@ fun JournalConfigScreen(
                         Switch(
                             checked = channel.saveText,
                             onCheckedChange = { enabled ->
-                                if (enabled || channel.saveVoice) actions.setJournalSaveText(enabled)
+                                if (enabled || channel.saveVoice) {
+                                    actions.setJournalSaveText(channel.id, enabled)
+                                }
                             },
                         )
                     }

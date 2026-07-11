@@ -22,6 +22,21 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Close
+import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
+import dev.nilp0inter.subspace.service.ChannelExecutionStatus
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.foundation.layout.size
+import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.model.JournalConfig
+import dev.nilp0inter.subspace.model.DebugConfig
+import dev.nilp0inter.subspace.model.KeyboardConfig
+import dev.nilp0inter.subspace.model.DebugMode
+import io.sleepwalker.core.keymap.HostProfile
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -54,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import dev.nilp0inter.subspace.model.ChannelKind
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.InputMode
@@ -317,51 +333,201 @@ private fun ChannelPanel(
     phonePttLockThresholdPx: Float,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
+    var isManaging by remember { mutableStateOf(false) }
+
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(
-            text = "CHANNELS",
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.primary,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "CHANNELS",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            IconButton(onClick = { isManaging = !isManaging }) {
+                Icon(
+                    imageVector = if (isManaging) Icons.Filled.Close else Icons.Filled.Edit,
+                    contentDescription = if (isManaging) "Done" else "Manage Channels"
+                )
+            }
+        }
 
-        JournalCard(
-            appState = appState,
-            actions = actions,
-            phonePttGesture = phonePttGesture,
-            phonePttLockThresholdPx = phonePttLockThresholdPx,
-            onPhonePttTransition = onPhonePttTransition,
-        )
-        KeyboardChannelCard(
-            appState = appState,
-            actions = actions,
-            phonePttGesture = phonePttGesture,
-            phonePttLockThresholdPx = phonePttLockThresholdPx,
-            onPhonePttTransition = onPhonePttTransition,
-        )
-        DebugChannelCard(
-            appState = appState,
-            actions = actions,
-            phonePttGesture = phonePttGesture,
-            phonePttLockThresholdPx = phonePttLockThresholdPx,
-            onPhonePttTransition = onPhonePttTransition,
-        )
-
-        previewChannels.forEach { channel ->
-            ChannelCard(channel)
+        if (isManaging) {
+            CatalogueManagementPanel(
+                appState = appState,
+                actions = actions,
+            )
+        } else {
+            appState.channels.forEach { channel ->
+                ChannelCard(
+                    channel = channel,
+                    appState = appState,
+                    actions = actions,
+                    phonePttGesture = phonePttGesture,
+                    phonePttLockThresholdPx = phonePttLockThresholdPx,
+                    onPhonePttTransition = onPhonePttTransition,
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun JournalCard(
+private fun CatalogueManagementPanel(
+    appState: AppState,
+    actions: PttUiActions,
+) {
+    var newName by remember { mutableStateOf("") }
+    var selectedKind by remember { mutableStateOf(ChannelKind.JOURNAL) }
+    var renameTargetId by remember { mutableStateOf<String?>(null) }
+    var renameText by remember { mutableStateOf("") }
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        appState.channels.forEachIndexed { index, channel ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (renameTargetId == channel.id) {
+                            OutlinedTextField(
+                                value = renameText,
+                                onValueChange = { renameText = it },
+                                label = { Text("Channel Name") },
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.size(8.dp))
+                            Button(onClick = {
+                                if (renameText.isNotBlank()) {
+                                    actions.renameChannel(channel.id, renameText)
+                                }
+                                renameTargetId = null
+                            }) {
+                                Text("Save")
+                            }
+                        } else {
+                            Column {
+                                Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                Text(channel.kind.name, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = {
+                                    renameTargetId = channel.id
+                                    renameText = channel.name
+                                }) {
+                                    Icon(Icons.Filled.Edit, contentDescription = "Rename")
+                                }
+                                
+                                IconButton(
+                                    onClick = { actions.moveChannel(channel.id, index - 1) },
+                                    enabled = index > 0
+                                ) {
+                                    Text("▲", style = MaterialTheme.typography.bodyLarge)
+                                }
+                                
+                                IconButton(
+                                    onClick = { actions.moveChannel(channel.id, index + 1) },
+                                    enabled = index < appState.channels.lastIndex
+                                ) {
+                                    Text("▼", style = MaterialTheme.typography.bodyLarge)
+                                }
+
+                                val canDelete = appState.channels.size > 1
+                                IconButton(
+                                    onClick = { actions.removeChannel(channel.id) },
+                                    enabled = canDelete
+                                ) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Delete")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("ADD CHANNEL", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("Display Name") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Kind", style = MaterialTheme.typography.bodyMedium)
+                    ChannelKind.values()
+                        .filter { it != ChannelKind.TEST_FOURTH }
+                        .forEach { kind ->
+                            OutlinedButton(
+                                onClick = { selectedKind = kind },
+                                modifier = Modifier.fillMaxWidth(),
+                                border = if (selectedKind == kind) {
+                                    BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+                                } else {
+                                    null
+                                },
+                            ) {
+                                Text(kind.name)
+                            }
+                        }
+                }
+
+                Button(
+                    onClick = {
+                        if (newName.isNotBlank()) {
+                            val newDef = ChannelDefinition(
+                                id = "chan-${System.currentTimeMillis()}",
+                                name = newName,
+                                kind = selectedKind,
+                                enabled = true,
+                                configSchemaVersion = 1,
+                                config = when (selectedKind) {
+                                    ChannelKind.JOURNAL -> JournalConfig(null, true, true)
+                                    ChannelKind.DEBUG -> DebugConfig(DebugMode.ECHO)
+                                    ChannelKind.KEYBOARD -> KeyboardConfig(HostProfile.LINUX_US)
+                                    else -> throw IllegalStateException()
+                                }
+                            )
+                            actions.addChannel(newDef)
+                            newName = ""
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = newName.isNotBlank()
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = "Add")
+                    Spacer(Modifier.size(4.dp))
+                    Text("CREATE INSTANCE")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelCard(
+    channel: ChannelRuntimeSnapshot,
     appState: AppState,
     actions: PttUiActions,
     phonePttGesture: PhonePttGestureState,
     phonePttLockThresholdPx: Float,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
-    val channel = appState.journal
-    val channelId = JournalChannel.ID
+    val channelId = channel.id
     val isActive = appState.activeChannelId == channelId
     val isReady = channel.isReady
     val accent = when {
@@ -396,10 +562,32 @@ private fun JournalCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("CH-01 / LOCAL LOG", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    if (!isReady) {
+                    
+                    val subtitle = when (channel.kind) {
+                        ChannelKind.JOURNAL -> "LOCAL LOG"
+                        ChannelKind.KEYBOARD -> "BLE HID"
+                        ChannelKind.DEBUG -> "TEST"
+                        ChannelKind.TEST_FOURTH -> "TEST"
+                    }
+                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
+                    
+                    if (channel.kind == ChannelKind.DEBUG && !channel.summary.isNullOrBlank()) {
                         Text(
-                            text = "Requires configuration to broadcast.",
+                            text = "Mode: ${channel.summary}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    if (!isReady) {
+                        val errorText = when (channel.kind) {
+                            ChannelKind.JOURNAL -> "Requires configuration to broadcast."
+                            ChannelKind.KEYBOARD -> "Requires active BLE bridge connection."
+                            ChannelKind.DEBUG -> "Selected debug mode is unavailable."
+                            else -> "Requires configuration to broadcast."
+                        }
+                        Text(
+                            text = errorText,
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                         )
@@ -419,161 +607,20 @@ private fun JournalCard(
                     },
                     accent = accent,
                 )
-                IconButton(onClick = actions::navigateToJournalConfig) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Config")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun KeyboardChannelCard(
-    appState: AppState,
-    actions: PttUiActions,
-    phonePttGesture: PhonePttGestureState,
-    phonePttLockThresholdPx: Float,
-    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
-) {
-    val channel = appState.keyboard
-    val channelId = KeyboardChannel.ID
-    val isActive = appState.activeChannelId == channelId
-    val isReady = channel.isReady
-    val accent = when {
-        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
-        isActive -> MaterialTheme.colorScheme.primary
-        isReady -> MaterialTheme.colorScheme.secondary
-        else -> MaterialTheme.colorScheme.outline
-    }
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        border = BorderStroke(1.dp, accent),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.Top,
-        ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .phonePttInput(
-                            channelId = channelId,
-                            lockThresholdPx = phonePttLockThresholdPx,
-                            onSelect = actions::setActiveChannel,
-                            onPhonePttTransition = onPhonePttTransition,
-                        ),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("CH-02 / BLE HID", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    if (!isReady) {
-                        Text(
-                            text = "Requires active BLE bridge connection.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
+                IconButton(onClick = {
+                    when (channel.kind) {
+                        ChannelKind.JOURNAL -> actions.navigateToJournalConfig(channel.id)
+                        ChannelKind.KEYBOARD -> actions.navigateToKeyboardConfig(channel.id)
+                        ChannelKind.DEBUG -> actions.navigateToDebugConfig(channel.id)
+                        ChannelKind.TEST_FOURTH -> {}
                     }
-                    HeldPhonePttInstruction(channelId, phonePttGesture)
-                }
-                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                StatusPill(
-                    label = when {
-                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
-                        phonePttGesture.activeChannelId == channelId -> "PTT"
-                        isActive -> "ACTIVE"
-                        isReady -> "READY"
-                        else -> "STANDBY"
-                    },
-                    accent = accent,
-                )
-                IconButton(onClick = actions::navigateToKeyboardConfig) {
+                }) {
                     Icon(Icons.Filled.Settings, contentDescription = "Config")
                 }
             }
         }
     }
 }
-
-
-@Composable
-private fun DebugChannelCard(
-    appState: AppState,
-    actions: PttUiActions,
-    phonePttGesture: PhonePttGestureState,
-    phonePttLockThresholdPx: Float,
-    onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
-) {
-    val channel = appState.debugChannel
-    val channelId = DebugChannel.ID
-    val isActive = appState.activeChannelId == channelId
-    val accent = when {
-        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
-        isActive -> MaterialTheme.colorScheme.primary
-        else -> MaterialTheme.colorScheme.secondary
-    }
-
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        border = BorderStroke(1.dp, accent),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.Top,
-        ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .phonePttInput(
-                            channelId = channelId,
-                            lockThresholdPx = phonePttLockThresholdPx,
-                            onSelect = actions::setActiveChannel,
-                            onPhonePttTransition = onPhonePttTransition,
-                        ),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text("CH-03 / TEST", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    Text(
-                        text = "Mode: ${channel.mode.name}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    HeldPhonePttInstruction(channelId, phonePttGesture)
-                }
-                LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                StatusPill(
-                    label = when {
-                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
-                        phonePttGesture.activeChannelId == channelId -> "PTT"
-                        isActive -> "ACTIVE"
-                        else -> "READY"
-                    },
-                    accent = accent,
-                )
-                IconButton(onClick = actions::navigateToDebugConfig) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Config")
-                }
-            }
-        }
-    }
-}
-
 @Composable
 private fun HeldPhonePttInstruction(
     channelId: String,
@@ -615,49 +662,6 @@ private fun LockedPhonePttStop(
     }
 }
 
-@Composable
-private fun ChannelCard(channel: MockChannel) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = channel.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                StatusPill(label = "MOCK", accent = MaterialTheme.colorScheme.outline)
-            }
-            Text(
-                text = channel.route,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.primary,
-            )
-            Text(
-                text = channel.description,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                text = "Preview only. No audio, network, command, or storage action is wired.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
 
 
 
@@ -684,13 +688,6 @@ private data class MockChannel(
     val description: String,
 )
 
-private val previewChannels = listOf(
-    MockChannel(
-        name = "Command Uplink",
-        route = "CH-02 / REMOTE",
-        description = "Placeholder for a future network-backed channel.",
-    )
-)
 
 data class DashboardVuMeterState(
     val isPresent: Boolean,

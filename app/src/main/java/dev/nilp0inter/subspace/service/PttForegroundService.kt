@@ -75,7 +75,20 @@ import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.JournalEntryDiscovery
 import dev.nilp0inter.subspace.channel.JournalEntryPaths
 import dev.nilp0inter.subspace.channel.JournalMetadataStore
-import dev.nilp0inter.subspace.channel.JournalPttController
+import dev.nilp0inter.subspace.model.ChannelKind
+import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
+import dev.nilp0inter.subspace.model.JournalConfig
+import dev.nilp0inter.subspace.model.DebugConfig
+import dev.nilp0inter.subspace.model.KeyboardConfig
+import dev.nilp0inter.subspace.channel.JournalRuntimeFactory
+import dev.nilp0inter.subspace.channel.KeyboardRuntimeFactory
+import dev.nilp0inter.subspace.channel.JournalEntryMetadata
+import dev.nilp0inter.subspace.channel.MetadataChannelSnapshot
+import dev.nilp0inter.subspace.channel.CaptureState
+import dev.nilp0inter.subspace.channel.CaptureTaskState
+import dev.nilp0inter.subspace.channel.DerivedTaskState
+import dev.nilp0inter.subspace.channel.DerivedTaskStatus
+import kotlinx.coroutines.flow.update
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapState
@@ -84,10 +97,8 @@ import dev.nilp0inter.subspace.model.ChannelBrowseEntry
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.InputModeAvailability
 import dev.nilp0inter.subspace.model.InputModeSelection
-import dev.nilp0inter.subspace.model.JournalChannel
 import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
-import dev.nilp0inter.subspace.model.DebugChannel
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.DevicePresence
 import dev.nilp0inter.subspace.model.EchoStatus
@@ -133,6 +144,12 @@ internal fun deriveCarMediaPttState(
     PttAudioSessionManager.SessionPhase.PttHeld -> CarMediaPttState.Recording
     PttAudioSessionManager.SessionPhase.TerminalWork -> CarMediaPttState.Finalizing
     null -> if (onTheRoadAvailable) CarMediaPttState.Ready else CarMediaPttState.NotReady
+}
+
+internal fun rsmChannelOffset(event: RawButtonEvent): Int? = when (event) {
+    RawButtonEvent.VolumeUpClicked -> -1
+    RawButtonEvent.VolumeDownClicked -> 1
+    else -> null
 }
 
 class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter, CoreInit {
@@ -197,6 +214,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             }
         }
     }
+    override var journalController: JournalController? = null
+    private lateinit var runtimeRegistry: ChannelRuntimeRegistry
+    private val bridgeConnectedFlow = MutableStateFlow(false)
     private lateinit var scanner: DeviceScanner
     private lateinit var channelRepository: ChannelRepository
     private lateinit var audioManager: AudioManager
@@ -218,7 +238,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override var announcer: SystemAnnouncer? = null
     private var ttsModelStatusJob: Job? = null
     override var sttTtsController: SttTtsController? = null
-    override var journalPttController: JournalPttController? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
     private val keymapDatabase: JsonKeymapDatabase by lazy { JsonKeymapDatabase(resources) }
     private var keyboardProfilesCache: List<Pair<HostProfile, String>>? = null
@@ -232,7 +251,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var carTelecomStarter: CarTelecomStarter
     private lateinit var audioSessionManager: PttAudioSessionManager
     private lateinit var pttDispatcher: PttDispatcher
-    private lateinit var controllerRegistry: PttControllerRegistry
     private val inputModeController = InputModeController()
     private var idleTimerJob: Job? = null
 
@@ -262,6 +280,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     inner class LocalBinder : Binder() {
         fun service(): PttForegroundService = this@PttForegroundService
     }
+    val repository: ChannelRepository
+        get() = channelRepository
 
     override fun onCreate() {
         super.onCreate()
@@ -272,9 +292,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sleepwalkerConnection = SleepwalkerBleConnection()
         channelRepository = ChannelRepository(applicationContext)
         _appState.value = _appState.value.copy(
-            journal = channelRepository.loadJournal(),
-            debugChannel = channelRepository.loadDebugChannel(),
-            keyboard = channelRepository.loadKeyboard({ sleepwalkerConnection.connectionState.value == KeyboardConnectionState.Connected }),
+            channels = emptyList(),
             activeChannelId = channelRepository.loadActiveChannelId(),
         )
 
@@ -343,10 +361,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         serviceScope.launch {
             sleepwalkerConnection.connectionState.collect { state ->
                 updateMonitor { it.copy(keyboardConnectionState = state) }
-                val currentKeyboard = _appState.value.keyboard
-                _appState.value = _appState.value.copy(
-                    keyboard = currentKeyboard.copy()
-                )
+                bridgeConnectedFlow.value = state == KeyboardConnectionState.Connected
                 refreshReadiness()
             }
         }
@@ -360,6 +375,40 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             output = pcmOutput,
         )
 
+        val factories = mapOf(
+            ChannelKind.JOURNAL to JournalRuntimeFactory(
+                scope = serviceScope,
+                journalControllerProvider = { journalController }
+            ),
+            ChannelKind.DEBUG to DebugRuntimeFactory(
+                echoController = echo,
+                sttControllerProvider = { sttController },
+                ttsControllerProvider = { ttsController },
+                sttTtsControllerProvider = { sttTtsController },
+                modelDirProvider = { supertonicModelDir },
+                monitorStateProvider = { _appState.value.monitor }
+            ),
+            ChannelKind.KEYBOARD to KeyboardRuntimeFactory(
+                scope = serviceScope,
+                controllerProvider = { keyboardController },
+                bridgeConnectedFlow = bridgeConnectedFlow
+            )
+        )
+        runtimeRegistry = ChannelRuntimeRegistry(factories, onPttSessionCancelRequested = {
+            pttDispatcher.forceReleaseActivePtt()
+        })
+
+        serviceScope.launch {
+            channelRepository.catalogueState.collect { catalogueSnapshot ->
+                runtimeRegistry.reconcile(catalogueSnapshot)
+                updateActiveControllers(catalogueSnapshot)
+                _appState.value = _appState.value.copy(
+                    channels = runtimeRegistry.getAllRuntimeSnapshots(),
+                    activeChannelId = catalogueSnapshot.activeChannelId
+                )
+                updateCarMediaState()
+            }
+        }
         // Initialize the process-scoped model asset repository and bootstrap
         // coordinator. The coordinator owns the authoritative bootstrap state
         // and drives native initialization, controller construction, and
@@ -392,11 +441,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             updateInputMode()
         }
 
+        reconnectPolicy.startMonitoring()
         refreshReadiness()
         updateInputMode()
-        controllerRegistry = PttControllerRegistry(
-            echo = echo,
-        )
 
         updateCarMediaState()
     }
@@ -525,9 +572,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun constructJournalPttController() {
-        if (journalPttController != null) return
-        // sttReady is already completed by constructSttController before
-        // this is called, so we can get the transcriber synchronously.
+        if (journalController != null) return
         val transcriber = sttReady.getCompleted()
         val pcmTranscriber: PcmTranscriber = if (transcriber != null) {
             TranscriptionService(transcriber)
@@ -538,34 +583,30 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 }
             }
         }
-        val journalController = JournalController(
+        val jc = JournalController(
             scope = serviceScope,
             encoder = OggEncoder(),
             transcriber = pcmTranscriber,
         )
-        journalPttController = JournalPttController(
-            scope = serviceScope,
-            sco = sco,
-            output = pcmOutput,
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            journal = journalController,
-            channelProvider = { _appState.value.journal },
-        )
-        // Run journal recovery asynchronously — it's outside the bootstrap
-        // completion predicate.
+        this.journalController = jc
+
+        val currentSnapshot = channelRepository.catalogueState.value
+        val journalDef = currentSnapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
+        val journalConfig = journalDef?.config as? JournalConfig
+        val baseDir = journalConfig?.baseDirectory?.takeIf { it.isNotBlank() }
+        if (baseDir != null) {
+            jc.runRecovery(java.io.File(baseDir))
+        }
+
         serviceScope.launch {
-            val journal = _appState.value.journal
-            val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
-            if (baseDir != null) {
-                journalController.runRecovery(java.io.File(baseDir))
-            }
             var lastBaseDir: String? = baseDir
-            _appState.collect { state ->
-                val currentDir = state.journal.baseDirectory?.takeIf { it.isNotBlank() }
+            channelRepository.catalogueState.collect { snapshot ->
+                val def = snapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
+                val config = def?.config as? JournalConfig
+                val currentDir = config?.baseDirectory?.takeIf { it.isNotBlank() }
                 if (currentDir != null && currentDir != lastBaseDir) {
                     lastBaseDir = currentDir
-                    journalController.runRecovery(java.io.File(currentDir))
+                    jc.runRecovery(java.io.File(currentDir))
                 }
             }
         }
@@ -584,7 +625,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             connection = sleepwalkerConnection,
             hid = LowLevelHidImpl(),
             keymapDatabase = keymapDatabase,
-            hostProfileProvider = { _appState.value.keyboard.hostProfile },
+            hostProfileProvider = {
+                val snapshot = channelRepository.catalogueState.value
+                val def = snapshot.definitions.find { it.kind == ChannelKind.KEYBOARD }
+                val config = def?.config as? KeyboardConfig
+                config?.hostProfile ?: HostProfile.LINUX_US
+            },
         )
         serviceScope.launch {
             keyboardController?.status?.collect { status ->
@@ -628,15 +674,16 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         announcer = SystemAnnouncer(synthesizer, persistentCache)
     }
 
-    override fun buildVocabulary(): Map<String, String> = mapOf(
-        "sys.menu.channels" to "Channels",
-        "chan.${JournalChannel.ID}.name" to "Journal Channel",
-        "chan.${JournalChannel.ID}.selected" to "Journal Channel Selected",
-        "chan.${DebugChannel.ID}.name" to "Debug Channel",
-        "chan.${DebugChannel.ID}.selected" to "Debug Channel Selected",
-        "chan.${KeyboardChannel.ID}.name" to "Keyboard Channel",
-        "chan.${KeyboardChannel.ID}.selected" to "Keyboard Channel Selected",
-    )
+    override fun buildVocabulary(): Map<String, String> {
+        val vocab = mutableMapOf<String, String>()
+        vocab["sys.menu.channels"] = "Channels"
+        val snapshot = channelRepository.catalogueState.value
+        for (def in snapshot.definitions) {
+            vocab["chan.${def.id}.name"] = def.name
+            vocab["chan.${def.id}.selected"] = "${def.name} Selected"
+        }
+        return vocab
+    }
 
     override fun voiceStylePath(): String {
         val styleDir = supertonicModelDir ?: java.io.File(filesDir, ModelVerifier.SUPERTONIC_DIR)
@@ -654,8 +701,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController = null
         sttTtsController?.cancelAndRelease()
         sttTtsController = null
-        journalPttController?.cancelAndRelease()
-        journalPttController = null
+        journalController = null
         keyboardController?.cancelAndRelease()
         keyboardController = null
         announcer = null
@@ -688,6 +734,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun onDestroy() {
+        runtimeRegistry.shutdown()
         bootstrapCoordinator.cancelAttempt()
         pttDispatcher.forceReleaseActivePtt()
         keyboardController?.cancelAndRelease()
@@ -709,7 +756,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        journalPttController?.cancelAndRelease()
         serviceScope.cancel()
         stopForegroundIfNeeded()
         headsetProxy?.let { bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HEADSET, it) }
@@ -782,15 +828,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 transcriber = transcriber,
             )
 
-            val journal = _appState.value.journal
-            val baseDir = journal.baseDirectory?.takeIf { it.isNotBlank() }
+            val currentSnapshot = channelRepository.catalogueState.value
+            val journalDef = currentSnapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
+            val journalConfig = journalDef?.config as? JournalConfig
+            val baseDir = journalConfig?.baseDirectory?.takeIf { it.isNotBlank() }
             if (baseDir != null) {
                 journalController.runRecovery(java.io.File(baseDir))
             }
 
             var lastBaseDir: String? = baseDir
-            _appState.collect { state ->
-                val currentDir = state.journal.baseDirectory?.takeIf { it.isNotBlank() }
+            channelRepository.catalogueState.collect { snapshot ->
+                val def = snapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
+                val config = def?.config as? JournalConfig
+                val currentDir = config?.baseDirectory?.takeIf { it.isNotBlank() }
                 if (currentDir != null && currentDir != lastBaseDir) {
                     lastBaseDir = currentDir
                     journalController.runRecovery(java.io.File(currentDir))
@@ -799,12 +849,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
 
-    private fun updateActiveControllers() {
-        val state = _appState.value
-        val activeChannelId = state.activeChannelId
-        val mode = state.debugChannel.mode
-
-        val isDebugActive = activeChannelId == DebugChannel.ID
+    private fun updateActiveControllers(
+        snapshot: ChannelCatalogueSnapshot = channelRepository.catalogueState.value
+    ) {
+        val activeDefinition = snapshot.definitions.find { it.id == snapshot.activeChannelId }
+        val debugConfig = activeDefinition?.config as? DebugConfig
+        val mode = debugConfig?.mode ?: DebugMode.ECHO
+        val isDebugActive = activeDefinition?.kind == ChannelKind.DEBUG
 
         echo.setEnabled(isDebugActive && mode == DebugMode.ECHO)
         if (!(isDebugActive && mode == DebugMode.ECHO)) {
@@ -830,15 +881,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             sttTtsController?.cancelAndRelease()
             updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
         }
-        if (activeChannelId != JournalChannel.ID) {
-            journalPttController?.cancelAndRelease()
-        }
 
-        val isKeyboardActive = activeChannelId == KeyboardChannel.ID
+        val isKeyboardActive = activeDefinition?.kind == ChannelKind.KEYBOARD
         keyboardController?.setEnabled(isKeyboardActive)
         if (!isKeyboardActive) {
             keyboardController?.cancelAndRelease()
             updateMonitor { it.copy(keyboardStatus = KeyboardStatus.Idle) }
+        }
+        if (::runtimeRegistry.isInitialized) {
+            runtimeRegistry.refreshReadiness()
+            _appState.update { state ->
+                state.copy(channels = runtimeRegistry.getAllRuntimeSnapshots())
+            }
         }
     }
 
@@ -857,6 +911,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             )
         }
         updateInputMode()
+
+        if (::runtimeRegistry.isInitialized) {
+            runtimeRegistry.refreshReadiness()
+            _appState.update { it.copy(channels = runtimeRegistry.getAllRuntimeSnapshots()) }
+        }
+        maybeScheduleAutomaticSerialConnection()
     }
 
     @SuppressLint("MissingPermission")
@@ -900,25 +960,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
 
-    @SuppressLint("MissingPermission")
     fun connectSerial() {
-        val adapter = bluetoothAdapter ?: return
         if (serialJob?.isActive == true) return
         reconnectPolicy.startMonitoring()
         reconnectJob?.cancel()
-
-        serviceScope.launch {
-            refreshReadiness()
-            if (_appState.value.connection.permissions != PermissionState.Granted) return@launch
-            if (!_appState.value.connection.bluetoothEnabled) return@launch
-
-            val device = resolveManualSerialTarget()
-            if (device == null) {
-                updateConnection { it.copy(devicePresence = DevicePresence.NotFound) }
-                return@launch
-            }
-            startSerialSession(adapter, device, automatic = false)
-        }
+        reconnectJob = null
+        serviceScope.launch { refreshReadiness() }
     }
 
     fun disconnectSerial() {
@@ -937,23 +984,22 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        journalPttController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
     }
 
-    fun setJournalDirectory(path: String) {
-        val channel = channelRepository.loadJournal().copy(baseDirectory = path)
-        saveJournal(channel)
+    fun setJournalDirectory(channelId: String, path: String) {
+        channelRepository.updateChannel(channelId) { old ->
+            val oldConfig = old.config as JournalConfig
+            old.copy(config = oldConfig.copy(baseDirectory = path))
+        }
     }
 
-    fun setKeyboardHostProfile(profile: io.sleepwalker.core.keymap.HostProfile) {
-        val currentKeyboard = _appState.value.keyboard
-        val newKeyboard = currentKeyboard.copy(hostProfile = profile)
-        channelRepository.saveKeyboard(newKeyboard)
-        _appState.value = _appState.value.copy(keyboard = newKeyboard)
-        refreshReadiness()
+    fun setKeyboardHostProfile(channelId: String, profile: io.sleepwalker.core.keymap.HostProfile) {
+        channelRepository.updateChannel(channelId) { old ->
+            old.copy(config = KeyboardConfig(profile))
+        }
     }
 
     fun getKeymapProfiles(): List<Pair<HostProfile, String>> {
@@ -980,44 +1026,32 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sleepwalkerConnection.disconnect()
     }
 
-    fun setJournalSaveVoice(enabled: Boolean) {
-        val current = _appState.value.journal
-        if (!enabled && !current.saveText) return
-        saveJournal(current.copy(saveVoice = enabled))
+    fun setJournalSaveVoice(channelId: String, enabled: Boolean) {
+        channelRepository.updateChannel(channelId) { old ->
+            val oldConfig = old.config as JournalConfig
+            if (!enabled && !oldConfig.saveText) old
+            else old.copy(config = oldConfig.copy(saveVoice = enabled))
+        }
     }
 
-    fun setJournalSaveText(enabled: Boolean) {
-        val current = _appState.value.journal
-        if (!enabled && !current.saveVoice) return
-        saveJournal(current.copy(saveText = enabled))
+    fun setJournalSaveText(channelId: String, enabled: Boolean) {
+        channelRepository.updateChannel(channelId) { old ->
+            val oldConfig = old.config as JournalConfig
+            if (!enabled && !oldConfig.saveVoice) old
+            else old.copy(config = oldConfig.copy(saveText = enabled))
+        }
     }
 
     fun setActiveChannelId(id: String) {
-        val current = _appState.value
-        if (current.activeChannelId == id) return
-
-        channelRepository.saveActiveChannelId(id)
-        _appState.update { it.copy(activeChannelId = id) }
-        updateActiveControllers()
-        updateCarMediaState()
+        channelRepository.selectChannel(id)
     }
 
-    /**
-     * Advance the active channel by [offset] positions in the stable channel
-     * ordering (`Channel.orderIndex`), saturating at the bounds — no
-     * wraparound (design D5 / spec `car-contextual-skip-controls` "Previous
-     * saturates at the first channel rather than wrap"). Powered by
-     * [selectChannelByOffset] so the phone hardware control mode and the car
-     * steering wheel share the exact same selection path.
-     */
     fun setActiveChannelOffset(offset: Int) {
         val orderedIds = orderedChannelIds(_appState.value)
         val newId = selectChannelByOffset(orderedIds, _appState.value.activeChannelId, offset)
             ?: return
         if (newId == _appState.value.activeChannelId) return
-        channelRepository.saveActiveChannelId(newId)
-        _appState.update { it.copy(activeChannelId = newId) }
-        updateActiveControllers()
+        channelRepository.selectChannel(newId)
     }
 
     /**
@@ -1132,19 +1166,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
 
-    fun setDebugChannelMode(mode: DebugMode) {
-        saveDebugChannel(_appState.value.debugChannel.copy(mode = mode))
-        updateActiveControllers()
-    }
-
-    private fun saveJournal(channel: JournalChannel) {
-        channelRepository.saveJournal(channel)
-        _appState.value = _appState.value.copy(journal = channel)
-    }
-
-    private fun saveDebugChannel(channel: DebugChannel) {
-        channelRepository.saveDebugChannel(channel)
-        _appState.value = _appState.value.copy(debugChannel = channel)
+    fun setDebugChannelMode(channelId: String, mode: DebugMode) {
+        channelRepository.updateChannel(channelId) { old ->
+            old.copy(config = DebugConfig(mode))
+        }
     }
 
     fun setTtsText(text: String) {
@@ -1202,13 +1227,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun voiceStyleFile(style: String, modelDir: java.io.File): java.io.File =
         java.io.File(modelDir, "$style.json")
 
-    private fun cycleActiveChannel(next: Boolean) {
-        val offset = if (next) 1 else -1
+    private fun cycleActiveChannel(offset: Int) {
         val previousId = _appState.value.activeChannelId
         setActiveChannelOffset(offset)
         val newId = _appState.value.activeChannelId
-        if (newId != previousId) {
-            serviceScope.launch {
+        serviceScope.launch {
+            if (newId == previousId) {
+                announcer?.playErrorBeep(sco, pcmOutput)
+            } else {
                 announcer?.announce("chan.$newId.name", sco, pcmOutput)
             }
         }
@@ -1248,15 +1274,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     }
                 }
             }
-            RawButtonEvent.VolumeUpClicked -> {
-                if (snapshot.hardwareMode == HardwareMode.Control) {
-                    cycleActiveChannel(next = true)
-                }
-                scheduleVolumeExpiry()
-            }
+            RawButtonEvent.VolumeUpClicked,
             RawButtonEvent.VolumeDownClicked -> {
                 if (snapshot.hardwareMode == HardwareMode.Control) {
-                    cycleActiveChannel(next = false)
+                    cycleActiveChannel(checkNotNull(rsmChannelOffset(event)))
                 }
                 scheduleVolumeExpiry()
             }
@@ -1331,14 +1352,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
 
     @SuppressLint("MissingPermission")
-    private fun resolveManualSerialTarget(): BluetoothDevice? {
-        val device = findBondedTarget() ?: targetDevice
-        if (device?.bondState != BluetoothDevice.BOND_BONDED) return null
-        targetDevice = device
-        return device
-    }
-
-    @SuppressLint("MissingPermission")
     private fun findBondedTarget(): BluetoothDevice? {
         if (!RequiredPermissions.hasBluetoothConnect(this)) return null
         if (bluetoothAdapter?.isEnabled != true) return null
@@ -1405,7 +1418,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
         sttTtsController?.cancelAndRelease()
-        journalPttController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {
@@ -1443,6 +1455,29 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 stopSelf()
             }
         }
+    }
+
+    private fun maybeScheduleAutomaticSerialConnection() {
+        if (!reconnectPolicy.monitoringRequested ||
+            reconnectPolicy.attemptInProgress ||
+            serialJob?.isActive == true ||
+            reconnectJob?.isActive == true
+        ) {
+            return
+        }
+        val prerequisites = reconnectPrerequisites()
+        if (!prerequisites.permissionsGranted ||
+            !prerequisites.bluetoothEnabled ||
+            !prerequisites.bondedTargetAvailable
+        ) {
+            return
+        }
+        handleReconnectDecision(
+            reconnectPolicy.scheduleInitialConnection(
+                nowMillis = SystemClock.elapsedRealtime(),
+                prerequisites = prerequisites,
+            )
+        )
     }
 
     private fun scheduleReconnectAt(attemptAtMillis: Long) {
@@ -1602,166 +1637,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     // -- ChannelRouter implementation --------------------------------------------------
 
     override fun prepareInput(channelId: String): ChannelInputAcceptance {
-        Log.d(
-            ROUTE_LOG_TAG,
-            "CHANNEL_INPUT_PREPARE channel=$channelId mode=${_appState.value.debugChannel.mode} " +
-                "stt=${sttController != null}(e=${sttController?.enabled}) " +
-                "sttTts=${sttTtsController != null}(e=${sttTtsController?.enabled}) " +
-                "tts=${ttsController != null}(e=${ttsController?.enabled})",
-        )
-        return when (channelId) {
-            JournalChannel.ID -> {
-                journalPttController?.prepareInput()
-                    ?: ChannelInputAcceptance.Unavailable("Journal controller unavailable")
-            }
-            KeyboardChannel.ID -> {
-                val keyboard = keyboardController
-                    ?: return ChannelInputAcceptance.Unavailable("Keyboard controller unavailable")
-                if (!keyboard.enabled) {
-                    ChannelInputAcceptance.Refused("Keyboard channel disabled")
-                } else {
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            keyboard.onInputStarted(session)
-                        }
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
-                            keyboard.onInputReleased(recording)
-
-                        override fun onInputCancelled(reason: String) {
-                            keyboard.onInputCancelled(reason)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            keyboard.onInputFailed(reason)
-                        }
-                    })
-                }
-            }
-            DebugChannel.ID -> prepareDebugInput()
-            else -> ChannelInputAcceptance.Unavailable("Unknown channel: $channelId")
-        }
-    }
-
-    private fun prepareDebugInput(): ChannelInputAcceptance {
-        val monitor = _appState.value.monitor
-        return when (_appState.value.debugChannel.mode) {
-            DebugMode.ECHO -> {
-                if (!echo.enabled) {
-                    ChannelInputAcceptance.Refused("Echo debug channel disabled")
-                } else {
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            echo.onInputStarted(session)
-                        }
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
-                            echo.onInputReleased(recording)
-
-                        override fun onInputPlaybackCompleted() {
-                            echo.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            echo.onInputCancelled(reason)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            echo.onInputFailed(reason)
-                        }
-                    })
-                }
-            }
-            DebugMode.STT -> {
-                val stt = sttController
-                    ?: return ChannelInputAcceptance.Unavailable("STT controller unavailable")
-                if (!stt.enabled) {
-                    ChannelInputAcceptance.Refused("STT debug channel disabled")
-                } else {
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            stt.onInputStarted(session)
-                        }
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
-                            stt.onInputReleased(recording)
-
-                        override fun onInputCancelled(reason: String) {
-                            stt.onInputCancelled(reason)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            stt.onInputFailed(reason)
-                        }
-                    })
-                }
-            }
-            DebugMode.TTS -> {
-                val tts = ttsController
-                    ?: return ChannelInputAcceptance.Unavailable("TTS controller unavailable")
-                val modelDir = supertonicModelDir
-                    ?: return ChannelInputAcceptance.Unavailable("TTS model directory unavailable")
-                if (!tts.enabled) {
-                    ChannelInputAcceptance.Refused("TTS debug channel disabled")
-                } else {
-                    val text = monitor.ttsText
-                    val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath
-                    val lang = monitor.ttsLang
-                    val totalSteps = monitor.ttsTotalSteps
-                    val speed = monitor.ttsSpeed
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) = Unit
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
-                            tts.onInputReleased(text, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
-
-                        override fun onInputPlaybackCompleted() {
-                            tts.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            tts.cancelAndRelease()
-                        }
-
-                        override fun onInputFailed(reason: String) = Unit
-                    })
-                }
-            }
-            DebugMode.STT_TTS -> {
-                val sttTts = sttTtsController
-                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS controller unavailable")
-                val modelDir = supertonicModelDir
-                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS model directory unavailable")
-                if (!sttTts.enabled) {
-                    ChannelInputAcceptance.Refused("STT/TTS debug channel disabled")
-                } else {
-                    val voiceStylePath = voiceStyleFile(monitor.sttTtsVoiceStyle, modelDir).absolutePath
-                    val lang = monitor.sttTtsLang
-                    val totalSteps = monitor.sttTtsTotalSteps
-                    val speed = monitor.sttTtsSpeed
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            sttTts.onInputStarted(session)
-                        }
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult =
-                            sttTts.onInputReleased(recording, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
-
-                        override fun onInputPlaybackCompleted() {
-                            sttTts.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            sttTts.onInputCancelled(reason)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            sttTts.onInputFailed(reason)
-                        }
-                    })
-                }
-            }
-        }
+        Log.d(ROUTE_LOG_TAG, "CHANNEL_INPUT_PREPARE channel=$channelId")
+        return runtimeRegistry.prepareInput(channelId)
     }
     companion object {
         const val ACTION_START_MONITORING = "dev.nilp0inter.subspace.START_MONITORING"

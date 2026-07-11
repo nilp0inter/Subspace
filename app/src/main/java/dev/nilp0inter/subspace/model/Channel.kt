@@ -60,3 +60,23 @@ data class KeyboardChannel(
         const val NAME = "Keyboard Channel"
     }
 }
+fun JournalConfig.toLegacyChannel(name: String, id: String = JournalChannel.ID) = JournalChannel(
+    id = id,
+    name = name,
+    baseDirectory = baseDirectory,
+    saveVoice = saveVoice,
+    saveText = saveText
+)
+
+fun DebugConfig.toLegacyChannel(name: String, id: String = DebugChannel.ID) = DebugChannel(
+    id = id,
+    name = name,
+    mode = mode
+)
+
+fun KeyboardConfig.toLegacyChannel(name: String, id: String = KeyboardChannel.ID, bridgeConnectedProvider: () -> Boolean = { false }) = KeyboardChannel(
+    id = id,
+    name = name,
+    hostProfile = hostProfile,
+    bridgeConnectedProvider = bridgeConnectedProvider
+)

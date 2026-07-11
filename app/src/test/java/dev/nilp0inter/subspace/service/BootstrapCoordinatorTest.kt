@@ -30,7 +30,7 @@ import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
-import dev.nilp0inter.subspace.channel.JournalPttController
+import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.KeyboardPttController
 import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapState
@@ -412,7 +412,7 @@ class BootstrapCoordinatorTest {
         assertEquals(null, init.sttController)
         assertEquals(null, init.ttsController)
         assertEquals(null, init.sttTtsController)
-        assertEquals(null, init.journalPttController)
+        assertEquals(null, init.journalController)
         assertEquals(null, init.keyboardController)
         assertEquals(null, init.announcer)
     }
@@ -473,7 +473,7 @@ class BootstrapCoordinatorTest {
         override val sttController: SttController? = null
         override val ttsController: TtsController? = null
         override val sttTtsController: SttTtsController? = null
-        override val journalPttController: JournalPttController? = null
+        override val journalController: JournalController? = null
         override val keyboardController: KeyboardPttController? = null
         override val announcer: SystemAnnouncer? = null
 

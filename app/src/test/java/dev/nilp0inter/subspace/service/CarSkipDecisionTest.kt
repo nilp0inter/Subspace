@@ -1,6 +1,8 @@
 package dev.nilp0inter.subspace.service
 
+import dev.nilp0inter.subspace.model.RawButtonEvent
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class CarSkipDecisionTest {
@@ -62,6 +64,17 @@ class CarSkipDecisionTest {
         // Standard advance.
         assertEquals("debug-channel", selectChannelByOffsetForTest(orderedIds, "captains-log", +1))
         assertEquals("captains-log", selectChannelByOffsetForTest(orderedIds, "debug-channel", -1))
+    }
+
+    @Test
+    fun rsmVolumeKeysUseInvertedChannelOffsets() {
+        // RSM Control mode: Volume Up selects the preceding/up catalogue
+        // channel (offset -1); Volume Down selects the following/down
+        // catalogue channel (offset +1). Non-volume events carry no
+        // traversal offset.
+        assertEquals(-1, rsmChannelOffset(RawButtonEvent.VolumeUpClicked))
+        assertEquals(1, rsmChannelOffset(RawButtonEvent.VolumeDownClicked))
+        assertNull(rsmChannelOffset(RawButtonEvent.PttPressed))
     }
 
     private fun selectChannelByOffsetForTest(

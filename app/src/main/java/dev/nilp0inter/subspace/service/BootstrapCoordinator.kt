@@ -8,7 +8,7 @@ import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
-import dev.nilp0inter.subspace.channel.JournalPttController
+import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.KeyboardPttController
 import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapStage
@@ -326,7 +326,7 @@ class BootstrapCoordinator(
             coreInit.sttController != null &&
             coreInit.ttsController != null &&
             coreInit.sttTtsController != null &&
-            coreInit.journalPttController != null &&
+            coreInit.journalController != null &&
             coreInit.keyboardController != null &&
             coreInit.announcer != null &&
             coreInit.announcer?.precomputeState?.value is AnnouncementResult.Ready
@@ -339,7 +339,7 @@ class BootstrapCoordinator(
             "sttController=${coreInit.sttController != null}",
             "ttsController=${coreInit.ttsController != null}",
             "sttTtsController=${coreInit.sttTtsController != null}",
-            "journalPttController=${coreInit.journalPttController != null}",
+            "journalController=${coreInit.journalController != null}",
             "keyboardController=${coreInit.keyboardController != null}",
             "announcer=${coreInit.announcer != null}",
             "announcerState=${coreInit.announcer?.precomputeState?.value}",
@@ -431,7 +431,7 @@ interface CoreInit {
     val sttController: SttController?
     val ttsController: TtsController?
     val sttTtsController: SttTtsController?
-    val journalPttController: JournalPttController?
+    val journalController: JournalController?
     val keyboardController: KeyboardPttController?
     val announcer: SystemAnnouncer?
 

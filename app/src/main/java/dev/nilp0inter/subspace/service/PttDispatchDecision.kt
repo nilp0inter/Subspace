@@ -1,9 +1,6 @@
 package dev.nilp0inter.subspace.service
 
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.DebugChannel
-import dev.nilp0inter.subspace.model.JournalChannel
-import dev.nilp0inter.subspace.model.KeyboardChannel
 
 internal sealed interface PttDispatchDecision {
     val channelId: String
@@ -13,12 +10,7 @@ internal sealed interface PttDispatchDecision {
 }
 
 internal fun decidePttDispatch(appState: AppState): PttDispatchDecision? {
-    val channel = when (appState.activeChannelId) {
-        JournalChannel.ID -> appState.journal
-        DebugChannel.ID -> appState.debugChannel
-        KeyboardChannel.ID -> appState.keyboard
-        else -> return null
-    }
+    val channel = appState.channels.find { it.id == appState.activeChannelId } ?: return null
     return if (channel.isReady) {
         PttDispatchDecision.Dispatch(channel.id)
     } else {

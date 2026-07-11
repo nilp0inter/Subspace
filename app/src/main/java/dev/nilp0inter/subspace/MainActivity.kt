@@ -22,6 +22,11 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.nilp0inter.subspace.model.ChannelKind
+import dev.nilp0inter.subspace.model.JournalConfig
+import dev.nilp0inter.subspace.model.DebugConfig
+import dev.nilp0inter.subspace.model.KeyboardConfig
+import dev.nilp0inter.subspace.model.toLegacyChannel
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.InputMode
@@ -41,13 +46,13 @@ import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<PttForegroundService?>(null)
     private var bound = false
-    private var pendingJournalDirectory: String? = null
+    private var pendingJournalDirectory: Pair<String, String>? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
-                pendingJournalDirectory?.let { path ->
-                    connectedService.setJournalDirectory(path)
+                pendingJournalDirectory?.let { (channelId, path) ->
+                    connectedService.setJournalDirectory(channelId, path)
                     pendingJournalDirectory = null
                 }
                 connectedService.refreshReadiness()
@@ -69,6 +74,8 @@ class MainActivity : ComponentActivity() {
             val currentServiceState by rememberUpdatedState(currentService)
             val state by currentService?.appState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(AppState()) }
+            val catalogue by currentService?.repository?.catalogueState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(null) }
             val level by currentService?.level?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(0f) }
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
@@ -83,6 +90,8 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(dev.nilp0inter.subspace.model.ModelAcquisitionProgress()) }
 
             var dashboardRoute by remember { mutableStateOf(DashboardRoute.Main) }
+            var configuredChannelId by remember { mutableStateOf<String?>(null) }
+            var journalDirectoryTargetId by remember { mutableStateOf<String?>(null) }
             val scope = rememberCoroutineScope()
 
             // Derive the root surface from bootstrap state.
@@ -98,13 +107,15 @@ class MainActivity : ComponentActivity() {
             val directoryLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocumentTree(),
             ) { uri ->
+                val channelId = journalDirectoryTargetId
+                journalDirectoryTargetId = null
                 val path = uri?.let(StoragePathResolver::resolveTreeUri)
-                if (path != null) {
+                if (channelId != null && path != null) {
                     val connectedService = currentServiceState
                     if (connectedService == null) {
-                        pendingJournalDirectory = path
+                        pendingJournalDirectory = channelId to path
                     } else {
-                        connectedService.setJournalDirectory(path)
+                        connectedService.setJournalDirectory(channelId, path)
                     }
                 }
             }
@@ -119,7 +130,8 @@ class MainActivity : ComponentActivity() {
                         startActivity(RequiredPermissions.manageExternalStorageIntent(this@MainActivity))
                     }
 
-                    override fun pickJournalDirectory() {
+                    override fun pickJournalDirectory(channelId: String) {
+                        journalDirectoryTargetId = channelId
                         directoryLauncher.launch(null)
                     }
 
@@ -152,12 +164,12 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.disconnectSerial()
                     }
 
-                    override fun setJournalSaveVoice(enabled: Boolean) {
-                        currentServiceState?.setJournalSaveVoice(enabled)
+                    override fun setJournalSaveVoice(channelId: String, enabled: Boolean) {
+                        currentServiceState?.setJournalSaveVoice(channelId, enabled)
                     }
 
-                    override fun setJournalSaveText(enabled: Boolean) {
-                        currentServiceState?.setJournalSaveText(enabled)
+                    override fun setJournalSaveText(channelId: String, enabled: Boolean) {
+                        currentServiceState?.setJournalSaveText(channelId, enabled)
                     }
 
                     override fun setActiveChannel(id: String) {
@@ -168,12 +180,18 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.setInputMode(mode)
                     }
 
-                    override fun setDebugChannelMode(mode: dev.nilp0inter.subspace.model.DebugMode) {
-                        currentServiceState?.setDebugChannelMode(mode)
+                    override fun setDebugChannelMode(
+                        channelId: String,
+                        mode: dev.nilp0inter.subspace.model.DebugMode,
+                    ) {
+                        currentServiceState?.setDebugChannelMode(channelId, mode)
                     }
 
-                    override fun setKeyboardHostProfile(profile: io.sleepwalker.core.keymap.HostProfile) {
-                        currentServiceState?.setKeyboardHostProfile(profile)
+                    override fun setKeyboardHostProfile(
+                        channelId: String,
+                        profile: io.sleepwalker.core.keymap.HostProfile,
+                    ) {
+                        currentServiceState?.setKeyboardHostProfile(channelId, profile)
                     }
 
                     override fun connectKeyboardBridge() {
@@ -188,19 +206,23 @@ class MainActivity : ComponentActivity() {
                         dashboardRoute = if (currentReadyForMonitor) DashboardRoute.Monitor else DashboardRoute.Connection
                     }
 
-                    override fun navigateToJournalConfig() {
+                    override fun navigateToJournalConfig(channelId: String) {
+                        configuredChannelId = channelId
                         dashboardRoute = DashboardRoute.JournalConfig
                     }
 
-                    override fun navigateToDebugConfig() {
+                    override fun navigateToDebugConfig(channelId: String) {
+                        configuredChannelId = channelId
                         dashboardRoute = DashboardRoute.DebugChannelConfig
                     }
 
-                    override fun navigateToKeyboardConfig() {
+                    override fun navigateToKeyboardConfig(channelId: String) {
+                        configuredChannelId = channelId
                         dashboardRoute = DashboardRoute.KeyboardConfig
                     }
 
                     override fun navigateBack() {
+                        configuredChannelId = null
                         dashboardRoute = DashboardRoute.Main
                     }
 
@@ -251,6 +273,23 @@ class MainActivity : ComponentActivity() {
                     override fun phonePttReleased(channelId: String) {
                         currentServiceState?.phonePttReleased(channelId)
                     }
+                    override fun addChannel(definition: dev.nilp0inter.subspace.model.ChannelDefinition) {
+                        currentServiceState?.repository?.addChannel(definition)
+                    }
+
+                    override fun removeChannel(id: String) {
+                        currentServiceState?.repository?.removeChannel(id)
+                    }
+
+                    override fun moveChannel(id: String, toIndex: Int) {
+                        currentServiceState?.repository?.moveChannel(id, toIndex)
+                    }
+
+                    override fun renameChannel(id: String, newName: String) {
+                        currentServiceState?.repository?.updateChannel(id) { old ->
+                            old.copy(name = newName)
+                        }
+                    }
                 }
             }
 
@@ -288,7 +327,7 @@ class MainActivity : ComponentActivity() {
 
                         BootstrapRootSurface.Dashboard -> {
                             BackHandler(enabled = dashboardRoute != DashboardRoute.Main) {
-                                dashboardRoute = DashboardRoute.Main
+                                actions.navigateBack()
                             }
 
                             when (dashboardRoute) {
@@ -301,24 +340,44 @@ class MainActivity : ComponentActivity() {
 
                                 DashboardRoute.Connection -> ConnectionScreen(state.connection, actions)
                                 DashboardRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                                DashboardRoute.JournalConfig -> dev.nilp0inter.subspace.ui.JournalConfigScreen(
-                                    channel = state.journal,
-                                    actions = actions,
-                                    onBack = { dashboardRoute = DashboardRoute.Main },
-                                )
-                                DashboardRoute.DebugChannelConfig -> dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
-                                    channel = state.debugChannel,
-                                    monitorState = state.monitor,
-                                    actions = actions,
-                                    onBack = { dashboardRoute = DashboardRoute.Main },
-                                )
-                                DashboardRoute.KeyboardConfig -> dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
-                                    channel = state.keyboard,
-                                    monitorState = state.monitor,
-                                    actions = actions,
-                                    keymapProfiles = service?.getKeymapProfiles() ?: emptyList(),
-                                    onBack = { dashboardRoute = DashboardRoute.Main },
-                                )
+                                DashboardRoute.JournalConfig -> {
+                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
+                                    val config = def?.config as? JournalConfig
+                                    if (config != null) {
+                                        dev.nilp0inter.subspace.ui.JournalConfigScreen(
+                                            channel = config.toLegacyChannel(def.name, def.id),
+                                            actions = actions,
+                                            onBack = actions::navigateBack,
+                                        )
+                                    }
+                                }
+                                DashboardRoute.DebugChannelConfig -> {
+                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
+                                    val config = def?.config as? DebugConfig
+                                    if (config != null) {
+                                        dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
+                                            channel = config.toLegacyChannel(def.name, def.id),
+                                            monitorState = state.monitor,
+                                            actions = actions,
+                                            onBack = actions::navigateBack,
+                                        )
+                                    }
+                                }
+                                DashboardRoute.KeyboardConfig -> {
+                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
+                                    val config = def?.config as? KeyboardConfig
+                                    if (config != null) {
+                                        dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
+                                            channel = config.toLegacyChannel(def.name, def.id) {
+                                                service?.sleepwalkerConnection?.connectionState?.value == dev.nilp0inter.subspace.model.KeyboardConnectionState.Connected
+                                            },
+                                            monitorState = state.monitor,
+                                            actions = actions,
+                                            keymapProfiles = service?.getKeymapProfiles() ?: emptyList(),
+                                            onBack = actions::navigateBack,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
