@@ -98,9 +98,9 @@ disarm) to the bridge if the connection is still open.
   error
 
 ### Requirement: Text rendering failure handling
-If `TextPlanner.plan` cannot represent the transcript on the configured host
-profile, the channel SHALL surface an `Error` status with the failure reason
-and SHALL NOT send any HID operations for that transcript.
+The keyboard channel SHALL surface an `Error` status with the failure reason and
+SHALL NOT send any HID operations for a transcript that `TextPlanner.plan`
+cannot represent on the configured host profile.
 
 #### Scenario: Unrepresentable glyph in transcript
 - **WHEN** the transcript contains a character the host profile cannot type

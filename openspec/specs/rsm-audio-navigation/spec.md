@@ -1,7 +1,7 @@
 # Capability: rsm-audio-navigation
 
 ## Purpose
-TBD.
+Defines RSM hardware-driven channel navigation, synchronized dashboard selection, and headset audio feedback.
 
 ## Requirements
 
