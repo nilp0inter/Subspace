@@ -17,6 +17,7 @@ import dev.nilp0inter.subspace.model.ModelAssetResult
 import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.TtsModelStatus
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
@@ -52,6 +53,7 @@ class BootstrapCoordinator(
     private val scope: CoroutineScope,
     private val modelRepository: ModelAssetRepository,
     private val coreInit: CoreInit,
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val _state = MutableStateFlow<BootstrapState>(BootstrapState.ConnectingService)
     val state: StateFlow<BootstrapState> = _state.asStateFlow()
@@ -180,7 +182,7 @@ class BootstrapCoordinator(
         _state.value = BootstrapState.CheckingPrerequisites(
             BootstrapStage.CheckingPermissions,
         )
-        val missingPermissions = withContext(Dispatchers.IO) {
+        val missingPermissions = withContext(ioDispatcher) {
             RequiredPermissions.missing(context)
         }
         if (missingPermissions.isNotEmpty()) {
@@ -208,10 +210,10 @@ class BootstrapCoordinator(
         )
 
         kotlinx.coroutines.coroutineScope {
-            val sttDeferred = async(Dispatchers.IO) {
+            val sttDeferred = async(ioDispatcher) {
                 prepareStt()
             }
-            val ttsDeferred = async(Dispatchers.IO) {
+            val ttsDeferred = async(ioDispatcher) {
                 prepareTts()
             }
 

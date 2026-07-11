@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.test.resetMain
 import org.junit.After
@@ -231,6 +232,7 @@ class BootstrapCoordinatorTest {
         }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun `stale attempt cannot publish state or mutate controllers after retry`() = runTest {
         val context = mockk<Context>(relaxed = true)
@@ -240,11 +242,10 @@ class BootstrapCoordinatorTest {
         coEvery { modelRepository.inspectAll() } returns emptyList()
 
         val sttTranscriber1 = mockk<SttTranscriber>(relaxed = true)
-        var transcriber1Status: SttModelStatus = SttModelStatus.Loading
         val firstTranscriberWaiting = CompletableDeferred<Unit>()
         every { sttTranscriber1.modelStatus } answers {
             firstTranscriberWaiting.complete(Unit)
-            transcriber1Status
+            SttModelStatus.Loading
         }
 
         val sttTranscriber2 = mockk<SttTranscriber>(relaxed = true)
@@ -268,17 +269,17 @@ class BootstrapCoordinatorTest {
             scope = this,
             modelRepository = modelRepository,
             coreInit = coreInit,
+            ioDispatcher = StandardTestDispatcher(testScheduler),
         )
 
         try {
             coordinator.startBootstrap()
+            runCurrent()
             firstTranscriberWaiting.await()
 
             coordinator.retry()
+            runCurrent()
             replacementTranscriberWaiting.await()
-
-            // The replacement cannot begin until retry has cancelled and joined the stale attempt.
-            transcriber1Status = SttModelStatus.Ready
 
             // Verify that coreInit.constructSttController was never called with transcriber1!
             verify(exactly = 0) { coreInit.constructSttController(sttTranscriber1) }
