@@ -1,228 +1,716 @@
 package dev.nilp0inter.subspace.service
 
-import android.util.Log
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
-import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
+import dev.nilp0inter.subspace.channel.capability.RevocableChannelCapabilityScope
+import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelDefinition
-import dev.nilp0inter.subspace.model.ChannelKind
+import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelProviderError
+import dev.nilp0inter.subspace.model.ChannelProviderResolution
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
+import dev.nilp0inter.subspace.model.ProviderConfigurationResult
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
+/** Ordered host projection; its entries always mirror catalogue membership and order. */
+data class RuntimeRegistrySnapshot(
+    val activeChannelId: String,
+    val entries: List<ChannelRuntimeSnapshot>,
+)
+
+sealed interface ChannelRuntimeRegistryShutdownResult {
+    data object Closed : ChannelRuntimeRegistryShutdownResult
+    data object TimedOutWaitingForCommittedTargets : ChannelRuntimeRegistryShutdownResult
+}
+
+/**
+ * The only instance-ID keyed registry of channel runtimes. Its monitor protects structural
+ * ownership only; all provider, runtime, capability, and close work is performed after release.
+ */
 class ChannelRuntimeRegistry(
-    private val factories: Map<ChannelKind, ChannelRuntimeFactory>,
-    private val onPttSessionCancelRequested: () -> Unit = {}
+    private val providers: ChannelImplementationProviderRegistry,
+    private val capabilityHost: ChannelCapabilityHost,
+    private val invocationBoundary: RuntimeInvocationBoundary,
+    private val runtimeScope: CoroutineScope,
+    private val closeScope: CoroutineScope,
+    private val onPttSessionCancelRequested: suspend () -> Unit = {},
+    private val shutdownAwaitMillis: Long = DEFAULT_SHUTDOWN_AWAIT_MILLIS,
 ) : ChannelRouter {
-
     private val lock = Any()
     private val entries = mutableMapOf<String, RuntimeEntry>()
+    private val retiredEntries = linkedSetOf<RuntimeEntry>()
+    private val generations = mutableMapOf<String, Long>()
     private var orderedIds = emptyList<String>()
-    private val retiredEntries = mutableListOf<RuntimeEntry>()
+    private var activeChannelId = ""
     private var isShutdown = false
 
-    internal class RuntimeEntry(
+    private val _runtimeSnapshots = MutableStateFlow(RuntimeRegistrySnapshot("", emptyList()))
+    val runtimeSnapshots: StateFlow<RuntimeRegistrySnapshot> = _runtimeSnapshots.asStateFlow()
+
+    private sealed class RuntimeEntry(
+        val definition: ChannelDefinition,
+        val generation: RuntimeGeneration,
+        var snapshotState: ChannelRuntimeSnapshot,
+    ) {
+        var retired = false
+        var activeLeases = 0
+        var closeStarted = false
+        var snapshotCollection: Job? = null
+        val closed = CompletableDeferred<Unit>()
+    }
+
+    private sealed class LifecycleEntry(
+        definition: ChannelDefinition,
+        generation: RuntimeGeneration,
+        snapshotState: ChannelRuntimeSnapshot,
+        val capabilities: RevocableChannelCapabilityScope,
+        val gate: RuntimeGenerationInvocationGate,
+    ) : RuntimeEntry(definition, generation, snapshotState)
+
+    private class PendingEntry(
+        definition: ChannelDefinition,
+        generation: RuntimeGeneration,
+        snapshotState: ChannelRuntimeSnapshot,
+        capabilities: RevocableChannelCapabilityScope,
+        gate: RuntimeGenerationInvocationGate,
+    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate)
+
+    private class LiveEntry(
+        definition: ChannelDefinition,
+        generation: RuntimeGeneration,
+        snapshotState: ChannelRuntimeSnapshot,
+        capabilities: RevocableChannelCapabilityScope,
+        gate: RuntimeGenerationInvocationGate,
         val runtime: ChannelRuntime,
-        var retired: Boolean = false,
-        var activeLeases: Int = 0,
-        var closed: Boolean = false
+    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate)
+
+    private class UnavailableEntry(
+        definition: ChannelDefinition,
+        generation: RuntimeGeneration,
+        snapshotState: ChannelRuntimeSnapshot,
+    ) : RuntimeEntry(definition, generation, snapshotState)
+
+    private data class ConstructionPlan(
+        val entry: PendingEntry,
+        val provider: ChannelImplementationProvider,
+        val summary: String,
     )
 
-    private fun closeEntryLocked(entry: RuntimeEntry) {
-        if (!entry.closed) {
-            entry.closed = true
-            entry.runtime.close()
-        }
+    private sealed interface ConstructionAttempt {
+        data class Runtime(val runtime: ChannelRuntime) : ConstructionAttempt
+        data class Failed(val error: ChannelProviderError) : ConstructionAttempt
     }
 
-    fun reconcile(snapshot: ChannelCatalogueSnapshot) {
+    /**
+     * Reconciles a committed catalogue in two phases. Construction plans are recorded while the
+     * lock is held and all provider work begins only after the structural transition is visible.
+     */
+    suspend fun reconcile(snapshot: ChannelCatalogueSnapshot) {
+        val constructionPlans = mutableListOf<ConstructionPlan>()
+        val stops = mutableListOf<LifecycleEntry>()
+        val closures = mutableListOf<LifecycleEntry>()
+
         synchronized(lock) {
             if (isShutdown) return
-            
-            val nextIds = snapshot.definitions.map { it.id }.toSet()
-            
-            // 1. Retire/remove runtimes no longer in catalogue
-            val removedIds = entries.keys.filter { it !in nextIds }
-            for (id in removedIds) {
-                val entry = entries.remove(id) ?: continue
-                retireEntryLocked(entry)
+
+            val nextDefinitions = snapshot.definitions.associateBy(ChannelDefinition::id)
+            entries.keys.filter { it !in nextDefinitions }.toList().forEach { id ->
+                val entry = entries.remove(id) ?: return@forEach
+                retireLocked(entry, stops, closures)
             }
-            
-            // 2. Add or update/replace runtimes in catalogue
-            for (def in snapshot.definitions) {
-                val existing = entries[def.id]
+
+            snapshot.definitions.forEach { definition ->
+                val existing = entries[definition.id]
                 if (existing == null) {
-                    val factory = factories[def.kind] ?: continue
-                    val runtime = factory.create(def)
-                    entries[def.id] = RuntimeEntry(runtime)
-                } else {
-                    if (existing.runtime.definition != def) {
-                        // Configuration changed! Replace and retire old
-                        retireEntryLocked(existing)
-                        
-                        val factory = factories[def.kind] ?: continue
-                        val runtime = factory.create(def)
-                        entries[def.id] = RuntimeEntry(runtime)
-                    }
+                    installDefinitionLocked(definition, constructionPlans)
+                } else if (existing.definition != definition) {
+                    retireLocked(existing, stops, closures)
+                    installDefinitionLocked(definition, constructionPlans)
                 }
             }
-            orderedIds = snapshot.definitions.mapNotNull { definition ->
-                entries[definition.id]?.let { definition.id }
-            }
-        }
-    }
 
-    private fun retireEntryLocked(entry: RuntimeEntry) {
-        entry.retired = true
-        if (entry.activeLeases == 0) {
-            closeEntryLocked(entry)
-        } else {
-            retiredEntries.add(entry)
+            orderedIds = snapshot.definitions.map(ChannelDefinition::id)
+            activeChannelId = snapshot.activeChannelId
+            publishAggregateLocked()
         }
+
+        stops.forEach { it.gate.stopAdmission() }
+        for (entry in closures) closeLifecycleEntry(entry)
+        for (plan in constructionPlans) construct(plan)
     }
 
     override suspend fun prepareInput(channelId: String): ChannelInputAcceptance {
         val entry = synchronized(lock) {
-            if (isShutdown) {
-                return ChannelInputAcceptance.Unavailable("Registry is shut down")
+            when {
+                isShutdown -> return ChannelInputAcceptance.Unavailable(
+                    ChannelPreparationReason.RegistryShutDown.message,
+                )
+                else -> entries[channelId] as? LiveEntry
+                    ?: return ChannelInputAcceptance.Unavailable(
+                        preparationLocked(channelId).reasonMessage(),
+                    )
+            }.also { live ->
+                if (!live.definition.enabled) {
+                    return ChannelInputAcceptance.Refused(ChannelPreparationReason.Disabled.message)
+                }
+                when (val preparation = live.snapshotState.preparation) {
+                    is ChannelPreparationAvailability.Unavailable ->
+                        return ChannelInputAcceptance.Unavailable(preparation.reason.message)
+                    ChannelPreparationAvailability.Available,
+                    is ChannelPreparationAvailability.Recoverable -> Unit
+                }
             }
-            val selected = entries[channelId]
-                ?: return ChannelInputAcceptance.Unavailable("Channel $channelId not found")
-            if (!selected.runtime.definition.enabled) {
-                return ChannelInputAcceptance.Refused("Channel $channelId is disabled")
-            }
-            selected.activeLeases++
-            selected
         }
 
-        var leaseTransferred = false
-        try {
-            val acceptance = entry.runtime.prepareInput()
-            if (acceptance !is ChannelInputAcceptance.Accepted) return acceptance
-            val canCommit = synchronized(lock) {
-                !isShutdown &&
-                    !entry.closed &&
-                    !entry.retired &&
-                    entries[channelId] === entry
+        val acceptance = when (
+            val outcome = entry.gate.invoke(RuntimeInvocationPhase.PREPARE_INPUT) {
+                val result = entry.runtime.prepareInput()
+                val stillCurrent = synchronized(lock) {
+                    !isShutdown && !entry.retired && entries[channelId] === entry
+                }
+                if (result is ChannelInputAcceptance.Accepted && !stillCurrent) {
+                    // This code still executes inside the generation's serialized invocation.
+                    // Do not defer cleanup to a closed gate when provider code ignored cancellation.
+                    result.target.onInputCancelled("Channel $channelId changed during preparation")
+                    ChannelInputAcceptance.Unavailable(ChannelPreparationReason.RuntimeClosed.message)
+                } else {
+                    result
+                }
             }
-            if (!canCommit) {
-                acceptance.target.onInputCancelled("Channel $channelId changed during preparation")
-                return ChannelInputAcceptance.Unavailable("Channel $channelId is unavailable")
-            }
-            leaseTransferred = true
-            return ChannelInputAcceptance.Accepted(
-                LeaseWrappingTarget(entry, acceptance.target),
+        ) {
+            is RuntimeInvocationOutcome.Success -> outcome.value
+            RuntimeInvocationOutcome.Busy -> ChannelInputAcceptance.Refused(ChannelPreparationReason.RuntimeBusy.message)
+            RuntimeInvocationOutcome.Cancelled -> ChannelInputAcceptance.Unavailable(
+                ChannelPreparationReason.RuntimeCancelled.message,
             )
-        } finally {
-            if (!leaseTransferred) releaseLease(entry)
+            RuntimeInvocationOutcome.TimedOut -> ChannelInputAcceptance.Unavailable(
+                ChannelPreparationReason.RuntimeTimedOut.message,
+            )
+            RuntimeInvocationOutcome.Closed -> ChannelInputAcceptance.Unavailable(
+                ChannelPreparationReason.RuntimeClosed.message,
+            )
+            is RuntimeInvocationOutcome.Unavailable -> ChannelInputAcceptance.Unavailable(outcome.reason)
+            is RuntimeInvocationOutcome.ProviderFailure,
+            is RuntimeInvocationOutcome.RuntimeFailure -> ChannelInputAcceptance.Unavailable(
+                ChannelPreparationReason.RuntimeFailed().message,
+            )
+        }
+
+        if (acceptance !is ChannelInputAcceptance.Accepted) return acceptance
+        val committed = entry.gate.commitIfLive {
+            synchronized(lock) {
+                if (!isShutdown && !entry.retired && entries[channelId] === entry) {
+                    entry.gate.openCommittedTarget()?.also {
+                        entry.activeLeases += 1
+                    }
+                } else {
+                    null
+                }
+            }
+        }
+        val committedTarget = when (committed) {
+            is RuntimeInvocationOutcome.Success -> committed.value
+            else -> null
+        }
+        if (committedTarget == null) {
+            discardUncommittedTarget(entry, acceptance.target, "Channel $channelId changed during preparation")
+            return ChannelInputAcceptance.Unavailable(ChannelPreparationReason.RuntimeClosed.message)
+        }
+        return ChannelInputAcceptance.Accepted(LeaseWrappingTarget(entry, acceptance.target, committedTarget))
+    }
+
+    /** Executes a provider-neutral SOS action through the selected generation gate. */
+    suspend fun dispatchSos(channelId: String): ChannelPreparationAvailability {
+        val entry = synchronized(lock) {
+            if (isShutdown) return ChannelPreparationAvailability.Unavailable(
+                ChannelPreparationReason.RegistryShutDown,
+            )
+            entries[channelId] as? LiveEntry
+                ?: return preparationLocked(channelId)
+        }
+        return when (val outcome = entry.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+            entry.runtime.handleSos()
+        }) {
+            is RuntimeInvocationOutcome.Success -> ChannelPreparationAvailability.Available
+            else -> ChannelPreparationAvailability.Unavailable(outcome.reason())
         }
     }
 
-    fun getRuntime(id: String): ChannelRuntime? {
-        synchronized(lock) {
-            return entries[id]?.runtime
-        }
-    }
-    fun getRuntimeSnapshot(id: String): ChannelRuntimeSnapshot? {
-        synchronized(lock) {
-            return entries[id]?.runtime?.snapshot?.value
-        }
+    /** Returns the aggregate projection's current generic preparation state without sampling a child flow. */
+    fun preparation(channelId: String): ChannelPreparationAvailability = synchronized(lock) {
+        preparationLocked(channelId)
     }
 
-    fun getAllRuntimeSnapshots(): List<ChannelRuntimeSnapshot> {
-        synchronized(lock) {
-            return orderedIds.mapNotNull { id -> entries[id]?.runtime?.snapshot?.value }
-        }
+
+    /** Compatibility read of the aggregate's entry state; it never samples a runtime StateFlow. */
+    fun getRuntimeSnapshot(id: String): ChannelRuntimeSnapshot? = synchronized(lock) {
+        entries[id]?.snapshotState
     }
 
+    /** Compatibility read of the ordered aggregate; new consumers should collect [runtimeSnapshots]. */
+    fun getAllRuntimeSnapshots(): List<ChannelRuntimeSnapshot> = runtimeSnapshots.value.entries
+
+    /** Schedules readiness callbacks through generation gates after taking a structural snapshot. */
     fun refreshReadiness() {
-        synchronized(lock) {
-            for (entry in entries.values) {
-                entry.runtime.refreshReadiness()
-            }
-        }
-    }
-    internal fun releaseLease(entry: RuntimeEntry) {
-        synchronized(lock) {
-            entry.activeLeases--
-            if (entry.activeLeases == 0 && entry.retired) {
-                retiredEntries.remove(entry)
-                closeEntryLocked(entry)
+        val liveEntries = synchronized(lock) { entries.values.filterIsInstance<LiveEntry>() }
+        liveEntries.forEach { entry ->
+            runtimeScope.launch {
+                entry.gate.invoke(RuntimeInvocationPhase.READINESS_REFRESH) {
+                    entry.runtime.refreshReadiness()
+                }
             }
         }
     }
 
-    fun shutdown() {
+    /**
+     * Stops admission, asks the audio terminal owner to end committed input, then waits within a
+     * bounded policy for every committed lease to release and every generation to close.
+     */
+    suspend fun shutdownAndAwait(): ChannelRuntimeRegistryShutdownResult {
+        val stops = mutableListOf<LifecycleEntry>()
+        val closures = mutableListOf<LifecycleEntry>()
+        val toAwait: List<CompletableDeferred<Unit>>
         synchronized(lock) {
-            if (isShutdown) return
-            isShutdown = true
-            
-            onPttSessionCancelRequested()
-            
-            for (entry in entries.values) {
-                entry.retired = true
-                closeEntryLocked(entry)
+            if (!isShutdown) {
+                isShutdown = true
+                entries.values.toList().forEach { entry ->
+                    retireLocked(entry, stops, closures)
+                }
+                entries.clear()
+                orderedIds = emptyList()
+                activeChannelId = ""
+                publishAggregateLocked()
             }
-            entries.clear()
-            orderedIds = emptyList()
-            
-            for (entry in retiredEntries) {
-                entry.retired = true
-                closeEntryLocked(entry)
+            toAwait = retiredEntries.map { it.closed }
+        }
+
+        stops.forEach { it.gate.stopAdmission() }
+        try {
+            withContext(NonCancellable) { onPttSessionCancelRequested() }
+        } finally {
+            for (entry in closures) closeLifecycleEntry(entry)
+        }
+
+        val completed = withContext(NonCancellable) {
+            withTimeoutOrNull(shutdownAwaitMillis) {
+                toAwait.forEach { it.await() }
+                true
+            } ?: false
+        }
+        return if (completed) {
+            ChannelRuntimeRegistryShutdownResult.Closed
+        } else {
+            ChannelRuntimeRegistryShutdownResult.TimedOutWaitingForCommittedTargets
+        }
+    }
+
+    private fun installDefinitionLocked(
+        definition: ChannelDefinition,
+        constructionPlans: MutableList<ConstructionPlan>,
+    ) {
+        val generation = RuntimeGeneration((generations[definition.id] ?: -1L) + 1L)
+        generations[definition.id] = generation.value
+        when (val resolution = providers.resolve(definition.implementationId)) {
+            is ChannelProviderResolution.Missing -> {
+                entries[definition.id] = unavailableEntry(
+                    definition,
+                    generation,
+                    ChannelPreparationReason.Provider(resolution.error),
+                    null,
+                )
             }
-            retiredEntries.clear()
+            is ChannelProviderResolution.Available -> {
+                val descriptor = resolution.provider.descriptor
+                val scope = RevocableChannelCapabilityScope(
+                    CapabilityScopeIdentity(definition.id, generation),
+                    descriptor.requiredCapabilities,
+                    capabilityHost,
+                )
+                val gate = invocationBoundary.openGeneration(
+                    definition.id,
+                    generation,
+                    runtimeScope,
+                    closeScope,
+                )
+                val pending = PendingEntry(
+                    definition,
+                    generation,
+                    snapshotFor(
+                        definition,
+                        ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.ProviderInitialising),
+                        descriptor.presentation.summary,
+                    ),
+                    scope,
+                    gate,
+                )
+                entries[definition.id] = pending
+                constructionPlans += ConstructionPlan(pending, resolution.provider, descriptor.presentation.summary)
+            }
+        }
+    }
+
+    private suspend fun construct(plan: ConstructionPlan) {
+        val attempt = when (
+            val outcome = plan.entry.gate.invoke(
+                RuntimeInvocationPhase.CONSTRUCT,
+                RuntimeInvocationOrigin.PROVIDER,
+            ) {
+                construct(plan.provider, plan.entry)
+            }
+        ) {
+            is RuntimeInvocationOutcome.Success -> outcome.value
+            else -> ConstructionAttempt.Failed(outcome.providerError(plan.entry.definition))
+        }
+
+        when (attempt) {
+            is ConstructionAttempt.Runtime -> installConstructedRuntime(plan, attempt.runtime)
+            is ConstructionAttempt.Failed -> installConstructionFailure(plan, attempt.error)
+        }
+    }
+
+    private suspend fun construct(
+        provider: ChannelImplementationProvider,
+        entry: PendingEntry,
+    ): ConstructionAttempt {
+        val configuration = when (
+            val result = provider.descriptor.configuration.migrateAndValidate(
+                entry.definition.configSchemaVersion,
+                entry.definition.configPayload,
+            )
+        ) {
+            is ProviderConfigurationResult.Success -> result.configuration
+            is ProviderConfigurationResult.Failure -> return ConstructionAttempt.Failed(result.error)
+        }
+        val effectiveDefinition = entry.definition.copy(
+            configSchemaVersion = configuration.schemaVersion,
+            configPayload = configuration.payload,
+        )
+        return when (
+            val result = provider.constructRuntime(
+                ChannelRuntimeConstructionRequest(effectiveDefinition, configuration, entry.capabilities),
+            )
+        ) {
+            is ChannelRuntimeConstructionResult.Success -> ConstructionAttempt.Runtime(result.runtime)
+            is ChannelRuntimeConstructionResult.Failure -> ConstructionAttempt.Failed(result.error)
+        }
+    }
+
+    private suspend fun installConstructedRuntime(plan: ConstructionPlan, runtime: ChannelRuntime) {
+        val live = synchronized(lock) {
+            if (!isShutdown && entries[plan.entry.definition.id] === plan.entry && !plan.entry.retired) {
+                LiveEntry(
+                    plan.entry.definition,
+                    plan.entry.generation,
+                    plan.entry.snapshotState,
+                    plan.entry.capabilities,
+                    plan.entry.gate,
+                    runtime,
+                ).also { entries[plan.entry.definition.id] = it }
+            } else {
+                null
+            }
+        }
+        if (live == null) {
+            closeDetachedGeneration(plan.entry, runtime)
+            return
+        }
+        collectSnapshots(live)
+    }
+
+    private suspend fun installConstructionFailure(plan: ConstructionPlan, error: ChannelProviderError) {
+        val closePending = synchronized(lock) {
+            if (!isShutdown && entries[plan.entry.definition.id] === plan.entry && !plan.entry.retired) {
+                entries[plan.entry.definition.id] = unavailableEntry(
+                    plan.entry.definition,
+                    plan.entry.generation,
+                    ChannelPreparationReason.Provider(error),
+                    plan.summary,
+                )
+                publishAggregateLocked()
+            }
+            plan.entry
+        }
+        closeDetachedGeneration(closePending, runtime = null)
+    }
+
+    private fun collectSnapshots(entry: LiveEntry) {
+        entry.snapshotCollection = runtimeScope.launch {
+            entry.runtime.snapshot.collect { runtimeSnapshot ->
+                entry.gate.commitIfLive {
+                    synchronized(lock) {
+                        if (!isShutdown && entries[entry.definition.id] === entry && !entry.retired) {
+                            entry.snapshotState = runtimeSnapshot.copy(
+                                id = entry.definition.id,
+                                name = entry.definition.name,
+                                implementationId = entry.definition.implementationId,
+                                enabled = entry.definition.enabled,
+                            )
+                            publishAggregateLocked()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun retireLocked(
+        entry: RuntimeEntry,
+        stops: MutableList<LifecycleEntry>,
+        closures: MutableList<LifecycleEntry>,
+    ) {
+        if (entry.retired) return
+        entry.retired = true
+        retiredEntries += entry
+        (entry as? LifecycleEntry)?.let(stops::add)
+        if (entry.activeLeases == 0) markForCloseLocked(entry)?.let(closures::add)
+    }
+
+    private fun markForCloseLocked(entry: RuntimeEntry): LifecycleEntry? {
+        if (entry.closeStarted) return null
+        entry.closeStarted = true
+        return entry as? LifecycleEntry ?: run {
+            entry.closed.complete(Unit)
+            retiredEntries -= entry
+            null
+        }
+    }
+
+    private suspend fun closeLifecycleEntry(entry: LifecycleEntry) {
+        entry.snapshotCollection?.cancel()
+        entry.gate.stopAdmission()
+        try {
+            entry.capabilities.revoke()
+            entry.gate.close {
+                (entry as? LiveEntry)?.runtime?.close()
+            }
+        } finally {
+            synchronized(lock) {
+                if (!entry.closed.isCompleted) entry.closed.complete(Unit)
+                retiredEntries -= entry
+            }
+        }
+    }
+
+    private suspend fun closeDetachedGeneration(entry: LifecycleEntry, runtime: ChannelRuntime?) {
+        entry.snapshotCollection?.cancel()
+        entry.gate.stopAdmission()
+        try {
+            entry.capabilities.revoke()
+            entry.gate.close { runtime?.close() }
+        } finally {
+            synchronized(lock) {
+                if (!entry.closed.isCompleted) entry.closed.complete(Unit)
+                retiredEntries -= entry
+            }
+        }
+    }
+
+    private suspend fun releaseLease(entry: LiveEntry) {
+        val closure = synchronized(lock) {
+            check(entry.activeLeases > 0) { "Committed target lease underflow" }
+            entry.activeLeases -= 1
+            if (entry.activeLeases == 0 && entry.retired) markForCloseLocked(entry) else null
+        }
+        if (closure != null) closeLifecycleEntry(closure)
+    }
+
+    private fun unavailableEntry(
+        definition: ChannelDefinition,
+        generation: RuntimeGeneration,
+        reason: ChannelPreparationReason,
+        summary: String?,
+    ): UnavailableEntry = UnavailableEntry(
+        definition,
+        generation,
+        snapshotFor(definition, ChannelPreparationAvailability.Unavailable(reason), summary),
+    )
+
+    private fun snapshotFor(
+        definition: ChannelDefinition,
+        preparation: ChannelPreparationAvailability,
+        summary: String?,
+    ): ChannelRuntimeSnapshot = ChannelRuntimeSnapshot(
+        id = definition.id,
+        name = definition.name,
+        implementationId = definition.implementationId,
+        enabled = definition.enabled,
+        preparation = if (definition.enabled) preparation else {
+            ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.Disabled)
+        },
+        executionStatus = ChannelExecutionStatus.IDLE,
+        summary = summary,
+    )
+
+    private fun preparationLocked(channelId: String): ChannelPreparationAvailability = when {
+        isShutdown -> ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.RegistryShutDown)
+        else -> entries[channelId]?.snapshotState?.preparation
+            ?: ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.UnknownInstance)
+    }
+
+    private fun publishAggregateLocked() {
+        _runtimeSnapshots.value = RuntimeRegistrySnapshot(
+            activeChannelId = activeChannelId,
+            entries = orderedIds.mapNotNull { entries[it]?.snapshotState },
+        )
+    }
+
+    private fun ChannelPreparationAvailability.reasonMessage(): String = when (this) {
+        ChannelPreparationAvailability.Available -> ChannelPreparationReason.UnknownInstance.message
+        is ChannelPreparationAvailability.Recoverable -> reason.message
+        is ChannelPreparationAvailability.Unavailable -> reason.message
+    }
+
+    private fun RuntimeInvocationOutcome<*>.reason(): ChannelPreparationReason = when (this) {
+        RuntimeInvocationOutcome.Busy -> ChannelPreparationReason.RuntimeBusy
+        RuntimeInvocationOutcome.Cancelled -> ChannelPreparationReason.RuntimeCancelled
+        RuntimeInvocationOutcome.TimedOut -> ChannelPreparationReason.RuntimeTimedOut
+        RuntimeInvocationOutcome.Closed -> ChannelPreparationReason.RuntimeClosed
+        is RuntimeInvocationOutcome.Unavailable -> ChannelPreparationReason.RuntimeFailed(reason)
+        is RuntimeInvocationOutcome.ProviderFailure,
+        is RuntimeInvocationOutcome.RuntimeFailure -> ChannelPreparationReason.RuntimeFailed()
+        is RuntimeInvocationOutcome.Success -> ChannelPreparationReason.RuntimeClosed
+    }
+
+    private fun RuntimeInvocationOutcome<*>.providerError(definition: ChannelDefinition): ChannelProviderError = when (this) {
+        is RuntimeInvocationOutcome.ProviderFailure -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            failure.message,
+        )
+        RuntimeInvocationOutcome.Busy -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            ChannelPreparationReason.RuntimeBusy.message,
+        )
+        RuntimeInvocationOutcome.Cancelled -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            ChannelPreparationReason.RuntimeCancelled.message,
+        )
+        RuntimeInvocationOutcome.TimedOut -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            ChannelPreparationReason.RuntimeTimedOut.message,
+        )
+        RuntimeInvocationOutcome.Closed -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            ChannelPreparationReason.RuntimeClosed.message,
+        )
+        is RuntimeInvocationOutcome.Unavailable -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            reason,
+        )
+        is RuntimeInvocationOutcome.RuntimeFailure -> ChannelProviderError.RuntimeConstructionFailed(
+            definition.implementationId,
+            failure.message,
+        )
+        is RuntimeInvocationOutcome.Success -> error("Successful construction has no provider error")
+    }
+
+    private suspend fun discardUncommittedTarget(
+        entry: LiveEntry,
+        target: ChannelInputTarget,
+        reason: String,
+    ) {
+        withContext(NonCancellable) {
+            entry.gate.invoke(RuntimeInvocationPhase.INPUT_CANCELLED) {
+                target.onInputCancelled(reason)
+            }
         }
     }
 
     private inner class LeaseWrappingTarget(
-        private val entry: RuntimeEntry,
-        private val original: ChannelInputTarget
-    ) : ChannelInputTarget {
-        private val released = AtomicBoolean(false)
-
-        private fun releaseLease() {
-            if (released.compareAndSet(false, true)) {
-                this@ChannelRuntimeRegistry.releaseLease(entry)
-            }
-        }
+        private val entry: LiveEntry,
+        private val original: ChannelInputTarget,
+        private val committedTarget: RuntimeCommittedTarget,
+    ) : ChannelInputTarget, CommittedTargetLeaseOwner {
+        private val terminalLock = Any()
+        private var terminalAdmissionClosed = false
+        private val terminalCallbacks = mutableListOf<Job>()
 
         override fun onInputStarted(session: ChannelAudioInputSession) {
-            try {
-                original.onInputStarted(session)
-            } catch (e: Exception) {
-                releaseLease()
-                throw e
+            runtimeScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                entry.gate.invoke(RuntimeInvocationPhase.INPUT_STARTED) {
+                    original.onInputStarted(session)
+                }
             }
         }
 
-        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-            return try {
+        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult = when (
+            val outcome = committedTarget.invoke(RuntimeInvocationPhase.INPUT_RELEASED) {
                 original.onInputReleased(recording)
-            } finally {
-                releaseLease()
             }
+        ) {
+            is RuntimeInvocationOutcome.Success -> outcome.value
+            else -> ChannelInputResult.None
         }
 
         override fun onInputPlaybackCompleted() {
-            original.onInputPlaybackCompleted()
+            enqueueTerminal(RuntimeInvocationPhase.INPUT_PLAYBACK_COMPLETED) {
+                original.onInputPlaybackCompleted()
+            }
         }
 
         override fun onInputCancelled(reason: String) {
-            try {
+            enqueueTerminal(RuntimeInvocationPhase.INPUT_CANCELLED) {
                 original.onInputCancelled(reason)
-            } finally {
-                releaseLease()
             }
         }
 
         override fun onInputFailed(reason: String) {
-            try {
+            enqueueTerminal(RuntimeInvocationPhase.INPUT_FAILED) {
                 original.onInputFailed(reason)
-            } finally {
-                releaseLease()
             }
         }
+
+        override suspend fun releaseCommittedTargetLease() {
+            val callbacks = synchronized(terminalLock) {
+                if (terminalAdmissionClosed) return
+                terminalAdmissionClosed = true
+                terminalCallbacks.toList()
+            }
+            withContext(NonCancellable) { callbacks.forEach { it.join() } }
+            committedTarget.release()
+            releaseLease(entry)
+        }
+
+        private fun enqueueTerminal(
+            phase: RuntimeInvocationPhase,
+            callback: suspend () -> Unit,
+        ) {
+            val job = runtimeScope.launch(start = CoroutineStart.LAZY) {
+                committedTarget.invoke(phase, callback = callback)
+            }
+            val admitted = synchronized(terminalLock) {
+                if (terminalAdmissionClosed) {
+                    false
+                } else {
+                    terminalCallbacks += job
+                    true
+                }
+            }
+            if (admitted) job.start()
+            else job.cancel()
+        }
+    }
+
+    private companion object {
+        const val DEFAULT_SHUTDOWN_AWAIT_MILLIS = 10_000L
     }
 }

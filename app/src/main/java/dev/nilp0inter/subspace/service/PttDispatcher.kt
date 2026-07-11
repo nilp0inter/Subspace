@@ -3,11 +3,8 @@ package dev.nilp0inter.subspace.service
 import android.util.Log
 import dev.nilp0inter.subspace.audio.ROUTE_LOG_TAG
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
-import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.routeDebugString
-import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.InputMode
-import dev.nilp0inter.subspace.model.KeyboardChannel
 import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
@@ -16,19 +13,16 @@ import kotlinx.coroutines.launch
 /**
  * Encapsulates PTT press/release dispatch and session tracking.
  *
- * Delegates channel-specific routing to [channelRouter] (typically the owning
- * [PttForegroundService]).
+ * Admission is decided from the provider-neutral runtime registry projection.
  */
 internal class PttDispatcher(
     private val serviceScope: CoroutineScope,
-    private val sco: ScoAudioController,
     private val inputModeController: InputModeController,
     private val audioSessionManager: PttAudioSessionManager,
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
     private val cancelIdleTimer: () -> Unit,
-    private val decidePttDispatch: (AppState) -> PttDispatchDecision?,
-    private val appStateProvider: () -> AppState,
+    private val decidePttDispatch: () -> PttDispatchDecision?,
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
 ) {
@@ -65,9 +59,8 @@ internal class PttDispatcher(
         }
         publishInputMode()
         cancelIdleTimer()
+        val decision = decidePttDispatch()
 
-        val appState = appStateProvider()
-        val decision = decidePttDispatch(appState)
         Log.d(ROUTE_LOG_TAG, "PTT_DECIDE decision=${decision?.let { it::class.simpleName }} channel=${decision?.channelId}")
         if (decision == null) return false
         val activeChannelId = decision.channelId
@@ -125,10 +118,4 @@ internal class PttDispatcher(
     fun isTerminalCarSource(): Boolean =
         activePttSession?.source == PttSource.CarTelecom
 
-    fun isKeyguardSession(): Boolean {
-        val session = activePttSession ?: return false
-        val state = appStateProvider()
-        val channel = state.channels.find { it.id == session.channelId } ?: return false
-        return channel.kind == dev.nilp0inter.subspace.model.ChannelKind.KEYBOARD
-    }
 }

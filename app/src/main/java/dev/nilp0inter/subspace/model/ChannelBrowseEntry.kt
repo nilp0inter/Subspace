@@ -1,82 +1,59 @@
 package dev.nilp0inter.subspace.model
 
+import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
+
 /**
- * Media-session-facing projection of a [Channel] for the Android Auto Media
- * browse tree (see `car-media-channel-browse` capability).
- *
- * The browse tree renders one row per entry; the row's mediaId is [id], title
- * is [name], and the subtitle combines [statusKind] with [pendingCount] (the
- * count is omitted from the subtitle when zero).
- *
- * The projection is produced by [projectChannelBrowseEntries] from an [AppState]
- * plus a per-channel pending-unheard count map (today always empty; a future
- * inbound-backlog tracker will feed the map without changing this data class).
+ * Host-owned Android Auto browse projection for one persisted channel instance.
+ * The identifier and order originate in the catalogue and remain stable even if the
+ * implementation provider cannot currently produce a runtime.
  */
 data class ChannelBrowseEntry(
     val id: String,
     val name: String,
     val statusKind: ChannelStatusKind,
     val pendingCount: Int,
+    val isPlayable: Boolean,
+    val recoveryMessage: String? = null,
 )
 
-enum class ChannelStatusKind { Active, Ready, Standby }
+enum class ChannelStatusKind { Active, Ready, Standby, Unavailable }
 
 /**
- * Stable ordering key for [Channel]. Channels are ordered ascending by this
- * index on both the phone dashboard and the Android Auto browse tree so
- * "Next/Prev" steering-wheel semantics and dashboard tap-to-activate share the
- * same mental model (see `car-media-channel-browse` spec: "Channel ordering is
- * stable across surfaces"). Defaults give [JournalChannel] index 0 and
- * [DebugChannel] index 1.
- */
-
-/**
- * Pure projection from [AppState] to a [ChannelBrowseEntry] list ordered by
- * [Channel.orderIndex], suitable for binding to Android Auto `onLoadChildren`.
- *
- * Active/Ready/Standby rule:
- *  - [ChannelStatusKind.Active]: channel id matches [AppState.activeChannelId].
- *  - [ChannelStatusKind.Ready]: channel [Channel.isReady] but not active.
- *  - [ChannelStatusKind.Standby]: channel not ready and not active.
- *
- * [pendingCounts] lets a future inbound-backlog tracker feed per-channel
- * pending counts without touching this function; missing entries default to 0.
+ * Projects every runtime aggregate entry in its existing catalogue order. Every persisted entry
+ * is playable because Android Auto uses the play command to select it; preparation remains
+ * separately represented by status and recovery metadata and is enforced only when PTT starts.
  */
 fun projectChannelBrowseEntries(
     appState: AppState,
     pendingCounts: Map<String, Int> = emptyMap(),
-): List<ChannelBrowseEntry> {
-    return appState.channels.map { channel ->
-        ChannelBrowseEntry(
-            id = channel.id,
-            name = channel.name,
-            statusKind = when {
-                appState.activeChannelId == channel.id -> ChannelStatusKind.Active
-                channel.isReady -> ChannelStatusKind.Ready
-                else -> ChannelStatusKind.Standby
-            },
-            pendingCount = pendingCounts[channel.id] ?: 0,
-        )
+): List<ChannelBrowseEntry> = appState.channels.map { channel ->
+    val isReady = channel.preparation is ChannelPreparationAvailability.Available
+    val reason = when (val preparation = channel.preparation) {
+        ChannelPreparationAvailability.Available -> null
+        is ChannelPreparationAvailability.Recoverable -> preparation.reason.message
+        is ChannelPreparationAvailability.Unavailable -> preparation.reason.message
     }
+    ChannelBrowseEntry(
+        id = channel.id,
+        name = channel.name,
+        statusKind = when {
+            !isReady -> ChannelStatusKind.Unavailable
+            appState.activeChannelId == channel.id -> ChannelStatusKind.Active
+            else -> ChannelStatusKind.Ready
+        },
+        pendingCount = pendingCounts[channel.id] ?: 0,
+        isPlayable = true,
+        recoveryMessage = reason?.let { "$it. Recover or remove this channel on your phone." },
+    )
 }
 
-/**
- * Stable ordered list of channel ids, sorted by [Channel.orderIndex]. Consumed
- * by both the phone dashboard and the Android Auto Media surface so
- * `Next/Prev` and tap-to-activate share the same ordering.
- */
+/** Stable full catalogue ordering shared by the phone and Android Auto. */
 fun orderedChannelIds(appState: AppState): List<String> =
-    projectChannelBrowseEntries(appState).map { it.id }
+    projectChannelBrowseEntries(appState).map(ChannelBrowseEntry::id)
 
 /**
- * Selects a channel id in the stable [Channel.orderIndex] ordering, saturating
- * at the bounds (no wraparound — see design D5 / spec
- * `car-contextual-skip-controls` "Previous saturates at the first channel
- * rather than wrap").
- *
- * [orderedChannelIds] MUST be in [Channel.orderIndex] order (use
- * [orderedChannelIds]). Returns null when the list is empty (the
- * empty-channel-list edge case in `car-contextual-skip-controls`).
+ * Selects a catalogue ID by stable order, saturating at the bounds. Unavailable IDs intentionally
+ * remain in the sequence because preparation state does not affect selection eligibility.
  */
 fun selectChannelByOffset(
     orderedChannelIds: List<String>,
@@ -84,9 +61,9 @@ fun selectChannelByOffset(
     offset: Int,
 ): String? {
     if (orderedChannelIds.isEmpty()) return null
-    val currentIndex = orderedChannelIds.indexOf(currentChannelId).let {
-        if (it < 0) 0 else it
+    val currentIndex = orderedChannelIds.indexOf(currentChannelId).let { index ->
+        if (index < 0) 0 else index
     }
-    val target = (currentIndex + offset).coerceIn(0, orderedChannelIds.lastIndex)
-    return orderedChannelIds[target]
+    return (currentIndex + offset).coerceIn(0, orderedChannelIds.lastIndex)
+        .let(orderedChannelIds::get)
 }

@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.audio
 
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
+
 import kotlinx.coroutines.flow.Flow
 
 interface ChannelAudioInputSession {
@@ -17,6 +19,7 @@ sealed interface ChannelInputEvent {
 sealed interface ChannelInputResult {
     data object None : ChannelInputResult
     data class Playback(val recording: RecordedPcm) : ChannelInputResult
+    data class PlaybackOperation(val operation: OpaqueAudioOperation) : ChannelInputResult
 }
 
 sealed interface ChannelInputAcceptance {

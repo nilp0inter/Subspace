@@ -103,11 +103,31 @@ The system SHALL request all required runtime permissions in a single batch when
 
 #### Scenario: All permissions granted
 - **WHEN** the user grants all requested permissions
-- **THEN** the permissions step shows a green check mark and the model download step becomes actionable
+- **THEN** the permissions step shows a green check mark and the storage-access step becomes actionable
 
 #### Scenario: Some permissions denied
 - **WHEN** the user denies one or more requested permissions
 - **THEN** the permissions step shows which permissions are still missing and the "Grant permissions" button remains available
+
+### Requirement: Storage access uses Android's dedicated settings flow
+
+The system SHALL require all-files access before model acquisition because Journal persists to
+user-selected real filesystem paths for external synchronization.
+
+#### Scenario: Request all-files access
+- **WHEN** runtime permissions are granted and the user taps "Allow storage access"
+- **THEN** the system opens Android's app-specific all-files access settings page
+
+#### Scenario: Return with storage access granted
+- **WHEN** the user grants all-files access and returns to Subspace
+- **THEN** bootstrap rechecks its prerequisites automatically
+- **AND** the storage-access step shows a green check mark
+- **AND** the model download step becomes actionable
+
+#### Scenario: Storage access remains denied
+- **WHEN** all-files access is missing
+- **THEN** bootstrap remains on the setup screen
+- **AND** model acquisition and core initialization do not start
 
 ### Requirement: ConnectionScreen no longer shows permissions
 

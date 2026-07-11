@@ -180,15 +180,15 @@ class CarMediaSessionService : MediaBrowserService() {
     }
 
     private fun mediaItemFor(entry: ChannelBrowseEntry): MediaItem {
-        val pill = statusKindPill(entry.statusKind)
-        val subtitle = appendPending(pill, entry.pendingCount)
+        val status = entry.recoveryMessage ?: statusKindPill(entry.statusKind)
+        val subtitle = appendPending(status, entry.pendingCount)
         return MediaItem(
             MediaDescription.Builder()
                 .setMediaId(entry.id)
                 .setTitle(entry.name)
                 .setSubtitle(subtitle)
                 .build(),
-            MediaItem.FLAG_PLAYABLE,
+            if (entry.isPlayable) MediaItem.FLAG_PLAYABLE else 0,
         )
     }
 
@@ -196,6 +196,7 @@ class CarMediaSessionService : MediaBrowserService() {
         ChannelStatusKind.Active -> "ACTIVE"
         ChannelStatusKind.Ready -> "READY"
         ChannelStatusKind.Standby -> "STANDBY"
+        ChannelStatusKind.Unavailable -> "UNAVAILABLE"
     }
 
     private fun updateSessionState(state: CarMediaPttState) {
@@ -250,21 +251,37 @@ class CarMediaSessionService : MediaBrowserService() {
         CarMediaPttState.Finalizing -> PlaybackState.STATE_BUFFERING
     }
 
-    private fun playbackState(state: Int): PlaybackState = PlaybackState.Builder()
-        .setActions(
-            PlaybackState.ACTION_PLAY or
-                PlaybackState.ACTION_PLAY_PAUSE or
-                PlaybackState.ACTION_PAUSE or
-                PlaybackState.ACTION_STOP or
-                PlaybackState.ACTION_SKIP_TO_NEXT or
-                PlaybackState.ACTION_SKIP_TO_PREVIOUS,
-        )
-        .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0f)
-        .build()
+    private fun playbackState(state: Int, errorMessage: String? = null): PlaybackState {
+        val builder = PlaybackState.Builder()
+            .setActions(
+                PlaybackState.ACTION_PLAY or
+                    PlaybackState.ACTION_PLAY_PAUSE or
+                    PlaybackState.ACTION_PAUSE or
+                    PlaybackState.ACTION_STOP or
+                    PlaybackState.ACTION_SKIP_TO_NEXT or
+                    PlaybackState.ACTION_SKIP_TO_PREVIOUS,
+            )
+            .setState(state, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0f)
+        errorMessage?.let(builder::setErrorMessage)
+        return builder.build()
+    }
+
+    private fun rejectPlayback(entry: ChannelBrowseEntry?) {
+        val message = entry?.recoveryMessage
+            ?: "This channel is unavailable. Recover or remove it on your phone."
+        lastKnownState = CarMediaPttState.NotReady
+        session.setPlaybackState(playbackState(PlaybackState.STATE_ERROR, message))
+    }
 
     private val callback = object : MediaSession.Callback() {
         override fun onPlay() {
-            CarPttCommandBus.startTelecomCapture()
+            val activeId = foregroundService?.appState?.value?.activeChannelId
+            val activeEntry = latestBrowseEntries.firstOrNull { it.id == activeId }
+            if (activeEntry != null) {
+                CarPttCommandBus.startTelecomCapture()
+            } else {
+                rejectPlayback(activeEntry)
+            }
         }
 
         override fun onPause() {
@@ -280,7 +297,12 @@ class CarMediaSessionService : MediaBrowserService() {
                 onPlay()
                 return
             }
-            CarPttCommandBus.setActiveChannel(mediaId)
+            val entry = latestBrowseEntries.firstOrNull { it.id == mediaId }
+            if (entry != null) {
+                CarPttCommandBus.setActiveChannel(entry.id)
+            } else {
+                rejectPlayback(entry)
+            }
         }
 
         override fun onSkipToNext() {
@@ -295,12 +317,12 @@ class CarMediaSessionService : MediaBrowserService() {
             val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
             if (event?.action != KeyEvent.ACTION_DOWN) return true
             when (event.keyCode) {
-                KeyEvent.KEYCODE_MEDIA_PLAY -> CarPttCommandBus.startTelecomCapture()
+                KeyEvent.KEYCODE_MEDIA_PLAY -> onPlay()
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                     if (lastKnownState == CarMediaPttState.Recording) {
                         CarPttCommandBus.release()
                     } else {
-                        CarPttCommandBus.startTelecomCapture()
+                        onPlay()
                     }
                 }
                 KeyEvent.KEYCODE_MEDIA_PAUSE,

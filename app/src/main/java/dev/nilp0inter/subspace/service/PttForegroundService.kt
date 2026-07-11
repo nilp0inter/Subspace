@@ -33,7 +33,6 @@ import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
-import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.LocalPcmOutput
 import dev.nilp0inter.subspace.audio.MediaResponsePlayer
 import dev.nilp0inter.subspace.audio.MediaResponsePcmOutput
@@ -43,7 +42,6 @@ import dev.nilp0inter.subspace.audio.ParakeetJniTranscriber
 import dev.nilp0inter.subspace.audio.PcmTranscriber
 import dev.nilp0inter.subspace.audio.ResolvedAudioRoute
 import dev.nilp0inter.subspace.audio.ScoAudioController
-import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
@@ -52,7 +50,6 @@ import dev.nilp0inter.subspace.audio.AnnouncementPcmCache
 import dev.nilp0inter.subspace.audio.AnnouncementCacheIdentity
 import android.content.pm.PackageManager
 import dev.nilp0inter.subspace.audio.TtsController
-import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.TelecomCallScoRoute
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
@@ -64,30 +61,27 @@ import dev.nilp0inter.subspace.audio.resolveScoAudioRoute
 import dev.nilp0inter.subspace.bluetooth.DeviceScanner
 import dev.nilp0inter.subspace.bluetooth.SppClient
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerBleConnection
-import dev.nilp0inter.subspace.channel.KeyboardPttController
-import dev.nilp0inter.subspace.model.KeyboardChannel
-import dev.nilp0inter.subspace.model.KeyboardConnectionState
-import dev.nilp0inter.subspace.model.KeyboardStatus
 import io.sleepwalker.core.hid.LowLevelHidImpl
 import io.sleepwalker.core.keymap.JsonKeymapDatabase
-import io.sleepwalker.core.keymap.HostProfile
 import dev.nilp0inter.subspace.channel.JournalController
-import dev.nilp0inter.subspace.channel.JournalEntryDiscovery
-import dev.nilp0inter.subspace.channel.JournalEntryPaths
-import dev.nilp0inter.subspace.channel.JournalMetadataStore
-import dev.nilp0inter.subspace.model.ChannelKind
-import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
-import dev.nilp0inter.subspace.model.JournalConfig
-import dev.nilp0inter.subspace.model.DebugConfig
-import dev.nilp0inter.subspace.model.KeyboardConfig
-import dev.nilp0inter.subspace.channel.JournalRuntimeFactory
-import dev.nilp0inter.subspace.channel.KeyboardRuntimeFactory
-import dev.nilp0inter.subspace.channel.JournalEntryMetadata
-import dev.nilp0inter.subspace.channel.MetadataChannelSnapshot
-import dev.nilp0inter.subspace.channel.CaptureState
-import dev.nilp0inter.subspace.channel.CaptureTaskState
-import dev.nilp0inter.subspace.channel.DerivedTaskState
-import dev.nilp0inter.subspace.channel.DerivedTaskStatus
+import dev.nilp0inter.subspace.channel.SleepwalkerTextOutputService
+import dev.nilp0inter.subspace.channel.JournalBuiltInProvider
+import dev.nilp0inter.subspace.channel.KeyboardBuiltInProvider
+import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
+import dev.nilp0inter.subspace.channel.capability.AudioOperationCapabilityAdapter
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.JournalStorageCapabilityAdapter
+import dev.nilp0inter.subspace.channel.capability.PlaybackResultFactory
+import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisParameters
+import dev.nilp0inter.subspace.channel.capability.SynthesisCapabilityAdapter
+import dev.nilp0inter.subspace.channel.capability.TranscriptionCapabilityAdapter
+import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
+import dev.nilp0inter.subspace.model.JournalProviderConfigurationCodec
+import java.util.concurrent.ConcurrentHashMap
+import dev.nilp0inter.subspace.channel.TextOutputAvailability
+import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
 import kotlinx.coroutines.flow.update
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.AnnouncementResult
@@ -101,7 +95,6 @@ import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ConnectionState
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.DevicePresence
-import dev.nilp0inter.subspace.model.EchoStatus
 import dev.nilp0inter.subspace.model.HardwareMode
 import dev.nilp0inter.subspace.model.HeadsetAudioState
 import dev.nilp0inter.subspace.model.MonitorState
@@ -110,8 +103,6 @@ import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.model.RawButtonEvent
 import dev.nilp0inter.subspace.model.SppState
 import dev.nilp0inter.subspace.model.SttModelStatus
-import dev.nilp0inter.subspace.model.SttStatus
-import dev.nilp0inter.subspace.model.SttTtsStatus
 import dev.nilp0inter.subspace.model.TtsStatus
 import dev.nilp0inter.subspace.model.projectChannelBrowseEntries
 import dev.nilp0inter.subspace.model.orderedChannelIds
@@ -121,7 +112,6 @@ import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
 import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -135,6 +125,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal fun deriveCarMediaPttState(
@@ -218,8 +210,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
     override var journalController: JournalController? = null
+    private lateinit var providerRegistry: ChannelImplementationProviderRegistry
+    private val _channelDescriptors = MutableStateFlow<List<ChannelImplementationDescriptor>>(emptyList())
+    val channelDescriptors: StateFlow<List<ChannelImplementationDescriptor>> = _channelDescriptors.asStateFlow()
+    private lateinit var runtimeInvocationBoundary: RuntimeInvocationBoundary
     private lateinit var runtimeRegistry: ChannelRuntimeRegistry
-    private val bridgeConnectedFlow = MutableStateFlow(false)
+    private lateinit var textOutputService: SleepwalkerTextOutputService
+    private lateinit var capabilityHost: ServiceChannelCapabilityHost
+    private val journalStorageBackends = ConcurrentHashMap<String, ServiceJournalStorageBackend>()
     private lateinit var scanner: DeviceScanner
     private lateinit var channelRepository: ChannelRepository
     private lateinit var audioManager: AudioManager
@@ -228,10 +226,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var telecomCaptureOutput: AndroidPcmOutput
     private lateinit var captureService: CaptureService
     private lateinit var voiceCommunicationSource: AndroidVoiceCommunicationCaptureSource
-    private lateinit var echo: EchoController
-    override var sttController: SttController? = null
     override var sttTranscriber: SttTranscriber? = null
-    private val sttReady = CompletableDeferred<SttTranscriber?>()
     private var sttModelDir: java.io.File? = null
     private var transcriptionService: TranscriptionService? = null
     private var sttModelStatusJob: Job? = null
@@ -240,12 +235,22 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var supertonicModelDir: java.io.File? = null
     override var announcer: SystemAnnouncer? = null
     private var ttsModelStatusJob: Job? = null
-    override var sttTtsController: SttTtsController? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
     private val keymapDatabase: JsonKeymapDatabase by lazy { JsonKeymapDatabase(resources) }
-    private var keyboardProfilesCache: List<Pair<HostProfile, String>>? = null
-    override var keyboardController: KeyboardPttController? = null
     private val buttonStateMachine = ButtonStateMachine()
+    override val textOutputAvailability: CapabilityAvailability
+        get() = if (!::textOutputService.isInitialized) {
+            CapabilityAvailability.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
+        } else {
+            when (textOutputService.availability.value) {
+                TextOutputAvailability.Available -> CapabilityAvailability.Available
+                TextOutputAvailability.Preparing,
+                TextOutputAvailability.Unavailable -> CapabilityAvailability.Recoverable
+                TextOutputAvailability.Closed -> CapabilityAvailability.Unavailable(
+                    CapabilityUnavailableReason.HOST_NOT_READY,
+                )
+            }
+        }
 
     private lateinit var localOutput: MediaResponsePcmOutput
     private lateinit var micSource: AndroidMicCaptureSource
@@ -293,11 +298,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         readinessProbe = ReadinessProbe(this, scanner, bluetoothAdapter, { headsetProxy })
         bluetoothAdapter?.getProfileProxy(this, headsetServiceListener, BluetoothProfile.HEADSET)
         sleepwalkerConnection = SleepwalkerBleConnection()
-        channelRepository = ChannelRepository(applicationContext)
-        _appState.value = _appState.value.copy(
-            channels = emptyList(),
-            activeChannelId = channelRepository.loadActiveChannelId(),
+        textOutputService = SleepwalkerTextOutputService(
+            scope = serviceScope,
+            connection = sleepwalkerConnection,
+            hid = LowLevelHidImpl(),
+            keymapDatabase = keymapDatabase,
+            connect = { timeoutMillis ->
+                sleepwalkerConnection.ensureConnected(bluetoothAdapter, this@PttForegroundService, timeoutMillis)
+            },
         )
+        channelRepository = ChannelRepository(applicationContext)
+        _appState.value = _appState.value.copy(channels = emptyList())
 
         audioManager = getSystemService(AudioManager::class.java)
         sco = ScoAudioController(
@@ -324,7 +335,37 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             captureService = captureService,
             channelRouter = this,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
+            cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
             onTerminalCompleted = ::onAudioSessionTerminalCompleted,
+        )
+        capabilityHost = ServiceChannelCapabilityHost(
+            textOutputService = textOutputService,
+            transcription = ::transcriptionCapability,
+            synthesis = ::synthesisCapability,
+            audioOperation = ::audioOperationCapability,
+            journal = ::journalCapability,
+        )
+        val keyboardProvider = KeyboardBuiltInProvider()
+        providerRegistry = ChannelImplementationProviderRegistry().also { providers ->
+            check(providers.register(JournalBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+            check(providers.register(DebugBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+            check(providers.register(keyboardProvider) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+        }
+        _channelDescriptors.value = providerRegistry.descriptors()
+        serviceScope.launch(Dispatchers.Default) {
+            keyboardProvider.updateHostProfiles(keymapDatabase.profiles)
+            _channelDescriptors.value = providerRegistry.descriptors()
+        }
+        runtimeInvocationBoundary = RuntimeInvocationBoundary(
+            RuntimeWorkerDispatcher.create(workerCount = 2, queueCapacity = 64),
+        )
+        runtimeRegistry = ChannelRuntimeRegistry(
+            providers = providerRegistry,
+            capabilityHost = capabilityHost,
+            invocationBoundary = runtimeInvocationBoundary,
+            runtimeScope = serviceScope,
+            closeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+            onPttSessionCancelRequested = { pttDispatcher.forceReleaseActivePtt() },
         )
         carTelecomStarter = CarTelecomStarter(
             context = this,
@@ -338,85 +379,49 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
             isActivePttSession = { pttDispatcher.activePttSession != null },
-            decidePttDispatch = { decidePttDispatch(_appState.value) },
+            decidePttDispatch = { decidePttDispatch(runtimeRegistry.runtimeSnapshots.value) },
             reservePendingCarPtt = { channelId ->
                 pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId)
             },
-            cancelPendingCarPtt = {
-                pttDispatcher.forceReleaseActivePtt()
-            },
+            cancelPendingCarPtt = { _ -> pttDispatcher.forceReleaseActivePtt() },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
             updateCarMediaState = ::updateCarMediaState,
         )
         pttDispatcher = PttDispatcher(
             serviceScope = serviceScope,
-            sco = sco,
             inputModeController = inputModeController,
             audioSessionManager = audioSessionManager,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
             cancelIdleTimer = ::cancelIdleTimer,
-            decidePttDispatch = ::decidePttDispatch,
-            appStateProvider = { _appState.value },
+            decidePttDispatch = { decidePttDispatch(runtimeRegistry.runtimeSnapshots.value) },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
             updateCarMediaState = ::updateCarMediaState,
         )
         serviceScope.launch {
-            sleepwalkerConnection.connectionState.collect { state ->
-                updateMonitor { it.copy(keyboardConnectionState = state) }
-                bridgeConnectedFlow.value = state == KeyboardConnectionState.Connected
-                refreshReadiness()
+            textOutputService.availability.collect { availability ->
+                val monitorState = when (availability) {
+                    TextOutputAvailability.Available -> dev.nilp0inter.subspace.model.KeyboardConnectionState.Connected
+                    TextOutputAvailability.Preparing -> dev.nilp0inter.subspace.model.KeyboardConnectionState.Connecting
+                    TextOutputAvailability.Unavailable,
+                    TextOutputAvailability.Closed -> dev.nilp0inter.subspace.model.KeyboardConnectionState.Disconnected
+                }
+                updateMonitor { it.copy(keyboardConnectionState = monitorState) }
+                runtimeRegistry.refreshReadiness()
             }
         }
         CarPttCommandBus.setListener(this)
         TelecomCarPttCoordinator.setListener(this)
-        echo = EchoController(
-            scope = serviceScope,
-            sco = sco,
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            output = pcmOutput,
-        )
-
-        val factories = mapOf(
-            ChannelKind.JOURNAL to JournalRuntimeFactory(
-                scope = serviceScope,
-                journalControllerProvider = { journalController }
-            ),
-            ChannelKind.DEBUG to DebugRuntimeFactory(
-                echoController = echo,
-                sttControllerProvider = { sttController },
-                ttsControllerProvider = { ttsController },
-                sttTtsControllerProvider = { sttTtsController },
-                modelDirProvider = { supertonicModelDir },
-                monitorStateProvider = { _appState.value.monitor }
-            ),
-            ChannelKind.KEYBOARD to KeyboardRuntimeFactory(
-                scope = serviceScope,
-                controllerProvider = { keyboardController },
-                bridgeConnectedFlow = bridgeConnectedFlow,
-                ensureBridgeConnected = {
-                    sleepwalkerConnection.ensureConnected(
-                        bluetoothAdapter,
-                        this@PttForegroundService,
-                    )
-                },
-            )
-        )
-        runtimeRegistry = ChannelRuntimeRegistry(factories, onPttSessionCancelRequested = {
-            pttDispatcher.forceReleaseActivePtt()
-        })
-
         serviceScope.launch {
-            channelRepository.catalogueState.collect { catalogueSnapshot ->
-                runtimeRegistry.reconcile(catalogueSnapshot)
-                updateActiveControllers(catalogueSnapshot)
-                _appState.value = _appState.value.copy(
-                    channels = runtimeRegistry.getAllRuntimeSnapshots(),
-                    activeChannelId = catalogueSnapshot.activeChannelId
-                )
+            runtimeRegistry.runtimeSnapshots.collect { aggregate ->
+                _appState.update {
+                    it.copy(channels = aggregate.entries, activeChannelId = aggregate.activeChannelId)
+                }
                 updateCarMediaState()
             }
+        }
+        serviceScope.launch {
+            channelRepository.catalogueState.collect(runtimeRegistry::reconcile)
         }
         // Initialize the process-scoped model asset repository and bootstrap
         // coordinator. The coordinator owns the authoritative bootstrap state
@@ -439,12 +444,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 updateMonitor { it.copy(scoState = state) }
             }
         }
-        serviceScope.launch {
-            echo.status.collect { status ->
-                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                updateMonitor { it.copy(echoStatus = status) }
-            }
-        }
 
         AndroidAutoPresenceBus.setListener { connected ->
             updateInputMode()
@@ -456,6 +455,47 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
         updateCarMediaState()
     }
+    private fun transcriptionCapability(identity: CapabilityScopeIdentity) =
+        transcriptionService?.let(::TranscriptionCapabilityAdapter)
+
+    private fun synthesisCapability(identity: CapabilityScopeIdentity) = ttsSynthesizer?.let { synthesizer ->
+        SynthesisCapabilityAdapter(synthesizer) { voice ->
+            if (voice.id != "default") {
+                null
+            } else {
+                supertonicModelDir?.let { modelDirectory ->
+                    SpeechSynthesisParameters(
+                        voiceStylePath = voiceStyleFile(_appState.value.monitor.ttsVoiceStyle, modelDirectory).absolutePath,
+                        totalSteps = _appState.value.monitor.ttsTotalSteps,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun audioOperationCapability(identity: CapabilityScopeIdentity) =
+        AudioOperationCapabilityAdapter(
+            PlaybackResultFactory { samples ->
+                AudioOperationArtifact(dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, SCO_RATE))
+            },
+        )
+
+    private fun journalCapability(identity: CapabilityScopeIdentity) =
+        journalController?.let { controller ->
+            val definition = channelRepository.catalogueState.value.definitions
+                .find { it.id == identity.channelInstanceId }
+                ?: return@let null
+            val configuration = JournalProviderConfigurationCodec.decode(definition.configPayload).getOrNull()
+                ?.takeIf { !it.baseDirectory.isNullOrBlank() }
+                ?: return@let null
+            val key = "${identity.channelInstanceId}:${identity.runtimeGeneration.value}"
+            JournalStorageCapabilityAdapter(
+                journalStorageBackends.computeIfAbsent(key) {
+                    ServiceJournalStorageBackend(identity.channelInstanceId, configuration, controller)
+                },
+            )
+        }
+
 
     // ---- CoreInit implementation ----
 
@@ -469,6 +509,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 modelDir = modelDir.absolutePath,
             )
             sttTranscriber = transcriber
+            transcriptionService = TranscriptionService(transcriber)
+            sttModelStatusJob = serviceScope.launch {
+                var lastStatus: SttModelStatus? = null
+                while (true) {
+                    val status = transcriber.modelStatus
+                    if (status != lastStatus) {
+                        lastStatus = status
+                        updateMonitor { it.copy(sttModelStatus = status) }
+                    }
+                    kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
+                }
+            }
             transcriber
         } catch (err: Throwable) {
             Log.w(TAG, "STT transcriber unavailable: ${err.message}")
@@ -493,42 +545,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         }
     }
 
-    override fun constructSttController(transcriber: SttTranscriber) {
-        sttReady.complete(transcriber)
-        val transcription = TranscriptionService(transcriber)
-        transcriptionService = transcription
-        sttController = SttController(
-            scope = serviceScope,
-            sco = sco,
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            output = pcmOutput,
-            transcriptionService = transcription,
-        )
-        Log.d(ROUTE_LOG_TAG, "STT_CONTROLLER_INIT sttController set")
-        sttModelStatusJob = serviceScope.launch {
-            var lastStatus: SttModelStatus? = null
-            while (true) {
-                val status = transcriber.modelStatus
-                if (status != lastStatus) {
-                    lastStatus = status
-                    updateMonitor { it.copy(sttModelStatus = status) }
-                }
-                kotlinx.coroutines.delay(STT_MODEL_POLL_MS)
-            }
-        }
-        serviceScope.launch {
-            sttController?.status?.collect { status ->
-                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                updateMonitor {
-                    val newTranscript = (status as? SttStatus.Transcribed)?.text
-                        ?: it.sttTranscript
-                    it.copy(sttStatus = status, sttTranscript = newTranscript)
-                }
-            }
-        }
-        updateActiveControllers()
-    }
 
     override fun constructTtsController(synthesizer: TtsSynthesizer) {
         ttsController = TtsController(
@@ -556,33 +572,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateActiveControllers()
     }
 
-    override fun constructSttTtsController(
-        transcriber: SttTranscriber,
-        synthesizer: TtsSynthesizer,
-    ) {
-        sttTtsController = SttTtsController(
-            scope = serviceScope,
-            sco = sco,
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            output = pcmOutput,
-            transcriber = transcriber,
-            synthesizer = synthesizer,
-        )
-        serviceScope.launch {
-            sttTtsController?.status?.collect { status ->
-                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                val transcript = (status as? SttTtsStatus.Transcript)?.text
-                    ?: _appState.value.monitor.sttTtsTranscript
-                updateMonitor { it.copy(sttTtsStatus = status, sttTtsTranscript = transcript) }
-            }
-        }
-        updateActiveControllers()
-    }
 
     override fun constructJournalPttController() {
         if (journalController != null) return
-        val transcriber = sttReady.getCompleted()
+        val transcriber = sttTranscriber
         val pcmTranscriber: PcmTranscriber = if (transcriber != null) {
             TranscriptionService(transcriber)
         } else {
@@ -592,62 +585,15 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 }
             }
         }
-        val jc = JournalController(
+        journalController = JournalController(
             scope = serviceScope,
             encoder = OggEncoder(),
             transcriber = pcmTranscriber,
         )
-        this.journalController = jc
-
-        val currentSnapshot = channelRepository.catalogueState.value
-        val journalDef = currentSnapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
-        val journalConfig = journalDef?.config as? JournalConfig
-        val baseDir = journalConfig?.baseDirectory?.takeIf { it.isNotBlank() }
-        if (baseDir != null) {
-            jc.runRecovery(java.io.File(baseDir))
-        }
-
-        serviceScope.launch {
-            var lastBaseDir: String? = baseDir
-            channelRepository.catalogueState.collect { snapshot ->
-                val def = snapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
-                val config = def?.config as? JournalConfig
-                val currentDir = config?.baseDirectory?.takeIf { it.isNotBlank() }
-                if (currentDir != null && currentDir != lastBaseDir) {
-                    lastBaseDir = currentDir
-                    jc.runRecovery(java.io.File(currentDir))
-                }
-            }
-        }
     }
 
-    override fun constructKeyboardController(transcriber: SttTranscriber) {
-        val transcription = transcriptionService
-            ?: TranscriptionService(transcriber).also { transcriptionService = it }
-        keyboardController = KeyboardPttController(
-            scope = serviceScope,
-            sco = sco,
-            captureService = captureService,
-            source = voiceCommunicationSource,
-            output = pcmOutput,
-            transcriptionService = transcription,
-            connection = sleepwalkerConnection,
-            hid = LowLevelHidImpl(),
-            keymapDatabase = keymapDatabase,
-            hostProfileProvider = {
-                val snapshot = channelRepository.catalogueState.value
-                val def = snapshot.definitions.find { it.kind == ChannelKind.KEYBOARD }
-                val config = def?.config as? KeyboardConfig
-                config?.hostProfile ?: HostProfile.LINUX_US
-            },
-        )
-        serviceScope.launch {
-            keyboardController?.status?.collect { status ->
-                if (isTerminalCarStatus(status)) pttDispatcher.forceReleaseActivePtt()
-                updateMonitor { it.copy(keyboardStatus = status) }
-            }
-        }
-        updateActiveControllers()
+    override fun initializeTextOutputCapability() {
+        check(::textOutputService.isInitialized) { "Text output host service must be initialized first" }
     }
 
     override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
@@ -704,15 +650,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sttModelStatusJob = null
         ttsModelStatusJob?.cancel()
         ttsModelStatusJob = null
-        sttController?.cancelAndRelease()
-        sttController = null
         ttsController?.cancelAndRelease()
         ttsController = null
-        sttTtsController?.cancelAndRelease()
-        sttTtsController = null
         journalController = null
-        keyboardController?.cancelAndRelease()
-        keyboardController = null
+        journalStorageBackends.clear()
         announcer = null
         sttTranscriber = null
         ttsSynthesizer = null
@@ -751,11 +692,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     override fun onDestroy() {
-        runtimeRegistry.shutdown()
+        runBlocking {
+            withContext(Dispatchers.Default) {
+                withTimeoutOrNull(45_000L) {
+                    audioSessionManager.shutdownAndAwait()
+                    runtimeRegistry.shutdownAndAwait()
+                    textOutputService.close()
+                    runtimeInvocationBoundary.close()
+                }
+            }
+        }
         bootstrapCoordinator.cancelAttempt()
-        pttDispatcher.forceReleaseActivePtt()
-        keyboardController?.cancelAndRelease()
-        sleepwalkerConnection.disconnect()
         CarPttCommandBus.setListener(null)
         AndroidAutoPresenceBus.setListener(null)
         TelecomCarPttCoordinator.setListener(null)
@@ -769,10 +716,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sppClient?.disconnect()
         sttModelStatusJob?.cancel()
         ttsModelStatusJob?.cancel()
-        echo.cancelAndRelease()
-        sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
-        sttTtsController?.cancelAndRelease()
         serviceScope.cancel()
         stopForegroundIfNeeded()
         headsetProxy?.let { bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HEADSET, it) }
@@ -821,95 +765,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
 
 
-    /**
-     * Initialize journal recovery. The [JournalPttController] is now
-     * constructed by the bootstrap coordinator via [constructJournalPttController].
-     * This method handles only journal recovery and base-directory watching,
-     * which are outside the bootstrap completion predicate.
-     */
-    private fun initializeJournal(audioManager: AudioManager) {
-        serviceScope.launch {
-            val sttTranscriber = sttReady.await()
-            val transcriber: PcmTranscriber = if (sttTranscriber != null) {
-                TranscriptionService(sttTranscriber)
-            } else {
-                object : PcmTranscriber {
-                    override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String {
-                        throw IllegalStateException("STT transcriber unavailable")
-                    }
-                }
-            }
-            val journalController = JournalController(
-                scope = serviceScope,
-                encoder = OggEncoder(),
-                transcriber = transcriber,
-            )
-
-            val currentSnapshot = channelRepository.catalogueState.value
-            val journalDef = currentSnapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
-            val journalConfig = journalDef?.config as? JournalConfig
-            val baseDir = journalConfig?.baseDirectory?.takeIf { it.isNotBlank() }
-            if (baseDir != null) {
-                journalController.runRecovery(java.io.File(baseDir))
-            }
-
-            var lastBaseDir: String? = baseDir
-            channelRepository.catalogueState.collect { snapshot ->
-                val def = snapshot.definitions.find { it.kind == ChannelKind.JOURNAL }
-                val config = def?.config as? JournalConfig
-                val currentDir = config?.baseDirectory?.takeIf { it.isNotBlank() }
-                if (currentDir != null && currentDir != lastBaseDir) {
-                    lastBaseDir = currentDir
-                    journalController.runRecovery(java.io.File(currentDir))
-                }
-            }
-        }
-    }
-
-    private fun updateActiveControllers(
-        snapshot: ChannelCatalogueSnapshot = channelRepository.catalogueState.value
-    ) {
-        val activeDefinition = snapshot.definitions.find { it.id == snapshot.activeChannelId }
-        val debugConfig = activeDefinition?.config as? DebugConfig
-        val mode = debugConfig?.mode ?: DebugMode.ECHO
-        val isDebugActive = activeDefinition?.kind == ChannelKind.DEBUG
-
-        echo.setEnabled(isDebugActive && mode == DebugMode.ECHO)
-        if (!(isDebugActive && mode == DebugMode.ECHO)) {
-            echo.cancelAndRelease()
-            updateMonitor { it.copy(echoStatus = EchoStatus.Idle) }
-        }
-
-        Log.d(ROUTE_LOG_TAG, "UPDATE_CONTROLLERS isDebugActive=$isDebugActive mode=$mode sttController=${sttController != null} setting=${isDebugActive && mode == DebugMode.STT}")
-        sttController?.setEnabled(isDebugActive && mode == DebugMode.STT)
-        if (!(isDebugActive && mode == DebugMode.STT)) {
-            sttController?.cancelAndRelease()
-            updateMonitor { it.copy(sttStatus = SttStatus.Idle) }
-        }
-
-        ttsController?.setEnabled(isDebugActive && mode == DebugMode.TTS)
-        if (!(isDebugActive && mode == DebugMode.TTS)) {
-            ttsController?.cancelAndRelease()
-            updateMonitor { it.copy(ttsStatus = TtsStatus.Idle) }
-        }
-
-        sttTtsController?.setEnabled(isDebugActive && mode == DebugMode.STT_TTS)
-        if (!(isDebugActive && mode == DebugMode.STT_TTS)) {
-            sttTtsController?.cancelAndRelease()
-            updateMonitor { it.copy(sttTtsStatus = SttTtsStatus.Idle) }
-        }
-
-        val isKeyboardActive = activeDefinition?.kind == ChannelKind.KEYBOARD
-        keyboardController?.setEnabled(isKeyboardActive)
-        if (!isKeyboardActive) {
-            keyboardController?.cancelAndRelease()
-            updateMonitor { it.copy(keyboardStatus = KeyboardStatus.Idle) }
-        }
+    private fun updateActiveControllers() {
         if (::runtimeRegistry.isInitialized) {
-            runtimeRegistry.refreshReadiness()
-            _appState.update { state ->
-                state.copy(channels = runtimeRegistry.getAllRuntimeSnapshots())
-            }
+            serviceScope.launch { runtimeRegistry.refreshReadiness() }
         }
     }
 
@@ -930,11 +788,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateInputMode()
 
         if (::runtimeRegistry.isInitialized) {
-            runtimeRegistry.refreshReadiness()
-            _appState.update { it.copy(channels = runtimeRegistry.getAllRuntimeSnapshots()) }
+            serviceScope.launch { runtimeRegistry.refreshReadiness() }
         }
         maybeScheduleAutomaticSerialConnection()
     }
+
 
     @SuppressLint("MissingPermission")
     fun scanForDevice() {
@@ -987,8 +845,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun disconnectSerial() {
         pttDispatcher.forceReleaseActivePtt()
-        keyboardController?.cancelAndRelease()
-        sleepwalkerConnection.disconnect()
         reconnectPolicy.clearMonitoring()
         reconnectJob?.cancel()
         stopReadinessRefreshLoop()
@@ -997,70 +853,77 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sppClient?.disconnect()
         sppClient = null
         updateConnection { it.copy(spp = SppState.Disconnected) }
-        echo.cancelAndRelease()
-        sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
-        sttTtsController?.cancelAndRelease()
         stopForegroundIfNeeded()
         stopSelf()
         refreshReadiness()
     }
 
-    fun setJournalDirectory(channelId: String, path: String) {
-        channelRepository.updateChannel(channelId) { old ->
-            val oldConfig = old.config as JournalConfig
-            old.copy(config = oldConfig.copy(baseDirectory = path))
-        }
-    }
 
-    fun setKeyboardHostProfile(channelId: String, profile: io.sleepwalker.core.keymap.HostProfile) {
-        channelRepository.updateChannel(channelId) { old ->
-            old.copy(config = KeyboardConfig(profile))
-        }
-    }
-
-    fun getKeymapProfiles(): List<Pair<HostProfile, String>> {
-        keyboardProfilesCache?.let { return it }
-        val profiles = keymapDatabase.profiles.sortedBy { it.hostOs + it.layout + (it.variant ?: "") }
-        val result = profiles.map { profile ->
-            val displayName = buildString {
-                append(profile.layout)
-                profile.variant?.let { append(" ($it)") }
-                append(" [${profile.hostOs}]")
+    fun createChannel(
+        implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId,
+        name: String,
+        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject? = null,
+    ): dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult {
+        val provider = when (val resolution = providerRegistry.resolve(implementationId)) {
+            is dev.nilp0inter.subspace.model.ChannelProviderResolution.Available -> resolution.provider
+            is dev.nilp0inter.subspace.model.ChannelProviderResolution.Missing -> {
+                return dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult.Failure(
+                    dev.nilp0inter.subspace.model.ChannelRepositoryError.ProviderMigration(
+                        definitionId = "new",
+                        error = resolution.error,
+                    ),
+                )
             }
-            profile to displayName
         }
-        keyboardProfilesCache = result
-        return result
+        return channelRepository.addChannel(
+            dev.nilp0inter.subspace.model.ChannelDefinition(
+                id = java.util.UUID.randomUUID().toString(),
+                name = name,
+                implementationId = implementationId,
+                enabled = true,
+                configSchemaVersion = provider.descriptor.configuration.currentSchemaVersion,
+                configPayload = payload ?: provider.descriptor.configuration.defaultPayload(),
+            ),
+        )
     }
 
-    fun connectKeyboardBridge() {
-        val adapter = bluetoothAdapter ?: return
-        sleepwalkerConnection.connect(adapter, this)
-    }
-
-    fun disconnectKeyboardBridge() {
-        sleepwalkerConnection.disconnect()
-    }
-
-    fun setJournalSaveVoice(channelId: String, enabled: Boolean) {
-        channelRepository.updateChannel(channelId) { old ->
-            val oldConfig = old.config as JournalConfig
-            if (!enabled && !oldConfig.saveText) old
-            else old.copy(config = oldConfig.copy(saveVoice = enabled))
+    fun updateChannelConfiguration(
+        channelId: String,
+        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
+    ): dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult {
+        val definition = channelRepository.catalogueState.value.definitions.find { it.id == channelId }
+            ?: return channelRepository.updateChannel(channelId) { it }
+        val provider = when (val resolution = providerRegistry.resolve(definition.implementationId)) {
+            is dev.nilp0inter.subspace.model.ChannelProviderResolution.Available -> resolution.provider
+            is dev.nilp0inter.subspace.model.ChannelProviderResolution.Missing -> {
+                return dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult.Failure(
+                    dev.nilp0inter.subspace.model.ChannelRepositoryError.ProviderMigration(channelId, resolution.error),
+                )
+            }
+        }
+        return channelRepository.updateChannel(channelId) { old ->
+            old.copy(
+                configSchemaVersion = provider.descriptor.configuration.currentSchemaVersion,
+                configPayload = payload,
+            )
         }
     }
 
-    fun setJournalSaveText(channelId: String, enabled: Boolean) {
-        channelRepository.updateChannel(channelId) { old ->
-            val oldConfig = old.config as JournalConfig
-            if (!enabled && !oldConfig.saveVoice) old
-            else old.copy(config = oldConfig.copy(saveText = enabled))
-        }
+    fun selectChannel(id: String): Boolean {
+        val previousId = channelRepository.catalogueState.value.activeChannelId
+        val result = channelRepository.selectChannel(id)
+        val selected = result is dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult.Success
+        Log.d(
+            ROUTE_LOG_TAG,
+            "CHANNEL_SELECT requested=$id previous=$previousId selected=$selected " +
+                "active=${channelRepository.catalogueState.value.activeChannelId}",
+        )
+        return selected
     }
 
     fun setActiveChannelId(id: String) {
-        channelRepository.selectChannel(id)
+        selectChannel(id)
     }
 
     fun setActiveChannelOffset(offset: Int) {
@@ -1068,7 +931,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val newId = selectChannelByOffset(orderedIds, _appState.value.activeChannelId, offset)
             ?: return
         if (newId == _appState.value.activeChannelId) return
-        channelRepository.selectChannel(newId)
+        selectChannel(newId)
     }
 
     /**
@@ -1095,11 +958,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     fun replayLastHeard() {
     }
 
-    fun phonePttPressed(channelId: String) {
+    fun startPhonePtt(channelId: String): Boolean {
+        if (!selectChannel(channelId)) return false
         Log.d(ROUTE_LOG_TAG, "PHONE_PTT_PRESSED channel=$channelId")
         logAudioRouteSnapshot("phone-ptt-pressed")
-        setActiveChannelId(channelId)
-        pttDispatcher.dispatchPttPressed(PttSource.Phone)
+        return pttDispatcher.dispatchPttPressed(PttSource.Phone)
     }
 
     fun phonePttReleased(channelId: String) {
@@ -1183,11 +1046,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         updateCarMediaState()
     }
 
-    fun setDebugChannelMode(channelId: String, mode: DebugMode) {
-        channelRepository.updateChannel(channelId) { old ->
-            old.copy(config = DebugConfig(mode))
-        }
-    }
 
     fun setTtsText(text: String) {
         updateMonitor { it.copy(ttsText = text) }
@@ -1227,7 +1085,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun requestTtsSynthesis() {
         val tts = ttsController ?: return
-        if (!tts.enabled) return
         val modelDir = supertonicModelDir ?: return
         val monitor = _appState.value.monitor
         val voiceStylePath = voiceStyleFile(monitor.ttsVoiceStyle, modelDir).absolutePath
@@ -1308,10 +1165,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 }
             }
             RawButtonEvent.PttReleased -> pttDispatcher.dispatchPttReleased(PttSource.Rsm)
-            RawButtonEvent.SosPressed -> {
-                if (_appState.value.activeChannelId == KeyboardChannel.ID) {
-                    keyboardController?.sendEnter()
-                }
+            RawButtonEvent.SosPressed -> serviceScope.launch {
+                runtimeRegistry.dispatchSos(_appState.value.activeChannelId)
             }
             else -> Unit
         }
@@ -1355,17 +1210,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         )
     }
 
-    private fun isTerminalCarStatus(status: EchoStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
-        (status is EchoStatus.Error || status == EchoStatus.MaxDurationReached)
 
-    private fun isTerminalCarStatus(status: SttStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
-        (status is SttStatus.Error || status == SttStatus.MaxDurationReached)
-
-    private fun isTerminalCarStatus(status: SttTtsStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
-        (status is SttTtsStatus.Error || status == SttTtsStatus.MaxDurationReached)
-
-    private fun isTerminalCarStatus(status: KeyboardStatus): Boolean = pttDispatcher.isTerminalCarSource() &&
-        (status is KeyboardStatus.Error || status == KeyboardStatus.MaxDurationReached)
 
 
     @SuppressLint("MissingPermission")
@@ -1430,11 +1275,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
         pttDispatcher.forceReleaseActivePtt()
-        keyboardController?.cancelAndRelease()
-        echo.cancelAndRelease("SPP disconnected")
-        sttController?.cancelAndRelease()
         ttsController?.cancelAndRelease()
-        sttTtsController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {

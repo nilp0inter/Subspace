@@ -1,182 +1,368 @@
 package dev.nilp0inter.subspace.service
 
+import dev.nilp0inter.subspace.audio.CaptureServiceFakes
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
+import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
-import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.audio.resolveLocalAudioRoute
+import dev.nilp0inter.subspace.channel.capability.CapabilityAcquisition
+import dev.nilp0inter.subspace.channel.capability.CapabilityAcquisitionPolicy
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
+import dev.nilp0inter.subspace.channel.capability.ChannelCapability
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
+import dev.nilp0inter.subspace.channel.capability.CapabilityKey
+import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
+import dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome
+import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
+import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
+import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
+import dev.nilp0inter.subspace.model.ChannelCatalogueCodec
+import dev.nilp0inter.subspace.model.ChannelCatalogueDecodeResult
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
+import dev.nilp0inter.subspace.model.ChannelConfigurationField
+import dev.nilp0inter.subspace.model.ChannelConfigurationMigrationStep
+import dev.nilp0inter.subspace.model.ChannelConfigurationProvider
 import dev.nilp0inter.subspace.model.ChannelDefinition
-import dev.nilp0inter.subspace.model.ChannelKind
-import dev.nilp0inter.subspace.model.JournalConfig
-import dev.nilp0inter.subspace.model.DebugConfig
-import dev.nilp0inter.subspace.model.DebugMode
-import dev.nilp0inter.subspace.model.KeyboardConfig
-import io.sleepwalker.core.keymap.HostProfile
+import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
+import dev.nilp0inter.subspace.model.ChannelImplementationId
+import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelPreparationTraits
+import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
+import dev.nilp0inter.subspace.model.ChannelProviderError
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
+import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.ProviderConfigurationResult
+import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
+import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class ServiceIntegrationTest {
-
     @Test
-    fun catalogueToRegistryToDispatchFlow() = runTest {
-        val fJournal = FakeRuntimeFactory()
-        val registry = ChannelRuntimeRegistry(mapOf(
-            ChannelKind.JOURNAL to fJournal
-        ))
+    fun persistedV1AndV2DefinitionsResolveGenericallyAndPreserveUnavailableOrder() = runTest {
+        val provider = CompositionProvider(BuiltInChannelImplementationIds.JOURNAL)
+        val registry = compositionRegistry(provider, RecordingCapabilityHost())
 
-        val d1 = ChannelDefinition("c1", "Journal", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        val snapshot = ChannelCatalogueSnapshot(listOf(d1), "c1")
-        registry.reconcile(snapshot)
-
-        // Verify dispatch decider resolves correctly against active channel ID and registry snapshot
-        val state = AppState(
-            channels = registry.getAllRuntimeSnapshots(),
-            activeChannelId = "c1"
+        val v1 = decoded(
+            """
+            {"version":1,"activeChannelId":"second","definitions":[
+              {"id":"first","name":"First","kind":"JOURNAL","enabled":true,"configSchemaVersion":1,
+               "config":{"stage":1,"profile":"first","future":{"keep":true}}},
+              {"id":"second","name":"Second","kind":"JOURNAL","enabled":true,"configSchemaVersion":1,
+               "config":{"stage":1,"profile":"second","future":{"keep":false}}}
+            ]}
+            """.trimIndent(),
         )
-        val decision = decidePttDispatch(state)
-        assertEquals(PttDispatchDecision.Dispatch("c1"), decision)
+        registry.reconcile(v1.snapshot)
+        advanceUntilIdle()
+
+        assertEquals(1, v1.sourceDocumentVersion)
+        assertEquals(listOf("first", "second"), registry.runtimeSnapshots.value.entries.map { it.id })
+        assertEquals(PttDispatchDecision.Dispatch("second"), decidePttDispatch(registry.runtimeSnapshots.value))
+        assertEquals(listOf("first", "second"), provider.constructions.map { it.instanceId })
+        assertEquals(listOf("first", "second"), provider.constructions.map { it.profile })
+        assertEquals(listOf("first", "second"), provider.constructions.map { it.scopeIdentity.channelInstanceId })
+        assertTrue(provider.constructions.first().payload.toJsonObject().getJSONObject("future").getBoolean("keep"))
+
+        val v2 = decoded(
+            """
+            {"version":2,"activeChannelId":"missing","definitions":[
+              {"id":"missing","name":"Offline extension","implementationId":"external:absent","enabled":true,
+               "configSchemaVersion":7,"config":{"preserve":"unchanged"}},
+              {"id":"second","name":"Second","implementationId":"builtin:journal","enabled":true,
+               "configSchemaVersion":2,"config":{"stage":2,"profile":"second","future":{"keep":false}}}
+            ]}
+            """.trimIndent(),
+        )
+        registry.reconcile(v2.snapshot)
+        advanceUntilIdle()
+
+        assertEquals(2, v2.sourceDocumentVersion)
+        assertEquals(listOf("missing", "second"), registry.runtimeSnapshots.value.entries.map { it.id })
+        assertEquals(PttDispatchDecision.ErrorBeep("missing"), decidePttDispatch(registry.runtimeSnapshots.value))
+        assertTrue(registry.prepareInput("missing") is ChannelInputAcceptance.Unavailable)
+        assertEquals("unchanged", v2.snapshot.definitions.first().configPayload.toJsonObject().getString("preserve"))
+
+        assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, registry.shutdownAndAwait())
     }
 
     @Test
-    fun committedTargetSurvivalAndRemovalDuringPtt() = runTest {
-        val fJournal = FakeRuntimeFactory()
-        val registry = ChannelRuntimeRegistry(mapOf(
-            ChannelKind.JOURNAL to fJournal
-        ))
+    fun unavailableCapabilityRefusesBeforeCaptureOrReadyBeep() = runTest {
+        val provider = CompositionProvider(ChannelImplementationId("test:needs-text"))
+        val capabilityHost = RecordingCapabilityHost(unavailableInstances = setOf("needs-text"))
+        val registry = compositionRegistry(provider, capabilityHost)
+        val definition = ChannelDefinition(
+            id = "needs-text",
+            name = "Needs text output",
+            implementationId = provider.descriptor.implementationId,
+            enabled = true,
+            configSchemaVersion = 2,
+            configPayload = opaque("""{"stage":2,"profile":"blocked"}"""),
+        )
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        advanceUntilIdle()
 
-        val d1 = ChannelDefinition("c1", "Journal", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        val snapshot = ChannelCatalogueSnapshot(listOf(d1), "c1")
-        registry.reconcile(snapshot)
+        val output = RecordingOutput()
+        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(4, 2))
+        val manager = PttAudioSessionManager(
+            scope = this,
+            captureService = CaptureServiceFakes.newService(this),
+            channelRouter = registry,
+            resolvePttAudioRoute = { resolveLocalAudioRoute(output, source) },
+        )
 
-        val rt = fJournal.instances.first()
-        val originalTarget = object : ChannelInputTarget {
-            override fun onInputStarted(session: ChannelAudioInputSession) {}
-            override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult = ChannelInputResult.None
-            override fun onInputCancelled(reason: String) {}
-            override fun onInputFailed(reason: String) {}
+        assertTrue(manager.start(dev.nilp0inter.subspace.model.PttSource.Phone, definition.id, dev.nilp0inter.subspace.model.InputMode.OnAPinch))
+        advanceUntilIdle()
+
+        assertEquals(listOf("needs-text"), capabilityHost.acquisitions.map { it.channelInstanceId })
+        assertEquals(0, source.openCount)
+        assertEquals(0, output.readyBeeps)
+        assertEquals(1, output.errorBeeps)
+        assertFalse(manager.isActive)
+        assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, registry.shutdownAndAwait())
+    }
+}
+
+internal fun TestScope.compositionRegistry(
+    provider: CompositionProvider,
+    capabilityHost: RecordingCapabilityHost,
+    onPttSessionCancelRequested: suspend () -> Unit = {},
+): ChannelRuntimeRegistry {
+    val providers = ChannelImplementationProviderRegistry()
+    check(providers.register(provider) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+    val workers = RuntimeWorkerDispatcher.fromDispatcher(StandardTestDispatcher(testScheduler))
+    return ChannelRuntimeRegistry(
+        providers = providers,
+        capabilityHost = capabilityHost,
+        invocationBoundary = RuntimeInvocationBoundary(workers),
+        runtimeScope = this,
+        closeScope = this,
+        onPttSessionCancelRequested = onPttSessionCancelRequested,
+    )
+}
+
+internal fun decoded(json: String) = (ChannelCatalogueCodec.decode(json) as? ChannelCatalogueDecodeResult.Success)
+    ?.document ?: throw AssertionError("Expected valid persisted catalogue")
+
+internal fun opaque(json: String): OpaqueJsonObject = OpaqueJsonObject.parse(json).getOrThrow()
+
+/** Test-only provider exercising only the public generic provider and capability contracts. */
+internal class CompositionProvider(
+    implementationId: ChannelImplementationId,
+) : ChannelImplementationProvider {
+    private val configuration = CompositionConfiguration(implementationId)
+    val constructions = mutableListOf<Construction>()
+    val runtimes = mutableListOf<CompositionRuntime>()
+
+    override val descriptor = ChannelImplementationDescriptor(
+        implementationId = implementationId,
+        presentation = ChannelPresentationMetadata("Composition", "Composition test provider", "Provider unavailable"),
+        configuration = configuration,
+        configurationFields = listOf(ChannelConfigurationField.TextField("profile", "Profile")),
+        requiredCapabilities = setOf(ChannelCapability.TextOutput),
+        preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = true),
+    )
+
+    override suspend fun constructRuntime(request: ChannelRuntimeConstructionRequest): ChannelRuntimeConstructionResult {
+        val profile = request.configuration.payload.toJsonObject().getString("profile")
+        constructions += Construction(request.definition.id, profile, request.capabilities.identity, request.configuration.payload)
+        val runtime = CompositionRuntime(request.definition, request.capabilities, profile)
+        runtimes += runtime
+        return ChannelRuntimeConstructionResult.Success(runtime)
+    }
+
+    data class Construction(
+        val instanceId: String,
+        val profile: String,
+        val scopeIdentity: CapabilityScopeIdentity,
+        val payload: OpaqueJsonObject,
+    )
+}
+
+private class CompositionConfiguration(
+    override val implementationId: ChannelImplementationId,
+) : ChannelConfigurationProvider {
+    override val currentSchemaVersion: Int = 2
+
+    override fun defaultPayload(): OpaqueJsonObject = opaque("""{"stage":2,"profile":"new"}""")
+
+    override fun validate(schemaVersion: Int, payload: OpaqueJsonObject): ProviderConfigurationResult {
+        val profile = payload.toJsonObject().optString("profile")
+        return if (schemaVersion == currentSchemaVersion && payload.toJsonObject().optInt("stage") == currentSchemaVersion && profile.isNotBlank()) {
+            ProviderConfigurationResult.Success(ValidatedChannelConfiguration(implementationId, schemaVersion, payload))
+        } else {
+            ProviderConfigurationResult.Failure(
+                ChannelProviderError.InvalidConfiguration(implementationId, schemaVersion, "stage and profile are required"),
+            )
         }
-        rt.nextAcceptance = ChannelInputAcceptance.Accepted(originalTarget)
-
-        // Prepare input -> lease acquired
-        val prep = registry.prepareInput("c1")
-        assertTrue(prep is ChannelInputAcceptance.Accepted)
-        val target = (prep as ChannelInputAcceptance.Accepted).target
-
-        // Simulate reorder / selection change (reconcile with same configuration but different active)
-        val snapshot2 = ChannelCatalogueSnapshot(listOf(d1), "c1")
-        registry.reconcile(snapshot2)
-        assertFalse(rt.isClosed) // Runtimes survive selection / reorder!
-
-        // Simulate removal of definition "c1" during active PTT session
-        val d2 = ChannelDefinition("c2", "Journal 2", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        val snapshot3 = ChannelCatalogueSnapshot(listOf(d2), "c2")
-        registry.reconcile(snapshot3)
-
-        // Old runtime should be retired but NOT closed since it has active leases!
-        assertFalse(rt.isClosed)
-
-        // Release target -> retired runtime closes exactly once
-        target.onInputCancelled("Done")
-        assertTrue(rt.isClosed)
-        assertEquals(1, rt.closeCount.get())
     }
 
-    @Test
-    fun runtimeFailureIsolationAndTeardown() = runTest {
-        val fJournal = FakeRuntimeFactory()
-        val registry = ChannelRuntimeRegistry(mapOf(
-            ChannelKind.JOURNAL to fJournal
-        ))
+    override fun migrateStep(
+        fromSchemaVersion: Int,
+        payload: OpaqueJsonObject,
+    ): ChannelConfigurationMigrationStep = if (fromSchemaVersion == 1) {
+        ChannelConfigurationMigrationStep.Success(
+            OpaqueJsonObject.fromJsonObject(payload.toJsonObject().put("stage", currentSchemaVersion)),
+        )
+    } else {
+        ChannelConfigurationMigrationStep.Failure(
+            ChannelProviderError.UnsupportedSchemaVersion(implementationId, fromSchemaVersion, currentSchemaVersion),
+        )
+    }
+}
 
-        val d1 = ChannelDefinition("c1", "Journal", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        registry.reconcile(ChannelCatalogueSnapshot(listOf(d1), "c1"))
+internal class CompositionRuntime(
+    private val definition: ChannelDefinition,
+    private val capabilities: ChannelCapabilityScope,
+    val profile: String,
+) : ChannelRuntime {
+    private val _snapshot = MutableStateFlow(
+        ChannelRuntimeSnapshot(
+            id = definition.id,
+            name = definition.name,
+            implementationId = definition.implementationId,
+            enabled = definition.enabled,
+            preparation = ChannelPreparationAvailability.Available,
+            executionStatus = ChannelExecutionStatus.IDLE,
+        ),
+    )
+    var releaseGate: CompletableDeferred<Unit>? = null
+    private var textLease: dev.nilp0inter.subspace.channel.capability.CapabilityLease<TextOutputCapability>? = null
+    val events = mutableListOf<String>()
+    var closeCount = 0
+        private set
 
-        val rt = fJournal.instances.first()
-        val throwingTarget = object : ChannelInputTarget {
-            override fun onInputStarted(session: ChannelAudioInputSession) {}
+    override val id: String = definition.id
+    override val snapshot: StateFlow<ChannelRuntimeSnapshot> = _snapshot.asStateFlow()
+
+    override suspend fun prepareInput(): ChannelInputAcceptance {
+        val acquisition = capabilities.acquire(
+            CapabilityKey.TextOutput,
+            CapabilityAcquisitionPolicy.PrepareRecoverable(100),
+        )
+        val lease = (acquisition as? CapabilityAcquisition.Available)?.lease
+            ?: return ChannelInputAcceptance.Unavailable("Text output is unavailable")
+        textLease = lease
+        return ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+            override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
             override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-                throw RuntimeException("Target threw non-cancellation exception")
+                events += "released:$profile"
+                releaseGate?.await()
+                return ChannelInputResult.None
             }
-            override fun onInputCancelled(reason: String) {}
-            override fun onInputFailed(reason: String) {}
-        }
-        rt.nextAcceptance = ChannelInputAcceptance.Accepted(throwingTarget)
 
-        val prep = registry.prepareInput("c1")
-        assertTrue(prep is ChannelInputAcceptance.Accepted)
-        val target = (prep as ChannelInputAcceptance.Accepted).target
+            override fun onInputCancelled(reason: String) {
+                events += "cancelled:$profile:$reason"
+            }
 
-        // Verify that even if target throws, lease gets released and no double close or leaks happen
-        try {
-            target.onInputReleased(RecordedPcm(shortArrayOf(1,2,3), 16_000))
-        } catch (e: Exception) {
-            // caught
-        }
-
-        // Registry should have 0 active leases
-        // Reconcile removal
-        registry.reconcile(ChannelCatalogueSnapshot(listOf(ChannelDefinition("c2", "J2", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))), "c2"))
-        
-        // Old runtime should close exactly once since leases was released!
-        assertTrue(rt.isClosed)
-        assertEquals(1, rt.closeCount.get())
+            override fun onInputFailed(reason: String) {
+                events += "failed:$profile:$reason"
+            }
+        })
     }
 
-    private class FakeRuntime(
-        override val definition: ChannelDefinition
-    ) : ChannelRuntime {
-        override val id: String = definition.id
-        
-        private val _snapshot = MutableStateFlow(
-            ChannelRuntimeSnapshot(
-                id = definition.id,
-                name = definition.name,
-                kind = definition.kind,
-                enabled = definition.enabled,
-                isReady = true,
-                executionStatus = ChannelExecutionStatus.IDLE
-            )
+    suspend fun sendLateText(): CapabilityOperationResult<TextDeliveryOutcome>? = textLease?.use { port ->
+        CapabilityOperationResult.Success(
+            port.sendText(TextOutputRequest("late", TextOutputProfile("test:profile"))),
         )
-        override val snapshot: StateFlow<ChannelRuntimeSnapshot> = _snapshot.asStateFlow()
-
-        var isClosed = false
-        val closeCount = AtomicInteger(0)
-        var nextAcceptance: ChannelInputAcceptance = ChannelInputAcceptance.Refused("No input configured")
-
-        override fun updateDefinition(definition: ChannelDefinition) {
-            _snapshot.value = _snapshot.value.copy(
-                name = definition.name,
-                enabled = definition.enabled
-            )
-        }
-
-        override suspend fun prepareInput(): ChannelInputAcceptance = nextAcceptance
-
-        override fun close() {
-            isClosed = true
-            closeCount.incrementAndGet()
-        }
     }
 
-    private class FakeRuntimeFactory : ChannelRuntimeFactory {
-        val instances = mutableListOf<FakeRuntime>()
+    override suspend fun close() {
+        closeCount += 1
+        events += "closed:$profile"
+    }
+}
 
-        override fun create(definition: ChannelDefinition): ChannelRuntime {
-            val rt = FakeRuntime(definition)
-            instances.add(rt)
-            return rt
+internal class RecordingCapabilityHost(
+    private val unavailableInstances: Set<String> = emptySet(),
+) : ChannelCapabilityHost {
+    val acquisitions = mutableListOf<CapabilityScopeIdentity>()
+    val cleanup = mutableListOf<String>()
+    val deliveredTexts = mutableListOf<String>()
+
+    override suspend fun availability(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<*>,
+    ): CapabilityAvailability = if (identity.channelInstanceId in unavailableInstances) {
+        CapabilityAvailability.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
+    } else {
+        CapabilityAvailability.Available
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    override suspend fun <T : ChannelCapabilityPort> acquire(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<T>,
+    ): HostedCapabilityAcquisition<T> {
+        acquisitions += identity
+        if (identity.channelInstanceId in unavailableInstances) {
+            return HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
         }
+        if (key != CapabilityKey.TextOutput) {
+            return HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        }
+        return HostedCapabilityAcquisition.Available(
+            object : TextOutputCapability {
+                override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
+                    deliveredTexts += "${identity.channelInstanceId}:${request.text}"
+                    return TextDeliveryOutcome.Delivered("delivery-${identity.channelInstanceId}")
+                }
+
+                override suspend fun sendKey(request: dev.nilp0inter.subspace.channel.capability.TextKeyRequest): TextDeliveryOutcome =
+                    TextDeliveryOutcome.Delivered("key-${identity.channelInstanceId}")
+            },
+            cleanup = { termination -> cleanup += "${identity.channelInstanceId}:${identity.runtimeGeneration.value}:$termination" },
+        ) as HostedCapabilityAcquisition<T>
+    }
+
+    override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<T>,
+        timeoutMillis: Long,
+    ): HostedCapabilityAcquisition<T> = acquire(identity, key)
+}
+internal class RecordingOutput : PcmOutput {
+    var readyBeeps = 0
+        private set
+    var errorBeeps = 0
+        private set
+    var routeReleases = 0
+        private set
+
+    override suspend fun playReadyBeep(coldStart: Boolean) {
+        readyBeeps += 1
+    }
+
+    override suspend fun playErrorBeep(coldStart: Boolean) {
+        errorBeeps += 1
+    }
+
+    override suspend fun play(recording: RecordedPcm) = Unit
+
+    override suspend fun releaseRoute() {
+        routeReleases += 1
     }
 }

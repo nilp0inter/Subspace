@@ -5,494 +5,363 @@ import android.content.pm.PackageManager
 import dev.nilp0inter.subspace.audio.FakeSttTranscriber
 import dev.nilp0inter.subspace.audio.FakeTtsSynthesizer
 import dev.nilp0inter.subspace.audio.ModelAssetRepository
-import io.mockk.coEvery
-import io.mockk.every
-import io.mockk.mockk
-import io.mockk.mockkObject
-import io.mockk.unmockkAll
-import io.mockk.verify
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.TestScope
-import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.runCurrent
-import kotlinx.coroutines.test.setMain
-import kotlinx.coroutines.test.resetMain
-import org.junit.After
-import org.junit.Before
-
-import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.SttTranscriber
-import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.channel.JournalController
-import dev.nilp0inter.subspace.channel.KeyboardPttController
-import dev.nilp0inter.subspace.model.BootstrapStage
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.model.AnnouncementResult
+import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.SttModelStatus
-import dev.nilp0inter.subspace.model.TtsModelStatus
+import io.mockk.coEvery
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.unmockkAll
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * Unit tests for [BootstrapCoordinator] state machine contracts.
- *
- * These tests verify the observable state types and the CoreInit interface
- * contracts. Full integration tests with a real coordinator require Android
- * Context and are covered by the spec's device verification tasks (5.7/5.8).
- */
 class BootstrapCoordinatorTest {
-    @Before
-    fun setUp() {
-    }
-
     @After
     fun tearDown() {
         unmockkAll()
     }
 
     @Test
-    fun `simple test to verify environment`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        every { context.checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
+    fun `ready native engines and host services complete bootstrap`() = runTest {
+        val coreInit = FakeCoreInit()
+        val coordinator = coordinator(coreInit)
 
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } returns emptyList()
+        coordinator.startBootstrap()
+        advanceUntilIdle()
 
-        val coreInit = FakeCoreInitImpl()
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+    }
+
+    @Test
+    fun `missing all-files access enters dedicated setup before model download or core initialization`() = runTest {
+        var modelDownloadCount = 0
+        val coreInit = FakeCoreInit()
+        val coordinator = coordinator(
             coreInit = coreInit,
-        )
-        assertEquals(BootstrapState.ConnectingService, coordinator.state.value)
-    }
-
-    @Test
-    fun `retry coalescing coalesces concurrent retries`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        every { context.checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
-
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } coAnswers {
-            delay(10000)
-            emptyList()
-        }
-
-        val sttTranscriberMock = mockk<SttTranscriber>(relaxed = true)
-        every { sttTranscriberMock.modelStatus } returns SttModelStatus.Loading
-
-        val ttsSynthesizerMock = mockk<TtsSynthesizer>(relaxed = true)
-        every { ttsSynthesizerMock.modelStatus } returns TtsModelStatus.Loading
-
-        var discardCount = 0
-        val coreInit = mockk<CoreInit>(relaxed = true)
-        every { coreInit.constructSttTranscriber() } returns sttTranscriberMock
-        every { coreInit.constructTtsSynthesizer() } returns ttsSynthesizerMock
-        every { coreInit.discardControllers() } answers { discardCount++ }
-
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
-            coreInit = coreInit,
-        )
-
-        try {
-            coordinator.startBootstrap()
-            delay(100)
-            Thread.sleep(50)
-
-            // Now call retry twice concurrently
-            coordinator.retry()
-            coordinator.retry()
-
-            delay(500)
-            Thread.sleep(250)
-
-            // The first retry will run discardControllers once.
-            // The second concurrent retry should be ignored because the first retryJob is active.
-            assertEquals("Expected exactly one call to discardControllers due to coalescing", 1, discardCount)
-        } finally {
-            coordinator.cancelAttempt()
-        }
-    }
-
-    @Test
-    fun `retry cancels and joins prior attempt before discarding controllers`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        every { context.checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
-
-        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
-
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } coAnswers {
-            try {
-                delay(10000)
-                emptyList()
-            } finally {
-                events.add("prior_cancelled")
-            }
-        }
-
-        val coreInit = mockk<CoreInit>(relaxed = true)
-        every { coreInit.discardControllers() } answers {
-            events.add("discard_controllers")
-        }
-
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
-            coreInit = coreInit,
-        )
-
-        try {
-            coordinator.startBootstrap()
-            // Let the prior attempt enter inspectAll and suspend
-            delay(100)
-            Thread.sleep(50)
-
-            // Call retry, which cancels/joins prior and then calls discardControllers
-            coordinator.retry()
-
-            // Wait to let it execute
-            delay(500)
-            Thread.sleep(250)
-
-            // Assert they executed in the correct order
-            assertEquals(listOf("prior_cancelled", "discard_controllers"), events)
-        } finally {
-            coordinator.cancelAttempt()
-        }
-    }
-
-    @Test
-    fun `replacement attempt does not start progress until prior attempt joins`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
-
-        every { context.checkPermission(any(), any(), any()) } answers {
-            // This is called by the replacement attempt when checking permissions
-            events.add("replacement_progress")
-            PackageManager.PERMISSION_GRANTED
-        }
-
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } coAnswers {
-            try {
-                delay(10000)
-                emptyList()
-            } finally {
-                events.add("prior_finished")
-            }
-        }
-
-        val coreInit = mockk<CoreInit>(relaxed = true)
-
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
-            coreInit = coreInit,
-        )
-
-        try {
-            coordinator.startBootstrap()
-            delay(100)
-            Thread.sleep(50)
-
-            // Clear events from the first attempt
-            events.clear()
-
-            // Trigger retry
-            coordinator.retry()
-
-            delay(500)
-            Thread.sleep(250)
-
-            assertTrue("Expected events to contain prior_finished", events.contains("prior_finished"))
-            assertTrue("Expected events to contain replacement_progress", events.contains("replacement_progress"))
-            assertTrue(
-                "Expected prior_finished to occur before replacement_progress, was: $events",
-                events.indexOf("prior_finished") < events.indexOf("replacement_progress")
-            )
-        } finally {
-            coordinator.cancelAttempt()
-        }
-    }
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    @Test
-    fun `stale attempt cannot publish state or mutate controllers after retry`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        every { context.checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
-
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } returns emptyList()
-
-        val sttTranscriber1 = mockk<SttTranscriber>(relaxed = true)
-        val firstTranscriberWaiting = CompletableDeferred<Unit>()
-        every { sttTranscriber1.modelStatus } answers {
-            firstTranscriberWaiting.complete(Unit)
-            SttModelStatus.Loading
-        }
-
-        val sttTranscriber2 = mockk<SttTranscriber>(relaxed = true)
-        val replacementTranscriberWaiting = CompletableDeferred<Unit>()
-        every { sttTranscriber2.modelStatus } answers {
-            replacementTranscriberWaiting.complete(Unit)
-            SttModelStatus.Loading
-        }
-
-        val coreInit = mockk<CoreInit>(relaxed = true)
-
-        // Return transcriber1 first, then transcriber2
-        var constructCount = 0
-        every { coreInit.constructSttTranscriber() } answers {
-            constructCount++
-            if (constructCount == 1) sttTranscriber1 else sttTranscriber2
-        }
-
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
-            coreInit = coreInit,
-            ioDispatcher = StandardTestDispatcher(testScheduler),
-        )
-
-        try {
-            coordinator.startBootstrap()
-            runCurrent()
-            firstTranscriberWaiting.await()
-
-            coordinator.retry()
-            runCurrent()
-            replacementTranscriberWaiting.await()
-
-            // Verify that coreInit.constructSttController was never called with transcriber1!
-            verify(exactly = 0) { coreInit.constructSttController(sttTranscriber1) }
-
-            // State should still be PreparingCore (InitializingStt) for the replacement attempt
-            assertEquals(
-                BootstrapState.PreparingCore(BootstrapStage.InitializingStt),
-                coordinator.state.value,
-            )
-
-        } finally {
-            coordinator.cancelAttempt()
-        }
-    }
-    @Test
-    fun `cancelling bootstrap attempt cancels STT and TTS async children`() = runTest {
-        val context = mockk<Context>(relaxed = true)
-        every { context.checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
-
-        val modelRepository = mockk<ModelAssetRepository>(relaxed = true)
-        coEvery { modelRepository.inspectAll() } returns emptyList()
-
-        var sttPollCount = 0
-        var ttsPollCount = 0
-
-        val sttTranscriberMock = mockk<SttTranscriber>(relaxed = true)
-        every { sttTranscriberMock.modelStatus } answers {
-            sttPollCount++
-            SttModelStatus.Loading
-        }
-
-        val ttsSynthesizerMock = mockk<TtsSynthesizer>(relaxed = true)
-        every { ttsSynthesizerMock.modelStatus } answers {
-            ttsPollCount++
-            TtsModelStatus.Loading
-        }
-
-        val coreInit = mockk<CoreInit>(relaxed = true)
-        every { coreInit.sttTranscriber } returns sttTranscriberMock
-        every { coreInit.ttsSynthesizer } returns ttsSynthesizerMock
-        every { coreInit.constructSttTranscriber() } returns sttTranscriberMock
-        every { coreInit.constructTtsSynthesizer() } returns ttsSynthesizerMock
-
-        val coordinator = BootstrapCoordinator(
-            context = context,
-            scope = this,
-            modelRepository = modelRepository,
-            coreInit = coreInit,
-        )
-
-        try {
-            coordinator.startBootstrap()
-
-            // Let it run and poll a few times
-            var attempts = 0
-            while ((sttPollCount < 2 || ttsPollCount < 2) && attempts < 20) {
-                delay(100)
-                Thread.sleep(50)
-                attempts++
-            }
-            if (sttPollCount < 2) {
-                throw RuntimeException("Expected STT to poll at least twice, was $sttPollCount. State: ${coordinator.state.value}")
-            }
-            if (ttsPollCount < 2) {
-                throw RuntimeException("Expected TTS to poll at least twice, was $ttsPollCount. State: ${coordinator.state.value}")
-            }
-
-            val sttPollCountBeforeCancel = sttPollCount
-            val ttsPollCountBeforeCancel = ttsPollCount
-
-            // Cancel the attempt
-            coordinator.cancelAttempt()
-
-            // Advance time significantly in real time to see if the background threads stopped polling
-            delay(1000)
-            Thread.sleep(500)
-
-            // Verify poll count did not increase further
-            assertEquals(sttPollCountBeforeCancel, sttPollCount)
-            assertEquals(ttsPollCountBeforeCancel, ttsPollCount)
-        } finally {
-            coordinator.cancelAttempt()
-        }
-    }
-    fun `ConnectingService is the initial state type`() {
-        val state = BootstrapState.ConnectingService
-        assertTrue(state is BootstrapState.ConnectingService)
-    }
-
-    @Test
-    fun `NeedsSetup carries missing permissions and invalid model sets`() {
-        val state = BootstrapState.NeedsSetup(
-            missingPermissions = listOf("android.permission.RECORD_AUDIO"),
-            invalidModelSets = listOf("parakeet-tdt-0.6b-v3-int8"),
-        )
-        assertEquals(1, state.missingPermissions.size)
-        assertEquals(1, state.invalidModelSets.size)
-        assertEquals("android.permission.RECORD_AUDIO", state.missingPermissions[0])
-    }
-
-    @Test
-    fun `Failed state carries stage and diagnostic`() {
-        val state = BootstrapState.Failed(
-            dev.nilp0inter.subspace.model.BootstrapStage.InitializingStt,
-            "STT model failed to load",
-            retryable = true,
-        )
-        assertEquals(
-            dev.nilp0inter.subspace.model.BootstrapStage.InitializingStt,
-            state.stage,
-        )
-        assertEquals("STT model failed to load", state.diagnostic)
-        assertTrue(state.retryable)
-    }
-
-    @Test
-    fun `PreparingCore carries stage and units`() {
-        val state = BootstrapState.PreparingCore(
-            stage = dev.nilp0inter.subspace.model.BootstrapStage.RenderingAnnouncements,
-            completedUnits = 3,
-            totalUnits = 7,
-        )
-        assertEquals(3, state.completedUnits)
-        assertEquals(7, state.totalUnits)
-    }
-
-    @Test
-    fun `CoreInit interface declares all required controller properties`() {
-        // Verify CoreInit interface exists and declares the required
-        // controller accessors. This is a compile-time check — if the
-        // interface changes, this test won't compile.
-        val init: CoreInit = FakeCoreInitImpl()
-        assertEquals(null, init.sttController)
-        assertEquals(null, init.ttsController)
-        assertEquals(null, init.sttTtsController)
-        assertEquals(null, init.journalController)
-        assertEquals(null, init.keyboardController)
-        assertEquals(null, init.announcer)
-    }
-
-    @Test
-    fun `AnnouncementResult Ready is required for core readiness`() {
-        // The coordinator's isCoreReady checks that announcer's
-        // precomputeState is AnnouncementResult.Ready.
-        val ready = AnnouncementResult.Ready(setOf("sys.menu.channels"))
-        assertTrue(ready is AnnouncementResult.Ready)
-        assertTrue(ready !is AnnouncementResult.Failed)
-    }
-
-    @Test
-    fun `BootstrapState Ready is terminal until explicit retry`() {
-        // Ready is distinct from all other states.
-        val ready = BootstrapState.Ready
-        val failed = BootstrapState.Failed(
-            dev.nilp0inter.subspace.model.BootstrapStage.VerifyingReadiness,
-            "verification failed",
-        )
-        assertTrue(ready !is BootstrapState.Failed)
-        assertTrue(failed !is BootstrapState.Ready)
-    }
-
-    @Test
-    fun `Failed state with retryable false prevents retry`() {
-        val state = BootstrapState.Failed(
-            dev.nilp0inter.subspace.model.BootstrapStage.InitializingStt,
-            "STT construction failed",
-            retryable = false,
-        )
-        assertTrue(!state.retryable)
-    }
-
-    @Test
-    fun `AcquiringModels carries progress`() {
-        val progress = dev.nilp0inter.subspace.model.ModelAcquisitionProgress(
-            sets = listOf(
-                dev.nilp0inter.subspace.model.ModelSetProgress(
-                    dirName = "parakeet",
-                    bytesRead = 100,
-                    totalBytes = 500,
-                ),
+            modelRepository = modelRepository(
+                inspect = { emptyList() },
+                ensureReady = {
+                    modelDownloadCount += 1
+                    true
+                },
             ),
+            hasManageExternalStorage = { false },
         )
-        val state = BootstrapState.AcquiringModels(progress)
-        assertEquals(100L, state.progress.bytesRead)
-        assertEquals(500L, state.progress.totalBytes)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        assertEquals(
+            BootstrapState.NeedsSetup(needsManageExternalStorage = true),
+            coordinator.state.value,
+        )
+        assertEquals(0, coreInit.sttConstructionCount)
+        assertEquals(0, coreInit.ttsConstructionCount)
+
+        coordinator.startModelAcquisition()
+        advanceUntilIdle()
+
+        assertEquals(0, modelDownloadCount)
+        assertEquals(
+            BootstrapState.NeedsSetup(needsManageExternalStorage = true),
+            coordinator.state.value,
+        )
+    }
+
+    @Test
+    fun `refreshing after all-files access is granted completes bootstrap`() = runTest {
+        var hasAllFilesAccess = false
+        val coreInit = FakeCoreInit()
+        val coordinator = coordinator(
+            coreInit = coreInit,
+            hasManageExternalStorage = { hasAllFilesAccess },
+        )
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+        assertEquals(
+            BootstrapState.NeedsSetup(needsManageExternalStorage = true),
+            coordinator.state.value,
+        )
+
+        hasAllFilesAccess = true
+        coordinator.refreshPrerequisites()
+        advanceUntilIdle()
+
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+    }
+
+    @Test
+    fun `loading native STT past its deadline fails at STT initialization`() = runTest {
+        val coreInit = FakeCoreInit(
+            sttFactory = { FakeSttTranscriber(modelStatus = SttModelStatus.Loading) },
+        )
+        val coordinator = coordinator(coreInit).apply {
+            sttTimeoutMs = 999L
+        }
+
+        coordinator.startBootstrap()
+        runCurrent()
+        advanceTimeBy(1_000L)
+        runCurrent()
+
+        assertEquals(
+            BootstrapState.Failed(
+                BootstrapStage.InitializingStt,
+                "STT initialization timed out after 999ms",
+            ),
+            coordinator.state.value,
+        )
+        coordinator.cancelAttempt()
+        runCurrent()
+    }
+
+    @Test
+    fun `native STT load failure surfaces its diagnostic and blocks readiness`() = runTest {
+        val coreInit = FakeCoreInit(
+            sttFactory = {
+                FakeSttTranscriber(
+                    modelStatus = SttModelStatus.Failed,
+                    loadError = "corrupt native model",
+                )
+            },
+        )
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        assertEquals(
+            BootstrapState.Failed(
+                BootstrapStage.InitializingStt,
+                "STT model failed to load: corrupt native model",
+            ),
+            coordinator.state.value,
+        )
+    }
+
+    @Test
+    fun `announcement rendering failure identifies the phrase and blocks readiness`() = runTest {
+        val coreInit = FakeCoreInit(
+            announcementBehavior = {
+                AnnouncementResult.Failed(
+                    completed = 0,
+                    total = 1,
+                    failedKey = "sys.error",
+                    reason = "empty PCM",
+                )
+            },
+        )
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        assertEquals(
+            BootstrapState.Failed(
+                BootstrapStage.RenderingAnnouncements,
+                "Announcement 'sys.error' failed: empty PCM",
+            ),
+            coordinator.state.value,
+        )
+    }
+
+    @Test
+    fun `concurrent retries coalesce and discard only after the prior attempt joins`() = runTest {
+        val events = mutableListOf<String>()
+        val firstInspectionStarted = CompletableDeferred<Unit>()
+        var inspectionCount = 0
+        val modelRepository = modelRepository(inspect = {
+            inspectionCount += 1
+            if (inspectionCount == 1) {
+                firstInspectionStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    events += "prior joined"
+                }
+            } else {
+                events += "replacement inspected"
+                emptyList()
+            }
+        })
+        val coreInit = FakeCoreInit(onDiscard = { events += "controllers discarded" })
+        val coordinator = coordinator(coreInit, modelRepository)
+
+        coordinator.startBootstrap()
+        runCurrent()
+        firstInspectionStarted.await()
+
+        coordinator.retry()
+        coordinator.retry()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("prior joined", "controllers discarded", "replacement inspected"),
+            events,
+        )
+        assertEquals(1, coreInit.discardCount)
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+    }
+
+    @Test
+    fun `recoverable physical text output and journal recovery do not block core readiness`() = runTest {
+        val coreInit = FakeCoreInit(
+            textOutputAfterInitialization = CapabilityAvailability.Recoverable,
+        )
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        assertEquals(CapabilityAvailability.Recoverable, coreInit.textOutputAvailability)
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+    }
+
+    @Test
+    fun `unavailable semantic text output fails readiness with an actionable diagnostic`() = runTest {
+        val unavailable = CapabilityAvailability.Unavailable(
+            dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
+        )
+        val coreInit = FakeCoreInit(textOutputAfterInitialization = unavailable)
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        val state = coordinator.state.value
+        assertTrue(state is BootstrapState.Failed)
+        state as BootstrapState.Failed
+        assertEquals(BootstrapStage.VerifyingReadiness, state.stage)
+        assertTrue(state.diagnostic.contains("textOutputAvailability=$unavailable"))
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.coordinator(
+        coreInit: CoreInit,
+        modelRepository: ModelAssetRepository = modelRepository(inspect = { emptyList() }),
+        hasManageExternalStorage: () -> Boolean = { true },
+    ): BootstrapCoordinator = BootstrapCoordinator(
+        context = grantedContext(),
+        scope = this,
+        modelRepository = modelRepository,
+        coreInit = coreInit,
+        ioDispatcher = StandardTestDispatcher(testScheduler),
+        hasManageExternalStorage = hasManageExternalStorage,
+    )
+
+    private fun grantedContext(): Context = mockk(relaxed = true) {
+        every { checkPermission(any(), any(), any()) } returns PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun modelRepository(
+        inspect: suspend () -> List<dev.nilp0inter.subspace.model.ModelAssetResult>,
+        ensureReady: suspend () -> Boolean = { true },
+    ): ModelAssetRepository = mockk(relaxed = true) {
+        coEvery { inspectAll() } coAnswers { inspect() }
+        coEvery { ensureAllReady() } coAnswers { ensureReady() }
     }
 
     /**
-     * Minimal fake CoreInit for compile-time interface verification.
+     * Host-boundary fake matching the current [CoreInit] contract. Construction methods publish
+     * the same observable services that production readiness consumes; retry clears all of them.
      */
-    private class FakeCoreInitImpl : CoreInit {
-        override val sttTranscriber: SttTranscriber? = null
-        override val ttsSynthesizer: TtsSynthesizer? = null
-        override val sttController: SttController? = null
-        override val ttsController: TtsController? = null
-        override val sttTtsController: SttTtsController? = null
-        override val journalController: JournalController? = null
-        override val keyboardController: KeyboardPttController? = null
-        override val announcer: SystemAnnouncer? = null
+    private class FakeCoreInit(
+        private val sttFactory: () -> SttTranscriber? = { FakeSttTranscriber() },
+        private val ttsFactory: () -> TtsSynthesizer? = { FakeTtsSynthesizer() },
+        private val textOutputAfterInitialization: CapabilityAvailability =
+            CapabilityAvailability.Available,
+        private val announcementBehavior: suspend () -> AnnouncementResult = {
+            AnnouncementResult.Ready(setOf("sys.ready"))
+        },
+        private val onDiscard: () -> Unit = {},
+    ) : CoreInit {
+        override var sttTranscriber: SttTranscriber? = null
+            private set
+        override var ttsSynthesizer: TtsSynthesizer? = null
+            private set
+        override var ttsController: TtsController? = null
+            private set
+        override var journalController: JournalController? = null
+            private set
+        override var textOutputAvailability: CapabilityAvailability =
+            CapabilityAvailability.Unavailable(
+                dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
+            )
+            private set
+        override var announcer: SystemAnnouncer? = null
+            private set
 
-        override fun constructSttTranscriber(): SttTranscriber? = null
-        override fun constructTtsSynthesizer(): TtsSynthesizer? = null
-        override fun constructSttController(transcriber: SttTranscriber) {}
-        override fun constructTtsController(synthesizer: TtsSynthesizer) {}
-        override fun constructSttTtsController(
-            transcriber: SttTranscriber,
-            synthesizer: TtsSynthesizer,
-        ) {}
-        override fun constructJournalPttController() {}
-        override fun constructKeyboardController(transcriber: SttTranscriber) {}
-        override fun constructAnnouncer(synthesizer: TtsSynthesizer) {}
-        override fun buildVocabulary(): Map<String, String> = emptyMap()
-        override fun voiceStylePath(): String = ""
-        override fun discardControllers() {}
+        var discardCount: Int = 0
+            private set
+        var sttConstructionCount: Int = 0
+            private set
+        var ttsConstructionCount: Int = 0
+            private set
+
+        override fun constructSttTranscriber(): SttTranscriber? = sttFactory().also {
+            sttConstructionCount += 1
+            sttTranscriber = it
+        }
+
+        override fun constructTtsSynthesizer(): TtsSynthesizer? = ttsFactory().also {
+            ttsConstructionCount += 1
+            ttsSynthesizer = it
+        }
+
+        override fun constructTtsController(synthesizer: TtsSynthesizer) {
+            ttsController = mockk(relaxed = true)
+        }
+
+        override fun constructJournalPttController() {
+            journalController = mockk(relaxed = true)
+        }
+
+        override fun initializeTextOutputCapability() {
+            textOutputAvailability = textOutputAfterInitialization
+        }
+
+        override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
+            val state = MutableStateFlow<AnnouncementResult>(AnnouncementResult.WaitingForTts)
+            announcer = mockk {
+                every { precomputeState } returns state
+                coEvery { precompute(any(), any(), any()) } coAnswers {
+                    announcementBehavior().also { state.value = it }
+                }
+            }
+        }
+
+        override fun buildVocabulary(): Map<String, String> = mapOf("sys.ready" to "Ready")
+
+        override fun voiceStylePath(): String = "/models/voice.json"
+
+        override fun discardControllers() {
+            discardCount += 1
+            sttTranscriber = null
+            ttsSynthesizer = null
+            ttsController = null
+            journalController = null
+            textOutputAvailability = CapabilityAvailability.Unavailable(
+                dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
+            )
+            announcer = null
+            onDiscard()
+        }
     }
 }

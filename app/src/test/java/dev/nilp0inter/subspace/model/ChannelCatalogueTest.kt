@@ -1,441 +1,405 @@
 package dev.nilp0inter.subspace.model
 
-import io.sleepwalker.core.keymap.HostProfile
 import android.content.SharedPreferences
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertThrows
-import org.junit.Assert.assertSame
-import org.junit.Assert.assertTrue
-import org.junit.Test
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
+import org.junit.Test
 
 class ChannelCatalogueTest {
-
     @Test
-    fun codecRoundTripPreservesAllFields() {
-        val journalConfig = JournalConfig(
-            baseDirectory = "/test/dir",
-            saveVoice = true,
-            saveText = false
-        )
-        val journalDef = ChannelDefinition(
-            id = "c1",
-            name = "Journal 1",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = journalConfig
-        )
-        val debugDef = ChannelDefinition(
-            id = "c2",
-            name = "Debug 1",
-            kind = ChannelKind.DEBUG,
-            enabled = false,
-            configSchemaVersion = 1,
-            config = DebugConfig(DebugMode.TTS)
-        )
-        val keyboardDef = ChannelDefinition(
-            id = "c3",
-            name = "Keyboard 1",
-            kind = ChannelKind.KEYBOARD,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = KeyboardConfig(HostProfile.LINUX_US)
-        )
-
-        val original = ChannelCatalogueSnapshot(
-            definitions = listOf(journalDef, debugDef, keyboardDef),
-            activeChannelId = "c1"
-        )
-
-        val json = ChannelCatalogueCodec.toJson(original)
-        val parsed = ChannelCatalogueCodec.fromJson(json)
-
-        assertEquals(original.activeChannelId, parsed.activeChannelId)
-        assertEquals(original.definitions.size, parsed.definitions.size)
-        
-        val pJournal = parsed.definitions[0]
-        assertEquals("c1", pJournal.id)
-        assertEquals("Journal 1", pJournal.name)
-        assertEquals(ChannelKind.JOURNAL, pJournal.kind)
-        assertTrue(pJournal.enabled)
-        val pJournalConfig = pJournal.config as JournalConfig
-        assertEquals("/test/dir", pJournalConfig.baseDirectory)
-        assertTrue(pJournalConfig.saveVoice)
-        assertFalse(pJournalConfig.saveText)
-
-        val pDebug = parsed.definitions[1]
-        assertEquals("c2", pDebug.id)
-        assertEquals("Debug 1", pDebug.name)
-        assertEquals(ChannelKind.DEBUG, pDebug.kind)
-        assertFalse(pDebug.enabled)
-        val pDebugConfig = pDebug.config as DebugConfig
-        assertEquals(DebugMode.TTS, pDebugConfig.mode)
-
-        val pKeyboard = parsed.definitions[2]
-        assertEquals("c3", pKeyboard.id)
-        assertEquals("Keyboard 1", pKeyboard.name)
-        assertEquals(ChannelKind.KEYBOARD, pKeyboard.kind)
-        assertTrue(pKeyboard.enabled)
-        val pKeyboardConfig = pKeyboard.config as KeyboardConfig
-        assertEquals(HostProfile.LINUX_US.key, pKeyboardConfig.hostProfile.key)
+    fun implementationIdRejectsBlankAndNonNamespacedReferences() {
+        listOf("", "   ", "journal", ":journal", "builtin:", "Builtin:journal").forEach { value ->
+            assertThrows(IllegalArgumentException::class.java) {
+                ChannelImplementationId(value)
+            }
+        }
     }
 
     @Test
-    fun codecRejectsInvalidDocumentVersion() {
-        val badJson = """
+    fun v2CodecRoundTripPreservesOpaqueUnknownFieldsAndDetachedPayloadViews() {
+        val payload = opaque(
+            """{"providerSetting":{"nested":[1,{"future":"kept"}]},"unrecognisedFlag":true}""",
+        )
+        val snapshot = ChannelCatalogueSnapshot(
+            definitions = listOf(
+                definition(
+                    id = "external-1",
+                    name = "External provider",
+                    implementationId = ChannelImplementationId("external:provider"),
+                    enabled = false,
+                    payload = payload,
+                ),
+            ),
+            activeChannelId = "external-1",
+        )
+
+        val escapedView = payload.toJsonObject()
+        escapedView.getJSONObject("providerSetting").put("future", "mutated")
+        escapedView.remove("unrecognisedFlag")
+
+        val decoded = assertDecodeSuccess(ChannelCatalogueCodec.decode(ChannelCatalogueCodec.toJson(snapshot)))
+        val restored = decoded.snapshot.definitions.single()
+
+        assertEquals(2, decoded.sourceDocumentVersion)
+        assertEquals(snapshot.activeChannelId, decoded.snapshot.activeChannelId)
+        assertEquals(snapshot.definitions.single().implementationId, restored.implementationId)
+        assertFalse(restored.enabled)
+        assertTrue(restored.configPayload.toJsonObject().getBoolean("unrecognisedFlag"))
+        assertEquals(
+            "kept",
+            restored.configPayload.toJsonObject()
+                .getJSONObject("providerSetting")
+                .getJSONArray("nested")
+                .getJSONObject(1)
+                .getString("future"),
+        )
+    }
+
+    @Test
+    fun sameProviderInstancesRemainIndependentWhenOneIsUpdatedByInstanceId() {
+        val implementationId = ChannelImplementationId("test:repeatable")
+        val first = definition(
+            id = "repeatable-1",
+            name = "First",
+            implementationId = implementationId,
+            payload = opaque("""{"setting":"first","unknown":1}"""),
+        )
+        val second = definition(
+            id = "repeatable-2",
+            name = "Second",
+            implementationId = implementationId,
+            payload = opaque("""{"setting":"second","unknown":2}"""),
+        )
+        val snapshot = ChannelCatalogueSnapshot(listOf(first, second), activeChannelId = first.id)
+
+        val result = snapshot.updateChannel(second.id) {
+            it.copy(configPayload = opaque("""{"setting":"updated","unknown":2}"""))
+        }
+        val updated = assertMutationSuccess(result)
+
+        assertEquals(listOf(first.id, second.id), updated.definitions.map(ChannelDefinition::id))
+        assertEquals(first.id, updated.activeChannelId)
+        assertEquals(first, updated.definitions.first())
+        assertEquals("updated", updated.definitions[1].configPayload.toJsonObject().getString("setting"))
+        assertEquals(2, updated.definitions[1].configPayload.toJsonObject().getInt("unknown"))
+    }
+
+    @Test
+    fun migratorLeavesMissingProviderDefinitionByteForByteUnchanged() {
+        val missing = definition(
+            id = "retained",
+            name = "Unavailable provider",
+            implementationId = ChannelImplementationId("removed:provider"),
+            enabled = false,
+            schemaVersion = 7,
+            payload = opaque("""{"future":{"field":"value"}}"""),
+        )
+        val snapshot = ChannelCatalogueSnapshot(listOf(missing), missing.id)
+
+        val result = ChannelCatalogueProviderMigrator.migrate(
+            snapshot,
+            BuiltInChannelDescriptors.configurationResolver,
+        )
+
+        val migration = assertProviderMigrationSuccess(result)
+        assertFalse(migration.changed)
+        assertEquals(snapshot, migration.snapshot)
+        assertEquals(
+            "value",
+            migration.snapshot.definitions.single().configPayload.toJsonObject()
+                .getJSONObject("future")
+                .getString("field"),
+        )
+    }
+
+    @Test
+    fun v1MigrationBacksUpOriginalAndPreservesBuiltInDefinitions() = withTemporaryCatalogue { file ->
+        val v1 = """
             {
-              "version": 99,
-              "activeChannelId": "c1",
-              "definitions": []
+              "version": 1,
+              "activeChannelId": "legacy-debug",
+              "definitions": [
+                {
+                  "id": "legacy-journal",
+                  "name": "Field journal",
+                  "kind": "JOURNAL",
+                  "enabled": false,
+                  "configSchemaVersion": 1,
+                  "config": {
+                    "baseDirectory": "/records",
+                    "saveVoice": false,
+                    "saveText": true,
+                    "futureJournal": "preserve"
+                  }
+                },
+                {
+                  "id": "legacy-debug",
+                  "name": "Speech debug",
+                  "kind": "DEBUG",
+                  "enabled": true,
+                  "configSchemaVersion": 1,
+                  "config": {
+                    "mode": "STT",
+                    "futureDebug": 42
+                  }
+                },
+                {
+                  "id": "legacy-keyboard",
+                  "name": "Desk keyboard",
+                  "kind": "KEYBOARD",
+                  "enabled": true,
+                  "configSchemaVersion": 1,
+                  "config": {
+                    "hostProfile": "macos:us",
+                    "futureKeyboard": { "layout": "dvorak" }
+                  }
+                }
+              ]
             }
         """.trimIndent()
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueCodec.fromJson(badJson)
-        }
-    }
+        file.writeText(v1)
 
-    @Test
-    fun validatorRejectsEmptyDefinitions() {
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueSnapshot(definitions = emptyList(), activeChannelId = "c1")
-        }
-    }
-
-    @Test
-    fun validatorRejectsDuplicateIds() {
-        val def = ChannelDefinition(
-            id = "c1",
-            name = "J1",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = JournalConfig(null, true, true)
-        )
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueSnapshot(definitions = listOf(def, def), activeChannelId = "c1")
-        }
-    }
-
-    @Test
-    fun validatorRejectsBlankIds() {
-        val def = ChannelDefinition(
-            id = "  ",
-            name = "J1",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = JournalConfig(null, true, true)
-        )
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueSnapshot(definitions = listOf(def), activeChannelId = "  ")
-        }
-    }
-
-    @Test
-    fun validatorRejectsActiveIdOutsideDefinitions() {
-        val def = ChannelDefinition(
-            id = "c1",
-            name = "J1",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = JournalConfig(null, true, true)
-        )
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueSnapshot(definitions = listOf(def), activeChannelId = "c2")
-        }
-    }
-
-    @Test
-    fun validatorRejectsInvalidJournalConfig() {
-        val def = ChannelDefinition(
-            id = "c1",
-            name = "J1",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = JournalConfig(null, false, false) // Invalid: must save voice or text
-        )
-        assertThrows(IllegalArgumentException::class.java) {
-            ChannelCatalogueSnapshot(definitions = listOf(def), activeChannelId = "c1")
-        }
-    }
-
-    @Test
-    fun mutationsMaintainInvariants() {
-        val d1 = ChannelDefinition("c1", "J1", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        val d2 = ChannelDefinition("c2", "D1", ChannelKind.DEBUG, true, 1, DebugConfig(DebugMode.ECHO))
-        val d3 = ChannelDefinition("c3", "K1", ChannelKind.KEYBOARD, true, 1, KeyboardConfig(HostProfile.LINUX_US))
-
-        val start = ChannelCatalogueSnapshot(listOf(d1, d2, d3), "c1")
-
-        // 1. Select
-        val selected = start.selectChannel("c2")
-        assertEquals("c2", selected.activeChannelId)
-        assertThrows(IllegalArgumentException::class.java) {
-            start.selectChannel("unknown")
-        }
-
-        // 2. Add
-        val d4 = ChannelDefinition("c4", "New", ChannelKind.DEBUG, true, 1, DebugConfig(DebugMode.ECHO))
-        val added = start.addChannel(d4)
-        assertEquals(4, added.definitions.size)
-        assertEquals(d4, added.definitions.last())
-        assertThrows(IllegalArgumentException::class.java) {
-            start.addChannel(d1)
-        }
-
-        // 3. Update
-        val updated = start.updateChannel("c2") { it.copy(name = "Updated Debug") }
-        assertEquals("Updated Debug", updated.definitions[1].name)
-        assertThrows(IllegalArgumentException::class.java) {
-            start.updateChannel("unknown") { it }
-        }
-
-        // 4. Move
-        val moved = start.moveChannel("c1", 2)
-        assertEquals("c2", moved.definitions[0].id)
-        assertEquals("c3", moved.definitions[1].id)
-        assertEquals("c1", moved.definitions[2].id)
-        assertEquals("c1", moved.activeChannelId) // active ID preserved
-        assertThrows(IllegalArgumentException::class.java) {
-            start.moveChannel("c1", 99)
-        }
-
-        // 5. Remove & Repair
-        // Case A: Remove inactive
-        val removedInactive = start.removeChannel("c2")
-        assertEquals(2, removedInactive.definitions.size)
-        assertEquals("c1", removedInactive.activeChannelId)
-
-        // Case B: Remove active with successor (c1 removed, c2 is active)
-        val removedActiveSuccessor = start.removeChannel("c1")
-        assertEquals(2, removedActiveSuccessor.definitions.size)
-        assertEquals("c2", removedActiveSuccessor.activeChannelId)
-
-        // Case C: Remove active with only predecessor (c3 removed from [c1, c2, c3], active is c3)
-        val activeAtEnd = start.selectChannel("c3")
-        val removedActivePredecessor = activeAtEnd.removeChannel("c3")
-        assertEquals(2, removedActivePredecessor.definitions.size)
-        assertEquals("c2", removedActivePredecessor.activeChannelId)
-
-        // Case D: Try to remove final channel
-        val oneChannel = ChannelCatalogueSnapshot(listOf(d1), "c1")
-        assertThrows(IllegalArgumentException::class.java) {
-            oneChannel.removeChannel("c1")
-        }
-    }
-
-    @Test
-    fun fileStoreAtomicCommitsAndHandlesCorruption() {
-        val tempFile = File.createTempFile("store_test", ".json").apply { deleteOnExit() }
-        val store = ChannelCatalogueFileStore(tempFile)
-
-        val d1 = ChannelDefinition("c1", "J1", ChannelKind.JOURNAL, true, 1, JournalConfig(null, true, true))
-        val snapshot = ChannelCatalogueSnapshot(listOf(d1), "c1")
-
-        // Save and Load
-        store.save(snapshot)
-        val loaded = store.load()
-        assertEquals(snapshot.activeChannelId, loaded?.activeChannelId)
-
-        // Corrupt file
-        tempFile.writeText("invalid json content")
-        assertThrows(IOException::class.java) {
-            store.load()
-        }
-    }
-
-    @Test
-    fun repositoryUnchangedAfterCommitFailure() {
-        val readOnlyFile = File.createTempFile("readonly_test", ".json").apply { deleteOnExit() }
-        val prefs = FakeSharedPreferences()
-        
-        // Setup initial repo with defaults
-        val repository = ChannelRepository(prefs, readOnlyFile)
-        val initialSnapshot = repository.catalogueState.value
-
-        // Make the file directory/file write-fail by deleting and creating as a directory, or just making write fail.
-        // On Java/OS, making it a directory prevents file writeText.
-        readOnlyFile.delete()
-        readOnlyFile.mkdirs()
-
-        // Mutation should throw IOException and NOT update state
-        val d4 = ChannelDefinition("c4", "New", ChannelKind.DEBUG, true, 1, DebugConfig(DebugMode.ECHO))
-        assertThrows(IOException::class.java) {
-            repository.addChannel(d4)
-        }
-
-        // StateFlow remains unchanged
-        assertEquals(initialSnapshot, repository.catalogueState.value)
-    }
-
-    @Test
-    fun legacyMigrationPreservesValues() {
-        val tempFile = File.createTempFile("migration_test", ".json").apply { deleteOnExit() }
-        tempFile.delete() // Ensure it does not exist yet
-
-        val prefs = FakeSharedPreferences()
-        prefs.edit()
-            .putString("journal_base_directory", "/legacy/dir")
-            .putBoolean("journal_save_voice", false)
-            .putBoolean("journal_save_text", true)
-            .putString("debug_channel_mode", "STT")
-            .putString("keyboard_host_profile", "linux:us")
-            .putString("active_channel_id", "debug-channel")
-            .commit()
-
-        val repository = ChannelRepository(prefs, tempFile)
-        assertTrue(tempFile.exists())
-
+        val repository = ChannelRepository(FakeSharedPreferences(), file)
         val snapshot = repository.catalogueState.value
-        assertEquals("debug-channel", snapshot.activeChannelId)
-        assertEquals(3, snapshot.definitions.size)
+        val journal = snapshot.definitions[0]
+        val debug = snapshot.definitions[1]
+        val keyboard = snapshot.definitions[2]
+        val backup = File(file.parentFile, "${file.name}.v1.bak")
 
-        val jDef = snapshot.definitions[0]
-        assertEquals("captains-log", jDef.id)
-        val jConfig = jDef.config as JournalConfig
-        assertEquals("/legacy/dir", jConfig.baseDirectory)
-        assertFalse(jConfig.saveVoice)
-        assertTrue(jConfig.saveText)
-
-        val dDef = snapshot.definitions[1]
-        assertEquals("debug-channel", dDef.id)
-        val dConfig = dDef.config as DebugConfig
-        assertEquals(DebugMode.STT, dConfig.mode)
-
-        val kDef = snapshot.definitions[2]
-        assertEquals("keyboard-channel", kDef.id)
-        val kConfig = kDef.config as KeyboardConfig
-        assertEquals("linux:us", kConfig.hostProfile.key)
+        assertEquals(listOf("legacy-journal", "legacy-debug", "legacy-keyboard"), snapshot.definitions.map(ChannelDefinition::id))
+        assertEquals("legacy-debug", snapshot.activeChannelId)
+        assertEquals("Field journal", journal.name)
+        assertFalse(journal.enabled)
+        assertEquals(BuiltInChannelImplementationIds.JOURNAL, journal.implementationId)
+        assertEquals("/records", journal.configPayload.toJsonObject().getString("baseDirectory"))
+        assertFalse(journal.configPayload.toJsonObject().getBoolean("saveVoice"))
+        assertTrue(journal.configPayload.toJsonObject().getBoolean("saveText"))
+        assertEquals("preserve", journal.configPayload.toJsonObject().getString("futureJournal"))
+        assertEquals("Speech debug", debug.name)
+        assertEquals(BuiltInChannelImplementationIds.DEBUG, debug.implementationId)
+        assertEquals("STT", debug.configPayload.toJsonObject().getString("mode"))
+        assertEquals(42, debug.configPayload.toJsonObject().getInt("futureDebug"))
+        assertEquals("Desk keyboard", keyboard.name)
+        assertEquals(BuiltInChannelImplementationIds.KEYBOARD, keyboard.implementationId)
+        assertEquals("macos:us", keyboard.configPayload.toJsonObject().getString("hostProfile"))
+        assertEquals(
+            "dvorak",
+            keyboard.configPayload.toJsonObject().getJSONObject("futureKeyboard").getString("layout"),
+        )
+        assertEquals(v1, backup.readText())
+        assertEquals(2, JSONObject(file.readText()).getInt("version"))
     }
 
     @Test
-    fun updateChannelIsolatesSameKindInstances() {
-        // Two Debug-kind definitions with distinct IDs and distinct configs.
-        // Production seeds "debug-channel" (DebugMode.ECHO); we add a sibling
-        // Debug instance "dbg-2" (DebugMode.STT) and then drive the same
-        // updateChannel mutation path used in production to change only the
-        // sibling's DebugMode. The seed Debug instance must stay byte-for-byte
-        // unchanged — defending the same-kind isolation invariant: updating
-        // one channel by ID must not touch any other definition, including a
-        // same-kind sibling.
-        val prefs = FakeSharedPreferences()
-        val tempFile = File.createTempFile("iso_test", ".json").apply { deleteOnExit() }
-        val repository = ChannelRepository(prefs, tempFile)
-
-        val siblingId = "dbg-2"
-        val siblingDef = ChannelDefinition(
-            id = siblingId,
-            name = "Debug Sibling",
-            kind = ChannelKind.DEBUG,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = DebugConfig(DebugMode.STT)
+    fun existingV2CatalogueIsSoleSourceAndDoesNotMergeLegacyPreferences() = withTemporaryCatalogue { file ->
+        val persisted = ChannelCatalogueSnapshot(
+            definitions = listOf(
+                definition(
+                    id = "persisted-external",
+                    name = "Persisted unavailable provider",
+                    implementationId = ChannelImplementationId("external:persisted"),
+                    enabled = false,
+                    schemaVersion = 4,
+                    payload = opaque("""{"preserved":"payload"}"""),
+                ),
+            ),
+            activeChannelId = "persisted-external",
         )
-        repository.addChannel(siblingDef)
-
-        val before = repository.catalogueState.value
-        val idsBefore = before.definitions.map { it.id }
-        val seedDebugBefore = before.definitions.first { it.id == DebugChannel.ID }
-        val seedDebugConfigBefore = seedDebugBefore.config
-
-        // Production mutation path: update only the sibling by ID.
-        repository.updateChannel(siblingId) { def ->
-            def.copy(config = (def.config as DebugConfig).copy(mode = DebugMode.TTS))
+        val v2 = ChannelCatalogueCodec.toJson(persisted)
+        file.writeText(v2)
+        val preferences = FakeSharedPreferences().apply {
+            edit()
+                .putString("active_channel_id", "legacy-debug")
+                .putString("journal_base_directory", "/legacy-must-not-merge")
+                .putString("debug_channel_mode", "STT")
+                .commit()
         }
 
-        val after = repository.catalogueState.value
+        val repository = ChannelRepository(preferences, file)
 
-        // Order and active channel are untouched.
-        assertEquals(idsBefore, after.definitions.map { it.id })
-        assertEquals(before.activeChannelId, after.activeChannelId)
-
-        // The seed Debug instance is unchanged — same reference, same equality,
-        // same DebugMode. A bug that updates by kind or replaces the wrong
-        // index would fail here.
-        val seedDebugAfter = after.definitions.first { it.id == DebugChannel.ID }
-        assertSame(seedDebugConfigBefore, seedDebugAfter.config)
-        assertEquals(seedDebugBefore, seedDebugAfter)
-        assertEquals(DebugMode.ECHO, (seedDebugAfter.config as DebugConfig).mode)
-
-        // Only the sibling's DebugMode changed.
-        val siblingAfter = after.definitions.first { it.id == siblingId }
-        assertEquals(DebugMode.TTS, (siblingAfter.config as DebugConfig).mode)
-        assertEquals(siblingDef.copy(config = DebugConfig(DebugMode.TTS)), siblingAfter)
+        assertEquals(persisted, repository.catalogueState.value)
+        assertEquals(v2, file.readText())
     }
 
     @Test
-    fun keyboardInstancesAreRepeatableAndRecreatable() {
-        // Keyboard is a repeatable built-in kind, not a singleton: distinct
-        // instance IDs must permit multiple KEYBOARD definitions, and removing
-        // the migrated default must not prevent adding a replacement. Defends
-        // the repeatability/recreation invariant of the catalogue independent
-        // of any UI kind selector that may clip the KEYBOARD entry on narrow
-        // phone widths.
-        val prefs = FakeSharedPreferences()
-        val tempFile = File.createTempFile("kb_repeat_test", ".json").apply { deleteOnExit() }
-        val repository = ChannelRepository(prefs, tempFile)
+    fun providerMigrationFailureLeavesPersistedV2DocumentUnchanged() = withTemporaryCatalogue { file ->
+        val provider = FailingMigrationProvider(ChannelImplementationId("test:migration"))
+        val original = ChannelCatalogueSnapshot(
+            definitions = listOf(
+                definition(
+                    id = "would-migrate",
+                    name = "Would migrate",
+                    implementationId = provider.descriptor.implementationId,
+                    schemaVersion = 1,
+                    payload = opaque("""{"step":1,"required":"ok","unknown":"keep"}"""),
+                ),
+                definition(
+                    id = "invalid-after-first",
+                    name = "Invalid",
+                    implementationId = provider.descriptor.implementationId,
+                    schemaVersion = 2,
+                    payload = opaque("""{"step":2,"required":"invalid","unknown":"keep"}"""),
+                ),
+            ),
+            activeChannelId = "would-migrate",
+        )
+        val v2 = ChannelCatalogueCodec.toJson(original)
+        file.writeText(v2)
 
-        // Begin with the migrated/default catalogue.
-        val start = repository.catalogueState.value
-        assertEquals(KeyboardChannel.ID, start.definitions.last().id)
-        assertTrue(start.activeChannelId in start.definitions.map { it.id })
+        val exception = assertThrows(ChannelRepositoryLoadException::class.java) {
+            ChannelRepository(FakeSharedPreferences(), file, resolverFor(provider))
+        }
 
-        // 1. Add a second KEYBOARD definition with a distinct ID.
-        val secondId = "kb-2"
-        repository.addChannel(ChannelDefinition(
-            id = secondId,
-            name = "Keyboard Sibling",
-            kind = ChannelKind.KEYBOARD,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = KeyboardConfig(HostProfile.LINUX_US)
-        ))
+        val error = exception.error as ChannelRepositoryError.ProviderMigration
+        assertEquals("invalid-after-first", error.definitionId)
+        assertTrue(error.error is ChannelProviderError.InvalidConfiguration)
+        assertEquals(v2, file.readText())
+    }
 
-        val afterAdd = repository.catalogueState.value
-        assertTrue(afterAdd.definitions.isNotEmpty())
-        assertTrue(afterAdd.activeChannelId in afterAdd.definitions.map { it.id })
-        // Both keyboard instances coexist — Keyboard is repeatable, not a singleton.
-        assertEquals(
-            listOf(KeyboardChannel.ID, secondId),
-            afterAdd.definitions.filter { it.kind == ChannelKind.KEYBOARD }.map { it.id }
+    @Test
+    fun storageFailureDoesNotReplaceDirectoryTargetOrLeaveTemporaryDocument() = withTemporaryCatalogue { file ->
+        file.mkdirs()
+        val snapshot = ChannelCatalogueSnapshot(
+            listOf(
+                definition(
+                    id = "stored",
+                    name = "Stored",
+                    implementationId = ChannelImplementationId("test:storage"),
+                    payload = opaque("""{"value":"valid"}"""),
+                ),
+            ),
+            activeChannelId = "stored",
         )
 
-        // 2. Remove the original migrated default keyboard-channel.
-        repository.removeChannel(KeyboardChannel.ID)
+        val result = ChannelCatalogueFileStore(file).save(snapshot)
 
-        val afterRemove = repository.catalogueState.value
-        assertTrue(afterRemove.definitions.isNotEmpty())
-        assertTrue(afterRemove.activeChannelId in afterRemove.definitions.map { it.id })
-        // The seed keyboard is gone, but the kind is not orphaned.
-        assertFalse(afterRemove.definitions.any { it.id == KeyboardChannel.ID })
-        assertEquals(
-            listOf(secondId),
-            afterRemove.definitions.filter { it.kind == ChannelKind.KEYBOARD }.map { it.id }
+        assertTrue(result is ChannelCatalogueFileStoreResult.Failure)
+        assertEquals("save catalogue", (result as ChannelCatalogueFileStoreResult.Failure).operation)
+        assertTrue(file.isDirectory)
+        assertFalse(File(file.parentFile, "${file.name}.tmp").exists())
+    }
+
+    private fun definition(
+        id: String,
+        name: String,
+        implementationId: ChannelImplementationId,
+        enabled: Boolean = true,
+        schemaVersion: Int = 1,
+        payload: OpaqueJsonObject,
+    ) = ChannelDefinition(id, name, implementationId, enabled, schemaVersion, payload)
+
+    private fun opaque(value: String): OpaqueJsonObject = OpaqueJsonObject.parse(value).getOrThrow()
+
+    private fun assertDecodeSuccess(result: ChannelCatalogueDecodeResult): DecodedChannelCatalogue =
+        (result as? ChannelCatalogueDecodeResult.Success)?.document
+            ?: throw AssertionError("Expected catalogue decoding success, got $result")
+
+    private fun assertMutationSuccess(result: ChannelCatalogueMutationResult): ChannelCatalogueSnapshot =
+        (result as? ChannelCatalogueMutationResult.Success)?.snapshot
+            ?: throw AssertionError("Expected catalogue mutation success, got $result")
+
+    private fun assertProviderMigrationSuccess(
+        result: ChannelCatalogueProviderMigrationResult,
+    ): ChannelCatalogueProviderMigrationResult.Success =
+        result as? ChannelCatalogueProviderMigrationResult.Success
+            ?: throw AssertionError("Expected provider migration success, got $result")
+
+    private fun resolverFor(provider: ChannelImplementationProvider): ChannelImplementationDescriptorResolver =
+        object : ChannelImplementationDescriptorResolver {
+            override fun resolveDescriptor(implementationId: ChannelImplementationId): ChannelDescriptorResolution =
+                if (implementationId == provider.descriptor.implementationId) {
+                    ChannelDescriptorResolution.Available(provider.descriptor)
+                } else {
+                    ChannelDescriptorResolution.Missing(ChannelProviderError.MissingProvider(implementationId))
+                }
+        }
+
+    private inline fun withTemporaryCatalogue(block: (File) -> Unit) {
+        val directory = Files.createTempDirectory("channel-catalogue-test").toFile()
+        try {
+            block(File(directory, "catalogue.json"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    private class FailingMigrationProvider(
+        implementationId: ChannelImplementationId,
+    ) : ChannelImplementationProvider {
+        private val configuration = object : ChannelConfigurationProvider {
+            override val implementationId = implementationId
+            override val currentSchemaVersion = 2
+
+            override fun defaultPayload(): OpaqueJsonObject =
+                OpaqueJsonObject.parse("""{"step":2,"required":"ok"}""").getOrThrow()
+
+            override fun validate(
+                schemaVersion: Int,
+                payload: OpaqueJsonObject,
+            ): ProviderConfigurationResult {
+                if (schemaVersion != currentSchemaVersion) {
+                    return ProviderConfigurationResult.Failure(
+                        ChannelProviderError.UnsupportedSchemaVersion(
+                            implementationId,
+                            schemaVersion,
+                            currentSchemaVersion,
+                        ),
+                    )
+                }
+                return if (payload.toJsonObject().optString("required") == "ok") {
+                    ProviderConfigurationResult.Success(
+                        ValidatedChannelConfiguration(implementationId, schemaVersion, payload),
+                    )
+                } else {
+                    ProviderConfigurationResult.Failure(
+                        ChannelProviderError.InvalidConfiguration(
+                            implementationId,
+                            schemaVersion,
+                            "required must be ok",
+                        ),
+                    )
+                }
+            }
+
+            override fun migrateStep(
+                fromSchemaVersion: Int,
+                payload: OpaqueJsonObject,
+            ): ChannelConfigurationMigrationStep = when (fromSchemaVersion) {
+                1 -> ChannelConfigurationMigrationStep.Success(
+                    OpaqueJsonObject.fromJsonObject(payload.toJsonObject().put("step", 2)),
+                )
+                else -> ChannelConfigurationMigrationStep.Failure(
+                    ChannelProviderError.UnsupportedSchemaVersion(
+                        implementationId,
+                        fromSchemaVersion,
+                        currentSchemaVersion,
+                    ),
+                )
+            }
+        }
+
+        override val descriptor = ChannelImplementationDescriptor(
+            implementationId = implementationId,
+            presentation = ChannelPresentationMetadata("Test", "TEST", "Unavailable"),
+            configuration = configuration,
+            configurationFields = listOf(ChannelConfigurationField.TextField("required", "Required")),
+            requiredCapabilities = emptySet(),
+            preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
         )
 
-        // 3. Add a third replacement KEYBOARD definition with another distinct ID.
-        val replacementId = "kb-3"
-        repository.addChannel(ChannelDefinition(
-            id = replacementId,
-            name = "Keyboard Replacement",
-            kind = ChannelKind.KEYBOARD,
-            enabled = true,
-            configSchemaVersion = 1,
-            config = KeyboardConfig(HostProfile.LINUX_US)
-        ))
-
-        val afterReplace = repository.catalogueState.value
-        assertTrue(afterReplace.definitions.isNotEmpty())
-        assertTrue(afterReplace.activeChannelId in afterReplace.definitions.map { it.id })
-        // The remaining keyboard IDs are the second and replacement IDs, in catalogue order.
-        assertEquals(
-            listOf(secondId, replacementId),
-            afterReplace.definitions.filter { it.kind == ChannelKind.KEYBOARD }.map { it.id }
+        override suspend fun constructRuntime(
+            request: ChannelRuntimeConstructionRequest,
+        ): ChannelRuntimeConstructionResult = ChannelRuntimeConstructionResult.Failure(
+            ChannelProviderError.RuntimeConstructionFailed(
+                descriptor.implementationId,
+                "Runtime construction is outside catalogue migration coverage",
+            ),
         )
     }
 

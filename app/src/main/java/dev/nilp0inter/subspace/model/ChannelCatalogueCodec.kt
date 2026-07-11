@@ -1,104 +1,147 @@
 package dev.nilp0inter.subspace.model
 
-import io.sleepwalker.core.keymap.HostProfile
 import org.json.JSONArray
 import org.json.JSONObject
 
+data class DecodedChannelCatalogue(
+    val snapshot: ChannelCatalogueSnapshot,
+    val sourceDocumentVersion: Int,
+)
+
+sealed interface ChannelCatalogueDecodeResult {
+    data class Success(val document: DecodedChannelCatalogue) : ChannelCatalogueDecodeResult
+    data class Failure(val error: ChannelCatalogueDecodeError) : ChannelCatalogueDecodeResult
+}
+
+sealed interface ChannelCatalogueDecodeError {
+    val message: String
+
+    data class UnsupportedDocumentVersion(val version: Int) : ChannelCatalogueDecodeError {
+        override val message = "Unsupported catalogue document version: $version"
+    }
+
+    data class UnsupportedLegacyKind(val kind: String) : ChannelCatalogueDecodeError {
+        override val message = "Unsupported legacy channel kind: $kind"
+    }
+
+    data class MalformedDocument(override val message: String) : ChannelCatalogueDecodeError
+
+    data class InvalidCatalogue(val error: ChannelCatalogueError) : ChannelCatalogueDecodeError {
+        override val message = error.message
+    }
+}
+
 object ChannelCatalogueCodec {
-    private const val DOCUMENT_VERSION = 1
-    
+    const val CURRENT_DOCUMENT_VERSION = 2
+    private const val LEGACY_DOCUMENT_VERSION = 1
+
+    /** Encodes only document v2. Legacy v1 is read once and never written again. */
     fun toJson(snapshot: ChannelCatalogueSnapshot): String {
-        val root = JSONObject()
-        root.put("version", DOCUMENT_VERSION)
-        root.put("activeChannelId", snapshot.activeChannelId)
-        
-        val defsArray = JSONArray()
-        for (def in snapshot.definitions) {
-            val defObj = JSONObject()
-            defObj.put("id", def.id)
-            defObj.put("name", def.name)
-            defObj.put("kind", def.kind.name)
-            defObj.put("enabled", def.enabled)
-            defObj.put("configSchemaVersion", def.configSchemaVersion)
-            
-            val configObj = JSONObject()
-            when (def.config) {
-                is JournalConfig -> {
-                    configObj.put("baseDirectory", def.config.baseDirectory ?: JSONObject.NULL)
-                    configObj.put("saveVoice", def.config.saveVoice)
-                    configObj.put("saveText", def.config.saveText)
+        require(ChannelCatalogueValidator.validate(snapshot) is ChannelCatalogueValidationResult.Valid)
+        return JSONObject().apply {
+            put("version", CURRENT_DOCUMENT_VERSION)
+            put("activeChannelId", snapshot.activeChannelId)
+            put("definitions", JSONArray().also { definitions ->
+                snapshot.definitions.forEach { definition ->
+                    definitions.put(JSONObject().apply {
+                        put("id", definition.id)
+                        put("name", definition.name)
+                        put("implementationId", definition.implementationId.value)
+                        put("enabled", definition.enabled)
+                        put("configSchemaVersion", definition.configSchemaVersion)
+                        put("config", definition.configPayload.toJsonObject())
+                    })
                 }
-                is DebugConfig -> {
-                    configObj.put("mode", def.config.mode.name)
-                }
-                is KeyboardConfig -> {
-                    configObj.put("hostProfile", def.config.hostProfile.key)
-                }
-                is TestFourthConfig -> {
-                    configObj.put("data", def.config.data)
-                }
-            }
-            defObj.put("config", configObj)
-            defsArray.put(defObj)
-        }
-        root.put("definitions", defsArray)
-        return root.toString(2)
+            })
+        }.toString(2)
     }
 
-    fun fromJson(jsonStr: String): ChannelCatalogueSnapshot {
-        val root = JSONObject(jsonStr)
-        val version = root.getInt("version")
-        require(version == DOCUMENT_VERSION) { "Unsupported document version: $version" }
-        
-        val activeChannelId = root.getString("activeChannelId")
-        val defsArray = root.getJSONArray("definitions")
-        val definitions = mutableListOf<ChannelDefinition>()
-        
-        for (i in 0 until defsArray.length()) {
-            val defObj = defsArray.getJSONObject(i)
-            val id = defObj.getString("id")
-            val name = defObj.getString("name")
-            val kindStr = defObj.getString("kind")
-            val kind = ChannelKind.valueOf(kindStr)
-            val enabled = defObj.getBoolean("enabled")
-            val configSchemaVersion = defObj.getInt("configSchemaVersion")
-            
-            val configObj = defObj.getJSONObject("config")
-            val config = when (kind) {
-                ChannelKind.JOURNAL -> {
-                    val baseDir = if (configObj.isNull("baseDirectory")) null else configObj.getString("baseDirectory")
-                    val saveVoice = configObj.getBoolean("saveVoice")
-                    val saveText = configObj.getBoolean("saveText")
-                    JournalConfig(baseDir, saveVoice, saveText)
-                }
-                ChannelKind.DEBUG -> {
-                    val modeStr = configObj.getString("mode")
-                    val mode = DebugMode.valueOf(modeStr)
-                    DebugConfig(mode)
-                }
-                ChannelKind.KEYBOARD -> {
-                    val profileKey = configObj.getString("hostProfile")
-                    val profile = parseHostProfileKey(profileKey)
-                    KeyboardConfig(profile)
-                }
-                ChannelKind.TEST_FOURTH -> {
-                    val data = configObj.getString("data")
-                    TestFourthConfig(data)
-                }
-            }
-            definitions.add(ChannelDefinition(id, name, kind, enabled, configSchemaVersion, config))
+    fun decode(json: String): ChannelCatalogueDecodeResult = try {
+        val root = JSONObject(json)
+        when (val version = root.getInt("version")) {
+            CURRENT_DOCUMENT_VERSION -> decodeV2(root)
+            LEGACY_DOCUMENT_VERSION -> decodeV1(root)
+            else -> ChannelCatalogueDecodeResult.Failure(
+                ChannelCatalogueDecodeError.UnsupportedDocumentVersion(version),
+            )
         }
-        
-        return ChannelCatalogueSnapshot(definitions, activeChannelId)
-    }
-
-    private fun parseHostProfileKey(key: String): HostProfile {
-        val parts = key.split(":")
-        if (parts.size < 2 || parts.any { it.isBlank() }) return HostProfile.LINUX_US
-        return HostProfile(
-            hostOs = parts[0],
-            layout = parts[1],
-            variant = if (parts.size >= 3) parts[2] else null,
+    } catch (error: LegacyKindException) {
+        ChannelCatalogueDecodeResult.Failure(
+            ChannelCatalogueDecodeError.UnsupportedLegacyKind(error.kind),
+        )
+    } catch (error: Exception) {
+        ChannelCatalogueDecodeResult.Failure(
+            ChannelCatalogueDecodeError.MalformedDocument(error.message ?: "Malformed catalogue document"),
         )
     }
+
+    private fun decodeV2(root: JSONObject): ChannelCatalogueDecodeResult {
+        val definitions = decodeDefinitions(root) { definition ->
+            ChannelDefinition(
+                id = definition.getString("id"),
+                name = definition.getString("name"),
+                implementationId = ChannelImplementationId(definition.getString("implementationId")),
+                enabled = definition.getBoolean("enabled"),
+                configSchemaVersion = definition.getInt("configSchemaVersion"),
+                configPayload = OpaqueJsonObject.fromJsonObject(definition.getJSONObject("config")),
+            )
+        } ?: return ChannelCatalogueDecodeResult.Failure(
+            ChannelCatalogueDecodeError.MalformedDocument("Malformed v2 definition"),
+        )
+        return decoded(root.getString("activeChannelId"), definitions, CURRENT_DOCUMENT_VERSION)
+    }
+
+    /** Converts legacy discriminators into stable built-in implementation IDs without decoding config. */
+    private fun decodeV1(root: JSONObject): ChannelCatalogueDecodeResult {
+        val definitions = decodeDefinitions(root) { definition ->
+            val implementationId = when (val kind = definition.getString("kind")) {
+                "JOURNAL" -> BuiltInChannelImplementationIds.JOURNAL
+                "DEBUG" -> BuiltInChannelImplementationIds.DEBUG
+                "KEYBOARD" -> BuiltInChannelImplementationIds.KEYBOARD
+                else -> throw LegacyKindException(kind)
+            }
+            ChannelDefinition(
+                id = definition.getString("id"),
+                name = definition.getString("name"),
+                implementationId = implementationId,
+                enabled = definition.getBoolean("enabled"),
+                configSchemaVersion = definition.getInt("configSchemaVersion"),
+                configPayload = OpaqueJsonObject.fromJsonObject(definition.getJSONObject("config")),
+            )
+        } ?: return ChannelCatalogueDecodeResult.Failure(
+            ChannelCatalogueDecodeError.MalformedDocument("Malformed v1 definition"),
+        )
+        return decoded(root.getString("activeChannelId"), definitions, LEGACY_DOCUMENT_VERSION)
+    }
+
+    private fun decodeDefinitions(
+        root: JSONObject,
+        decode: (JSONObject) -> ChannelDefinition,
+    ): List<ChannelDefinition>? = try {
+        root.getJSONArray("definitions").let { array ->
+            List(array.length()) { index -> decode(array.getJSONObject(index)) }
+        }
+    } catch (error: LegacyKindException) {
+        throw error
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun decoded(
+        activeChannelId: String,
+        definitions: List<ChannelDefinition>,
+        sourceVersion: Int,
+    ): ChannelCatalogueDecodeResult {
+        val snapshot = ChannelCatalogueSnapshot(definitions, activeChannelId)
+        return when (val validation = ChannelCatalogueValidator.validate(snapshot)) {
+            ChannelCatalogueValidationResult.Valid -> ChannelCatalogueDecodeResult.Success(
+                DecodedChannelCatalogue(snapshot, sourceVersion),
+            )
+            is ChannelCatalogueValidationResult.Invalid -> ChannelCatalogueDecodeResult.Failure(
+                ChannelCatalogueDecodeError.InvalidCatalogue(validation.error),
+            )
+        }
+    }
+
+    private class LegacyKindException(val kind: String) : IllegalArgumentException(kind)
 }

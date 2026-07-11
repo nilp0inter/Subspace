@@ -1,0 +1,377 @@
+package dev.nilp0inter.subspace.channel.capability
+
+/**
+ * Stable semantic capabilities that a channel implementation may declare.
+ * These names describe host-domain operations; they are not platform handles.
+ */
+sealed interface ChannelCapability {
+    val stableId: String
+
+    data object Transcription : ChannelCapability { override val stableId = "transcription" }
+    data object Synthesis : ChannelCapability { override val stableId = "synthesis" }
+    data object AudioOperation : ChannelCapability { override val stableId = "audio-operation" }
+    data object Journal : ChannelCapability { override val stableId = "journal" }
+    data object TextOutput : ChannelCapability { override val stableId = "text-output" }
+}
+
+/** A monotonically assigned runtime generation. It is scoped to one channel instance. */
+@JvmInline
+value class RuntimeGeneration(val value: Long) {
+    init {
+        require(value >= 0) { "Runtime generation must be non-negative" }
+    }
+}
+
+/** Identity attached to every capability acquisition, operation, and diagnostic. */
+data class CapabilityScopeIdentity(
+    val channelInstanceId: String,
+    val runtimeGeneration: RuntimeGeneration,
+) {
+    init {
+        require(channelInstanceId.isNotBlank()) { "Channel instance ID must not be blank" }
+    }
+}
+
+/** The host-visible availability state, deliberately independent of platform state. */
+sealed interface CapabilityAvailability {
+    data object Available : CapabilityAvailability
+    data object Recoverable : CapabilityAvailability
+    data class Unavailable(val reason: CapabilityUnavailableReason) : CapabilityAvailability
+}
+
+enum class CapabilityUnavailableReason {
+    NOT_CONFIGURED,
+    MODEL_NOT_READY,
+    RESOURCE_BUSY,
+    HOST_NOT_READY,
+    UNSUPPORTED,
+    POLICY_REFUSED,
+}
+
+enum class CapabilityDeniedReason {
+    UNDECLARED,
+}
+
+enum class CapabilityFailureReason {
+    HOST_FAILURE,
+    PREPARATION_FAILED,
+    CLEANUP_FAILED,
+    INVALID_REQUEST,
+}
+
+enum class CapabilityLeaseState {
+    ACTIVE,
+    REVOKED,
+    RELEASED,
+}
+
+enum class CapabilityLeaseTermination {
+    REVOKED,
+    RELEASED,
+}
+
+/**
+ * A typed key prevents a capability port from being acquired as a different port.
+ * Only the host package defines the keys.
+ */
+sealed class CapabilityKey<T : ChannelCapabilityPort>(val capability: ChannelCapability) {
+    data object Transcription : CapabilityKey<TranscriptionCapability>(ChannelCapability.Transcription)
+    data object Synthesis : CapabilityKey<SynthesisCapability>(ChannelCapability.Synthesis)
+    data object AudioOperation : CapabilityKey<AudioOperationCapability>(ChannelCapability.AudioOperation)
+    data object Journal : CapabilityKey<JournalStorageCapability>(ChannelCapability.Journal)
+    data object TextOutput : CapabilityKey<TextOutputCapability>(ChannelCapability.TextOutput)
+}
+
+/** A semantic port. It never carries Android, hardware, route, filesystem, or coroutine ownership. */
+interface ChannelCapabilityPort
+
+/**
+ * Result of acquiring a capability. Recoverable is returned only when the host can
+ * prepare the resource according to its own bounded policy; channel code cannot pick
+ * a connection or retry mechanism.
+ */
+sealed interface CapabilityAcquisition<out T : ChannelCapabilityPort> {
+    data class Available<T : ChannelCapabilityPort>(val lease: CapabilityLease<T>) : CapabilityAcquisition<T>
+    data class Recoverable(val reason: CapabilityUnavailableReason) : CapabilityAcquisition<Nothing>
+    data class Unavailable(val reason: CapabilityUnavailableReason) : CapabilityAcquisition<Nothing>
+    data class Denied(val reason: CapabilityDeniedReason) : CapabilityAcquisition<Nothing>
+    data object Closed : CapabilityAcquisition<Nothing>
+    data object Cancelled : CapabilityAcquisition<Nothing>
+    data class Failed(val reason: CapabilityFailureReason) : CapabilityAcquisition<Nothing>
+}
+
+/** Semantic completion outcomes for a capability operation. */
+sealed interface CapabilityOperationResult<out T> {
+    data class Success<T>(val value: T) : CapabilityOperationResult<T>
+    data class Unavailable(val reason: CapabilityUnavailableReason) : CapabilityOperationResult<Nothing>
+    data class Denied(val reason: CapabilityDeniedReason) : CapabilityOperationResult<Nothing>
+    data object Closed : CapabilityOperationResult<Nothing>
+    data object Cancelled : CapabilityOperationResult<Nothing>
+    data class Failed(val reason: CapabilityFailureReason) : CapabilityOperationResult<Nothing>
+}
+
+sealed interface CapabilityReleaseResult {
+    data object Released : CapabilityReleaseResult
+    data object AlreadyTerminated : CapabilityReleaseResult
+    data class CleanupFailed(val reason: CapabilityFailureReason) : CapabilityReleaseResult
+}
+
+/**
+ * A revocable lease deliberately does not expose [T] as a property. A caller can use
+ * a port only inside [use], which lets the boundary reject a lease after revocation.
+ */
+interface CapabilityLease<T : ChannelCapabilityPort> {
+    val capability: ChannelCapability
+    val identity: CapabilityScopeIdentity
+    val state: CapabilityLeaseState
+
+    suspend fun <R> use(
+        operation: suspend (T) -> CapabilityOperationResult<R>,
+    ): CapabilityOperationResult<R>
+
+    suspend fun release(): CapabilityReleaseResult
+}
+
+sealed interface CapabilityAcquisitionPolicy {
+    data object Immediate : CapabilityAcquisitionPolicy
+
+    /** The timeout is enforced by host preparation, not by channel code. */
+    data class PrepareRecoverable(val timeoutMillis: Long) : CapabilityAcquisitionPolicy {
+        init {
+            require(timeoutMillis > 0) { "Preparation timeout must be positive" }
+        }
+    }
+}
+
+/** A provider/runtime-facing scope. It contains only capabilities authorized by its descriptor. */
+interface ChannelCapabilityScope {
+    val identity: CapabilityScopeIdentity
+    val declaredCapabilities: Set<ChannelCapability>
+    val isClosed: Boolean
+
+    suspend fun availability(key: CapabilityKey<*>): CapabilityAvailabilityResult
+
+    suspend fun <T : ChannelCapabilityPort> acquire(
+        key: CapabilityKey<T>,
+        policy: CapabilityAcquisitionPolicy = CapabilityAcquisitionPolicy.Immediate,
+    ): CapabilityAcquisition<T>
+}
+
+sealed interface CapabilityAvailabilityResult {
+    data class State(val availability: CapabilityAvailability) : CapabilityAvailabilityResult
+    data class Denied(val reason: CapabilityDeniedReason) : CapabilityAvailabilityResult
+    data object Closed : CapabilityAvailabilityResult
+    data object Cancelled : CapabilityAvailabilityResult
+    data class Failed(val reason: CapabilityFailureReason) : CapabilityAvailabilityResult
+}
+
+/**
+ * Host-only acquisition bridge. Composition supplies an implementation; runtimes never
+ * receive it and therefore cannot locate a global capability service.
+ */
+interface ChannelCapabilityHost {
+    suspend fun availability(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<*>,
+    ): CapabilityAvailability
+
+    suspend fun <T : ChannelCapabilityPort> acquire(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<T>,
+    ): HostedCapabilityAcquisition<T>
+
+    suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+        identity: CapabilityScopeIdentity,
+        key: CapabilityKey<T>,
+        timeoutMillis: Long,
+    ): HostedCapabilityAcquisition<T>
+}
+
+/**
+ * Host-internal acquisition outcome before it is bound to a revocable runtime lease.
+ * [Available.cleanup] MUST cancel or detach outstanding host operations before it
+ * returns for [CapabilityLeaseTermination.REVOKED], so a revoked generation cannot
+ * produce a later platform, persistence, playback, or publication effect.
+ */
+sealed interface HostedCapabilityAcquisition<out T : ChannelCapabilityPort> {
+    data class Available<T : ChannelCapabilityPort>(
+        val port: T,
+        val cleanup: suspend (CapabilityLeaseTermination) -> Unit,
+    ) : HostedCapabilityAcquisition<T>
+
+    data class Recoverable(val reason: CapabilityUnavailableReason) : HostedCapabilityAcquisition<Nothing>
+    data class Unavailable(val reason: CapabilityUnavailableReason) : HostedCapabilityAcquisition<Nothing>
+    data object Cancelled : HostedCapabilityAcquisition<Nothing>
+    data class Failed(val reason: CapabilityFailureReason) : HostedCapabilityAcquisition<Nothing>
+}
+
+enum class CapabilityDiagnosticPhase {
+    AVAILABILITY,
+    ACQUISITION,
+    PREPARATION,
+    OPERATION,
+    REVOCATION,
+    RELEASE,
+    CLEANUP,
+}
+
+enum class CapabilityDiagnosticOutcome {
+    AVAILABLE,
+    RECOVERABLE,
+    UNAVAILABLE,
+    DENIED,
+    CLOSED,
+    CANCELLED,
+    FAILED,
+    RELEASED,
+}
+
+/**
+ * Deliberately normalized diagnostic metadata. It has no free-form detail field, so
+ * payloads, text, addresses, secrets, and platform exception messages cannot cross
+ * this boundary.
+ */
+data class CapabilityDiagnostic(
+    val identity: CapabilityScopeIdentity,
+    val capability: ChannelCapability,
+    val phase: CapabilityDiagnosticPhase,
+    val outcome: CapabilityDiagnosticOutcome,
+)
+
+fun interface CapabilityDiagnosticSink {
+    fun record(diagnostic: CapabilityDiagnostic)
+}
+
+/** An opaque captured recording chosen and owned by the host audio lifecycle. */
+sealed interface OpaqueAudioRecording {
+    val operationId: String
+}
+
+/** An opaque synthesized audio artifact. Its samples and route stay host-owned. */
+sealed interface OpaqueSynthesizedAudio {
+    val operationId: String
+}
+
+/** A lifecycle-bound audio operation whose platform resources remain host-owned. */
+sealed interface OpaqueAudioOperation {
+    val operationId: String
+}
+
+interface TranscriptionCapability : ChannelCapabilityPort {
+    suspend fun transcribe(recording: OpaqueAudioRecording): CapabilityOperationResult<Transcription>
+}
+
+data class Transcription(val text: String)
+
+interface SynthesisCapability : ChannelCapabilityPort {
+    suspend fun synthesize(request: SpeechSynthesisRequest): CapabilityOperationResult<OpaqueSynthesizedAudio>
+}
+
+data class SpeechSynthesisRequest(
+    val text: String,
+    val languageTag: String,
+    val voice: SpeechVoice,
+    val speed: Float = 1f,
+) {
+    init {
+        require(languageTag.isNotBlank()) { "Language tag must not be blank" }
+        require(speed > 0f) { "Speech speed must be positive" }
+    }
+}
+
+@JvmInline
+value class SpeechVoice(val id: String) {
+    init {
+        require(id.isNotBlank()) { "Voice ID must not be blank" }
+    }
+}
+
+interface AudioOperationCapability : ChannelCapabilityPort {
+    suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio): CapabilityOperationResult<OpaqueAudioOperation>
+}
+
+interface JournalStorageCapability : ChannelCapabilityPort {
+    suspend fun createEntry(request: JournalEntryRequest): CapabilityOperationResult<JournalEntryHandle>
+    suspend fun storeCapture(
+        entry: JournalEntryHandle,
+        recording: OpaqueAudioRecording,
+    ): CapabilityOperationResult<JournalStoredCapture>
+    suspend fun derive(entry: JournalEntryHandle): CapabilityOperationResult<JournalDerivation>
+}
+
+data class JournalEntryRequest(
+    val capturedAtEpochMillis: Long,
+    val saveVoice: Boolean,
+    val saveText: Boolean,
+)
+
+sealed interface JournalEntryHandle {
+    val operationId: String
+}
+
+sealed interface JournalStoredCapture {
+    val operationId: String
+}
+
+sealed interface JournalDerivation {
+    val operationId: String
+}
+
+interface TextOutputCapability : ChannelCapabilityPort {
+    suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome
+    suspend fun sendKey(request: TextKeyRequest): TextDeliveryOutcome
+}
+
+data class TextOutputRequest(
+    val text: String,
+    val profile: TextOutputProfile,
+)
+
+@JvmInline
+value class TextOutputProfile(val id: String) {
+    init {
+        require(id.isNotBlank()) { "Text output profile must not be blank" }
+    }
+}
+
+data class TextKeyRequest(
+    val key: TextOutputKey,
+    val profile: TextOutputProfile,
+)
+
+enum class TextOutputKey {
+    ENTER,
+    ESCAPE,
+}
+
+/** Each submission has one terminal outcome and one host operation ID; hosts must never replay it automatically. */
+sealed interface TextDeliveryOutcome {
+    data class Delivered(val operationId: String) : TextDeliveryOutcome
+    data class Rejected(val operationId: String, val reason: TextOutputRejectionReason) : TextDeliveryOutcome
+    data class Failed(val operationId: String, val reason: TextOutputFailureReason) : TextDeliveryOutcome
+    data class Indeterminate(
+        val operationId: String,
+        val reason: TextOutputIndeterminateReason,
+    ) : TextDeliveryOutcome
+}
+
+enum class TextOutputRejectionReason {
+    EMPTY_TEXT,
+    UNSUPPORTED_CHARACTER,
+    INVALID_PROFILE,
+    POLICY_REFUSED,
+}
+
+enum class TextOutputFailureReason {
+    UNAVAILABLE,
+    TIMED_OUT,
+    CANCELLED,
+    HOST_FAILURE,
+}
+
+enum class TextOutputIndeterminateReason {
+    DISCONNECTED,
+    ACKNOWLEDGEMENT_LOST,
+    CANCELLED,
+    TIMED_OUT,
+}

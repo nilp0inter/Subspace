@@ -1,26 +1,58 @@
 package dev.nilp0inter.subspace.model
 
-import io.sleepwalker.core.keymap.HostProfile
-
 import android.content.Context
 import android.content.SharedPreferences
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+sealed interface ChannelRepositoryError {
+    val message: String
+
+    data class Decode(val error: ChannelCatalogueDecodeError) : ChannelRepositoryError {
+        override val message = error.message
+    }
+
+    data class ProviderMigration(
+        val definitionId: String,
+        val error: ChannelProviderError,
+    ) : ChannelRepositoryError {
+        override val message = "Could not migrate channel $definitionId: ${error.message}"
+    }
+
+    data class Storage(val operation: String, val cause: IOException) : ChannelRepositoryError {
+        override val message = "Could not $operation: ${cause.message}"
+    }
+
+    data class Mutation(val error: ChannelCatalogueError) : ChannelRepositoryError {
+        override val message = error.message
+    }
+}
+
+sealed interface ChannelRepositoryMutationResult {
+    data object Success : ChannelRepositoryMutationResult
+    data class Failure(val error: ChannelRepositoryError) : ChannelRepositoryMutationResult
+}
+
+class ChannelRepositoryLoadException(val error: ChannelRepositoryError) : IllegalStateException(error.message)
+
 class ChannelRepository(
     private val prefs: SharedPreferences,
     private val catalogueFile: File,
+    private val descriptorResolver: ChannelImplementationDescriptorResolver =
+        BuiltInChannelDescriptors.configurationResolver,
 ) {
     constructor(context: Context) : this(
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
-        File(context.filesDir, "channels_catalogue.json")
+        File(context.filesDir, "channels_catalogue.json"),
     )
 
     constructor(prefs: SharedPreferences) : this(
         prefs,
-        File(System.getProperty("java.io.tmpdir"), "channels_catalogue_${System.nanoTime()}.json").apply { deleteOnExit() }
+        File(System.getProperty("java.io.tmpdir"), "channels_catalogue_${System.nanoTime()}.json")
+            .apply { deleteOnExit() },
     )
 
     private val fileStore = ChannelCatalogueFileStore(catalogueFile)
@@ -31,144 +63,191 @@ class ChannelRepository(
         get() = _catalogueState.asStateFlow()
 
     init {
-        var snapshot = fileStore.load()
-        if (snapshot == null) {
-            snapshot = migrateOrSeed()
-            fileStore.save(snapshot)
+        val initial = when (val loaded = fileStore.load()) {
+            null -> seedFromLegacyPreferences().also(::saveOrThrow)
+            is ChannelCatalogueLoadResult.Failure -> throw ChannelRepositoryLoadException(
+                ChannelRepositoryError.Decode(loaded.error),
+            )
+            is ChannelCatalogueLoadResult.Success -> migrateLoadedDocument(loaded.document)
         }
-        _catalogueState = MutableStateFlow(snapshot)
+        _catalogueState = MutableStateFlow(initial)
     }
 
-    private fun migrateOrSeed(): ChannelCatalogueSnapshot {
-        val journalBaseDir = prefs.getString(KEY_BASE_DIRECTORY, null)
+    private fun migrateLoadedDocument(document: DecodedChannelCatalogue): ChannelCatalogueSnapshot {
+        val migration = ChannelCatalogueProviderMigrator.migrate(document.snapshot, descriptorResolver)
+        val migrated = when (migration) {
+            is ChannelCatalogueProviderMigrationResult.Failure -> throw ChannelRepositoryLoadException(
+                ChannelRepositoryError.ProviderMigration(migration.definitionId, migration.error),
+            )
+            is ChannelCatalogueProviderMigrationResult.Success -> migration
+        }
+        if (document.sourceDocumentVersion == 1) {
+            backupLegacyV1OrThrow()
+            saveOrThrow(migrated.snapshot)
+        } else if (migrated.changed) {
+            saveOrThrow(migrated.snapshot)
+        }
+        return migrated.snapshot
+    }
+
+    private fun seedFromLegacyPreferences(): ChannelCatalogueSnapshot {
         val journalSaveVoice = prefs.getBoolean(KEY_SAVE_VOICE, true)
         val journalSaveText = prefs.getBoolean(KEY_SAVE_TEXT, true)
-        val finalSaveVoice = if (!journalSaveVoice && !journalSaveText) true else journalSaveVoice
-        val journalConfig = JournalConfig(journalBaseDir, finalSaveVoice, journalSaveText)
-        val journalDef = ChannelDefinition(
-            id = JournalChannel.ID,
-            name = JournalChannel.NAME,
-            kind = ChannelKind.JOURNAL,
+        val journalDefinition = ChannelDefinition(
+            id = LegacyPreferenceCatalogueSeed.JOURNAL_ID,
+            name = LegacyPreferenceCatalogueSeed.JOURNAL_NAME,
+            implementationId = BuiltInChannelImplementationIds.JOURNAL,
             enabled = true,
             configSchemaVersion = 1,
-            config = journalConfig
+            configPayload = JournalProviderConfigurationCodec.encode(
+                JournalProviderConfiguration(
+                    baseDirectory = prefs.getString(KEY_BASE_DIRECTORY, null),
+                    saveVoice = journalSaveVoice || !journalSaveText,
+                    saveText = journalSaveText,
+                ),
+            ),
         )
-
-        val debugModeStr = prefs.getString(KEY_DEBUG_MODE, DebugMode.ECHO.name) ?: DebugMode.ECHO.name
-        val debugMode = try {
-            DebugMode.valueOf(debugModeStr)
-        } catch (e: Exception) {
-            DebugMode.ECHO
-        }
-        val debugDef = ChannelDefinition(
-            id = DebugChannel.ID,
-            name = DebugChannel.NAME,
-            kind = ChannelKind.DEBUG,
+        val debugMode = prefs.getString(KEY_DEBUG_MODE, DebugMode.ECHO.name)
+            ?.let { value -> runCatching { DebugMode.valueOf(value) }.getOrNull() }
+            ?: DebugMode.ECHO
+        val debugDefinition = ChannelDefinition(
+            id = LegacyPreferenceCatalogueSeed.DEBUG_ID,
+            name = LegacyPreferenceCatalogueSeed.DEBUG_NAME,
+            implementationId = BuiltInChannelImplementationIds.DEBUG,
             enabled = true,
             configSchemaVersion = 1,
-            config = DebugConfig(debugMode)
+            configPayload = DebugProviderConfigurationCodec.encode(DebugProviderConfiguration(debugMode)),
         )
-
-        val profileKey = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, HostProfile.LINUX_US.key) ?: HostProfile.LINUX_US.key
-        val hostProfile = parseHostProfileKey(profileKey)
-        val keyboardDef = ChannelDefinition(
-            id = KeyboardChannel.ID,
-            name = KeyboardChannel.NAME,
-            kind = ChannelKind.KEYBOARD,
+        val hostProfileKey = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, "linux:us") ?: "linux:us"
+        val keyboardDefinition = ChannelDefinition(
+            id = LegacyPreferenceCatalogueSeed.KEYBOARD_ID,
+            name = LegacyPreferenceCatalogueSeed.KEYBOARD_NAME,
+            implementationId = BuiltInChannelImplementationIds.KEYBOARD,
             enabled = true,
             configSchemaVersion = 1,
-            config = KeyboardConfig(hostProfile)
+            configPayload = KeyboardProviderConfigurationCodec.encode(
+                KeyboardProviderConfiguration(hostProfileKey.takeIf(::isHostProfileKey) ?: "linux:us"),
+            ),
         )
-
-        val activeId = prefs.getString(KEY_ACTIVE_CHANNEL, JournalChannel.ID) ?: JournalChannel.ID
-        val definitions = listOf(journalDef, debugDef, keyboardDef)
-        val finalActiveId = if (definitions.any { it.id == activeId }) activeId else JournalChannel.ID
-
-        return ChannelCatalogueSnapshot(definitions, finalActiveId)
-    }
-
-    fun selectChannel(id: String) {
-        synchronized(mutationLock) {
-            val current = _catalogueState.value
-            val next = current.selectChannel(id)
-            fileStore.save(next)
-            _catalogueState.value = next
-        }
-    }
-
-    fun addChannel(definition: ChannelDefinition) {
-        synchronized(mutationLock) {
-            val current = _catalogueState.value
-            val next = current.addChannel(definition)
-            fileStore.save(next)
-            _catalogueState.value = next
-        }
-    }
-
-    fun updateChannel(id: String, transform: (ChannelDefinition) -> ChannelDefinition) {
-        synchronized(mutationLock) {
-            val current = _catalogueState.value
-            val next = current.updateChannel(id, transform)
-            fileStore.save(next)
-            _catalogueState.value = next
-        }
-    }
-
-    fun moveChannel(id: String, toIndex: Int) {
-        synchronized(mutationLock) {
-            val current = _catalogueState.value
-            val next = current.moveChannel(id, toIndex)
-            fileStore.save(next)
-            _catalogueState.value = next
-        }
-    }
-
-    fun removeChannel(id: String) {
-        synchronized(mutationLock) {
-            val current = _catalogueState.value
-            val next = current.removeChannel(id)
-            fileStore.save(next)
-            _catalogueState.value = next
-        }
-    }
-
-    /**
-     * Parse a [HostProfile] from its [HostProfile.key] string ("hostOs:layout[:variant]").
-     * Falls back to [HostProfile.LINUX_US] if the key is malformed.
-     */
-    private fun parseHostProfileKey(key: String): HostProfile {
-        val parts = key.split(":")
-        if (parts.size < 2 || parts.any { it.isBlank() }) return HostProfile.LINUX_US
-        return HostProfile(
-            hostOs = parts[0],
-            layout = parts[1],
-            variant = if (parts.size >= 3) parts[2] else null,
+        val definitions = listOf(journalDefinition, debugDefinition, keyboardDefinition)
+        val preferredActiveId = prefs.getString(KEY_ACTIVE_CHANNEL, LegacyPreferenceCatalogueSeed.JOURNAL_ID)
+        return ChannelCatalogueSnapshot(
+            definitions = definitions,
+            activeChannelId = preferredActiveId.takeIf { id -> definitions.any { it.id == id } }
+                ?: LegacyPreferenceCatalogueSeed.JOURNAL_ID,
         )
     }
 
-    /**
-     * The single source of truth for channel ordering across both surfaces
-     * (phone dashboard + Android Auto browse tree). Order emanates solely from
-     * this repository per `car-media-channel-browse` spec "Channel ordering is
-     * stable across surfaces"; the ordering is [Channel.orderIndex] ascending
-     * (JournalChannel at index 0, DebugChannel at index 1 today).
-     */
-    fun loadChannels(): List<Channel> {
-        val snapshot = catalogueState.value
-        return snapshot.definitions.map { def ->
-            when (def.config) {
-                is JournalConfig -> def.config.toLegacyChannel(def.name, def.id)
-                is DebugConfig -> def.config.toLegacyChannel(def.name, def.id)
-                is KeyboardConfig -> def.config.toLegacyChannel(def.name, def.id)
-                else -> throw IllegalStateException("Unknown configuration type: ${def.config}")
+    fun selectChannel(id: String): ChannelRepositoryMutationResult = synchronized(mutationLock) {
+        commit(_catalogueState.value.selectChannel(id))
+    }
+
+    fun addChannel(definition: ChannelDefinition): ChannelRepositoryMutationResult = synchronized(mutationLock) {
+        when (val migrated = migrateProviderDefinition(definition)) {
+            is ChannelDefinitionMigrationResult.Failure -> ChannelRepositoryMutationResult.Failure(migrated.error)
+            is ChannelDefinitionMigrationResult.Success -> commit(_catalogueState.value.addChannel(migrated.definition))
+        }
+    }
+
+    fun updateChannel(
+        id: String,
+        transform: (ChannelDefinition) -> ChannelDefinition,
+    ): ChannelRepositoryMutationResult = synchronized(mutationLock) {
+        val current = _catalogueState.value
+        val currentDefinition = current.definitions.find { it.id == id }
+            ?: return@synchronized ChannelRepositoryMutationResult.Failure(
+                ChannelRepositoryError.Mutation(ChannelCatalogueError.UnknownChannelId(id)),
+            )
+        val replacement = transform(currentDefinition)
+        if (replacement.id != id) return@synchronized commit(current.updateChannel(id) { replacement })
+        when (val migrated = migrateProviderDefinition(replacement)) {
+            is ChannelDefinitionMigrationResult.Failure -> ChannelRepositoryMutationResult.Failure(migrated.error)
+            is ChannelDefinitionMigrationResult.Success -> commit(current.updateChannel(id) { migrated.definition })
+        }
+    }
+
+    fun moveChannel(id: String, toIndex: Int): ChannelRepositoryMutationResult = synchronized(mutationLock) {
+        commit(_catalogueState.value.moveChannel(id, toIndex))
+    }
+
+    fun removeChannel(id: String): ChannelRepositoryMutationResult = synchronized(mutationLock) {
+        commit(_catalogueState.value.removeChannel(id))
+    }
+
+    private sealed interface ChannelDefinitionMigrationResult {
+        data class Success(val definition: ChannelDefinition) : ChannelDefinitionMigrationResult
+        data class Failure(val error: ChannelRepositoryError) : ChannelDefinitionMigrationResult
+    }
+
+    private fun migrateProviderDefinition(definition: ChannelDefinition): ChannelDefinitionMigrationResult = when (
+        val resolution = descriptorResolver.resolveDescriptor(definition.implementationId)
+    ) {
+        is ChannelDescriptorResolution.Missing -> ChannelDefinitionMigrationResult.Failure(
+            ChannelRepositoryError.ProviderMigration(definition.id, resolution.error),
+        )
+        is ChannelDescriptorResolution.Available -> when (
+            val result = resolution.descriptor.configuration.migrateAndValidate(
+                definition.configSchemaVersion,
+                definition.configPayload,
+            )
+        ) {
+            is ProviderConfigurationResult.Failure -> ChannelDefinitionMigrationResult.Failure(
+                ChannelRepositoryError.ProviderMigration(definition.id, result.error),
+            )
+            is ProviderConfigurationResult.Success -> ChannelDefinitionMigrationResult.Success(
+                definition.copy(
+                    configSchemaVersion = result.configuration.schemaVersion,
+                    configPayload = result.configuration.payload,
+                ),
+            )
+        }
+    }
+
+    private fun commit(result: ChannelCatalogueMutationResult): ChannelRepositoryMutationResult = when (result) {
+        is ChannelCatalogueMutationResult.Failure ->
+            ChannelRepositoryMutationResult.Failure(ChannelRepositoryError.Mutation(result.error))
+        is ChannelCatalogueMutationResult.Success -> {
+            when (val stored = fileStore.save(result.snapshot)) {
+                ChannelCatalogueFileStoreResult.Success -> {
+                    _catalogueState.value = result.snapshot
+                    ChannelRepositoryMutationResult.Success
+                }
+                is ChannelCatalogueFileStoreResult.Failure -> ChannelRepositoryMutationResult.Failure(
+                    ChannelRepositoryError.Storage(stored.operation, stored.cause),
+                )
             }
         }
     }
-    fun loadActiveChannelId(): String =
-        prefs.getString(KEY_ACTIVE_CHANNEL, JournalChannel.ID) ?: JournalChannel.ID
 
+    private fun saveOrThrow(snapshot: ChannelCatalogueSnapshot) {
+        when (val stored = fileStore.save(snapshot)) {
+            ChannelCatalogueFileStoreResult.Success -> Unit
+            is ChannelCatalogueFileStoreResult.Failure -> throw ChannelRepositoryLoadException(
+                ChannelRepositoryError.Storage(stored.operation, stored.cause),
+            )
+        }
+    }
+
+    private fun backupLegacyV1OrThrow() {
+        when (val backup = fileStore.backupLegacyV1()) {
+            ChannelCatalogueFileStoreResult.Success -> Unit
+            is ChannelCatalogueFileStoreResult.Failure -> throw ChannelRepositoryLoadException(
+                ChannelRepositoryError.Storage(backup.operation, backup.cause),
+            )
+        }
+    }
 
     companion object {
+        /** Stable v1 preference-derived identities used only when no catalogue file exists. */
+        private object LegacyPreferenceCatalogueSeed {
+            const val JOURNAL_ID = "captains-log"
+            const val JOURNAL_NAME = "Journal"
+            const val DEBUG_ID = "debug-channel"
+            const val DEBUG_NAME = "Debug Channel"
+            const val KEYBOARD_ID = "keyboard-channel"
+            const val KEYBOARD_NAME = "Keyboard Channel"
+        }
+
         private const val PREFS_NAME = "channels"
         private const val KEY_BASE_DIRECTORY = "journal_base_directory"
         private const val KEY_SAVE_VOICE = "journal_save_voice"
@@ -176,5 +255,8 @@ class ChannelRepository(
         private const val KEY_DEBUG_MODE = "debug_channel_mode"
         private const val KEY_ACTIVE_CHANNEL = "active_channel_id"
         private const val KEY_KEYBOARD_HOST_PROFILE = "keyboard_host_profile"
+
+        private fun isHostProfileKey(key: String): Boolean =
+            key.split(":").let { parts -> parts.size >= 2 && parts.none(String::isBlank) }
     }
 }

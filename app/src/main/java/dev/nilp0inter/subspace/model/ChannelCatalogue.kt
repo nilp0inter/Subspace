@@ -1,127 +1,204 @@
 package dev.nilp0inter.subspace.model
 
-import io.sleepwalker.core.keymap.HostProfile
+/** A stable provider-owned implementation reference, independent of a channel instance ID. */
+@JvmInline
+value class ChannelImplementationId(val value: String) {
+    init {
+        require(IMPLEMENTATION_ID.matches(value)) {
+            "Implementation ID must be a non-blank namespaced identifier: $value"
+        }
+    }
 
-enum class ChannelKind {
-    JOURNAL, DEBUG, KEYBOARD, TEST_FOURTH
+    override fun toString(): String = value
+
+    companion object {
+        private val IMPLEMENTATION_ID = Regex("[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*")
+    }
 }
 
-sealed interface ChannelConfig
+/**
+ * Immutable, provider-owned JSON object. The catalogue never decodes its fields.
+ *
+ * The encoded object is retained rather than a mutable [org.json.JSONObject], so callers
+ * cannot mutate persisted configuration through a definition they already hold.
+ */
+class OpaqueJsonObject private constructor(private val encoded: String) {
+    fun toJsonString(): String = encoded
 
-data class JournalConfig(
-    val baseDirectory: String?,
-    val saveVoice: Boolean,
-    val saveText: Boolean
-) : ChannelConfig
+    fun toJsonObject(): org.json.JSONObject = org.json.JSONObject(encoded)
 
-data class DebugConfig(
-    val mode: DebugMode
-) : ChannelConfig
+    override fun equals(other: Any?): Boolean =
+        other is OpaqueJsonObject && encoded == other.encoded
 
-data class KeyboardConfig(
-    val hostProfile: HostProfile
-) : ChannelConfig
+    override fun hashCode(): Int = encoded.hashCode()
 
-data class TestFourthConfig(
-    val data: String
-) : ChannelConfig
+    override fun toString(): String = encoded
+
+    companion object {
+        fun parse(encoded: String): Result<OpaqueJsonObject> = runCatching {
+            val value = org.json.JSONTokener(encoded).nextValue()
+            require(value is org.json.JSONObject) { "Configuration payload must be a JSON object" }
+            OpaqueJsonObject(value.toString())
+        }
+
+        fun fromJsonObject(value: org.json.JSONObject): OpaqueJsonObject =
+            OpaqueJsonObject(value.toString())
+    }
+}
 
 data class ChannelDefinition(
     val id: String,
     val name: String,
-    val kind: ChannelKind,
+    val implementationId: ChannelImplementationId,
     val enabled: Boolean,
     val configSchemaVersion: Int,
-    val config: ChannelConfig
+    val configPayload: OpaqueJsonObject,
 )
 
 data class ChannelCatalogueSnapshot(
     val definitions: List<ChannelDefinition>,
-    val activeChannelId: String
-) {
-    init {
-        ChannelCatalogueValidator.validate(this)
+    val activeChannelId: String,
+)
+
+sealed interface ChannelCatalogueValidationResult {
+    data object Valid : ChannelCatalogueValidationResult
+    data class Invalid(val error: ChannelCatalogueError) : ChannelCatalogueValidationResult
+}
+
+sealed interface ChannelCatalogueError {
+    val message: String
+
+    data object EmptyDefinitions : ChannelCatalogueError {
+        override val message = "Catalogue definitions must not be empty"
     }
 
-    fun selectChannel(id: String): ChannelCatalogueSnapshot {
-        require(definitions.any { it.id == id }) { "Channel ID $id does not exist in catalogue" }
-        return copy(activeChannelId = id)
+    data class BlankChannelId(val index: Int) : ChannelCatalogueError {
+        override val message = "Channel ID at index $index must not be blank"
     }
 
-    fun addChannel(definition: ChannelDefinition): ChannelCatalogueSnapshot {
-        require(definitions.none { it.id == definition.id }) { "Channel ID ${definition.id} already exists" }
-        val nextDefinitions = definitions + definition
-        return copy(definitions = nextDefinitions)
+    data class DuplicateChannelId(val id: String) : ChannelCatalogueError {
+        override val message = "Duplicate channel ID: $id"
     }
 
-    fun updateChannel(id: String, transform: (ChannelDefinition) -> ChannelDefinition): ChannelCatalogueSnapshot {
-        val index = definitions.indexOfFirst { it.id == id }
-        require(index != -1) { "Channel ID $id does not exist" }
-        val oldDef = definitions[index]
-        val newDef = transform(oldDef)
-        require(newDef.id == id) { "Cannot change ID during update" }
-        val nextDefinitions = definitions.toMutableList()
-        nextDefinitions[index] = newDef
-        return copy(definitions = nextDefinitions)
+    data class BlankChannelName(val id: String) : ChannelCatalogueError {
+        override val message = "Channel $id must have a non-blank name"
     }
 
-    fun moveChannel(id: String, toIndex: Int): ChannelCatalogueSnapshot {
-        val fromIndex = definitions.indexOfFirst { it.id == id }
-        require(fromIndex != -1) { "Channel ID $id does not exist" }
-        require(toIndex in definitions.indices) { "Target index $toIndex is out of bounds" }
-        if (fromIndex == toIndex) return this
-        val nextDefinitions = definitions.toMutableList()
-        val item = nextDefinitions.removeAt(fromIndex)
-        nextDefinitions.add(toIndex, item)
-        return copy(definitions = nextDefinitions)
+    data class InvalidConfigSchemaVersion(val id: String, val version: Int) : ChannelCatalogueError {
+        override val message = "Channel $id has invalid configuration schema version $version"
     }
 
-    fun removeChannel(id: String): ChannelCatalogueSnapshot {
-        require(definitions.size > 1) { "Cannot remove the final channel" }
-        val index = definitions.indexOfFirst { it.id == id }
-        require(index != -1) { "Channel ID $id does not exist" }
-        
-        val nextDefinitions = definitions.toMutableList()
-        nextDefinitions.removeAt(index)
-        
-        val nextActiveId = if (activeChannelId == id) {
-            if (index < definitions.size - 1) {
-                definitions[index + 1].id
-            } else {
-                definitions[index - 1].id
-            }
-        } else {
-            activeChannelId
-        }
-        
-        return copy(definitions = nextDefinitions, activeChannelId = nextActiveId)
+    data class UnknownActiveChannelId(val id: String) : ChannelCatalogueError {
+        override val message = "Active channel ID $id does not exist in the catalogue"
+    }
+
+    data class UnknownChannelId(val id: String) : ChannelCatalogueError {
+        override val message = "Channel ID $id does not exist in catalogue"
+    }
+
+    data class ChangedChannelId(val expected: String, val actual: String) : ChannelCatalogueError {
+        override val message = "Cannot change channel ID from $expected to $actual during update"
+    }
+
+    data class InvalidMoveIndex(val index: Int, val size: Int) : ChannelCatalogueError {
+        override val message = "Target index $index is outside catalogue size $size"
+    }
+
+    data object CannotRemoveFinalChannel : ChannelCatalogueError {
+        override val message = "Cannot remove the final channel"
     }
 }
 
+sealed interface ChannelCatalogueMutationResult {
+    data class Success(val snapshot: ChannelCatalogueSnapshot) : ChannelCatalogueMutationResult
+    data class Failure(val error: ChannelCatalogueError) : ChannelCatalogueMutationResult
+}
+
+fun ChannelCatalogueSnapshot.selectChannel(id: String): ChannelCatalogueMutationResult =
+    if (definitions.any { it.id == id }) {
+        ChannelCatalogueMutationResult.Success(copy(activeChannelId = id))
+    } else {
+        ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.UnknownChannelId(id))
+    }
+
+fun ChannelCatalogueSnapshot.addChannel(definition: ChannelDefinition): ChannelCatalogueMutationResult =
+    when {
+        definitions.any { it.id == definition.id } ->
+            ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.DuplicateChannelId(definition.id))
+        else -> validatedMutation(copy(definitions = definitions + definition))
+    }
+
+fun ChannelCatalogueSnapshot.updateChannel(
+    id: String,
+    transform: (ChannelDefinition) -> ChannelDefinition,
+): ChannelCatalogueMutationResult {
+    val index = definitions.indexOfFirst { it.id == id }
+    if (index == -1) return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.UnknownChannelId(id))
+    val replacement = transform(definitions[index])
+    if (replacement.id != id) {
+        return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.ChangedChannelId(id, replacement.id))
+    }
+    return validatedMutation(copy(definitions = definitions.toMutableList().also { it[index] = replacement }))
+}
+
+fun ChannelCatalogueSnapshot.moveChannel(id: String, toIndex: Int): ChannelCatalogueMutationResult {
+    val fromIndex = definitions.indexOfFirst { it.id == id }
+    if (fromIndex == -1) return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.UnknownChannelId(id))
+    if (toIndex !in definitions.indices) {
+        return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.InvalidMoveIndex(toIndex, definitions.size))
+    }
+    if (fromIndex == toIndex) return ChannelCatalogueMutationResult.Success(this)
+    val reordered = definitions.toMutableList()
+    reordered.add(toIndex, reordered.removeAt(fromIndex))
+    return ChannelCatalogueMutationResult.Success(copy(definitions = reordered))
+}
+
+fun ChannelCatalogueSnapshot.removeChannel(id: String): ChannelCatalogueMutationResult {
+    if (definitions.size == 1) return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.CannotRemoveFinalChannel)
+    val index = definitions.indexOfFirst { it.id == id }
+    if (index == -1) return ChannelCatalogueMutationResult.Failure(ChannelCatalogueError.UnknownChannelId(id))
+    val remaining = definitions.toMutableList().also { it.removeAt(index) }
+    val activeId = if (activeChannelId == id) {
+        remaining[index.coerceAtMost(remaining.lastIndex)].id
+    } else {
+        activeChannelId
+    }
+    return ChannelCatalogueMutationResult.Success(copy(definitions = remaining, activeChannelId = activeId))
+}
+
+private fun ChannelCatalogueSnapshot.validatedMutation(snapshot: ChannelCatalogueSnapshot): ChannelCatalogueMutationResult =
+    when (val validation = ChannelCatalogueValidator.validate(snapshot)) {
+        ChannelCatalogueValidationResult.Valid -> ChannelCatalogueMutationResult.Success(snapshot)
+        is ChannelCatalogueValidationResult.Invalid -> ChannelCatalogueMutationResult.Failure(validation.error)
+    }
+
 object ChannelCatalogueValidator {
-    fun validate(snapshot: ChannelCatalogueSnapshot) {
-        require(snapshot.definitions.isNotEmpty()) { "Catalogue definitions must not be empty" }
+    /** Validates only document-envelope invariants; providers own payload semantics. */
+    fun validate(snapshot: ChannelCatalogueSnapshot): ChannelCatalogueValidationResult {
+        if (snapshot.definitions.isEmpty()) return ChannelCatalogueValidationResult.Invalid(ChannelCatalogueError.EmptyDefinitions)
         val ids = mutableSetOf<String>()
-        for (def in snapshot.definitions) {
-            require(def.id.isNotBlank()) { "Channel ID must not be blank" }
-            require(ids.add(def.id)) { "Duplicate channel ID: ${def.id}" }
-            when (def.kind) {
-                ChannelKind.JOURNAL -> {
-                    require(def.config is JournalConfig) { "Configuration must be JournalConfig for JOURNAL kind" }
-                    val config = def.config as JournalConfig
-                    require(config.saveVoice || config.saveText) { "Journal configuration must save voice, text, or both" }
-                }
-                ChannelKind.DEBUG -> {
-                    require(def.config is DebugConfig) { "Configuration must be DebugConfig for DEBUG kind" }
-                }
-                ChannelKind.KEYBOARD -> {
-                    require(def.config is KeyboardConfig) { "Configuration must be KeyboardConfig for KEYBOARD kind" }
-                }
-                ChannelKind.TEST_FOURTH -> {
-                    require(def.config is TestFourthConfig) { "Configuration must be TestFourthConfig for TEST_FOURTH kind" }
-                }
+        snapshot.definitions.forEachIndexed { index, definition ->
+            if (definition.id.isBlank()) {
+                return ChannelCatalogueValidationResult.Invalid(ChannelCatalogueError.BlankChannelId(index))
+            }
+            if (!ids.add(definition.id)) {
+                return ChannelCatalogueValidationResult.Invalid(ChannelCatalogueError.DuplicateChannelId(definition.id))
+            }
+            if (definition.name.isBlank()) {
+                return ChannelCatalogueValidationResult.Invalid(ChannelCatalogueError.BlankChannelName(definition.id))
+            }
+            if (definition.configSchemaVersion < 1) {
+                return ChannelCatalogueValidationResult.Invalid(
+                    ChannelCatalogueError.InvalidConfigSchemaVersion(definition.id, definition.configSchemaVersion),
+                )
             }
         }
-        require(snapshot.activeChannelId in ids) { "Active channel ID ${snapshot.activeChannelId} must exist in the catalogue" }
+        return if (snapshot.activeChannelId in ids) {
+            ChannelCatalogueValidationResult.Valid
+        } else {
+            ChannelCatalogueValidationResult.Invalid(
+                ChannelCatalogueError.UnknownActiveChannelId(snapshot.activeChannelId),
+            )
+        }
     }
 }

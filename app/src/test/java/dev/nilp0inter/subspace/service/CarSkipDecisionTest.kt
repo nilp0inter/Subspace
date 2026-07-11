@@ -1,89 +1,50 @@
 package dev.nilp0inter.subspace.service
 
 import dev.nilp0inter.subspace.model.RawButtonEvent
+import dev.nilp0inter.subspace.model.selectChannelByOffset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
 class CarSkipDecisionTest {
     @Test
-    fun notReadyIsNoOpForBothNextAndPrev() {
-        val (next, prev) = CarSkipDecision.fromState(CarMediaPttState.NotReady)
-        assertEquals(CarSkipAction.NoOp, next)
-        assertEquals(CarSkipAction.NoOp, prev)
-    }
+    fun `car skip actions permit channel navigation before readiness while protecting active capture`() {
+        data class Case(
+            val state: CarMediaPttState,
+            val next: CarSkipAction,
+            val previous: CarSkipAction,
+        )
 
-    @Test
-    fun readyAdvancesActiveChannelOnNextAndRetreatsOnPrev() {
-        val (next, prev) = CarSkipDecision.fromState(CarMediaPttState.Ready)
-        assertEquals(CarSkipAction.NextChannel, next)
-        assertEquals(CarSkipAction.PrevChannel, prev)
-    }
-
-    @Test
-    fun recordingIsNoOpToProtectCaptureLifecycle() {
-        val (next, prev) = CarSkipDecision.fromState(CarMediaPttState.Recording)
-        assertEquals(CarSkipAction.NoOp, next)
-        assertEquals(CarSkipAction.NoOp, prev)
-    }
-
-    @Test
-    fun finalizingSkipsCurrentMessageOnNextAndReplaysLastHeardOnPrev() {
-        val (next, prev) = CarSkipDecision.fromState(CarMediaPttState.Finalizing)
-        assertEquals(CarSkipAction.SkipMessage, next)
-        assertEquals(CarSkipAction.ReplayMessage, prev)
-    }
-
-    @Test
-    fun fromStateCoversEveryStateValue() {
-        CarMediaPttState.values().forEach { state ->
-            val (next, prev) = CarSkipDecision.fromState(state)
-            // Every state must produce a non-null action pair; no exceptions.
-            assert(next in CarSkipAction.values().toSet()) { "unexpected next: $next for $state" }
-            assert(prev in CarSkipAction.values().toSet()) { "unexpected prev: $prev for $state" }
+        listOf(
+            Case(CarMediaPttState.NotReady, CarSkipAction.NextChannel, CarSkipAction.PrevChannel),
+            Case(CarMediaPttState.Ready, CarSkipAction.NextChannel, CarSkipAction.PrevChannel),
+            Case(CarMediaPttState.Recording, CarSkipAction.NoOp, CarSkipAction.NoOp),
+            Case(CarMediaPttState.Finalizing, CarSkipAction.SkipMessage, CarSkipAction.ReplayMessage),
+        ).forEach { case ->
+            assertEquals(case.state.name, case.next to case.previous, CarSkipDecision.fromState(case.state))
         }
     }
 
     @Test
-    fun emptyChannelListEdgeCaseHandledAtOffsetSelectionTime() {
-        // The decision function itself is state-only; the empty-channel-list
-        // edge case lives in the offset-selection helper. Verify it returns
-        // null saturating signal which the MediaSession callback no-ops on.
-        val emptyOrderedIds = emptyList<String>()
-        val selected = selectChannelByOffsetForTest(emptyOrderedIds, "anything", +1)
-        assertEquals(null, selected)
+    fun `channel traversal retains unavailable positions so availability changes cannot renumber car controls`() {
+        val catalogueIds = listOf("ready-before", "unavailable-retained", "ready-after")
+
+        assertEquals("unavailable-retained", selectChannelByOffset(catalogueIds, "ready-before", +1))
+        assertEquals("ready-after", selectChannelByOffset(catalogueIds, "unavailable-retained", +1))
+        assertEquals("ready-before", selectChannelByOffset(catalogueIds, "unavailable-retained", -1))
+        assertEquals("ready-after", selectChannelByOffset(catalogueIds, "ready-after", +1))
+        assertEquals("ready-before", selectChannelByOffset(catalogueIds, "ready-before", -1))
     }
 
     @Test
-    fun offsetSelectionSaturatesAtBoundsWithoutWraparound() {
-        val orderedIds = listOf("captains-log", "debug-channel")
-        // Next beyond last index saturates — no wraparound.
-        assertEquals("debug-channel", selectChannelByOffsetForTest(orderedIds, "debug-channel", +1))
-        // Prev before first index saturates — no wraparound.
-        assertEquals("captains-log", selectChannelByOffsetForTest(orderedIds, "captains-log", -1))
-        // Standard advance.
-        assertEquals("debug-channel", selectChannelByOffsetForTest(orderedIds, "captains-log", +1))
-        assertEquals("captains-log", selectChannelByOffsetForTest(orderedIds, "debug-channel", -1))
+    fun `empty catalogue has no offset target`() {
+        assertNull(selectChannelByOffset(emptyList(), "any-instance", +1))
     }
 
     @Test
-    fun rsmVolumeKeysUseInvertedChannelOffsets() {
-        // RSM Control mode: Volume Up selects the preceding/up catalogue
-        // channel (offset -1); Volume Down selects the following/down
-        // catalogue channel (offset +1). Non-volume events carry no
-        // traversal offset.
+    fun `RSM volume offsets remain inverse to physical list direction`() {
         assertEquals(-1, rsmChannelOffset(RawButtonEvent.VolumeUpClicked))
         assertEquals(1, rsmChannelOffset(RawButtonEvent.VolumeDownClicked))
         assertNull(rsmChannelOffset(RawButtonEvent.PttPressed))
-    }
-
-    private fun selectChannelByOffsetForTest(
-        orderedIds: List<String>,
-        currentChannelId: String,
-        offset: Int,
-    ): String? {
-        // The pure selection helper lives in the model package and is exercised
-        // here through the same surface used by PttForegroundService.
-        return dev.nilp0inter.subspace.model.selectChannelByOffset(orderedIds, currentChannelId, offset)
     }
 }

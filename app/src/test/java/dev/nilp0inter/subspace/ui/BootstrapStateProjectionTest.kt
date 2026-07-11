@@ -79,6 +79,13 @@ class BootstrapStateProjectionTest {
     }
 
     @Test
+    fun `NeedsSetup with missing all-files access maps to Setup`() {
+        val state = BootstrapState.NeedsSetup(needsManageExternalStorage = true)
+
+        assertEquals(BootstrapRootSurface.Setup, bootstrapRootSurface(state))
+    }
+
+    @Test
     fun `NeedsSetup with error still maps to Setup`() {
         val state = BootstrapState.NeedsSetup(
             missingPermissions = emptyList(),

@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
 sealed interface SleepwalkerConnectionResult {
@@ -50,6 +51,7 @@ open class SleepwalkerBleConnection {
         private const val TAG = "SubspaceRoute"
         private const val CCCD_UUID = "00002902-0000-1000-8000-00805f9b34fb"
         const val CONNECTION_TIMEOUT_MS = 10_000L
+        private const val INTER_WRITE_DELAY_MS = 15L
     }
 
     protected val _connectionState = MutableStateFlow(KeyboardConnectionState.Disconnected)
@@ -324,32 +326,51 @@ open class SleepwalkerBleConnection {
 
     @SuppressLint("MissingPermission")
     open suspend fun sendOp(op: LowLevelOp) {
-        val g = gatt
-        val rx = rxChar
-        if (_connectionState.value != KeyboardConnectionState.Connected || g == null || rx == null) {
-            Log.d(TAG, "BLE_SEND_OP_SKIP state=${_connectionState.value} gatt=${g != null} rx=${rx != null}")
-            return
+        val (g, rx) = synchronized(gattLock) {
+            val currentGatt = gatt
+            val currentRx = rxChar
+            if (
+                _connectionState.value != KeyboardConnectionState.Connected ||
+                currentGatt == null ||
+                currentRx == null
+            ) {
+                Log.i(TAG, "BLE_WRITE_SKIP opcode=${op.opcode} reason=not_connected")
+                return
+            }
+            currentGatt to currentRx
         }
         val frame = op.toFrameBytes()
         val chunks = BleWriter.chunkFrame(frame, negotiatedMtu)
         for (chunk in chunks) {
             synchronized(gattLock) {
+                if (
+                    _connectionState.value != KeyboardConnectionState.Connected ||
+                    gatt !== g ||
+                    rxChar !== rx
+                ) {
+                    Log.i(TAG, "BLE_WRITE_SKIP opcode=${op.opcode} reason=disconnected_during_write")
+                    return
+                }
                 @Suppress("DEPRECATION")
                 rx.value = chunk
                 rx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                val success = g.writeCharacteristic(rx)
-                Log.d(TAG, "BLE_WRITE_RESULT opcode=${op.opcode} success=$success size=${chunk.size}")
+                g.writeCharacteristic(rx)
             }
-            kotlinx.coroutines.delay(15)
+            delay(INTER_WRITE_DELAY_MS)
         }
     }
 
     open suspend fun awaitAck(seqId: Int, timeoutMs: Long = 3000): Boolean {
-        if (_connectionState.value != KeyboardConnectionState.Connected) return false
-        return withTimeoutOrNull(timeoutMs) {
+        if (_connectionState.value != KeyboardConnectionState.Connected) {
+            Log.i(TAG, "BLE_ACK_RESULT seqId=$seqId result=disconnected")
+            return false
+        }
+        val acknowledged = withTimeoutOrNull(timeoutMs) {
             statusFlow.first { it.seqId == seqId && it.status == io.sleepwalker.core.protocol.Status.SENT_TO_USB }
             true
         } ?: false
+        Log.i(TAG, "BLE_ACK_RESULT seqId=$seqId result=${if (acknowledged) "acknowledged" else "timed_out"}")
+        return acknowledged
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -497,7 +518,7 @@ open class SleepwalkerBleConnection {
         if (data == null) return
         val status = SessionStatusParser.parse(data)
         if (status != null) {
-            Log.d(TAG, "BLE_STATUS seqId=${status.seqId} statusName=${status.statusName}")
+            Log.i(TAG, "BLE_STATUS seqId=${status.seqId} statusName=${status.statusName}")
             _statusFlow.tryEmit(status)
         }
     }

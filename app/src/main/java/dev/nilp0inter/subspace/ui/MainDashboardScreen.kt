@@ -1,48 +1,35 @@
 package dev.nilp0inter.subspace.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Close
-import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
-import dev.nilp0inter.subspace.service.ChannelExecutionStatus
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.foundation.layout.size
-import dev.nilp0inter.subspace.model.ChannelDefinition
-import dev.nilp0inter.subspace.model.JournalConfig
-import dev.nilp0inter.subspace.model.DebugConfig
-import dev.nilp0inter.subspace.model.KeyboardConfig
-import dev.nilp0inter.subspace.model.DebugMode
-import io.sleepwalker.core.keymap.HostProfile
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -59,29 +46,26 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import dev.nilp0inter.subspace.model.ChannelKind
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.DebugChannel
+import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.InputMode
-import dev.nilp0inter.subspace.model.JournalChannel
-import dev.nilp0inter.subspace.model.KeyboardChannel
-import kotlinx.coroutines.withTimeoutOrNull
+import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
+import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 
 @Composable
 fun MainDashboardScreen(
     appState: AppState,
     level: Float,
     isCapturing: Boolean,
+    providerDescriptors: List<ChannelImplementationDescriptor>,
     actions: PttUiActions,
     modifier: Modifier = Modifier,
 ) {
@@ -146,6 +130,7 @@ fun MainDashboardScreen(
 
         ChannelPanel(
             appState = appState,
+            providerDescriptors = providerDescriptors,
             actions = actions,
             phonePttGesture = phonePttGesture,
             phonePttLockThresholdPx = phonePttLockThresholdPx,
@@ -328,6 +313,7 @@ private fun ModeGlyph(
 @Composable
 private fun ChannelPanel(
     appState: AppState,
+    providerDescriptors: List<ChannelImplementationDescriptor>,
     actions: PttUiActions,
     phonePttGesture: PhonePttGestureState,
     phonePttLockThresholdPx: Float,
@@ -349,21 +335,21 @@ private fun ChannelPanel(
             IconButton(onClick = { isManaging = !isManaging }) {
                 Icon(
                     imageVector = if (isManaging) Icons.Filled.Close else Icons.Filled.Edit,
-                    contentDescription = if (isManaging) "Done" else "Manage Channels"
+                    contentDescription = if (isManaging) "Done" else "Manage Channels",
                 )
             }
         }
 
         if (isManaging) {
-            CatalogueManagementPanel(
-                appState = appState,
-                actions = actions,
-            )
+            CatalogueManagementPanel(appState, providerDescriptors, actions)
         } else {
             appState.channels.forEach { channel ->
                 ChannelCard(
                     channel = channel,
-                    appState = appState,
+                    activeChannelId = appState.activeChannelId,
+                    descriptor = providerDescriptors.firstOrNull {
+                        it.implementationId == channel.implementationId
+                    },
                     actions = actions,
                     phonePttGesture = phonePttGesture,
                     phonePttLockThresholdPx = phonePttLockThresholdPx,
@@ -377,10 +363,10 @@ private fun ChannelPanel(
 @Composable
 private fun CatalogueManagementPanel(
     appState: AppState,
+    providerDescriptors: List<ChannelImplementationDescriptor>,
     actions: PttUiActions,
 ) {
     var newName by remember { mutableStateOf("") }
-    var selectedKind by remember { mutableStateOf(ChannelKind.JOURNAL) }
     var renameTargetId by remember { mutableStateOf<String?>(null) }
     var renameText by remember { mutableStateOf("") }
 
@@ -388,64 +374,52 @@ private fun CatalogueManagementPanel(
         appState.channels.forEachIndexed { index, channel ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
             ) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (renameTargetId == channel.id) {
                             OutlinedTextField(
                                 value = renameText,
                                 onValueChange = { renameText = it },
-                                label = { Text("Channel Name") },
-                                modifier = Modifier.weight(1f)
+                                label = { Text("Channel name") },
+                                modifier = Modifier.weight(1f),
                             )
-                            Spacer(Modifier.size(8.dp))
-                            Button(onClick = {
-                                if (renameText.isNotBlank()) {
-                                    actions.renameChannel(channel.id, renameText)
-                                }
-                                renameTargetId = null
-                            }) {
-                                Text("Save")
-                            }
+                            Button(
+                                onClick = {
+                                    if (renameText.isNotBlank()) actions.renameChannel(channel.id, renameText)
+                                    renameTargetId = null
+                                },
+                            ) { Text("Save") }
                         } else {
-                            Column {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                Text(channel.kind.name, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                                val label = providerDescriptors.firstOrNull {
+                                    it.implementationId == channel.implementationId
+                                }?.presentation?.label ?: channel.implementationId.value
+                                Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(onClick = {
                                     renameTargetId = channel.id
                                     renameText = channel.name
-                                }) {
-                                    Icon(Icons.Filled.Edit, contentDescription = "Rename")
-                                }
-                                
+                                }) { Icon(Icons.Filled.Edit, contentDescription = "Rename") }
                                 IconButton(
                                     onClick = { actions.moveChannel(channel.id, index - 1) },
-                                    enabled = index > 0
-                                ) {
-                                    Text("▲", style = MaterialTheme.typography.bodyLarge)
-                                }
-                                
+                                    enabled = index > 0,
+                                ) { Text("▲") }
                                 IconButton(
                                     onClick = { actions.moveChannel(channel.id, index + 1) },
-                                    enabled = index < appState.channels.lastIndex
-                                ) {
-                                    Text("▼", style = MaterialTheme.typography.bodyLarge)
-                                }
-
-                                val canDelete = appState.channels.size > 1
+                                    enabled = index < appState.channels.lastIndex,
+                                ) { Text("▼") }
                                 IconButton(
                                     onClick = { actions.removeChannel(channel.id) },
-                                    enabled = canDelete
-                                ) {
-                                    Icon(Icons.Filled.Delete, contentDescription = "Delete")
-                                }
+                                    enabled = appState.channels.size > 1,
+                                ) { Icon(Icons.Filled.Delete, contentDescription = "Delete") }
                             }
                         }
                     }
@@ -455,87 +429,100 @@ private fun CatalogueManagementPanel(
 
         Card(
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("ADD CHANNEL", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                
                 OutlinedTextField(
                     value = newName,
                     onValueChange = { newName = it },
-                    label = { Text("Display Name") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Kind", style = MaterialTheme.typography.bodyMedium)
-                    ChannelKind.values()
-                        .filter { it != ChannelKind.TEST_FOURTH }
-                        .forEach { kind ->
-                            OutlinedButton(
-                                onClick = { selectedKind = kind },
-                                modifier = Modifier.fillMaxWidth(),
-                                border = if (selectedKind == kind) {
-                                    BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
-                                } else {
-                                    null
-                                },
-                            ) {
-                                Text(kind.name)
-                            }
-                        }
-                }
-
-                Button(
-                    onClick = {
-                        if (newName.isNotBlank()) {
-                            val newDef = ChannelDefinition(
-                                id = "chan-${System.currentTimeMillis()}",
-                                name = newName,
-                                kind = selectedKind,
-                                enabled = true,
-                                configSchemaVersion = 1,
-                                config = when (selectedKind) {
-                                    ChannelKind.JOURNAL -> JournalConfig(null, true, true)
-                                    ChannelKind.DEBUG -> DebugConfig(DebugMode.ECHO)
-                                    ChannelKind.KEYBOARD -> KeyboardConfig(HostProfile.LINUX_US)
-                                    else -> throw IllegalStateException()
-                                }
-                            )
-                            actions.addChannel(newDef)
-                            newName = ""
-                        }
-                    },
+                    label = { Text("Display name") },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = newName.isNotBlank()
-                ) {
-                    Icon(Icons.Filled.Add, contentDescription = "Add")
-                    Spacer(Modifier.size(4.dp))
-                    Text("CREATE INSTANCE")
+                )
+                Text("Choose a provider", style = MaterialTheme.typography.bodyMedium)
+                providerDescriptors.forEach { descriptor ->
+                    OutlinedButton(
+                        onClick = {
+                            actions.navigateToChannelCreation(descriptor.implementationId, newName)
+                        },
+                        enabled = newName.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(descriptor.presentation.label, fontWeight = FontWeight.SemiBold)
+                            Text(descriptor.presentation.summary, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                if (providerDescriptors.isEmpty()) {
+                    Text("No channel providers are currently available.", style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }
     }
 }
 
+internal enum class ChannelCardTone { Primary, Secondary }
+
+internal data class ChannelCardPresentation(
+    val statusLabel: String,
+    val tone: ChannelCardTone,
+)
+
+internal fun channelCardPresentation(
+    isActive: Boolean,
+    isAvailable: Boolean,
+    isPttActive: Boolean,
+    isLocked: Boolean,
+): ChannelCardPresentation = ChannelCardPresentation(
+    statusLabel = when {
+        isLocked -> "LOCKED"
+        isPttActive -> "PTT"
+        isActive -> "ACTIVE"
+        !isAvailable -> "UNAVAILABLE"
+        else -> "READY"
+    },
+    tone = if (isActive && !isPttActive) ChannelCardTone.Primary else ChannelCardTone.Secondary,
+)
+
 @Composable
 private fun ChannelCard(
     channel: ChannelRuntimeSnapshot,
-    appState: AppState,
+    activeChannelId: String,
+    descriptor: ChannelImplementationDescriptor?,
     actions: PttUiActions,
     phonePttGesture: PhonePttGestureState,
     phonePttLockThresholdPx: Float,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
 ) {
     val channelId = channel.id
-    val isActive = appState.activeChannelId == channelId
-    val isReady = channel.isReady
-    val accent = when {
-        phonePttGesture.activeChannelId == channelId -> MaterialTheme.colorScheme.secondary
-        isActive -> MaterialTheme.colorScheme.primary
-        isReady -> MaterialTheme.colorScheme.secondary
-        else -> MaterialTheme.colorScheme.outline
+    val isActive = activeChannelId == channelId
+    val isImmediatelyAvailable = channel.preparation is ChannelPreparationAvailability.Available
+    val isPttActive = phonePttGesture.activeChannelId == channelId
+    val presentation = channelCardPresentation(
+        isActive = isActive,
+        isAvailable = isImmediatelyAvailable,
+        isPttActive = isPttActive,
+        isLocked = phonePttGesture.isLocked && isPttActive,
+    )
+    val accent = when (presentation.tone) {
+        ChannelCardTone.Primary -> MaterialTheme.colorScheme.primary
+        ChannelCardTone.Secondary -> MaterialTheme.colorScheme.secondary
     }
+    val currentSelectChannel by rememberUpdatedState(actions::setActiveChannel)
+    val currentPhonePttTransition by rememberUpdatedState(onPhonePttTransition)
+    val interactionModifier = Modifier.phonePttInput(
+        channelId = channelId,
+        lockThresholdPx = phonePttLockThresholdPx,
+        onSelect = { currentSelectChannel(it) },
+        onPhonePttTransition = { currentPhonePttTransition(it) },
+    )
+    val availabilityMessage = when (val preparation = channel.preparation) {
+        ChannelPreparationAvailability.Available -> null
+        is ChannelPreparationAvailability.Recoverable -> preparation.reason.message
+        is ChannelPreparationAvailability.Unavailable -> preparation.reason.message
+    }
+
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         border = BorderStroke(1.dp, accent),
@@ -551,45 +538,27 @@ private fun ChannelCard(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .phonePttInput(
-                            channelId = channelId,
-                            lockThresholdPx = phonePttLockThresholdPx,
-                            onSelect = actions::setActiveChannel,
-                            onPhonePttTransition = onPhonePttTransition,
-                        ),
+                    modifier = Modifier.fillMaxWidth().then(interactionModifier),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(channel.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    
-                    val subtitle = when (channel.kind) {
-                        ChannelKind.JOURNAL -> "LOCAL LOG"
-                        ChannelKind.KEYBOARD -> "BLE HID"
-                        ChannelKind.DEBUG -> "TEST"
-                        ChannelKind.TEST_FOURTH -> "TEST"
-                    }
-                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-                    
-                    if (channel.kind == ChannelKind.DEBUG && !channel.summary.isNullOrBlank()) {
+                    Text(
+                        descriptor?.presentation?.summary ?: channel.implementationId.value,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    availabilityMessage?.let { reason ->
                         Text(
-                            text = "Mode: ${channel.summary}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-
-                    if (!isReady) {
-                        val errorText = when (channel.kind) {
-                            ChannelKind.JOURNAL -> "Requires configuration to broadcast."
-                            ChannelKind.KEYBOARD -> "Requires active BLE bridge connection."
-                            ChannelKind.DEBUG -> "Selected debug mode is unavailable."
-                            else -> "Requires configuration to broadcast."
-                        }
-                        Text(
-                            text = errorText,
+                            text = "$reason ${descriptor?.presentation?.unavailableMessage.orEmpty()}".trim(),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (!isImmediatelyAvailable) {
+                        Text(
+                            text = "Recovery: configure this channel when its provider is available, or remove it from channel management.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                     HeldPhonePttInstruction(channelId, phonePttGesture)
@@ -598,24 +567,14 @@ private fun ChannelCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 StatusPill(
-                    label = when {
-                        phonePttGesture.isLocked && phonePttGesture.activeChannelId == channelId -> "LOCKED"
-                        phonePttGesture.activeChannelId == channelId -> "PTT"
-                        isActive -> "ACTIVE"
-                        isReady -> "READY"
-                        else -> "STANDBY"
-                    },
+                    label = presentation.statusLabel,
                     accent = accent,
                 )
-                IconButton(onClick = {
-                    when (channel.kind) {
-                        ChannelKind.JOURNAL -> actions.navigateToJournalConfig(channel.id)
-                        ChannelKind.KEYBOARD -> actions.navigateToKeyboardConfig(channel.id)
-                        ChannelKind.DEBUG -> actions.navigateToDebugConfig(channel.id)
-                        ChannelKind.TEST_FOURTH -> {}
-                    }
-                }) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Config")
+                IconButton(
+                    onClick = { actions.navigateToChannelConfiguration(channel.id) },
+                    enabled = descriptor != null,
+                ) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Configure")
                 }
             }
         }
@@ -682,11 +641,6 @@ private fun StatusPill(label: String, accent: Color) {
     }
 }
 
-private data class MockChannel(
-    val name: String,
-    val route: String,
-    val description: String,
-)
 
 
 data class DashboardVuMeterState(

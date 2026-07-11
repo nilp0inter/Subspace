@@ -4,255 +4,284 @@ import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
-import dev.nilp0inter.subspace.audio.EchoController
 import dev.nilp0inter.subspace.audio.RecordedPcm
-import dev.nilp0inter.subspace.audio.SttController
-import dev.nilp0inter.subspace.audio.SttTtsController
-import dev.nilp0inter.subspace.audio.TtsController
-import dev.nilp0inter.subspace.model.ChannelDefinition
-import dev.nilp0inter.subspace.model.DebugConfig
+import dev.nilp0inter.subspace.channel.capability.CapabilityKey
+import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
+import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
+import dev.nilp0inter.subspace.channel.capability.SpeechVoice
+import dev.nilp0inter.subspace.channel.capability.opaqueAudioRecording
+import dev.nilp0inter.subspace.channel.preparationFor
+import dev.nilp0inter.subspace.channel.useCapability
+import dev.nilp0inter.subspace.model.BuiltInChannelDescriptors
+import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ChannelProviderError
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
+import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
 import dev.nilp0inter.subspace.model.DebugMode
-import dev.nilp0inter.subspace.model.MonitorState
+import dev.nilp0inter.subspace.model.DebugProviderConfiguration
+import dev.nilp0inter.subspace.model.DebugProviderConfigurationCodec
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.io.File
 
-class DebugRuntimeFactory(
-    private val echoController: EchoController,
-    private val sttControllerProvider: () -> SttController?,
-    private val ttsControllerProvider: () -> TtsController?,
-    private val sttTtsControllerProvider: () -> SttTtsController?,
-    private val modelDirProvider: () -> File?,
-    private val monitorStateProvider: () -> MonitorState
-) : ChannelRuntimeFactory {
-    override fun create(definition: ChannelDefinition): ChannelRuntime {
-        return DebugRuntime(
-            definition,
-            echoController,
-            sttControllerProvider,
-            ttsControllerProvider,
-            sttTtsControllerProvider,
-            modelDirProvider,
-            monitorStateProvider
+/** Provider-backed Debug runtime construction without controller, model-path, or service access. */
+class DebugBuiltInProvider : ChannelImplementationProvider {
+    override val descriptor = BuiltInChannelDescriptors.debug
+
+    override suspend fun constructRuntime(
+        request: ChannelRuntimeConstructionRequest,
+    ): ChannelRuntimeConstructionResult {
+        val configuration = DebugProviderConfigurationCodec.decode(request.configuration.payload)
+            .getOrElse { error ->
+                return ChannelRuntimeConstructionResult.Failure(
+                    ChannelProviderError.RuntimeConstructionFailed(
+                        descriptor.implementationId,
+                        error.message ?: "Invalid Debug configuration",
+                    ),
+                )
+            }
+        return ChannelRuntimeConstructionResult.Success(
+            DebugRuntime(
+                definition = request.definition,
+                configuration = configuration,
+                capabilities = request.capabilities,
+                initialPreparation = initialPreparation(configuration, request.capabilities),
+            ),
         )
     }
+
+    private suspend fun initialPreparation(
+        configuration: DebugProviderConfiguration,
+        capabilities: ChannelCapabilityScope,
+    ): ChannelPreparationAvailability = when (configuration.mode) {
+        DebugMode.ECHO -> ChannelPreparationAvailability.Available
+        DebugMode.STT -> capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false)
+        DebugMode.TTS -> requireAvailable(
+            capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+        )
+        DebugMode.STT_TTS -> requireAvailable(
+            capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+        )
+    }
+
+    private fun requireAvailable(
+        vararg states: ChannelPreparationAvailability,
+    ): ChannelPreparationAvailability = states.firstOrNull {
+        it !is ChannelPreparationAvailability.Available
+    } ?: ChannelPreparationAvailability.Available
 }
 
+/**
+ * Debug modes exercise generic input and semantic capability contracts. ECHO returns the host
+ * recording for host-owned playback; STT and TTS modes neither access controllers nor paths.
+ */
 class DebugRuntime(
-    override var definition: ChannelDefinition,
-    private val echoController: EchoController,
-    private val sttControllerProvider: () -> SttController?,
-    private val ttsControllerProvider: () -> TtsController?,
-    private val sttTtsControllerProvider: () -> SttTtsController?,
-    private val modelDirProvider: () -> File?,
-    private val monitorStateProvider: () -> MonitorState
+    val definition: dev.nilp0inter.subspace.model.ChannelDefinition,
+    private val configuration: DebugProviderConfiguration,
+    private val capabilities: ChannelCapabilityScope,
+    initialPreparation: ChannelPreparationAvailability,
 ) : ChannelRuntime {
-
+    private val closed = AtomicBoolean(false)
     private val _snapshot = MutableStateFlow(
         ChannelRuntimeSnapshot(
             id = definition.id,
             name = definition.name,
-            kind = definition.kind,
+            implementationId = definition.implementationId,
             enabled = definition.enabled,
-            isReady = evaluateReadiness(definition),
+            preparation = if (definition.enabled) initialPreparation else disabledPreparation(),
             executionStatus = ChannelExecutionStatus.IDLE,
-            summary = (definition.config as? DebugConfig)?.mode?.name
-        )
+            summary = configuration.mode.name,
+        ),
     )
     override val snapshot: StateFlow<ChannelRuntimeSnapshot> = _snapshot.asStateFlow()
 
     override val id: String
         get() = definition.id
 
-    private fun evaluateReadiness(def: ChannelDefinition): Boolean {
-        if (!def.enabled) return false
-        val config = def.config as? DebugConfig ?: return false
-        return when (config.mode) {
-            DebugMode.ECHO -> true
-            DebugMode.STT -> sttControllerProvider() != null
-            DebugMode.TTS -> ttsControllerProvider() != null && modelDirProvider() != null
-            DebugMode.STT_TTS -> sttTtsControllerProvider() != null && modelDirProvider() != null
-        }
-    }
-
-    override fun updateDefinition(definition: ChannelDefinition) {
-        this.definition = definition
-        _snapshot.value = _snapshot.value.copy(
-            name = definition.name,
-            enabled = definition.enabled,
-            isReady = evaluateReadiness(definition),
-            summary = (definition.config as? DebugConfig)?.mode?.name
-        )
-    }
-
-    override fun refreshReadiness() {
-        _snapshot.value = _snapshot.value.copy(
-            isReady = evaluateReadiness(definition)
-        )
-    }
     override suspend fun prepareInput(): ChannelInputAcceptance {
-        val config = definition.config as? DebugConfig
-            ?: return ChannelInputAcceptance.Unavailable("Invalid configuration")
-        if (!evaluateReadiness(definition)) {
-            return ChannelInputAcceptance.Refused("Debug channel mode dependencies unavailable")
+        if (closed.get()) return ChannelInputAcceptance.Unavailable("Debug runtime is closed")
+        if (!definition.enabled) return ChannelInputAcceptance.Refused("Debug channel is disabled")
+        val preparation = currentPreparation()
+        _snapshot.value = _snapshot.value.copy(preparation = preparation)
+        return if (preparation is ChannelPreparationAvailability.Available) {
+            ChannelInputAcceptance.Accepted(DebugInputTarget())
+        } else {
+            ChannelInputAcceptance.Refused(preparationReason(preparation))
+        }
+    }
+
+    override suspend fun refreshReadiness() {
+        if (!closed.get()) {
+            _snapshot.value = _snapshot.value.copy(
+                preparation = if (definition.enabled) currentPreparation() else disabledPreparation(),
+            )
+        }
+    }
+
+    override suspend fun close() {
+        if (closed.compareAndSet(false, true)) {
+            _snapshot.value = _snapshot.value.copy(
+                preparation = ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.RuntimeClosed),
+            )
+        }
+    }
+
+    private suspend fun currentPreparation(): ChannelPreparationAvailability = when (configuration.mode) {
+        DebugMode.ECHO -> ChannelPreparationAvailability.Available
+        DebugMode.STT -> capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false)
+        DebugMode.TTS -> firstUnavailable(
+            capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+        )
+        DebugMode.STT_TTS -> firstUnavailable(
+            capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+        )
+    }
+
+    private fun firstUnavailable(
+        vararg states: ChannelPreparationAvailability,
+    ): ChannelPreparationAvailability = states.firstOrNull {
+        it !is ChannelPreparationAvailability.Available
+    } ?: ChannelPreparationAvailability.Available
+
+    private inner class DebugInputTarget : ChannelInputTarget {
+        override fun onInputStarted(session: ChannelAudioInputSession) {
+            if (!closed.get()) {
+                _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)
+            }
         }
 
-        val monitor = monitorStateProvider()
-        return when (config.mode) {
-            DebugMode.ECHO -> {
-                if (!echoController.enabled) {
-                    ChannelInputAcceptance.Refused("Echo debug channel disabled")
-                } else {
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)
-                            echoController.onInputStarted(session)
-                        }
-
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
-                            val result = echoController.onInputReleased(recording)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                            return result
-                        }
-
-                        override fun onInputPlaybackCompleted() {
-                            echoController.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            echoController.onInputCancelled(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            echoController.onInputFailed(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-                    })
+        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+            if (closed.get()) return ChannelInputResult.None
+            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
+            return when (configuration.mode) {
+                DebugMode.ECHO -> ChannelInputResult.Playback(recording)
+                DebugMode.STT -> completeWithoutPlayback(processStt(recording))
+                DebugMode.TTS -> completeWithPlayback(synthesizeAndQueue(DEFAULT_DEBUG_TEXT))
+                DebugMode.STT_TTS -> when (val transcription = processTranscription(recording)) {
+                    is CapabilityOperationResult.Success -> completeWithPlayback(
+                        synthesizeAndQueue(transcription.value.text),
+                    )
+                    else -> completeWithoutPlayback(transcription)
                 }
             }
-            DebugMode.STT -> {
-                val stt = sttControllerProvider()
-                    ?: return ChannelInputAcceptance.Unavailable("STT controller unavailable")
-                if (!stt.enabled) {
-                    ChannelInputAcceptance.Refused("STT debug channel disabled")
-                } else {
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)
-                            stt.onInputStarted(session)
-                        }
+        }
 
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
-                            val result = stt.onInputReleased(recording)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                            return result
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            stt.onInputCancelled(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            stt.onInputFailed(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-                    })
-                }
+        override fun onInputPlaybackCompleted() {
+            if (!closed.get()) {
+                _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.SUCCESS)
             }
-            DebugMode.TTS -> {
-                val tts = ttsControllerProvider()
-                    ?: return ChannelInputAcceptance.Unavailable("TTS controller unavailable")
-                val modelDir = modelDirProvider()
-                    ?: return ChannelInputAcceptance.Unavailable("TTS model directory unavailable")
-                if (!tts.enabled) {
-                    ChannelInputAcceptance.Refused("TTS debug channel disabled")
-                } else {
-                    val text = monitor.ttsText
-                    val voiceStylePath = File(modelDir, "${monitor.ttsVoiceStyle}.json").absolutePath
-                    val lang = monitor.ttsLang
-                    val totalSteps = monitor.ttsTotalSteps
-                    val speed = monitor.ttsSpeed
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)
-                        }
+        }
 
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
-                            val result = tts.onInputReleased(text, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                            return result
-                        }
-
-                        override fun onInputPlaybackCompleted() {
-                            tts.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            tts.cancelAndRelease()
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-                    })
-                }
+        override fun onInputCancelled(reason: String) {
+            if (!closed.get()) {
+                _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
             }
-            DebugMode.STT_TTS -> {
-                val sttTts = sttTtsControllerProvider()
-                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS controller unavailable")
-                val modelDir = modelDirProvider()
-                    ?: return ChannelInputAcceptance.Unavailable("STT/TTS model directory unavailable")
-                if (!sttTts.enabled) {
-                    ChannelInputAcceptance.Refused("STT/TTS debug channel disabled")
-                } else {
-                    val voiceStylePath = File(modelDir, "${monitor.sttTtsVoiceStyle}.json").absolutePath
-                    val lang = monitor.sttTtsLang
-                    val totalSteps = monitor.sttTtsTotalSteps
-                    val speed = monitor.sttTtsSpeed
-                    ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
-                        override fun onInputStarted(session: ChannelAudioInputSession) {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.RECORDING)
-                            sttTts.onInputStarted(session)
-                        }
+        }
 
-                        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
-                            val result = sttTts.onInputReleased(recording, voiceStylePath, lang, totalSteps, speed, SCO_RATE)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                            return result
-                        }
-
-                        override fun onInputPlaybackCompleted() {
-                            sttTts.onInputPlaybackCompleted()
-                        }
-
-                        override fun onInputCancelled(reason: String) {
-                            sttTts.onInputCancelled(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-
-                        override fun onInputFailed(reason: String) {
-                            sttTts.onInputFailed(reason)
-                            _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.IDLE)
-                        }
-                    })
-                }
+        override fun onInputFailed(reason: String) {
+            if (!closed.get()) {
+                _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.FAILED)
             }
         }
     }
 
-    override fun close() {
-        // No coroutine scope is held/managed directly by DebugRuntime
+    private suspend fun processStt(recording: RecordedPcm): CapabilityOperationResult<Unit> =
+        processTranscription(recording).mapToUnit()
+
+    private suspend fun processTranscription(
+        recording: RecordedPcm,
+    ): CapabilityOperationResult<dev.nilp0inter.subspace.channel.capability.Transcription> =
+        capabilities.useCapability(CapabilityKey.Transcription) { transcription ->
+            transcription.transcribe(opaqueAudioRecording(recording))
+        }
+
+    private suspend fun synthesizeAndQueue(text: String): CapabilityOperationResult<OpaqueAudioOperation> {
+        val synthesized = capabilities.useCapability(CapabilityKey.Synthesis) { synthesis ->
+            synthesis.synthesize(
+                SpeechSynthesisRequest(
+                    text = text,
+                    languageTag = DEFAULT_LANGUAGE_TAG,
+                    voice = SpeechVoice(DEFAULT_VOICE_ID),
+                ),
+            )
+        }
+        return when (synthesized) {
+            is CapabilityOperationResult.Success -> capabilities.useCapability(CapabilityKey.AudioOperation) { audio ->
+                audio.createPlaybackResult(synthesized.value)
+            }
+            else -> synthesized.mapFailure()
+        }
     }
 
-    companion object {
-        private const val SCO_RATE = 16_000
+    private fun completeWithoutPlayback(result: CapabilityOperationResult<*>): ChannelInputResult {
+        publishCompletion(result)
+        return ChannelInputResult.None
+    }
+
+    private fun completeWithPlayback(
+        result: CapabilityOperationResult<OpaqueAudioOperation>,
+    ): ChannelInputResult = when (result) {
+        is CapabilityOperationResult.Success -> ChannelInputResult.PlaybackOperation(result.value)
+        else -> {
+            publishCompletion(result)
+            ChannelInputResult.None
+        }
+    }
+
+    private fun publishCompletion(result: CapabilityOperationResult<*>) {
+        if (!closed.get()) {
+            _snapshot.value = _snapshot.value.copy(
+                executionStatus = if (result is CapabilityOperationResult.Success) {
+                    ChannelExecutionStatus.SUCCESS
+                } else {
+                    ChannelExecutionStatus.FAILED
+                },
+            )
+        }
+    }
+
+    private fun preparationReason(preparation: ChannelPreparationAvailability): String = when (preparation) {
+        ChannelPreparationAvailability.Available -> "Debug channel is ready"
+        is ChannelPreparationAvailability.Recoverable -> "Debug channel is preparing"
+        is ChannelPreparationAvailability.Unavailable -> when (val reason = preparation.reason) {
+            is ChannelPreparationReason.RuntimeFailed -> reason.message
+            else -> "Debug channel dependencies are unavailable"
+        }
+    }
+
+    private companion object {
+        const val DEFAULT_DEBUG_TEXT = "Debug synthesis test"
+        const val DEFAULT_LANGUAGE_TAG = "en"
+        const val DEFAULT_VOICE_ID = "default"
     }
 }
+
+private fun <T> CapabilityOperationResult<T>.mapToUnit(): CapabilityOperationResult<Unit> = when (this) {
+    is CapabilityOperationResult.Success -> CapabilityOperationResult.Success(Unit)
+    is CapabilityOperationResult.Unavailable -> CapabilityOperationResult.Unavailable(reason)
+    is CapabilityOperationResult.Denied -> CapabilityOperationResult.Denied(reason)
+    CapabilityOperationResult.Closed -> CapabilityOperationResult.Closed
+    CapabilityOperationResult.Cancelled -> CapabilityOperationResult.Cancelled
+    is CapabilityOperationResult.Failed -> CapabilityOperationResult.Failed(reason)
+}
+
+private fun <T> CapabilityOperationResult<*>.mapFailure(): CapabilityOperationResult<T> = when (this) {
+    is CapabilityOperationResult.Success -> error("Successful capability result cannot be mapped as failure")
+    is CapabilityOperationResult.Unavailable -> CapabilityOperationResult.Unavailable(reason)
+    is CapabilityOperationResult.Denied -> CapabilityOperationResult.Denied(reason)
+    CapabilityOperationResult.Closed -> CapabilityOperationResult.Closed
+    CapabilityOperationResult.Cancelled -> CapabilityOperationResult.Cancelled
+    is CapabilityOperationResult.Failed -> CapabilityOperationResult.Failed(reason)
+}
+
+private fun disabledPreparation(): ChannelPreparationAvailability.Unavailable =
+    ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.Disabled)

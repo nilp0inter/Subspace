@@ -1,8 +1,5 @@
 package dev.nilp0inter.subspace.service
 
-import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.ChannelKind
-
 internal sealed interface PttDispatchDecision {
     val channelId: String
 
@@ -10,13 +7,20 @@ internal sealed interface PttDispatchDecision {
     data class ErrorBeep(override val channelId: String) : PttDispatchDecision
 }
 
-internal fun decidePttDispatch(appState: AppState): PttDispatchDecision? {
-    val channel = appState.channels.find { it.id == appState.activeChannelId } ?: return null
-    val canRecoverKeyboard =
-        channel.kind == ChannelKind.KEYBOARD && channel.enabled
-    return if (channel.isReady || canRecoverKeyboard) {
-        PttDispatchDecision.Dispatch(channel.id)
-    } else {
-        PttDispatchDecision.ErrorBeep(channel.id)
+/**
+ * Decides PTT admission exclusively from the registry's generic, ordered runtime projection.
+ * Both ordinary and car PTT supply the same snapshot before reserving input.
+ */
+internal fun decidePttDispatch(runtimeSnapshot: RuntimeRegistrySnapshot): PttDispatchDecision? {
+    val channelId = runtimeSnapshot.activeChannelId.takeIf(String::isNotBlank) ?: return null
+    val preparation = runtimeSnapshot.entries
+        .firstOrNull { it.id == channelId }
+        ?.preparation
+        ?: ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.UnknownInstance)
+
+    return when (preparation) {
+        ChannelPreparationAvailability.Available,
+        is ChannelPreparationAvailability.Recoverable -> PttDispatchDecision.Dispatch(channelId)
+        is ChannelPreparationAvailability.Unavailable -> PttDispatchDecision.ErrorBeep(channelId)
     }
 }

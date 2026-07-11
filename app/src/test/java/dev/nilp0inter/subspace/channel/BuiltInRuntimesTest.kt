@@ -2,230 +2,350 @@ package dev.nilp0inter.subspace.channel
 
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
-import dev.nilp0inter.subspace.audio.ChannelInputResult
-import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
-import dev.nilp0inter.subspace.audio.ScoRoute
-import dev.nilp0inter.subspace.model.ScoState
-import dev.nilp0inter.subspace.audio.PcmOutput
-import dev.nilp0inter.subspace.audio.CaptureServiceFakes
-import dev.nilp0inter.subspace.bluetooth.FakeSleepwalkerBleConnection
+import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.bluetooth.SleepwalkerBleConnection
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerConnectionResult
-import dev.nilp0inter.subspace.model.AppState
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
+import dev.nilp0inter.subspace.channel.capability.AudioOperationCapability
+import dev.nilp0inter.subspace.channel.capability.CapabilityKey
+import dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination
+import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
+import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
+import dev.nilp0inter.subspace.channel.capability.ChannelCapability
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
+import dev.nilp0inter.subspace.channel.capability.RevocableChannelCapabilityScope
+import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
+import dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome
+import dev.nilp0inter.subspace.channel.capability.TextKeyRequest
+import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
+import dev.nilp0inter.subspace.channel.capability.TextOutputKey
+import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
+import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
+import dev.nilp0inter.subspace.channel.capability.Transcription
+import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
+import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
+import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
+import dev.nilp0inter.subspace.channel.capability.SynthesizedAudioArtifact
+import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
 import dev.nilp0inter.subspace.model.ChannelDefinition
-import dev.nilp0inter.subspace.model.ChannelKind
-import dev.nilp0inter.subspace.model.JournalConfig
-import dev.nilp0inter.subspace.model.DebugConfig
+import dev.nilp0inter.subspace.model.KeyboardConnectionState
+import dev.nilp0inter.subspace.model.KeyboardProviderConfiguration
 import dev.nilp0inter.subspace.model.DebugMode
-import dev.nilp0inter.subspace.model.KeyboardConfig
-import io.sleepwalker.core.keymap.HostProfile
-import io.sleepwalker.core.hid.LowLevelHidImpl
-import io.sleepwalker.core.keymap.SeedKeymapDatabase
+import dev.nilp0inter.subspace.model.DebugProviderConfiguration
+import dev.nilp0inter.subspace.model.DebugProviderConfigurationCodec
+import dev.nilp0inter.subspace.model.KeyboardProviderConfigurationCodec
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
-import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
+import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
+import dev.nilp0inter.subspace.service.ChannelPreparationReason
 import dev.nilp0inter.subspace.service.DebugRuntime
+import io.sleepwalker.core.hid.LowLevelHidImpl
+import io.sleepwalker.core.hid.LowLevelOp
+import io.sleepwalker.core.keymap.SeedKeymapDatabase
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.flowOf
-import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class BuiltInRuntimesTest {
-
     @Test
-    fun journalRuntimeChecksReadinessAndPreparesInput() = runTest {
-        val tempDir = File.createTempFile("journal_test_dir", "").apply { delete(); mkdirs(); deleteOnExit() }
-        val config = JournalConfig(tempDir.absolutePath, true, true)
-        val def = ChannelDefinition("c1", "My Journal", ChannelKind.JOURNAL, true, 1, config)
-        
-        // Mock dependencies
-        val fTranscriber = object : dev.nilp0inter.subspace.audio.PcmTranscriber {
-            override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String = "decoded text"
-        }
-        val jc = JournalController(
-            scope = this,
-            encoder = object : dev.nilp0inter.subspace.audio.AudioEncoder {
-                override suspend fun encode(pcm: ShortArray, outputFile: File, sampleRate: Int): Result<File> = Result.success(outputFile)
-            },
-            transcriber = fTranscriber
+    fun keyboardInstancesKeepStatusAndConfiguredProfilesIndependent() = runTest {
+        val host = RuntimeCapabilityHost(transcript = "captured text")
+        val alpha = keyboardRuntime("alpha", "linux:us", host)
+        val bravo = keyboardRuntime("bravo", "windows:us", host)
+
+        val alphaTarget = (alpha.runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+        alphaTarget.onInputStarted(EmptySession)
+
+        assertEquals(ChannelExecutionStatus.RECORDING, alpha.runtime.snapshot.value.executionStatus)
+        assertEquals(ChannelExecutionStatus.IDLE, bravo.runtime.snapshot.value.executionStatus)
+
+        alphaTarget.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000))
+
+        assertEquals(ChannelExecutionStatus.SUCCESS, alpha.runtime.snapshot.value.executionStatus)
+        assertEquals(ChannelExecutionStatus.IDLE, bravo.runtime.snapshot.value.executionStatus)
+        assertEquals(
+            listOf(TextOutputRequest("captured text", TextOutputProfile("linux:us"))),
+            host.textRequests,
         )
-        val runtime = JournalRuntime(
-            parentScope = this,
-            definition = def,
-            journalControllerProvider = { jc },
-            pathGenerator = JournalEntryPaths(),
-            metadataStore = JournalMetadataStore()
-        )
-
-        assertTrue(runtime.snapshot.value.isReady)
-
-        val acceptance = runtime.prepareInput()
-        assertTrue(acceptance is ChannelInputAcceptance.Accepted)
-        val target = (acceptance as ChannelInputAcceptance.Accepted).target
-
-        val mockSession = object : ChannelAudioInputSession {
-            override val frames = flowOf(shortArrayOf(1, 2, 3))
-            override val sampleRate: Int = 16_000
-        }
-
-        // Start input
-        target.onInputStarted(mockSession)
-        assertEquals(ChannelExecutionStatus.RECORDING, runtime.snapshot.value.executionStatus)
-
-        // Release input
-        val recording = RecordedPcm(shortArrayOf(1, 2, 3), 16_000)
-        val result = target.onInputReleased(recording)
-        assertEquals(ChannelInputResult.None, result)
-        assertEquals(ChannelExecutionStatus.IDLE, runtime.snapshot.value.executionStatus)
-
-        runtime.close()
     }
 
     @Test
-    fun debugRuntimeEchoCheck() = runTest {
-        val config = DebugConfig(DebugMode.ECHO)
-        val def = ChannelDefinition("c2", "Debug", ChannelKind.DEBUG, true, 1, config)
-
-        val captureService = CaptureServiceFakes.newService(this)
-        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3))
-        val echo = dev.nilp0inter.subspace.audio.EchoController(this, FakeSco(), captureService, source, FakeOutput())
-        echo.setEnabled(true)
-
-        val runtime = DebugRuntime(
-            definition = def,
-            echoController = echo,
-            sttControllerProvider = { null },
-            ttsControllerProvider = { null },
-            sttTtsControllerProvider = { null },
-            modelDirProvider = { null },
-            monitorStateProvider = { dev.nilp0inter.subspace.model.MonitorState() }
+    fun keyboardReadinessUsesSemanticRecoverablePreparationAndNeverRequiresTransportState() = runTest {
+        val host = RuntimeCapabilityHost(transcript = "unused", textInitiallyRecoverable = true)
+        val runtime = keyboardRuntime(
+            id = "recoverable",
+            profile = "linux:us",
+            host = host,
+            initialPreparation = ChannelPreparationAvailability.Recoverable(ChannelPreparationReason.RuntimeBusy),
         )
 
-        assertTrue(runtime.snapshot.value.isReady)
-
-        val acceptance = runtime.prepareInput()
-        assertTrue(acceptance is ChannelInputAcceptance.Accepted)
-        val target = (acceptance as ChannelInputAcceptance.Accepted).target
-
-        val mockSession = object : ChannelAudioInputSession {
-            override val frames = flowOf(shortArrayOf(1, 2, 3))
-            override val sampleRate: Int = 16_000
-        }
-        target.onInputStarted(mockSession)
-        assertEquals(ChannelExecutionStatus.RECORDING, runtime.snapshot.value.executionStatus)
-
-        target.onInputCancelled("test")
-        assertEquals(ChannelExecutionStatus.IDLE, runtime.snapshot.value.executionStatus)
+        assertTrue(runtime.runtime.snapshot.value.preparation is ChannelPreparationAvailability.Recoverable)
+        assertTrue(runtime.runtime.prepareInput() is ChannelInputAcceptance.Accepted)
+        assertEquals(ChannelPreparationAvailability.Available, runtime.runtime.snapshot.value.preparation)
+        assertEquals(1, host.preparedTextAcquisitions)
     }
 
     @Test
-    fun debugRuntimeEchoReadyWhenControllerInactive() = runTest {
-        val config = DebugConfig(DebugMode.ECHO)
-        val def = ChannelDefinition("c2", "Debug", ChannelKind.DEBUG, true, 1, config)
-
-        val captureService = CaptureServiceFakes.newService(this)
-        val source = CaptureServiceFakes.singleShotSource(shortArrayOf(1, 2, 3))
-        val echo = dev.nilp0inter.subspace.audio.EchoController(this, FakeSco(), captureService, source, FakeOutput())
-        // Controller remains inactive (enabled = false): an available-but-inactive ECHO runtime
-        // must still report readiness from dependency availability, not activation state.
-
-        val runtime = DebugRuntime(
-            definition = def,
-            echoController = echo,
-            sttControllerProvider = { null },
-            ttsControllerProvider = { null },
-            sttTtsControllerProvider = { null },
-            modelDirProvider = { null },
-            monitorStateProvider = { dev.nilp0inter.subspace.model.MonitorState() }
-        )
-
-        assertFalse(echo.enabled)
-        assertTrue(runtime.snapshot.value.isReady)
-    }
-
-    @Test
-    fun keyboardRuntimeRecoversBeforeAcceptingAndKeepsReadinessPassive() = runTest {
-        val definition = ChannelDefinition(
-            "keyboard",
-            "Keyboard",
-            ChannelKind.KEYBOARD,
-            true,
-            1,
-            KeyboardConfig(HostProfile.LINUX_US),
-        )
-        val bridgeConnected = MutableStateFlow(false)
-        var recoveryCalls = 0
-        var recoveryResult: SleepwalkerConnectionResult = SleepwalkerConnectionResult.Connected
-        val controller = KeyboardPttController(
-            scope = this,
-            sco = FakeSco(),
-            captureService = CaptureServiceFakes.newService(this),
-            source = CaptureServiceFakes.emptySource(),
-            output = FakeOutput(),
-            transcriptionService = object : dev.nilp0inter.subspace.audio.PcmTranscriber {
-                override suspend fun transcribe(pcm: ShortArray, sampleRate: Int): String = "unused"
-            },
-            connection = FakeSleepwalkerBleConnection(),
+    fun runtimeCloseRejectsLateInputWithoutClosingTheSharedTextOutputService() = runTest {
+        val connection = CloseCountingConnection().apply { setState(KeyboardConnectionState.Connected) }
+        val service = SleepwalkerTextOutputService(
+            scope = backgroundScope,
+            connection = connection,
             hid = LowLevelHidImpl(),
             keymapDatabase = SeedKeymapDatabase,
-            hostProfileProvider = { HostProfile.LINUX_US },
+            connect = { SleepwalkerConnectionResult.Connected },
         )
-        val runtime = KeyboardRuntimeFactory(
-            scope = this,
-            controllerProvider = { controller },
-            bridgeConnectedFlow = bridgeConnected,
-            ensureBridgeConnected = {
-                recoveryCalls += 1
-                recoveryResult
-            },
-        ).create(definition)
-
-        assertFalse(runtime.snapshot.value.isReady)
-        assertTrue(runtime.prepareInput() is ChannelInputAcceptance.Accepted)
-        assertEquals(1, recoveryCalls)
-        assertFalse(runtime.snapshot.value.isReady)
-
-        bridgeConnected.value = true
         runCurrent()
-        assertTrue(runtime.snapshot.value.isReady)
-        assertTrue(runtime.prepareInput() is ChannelInputAcceptance.Accepted)
-        assertEquals(1, recoveryCalls)
-
-        bridgeConnected.value = false
-        runCurrent()
-        recoveryResult = SleepwalkerConnectionResult.Failed("Sleepwalker connection failed")
-        assertEquals(
-            ChannelInputAcceptance.Refused("Sleepwalker connection failed"),
-            runtime.prepareInput(),
+        val host = RuntimeCapabilityHost(
+            transcript = "should not be sent",
+            textOutput = service.capabilityFor("retired"),
         )
-        recoveryResult = SleepwalkerConnectionResult.TimedOut
-        assertEquals(
-            ChannelInputAcceptance.Refused("Sleepwalker connection timed out"),
-            runtime.prepareInput(),
-        )
-        assertEquals(3, recoveryCalls)
+        val runtime = keyboardRuntime("retired", "linux:us", host)
+        val target = (runtime.runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
 
-        runtime.close()
+        runtime.runtime.close()
+        runtime.scope.revoke()
+        target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000))
+
+        assertTrue(runtime.runtime.prepareInput() is ChannelInputAcceptance.Unavailable)
+        assertTrue(host.textRequests.isEmpty())
+        assertEquals(TextOutputAvailability.Available, service.availability.value)
+        assertEquals(0, connection.disconnectCount)
     }
 
-    private class FakeSco : ScoRoute {
-        override val state: StateFlow<ScoState> = MutableStateFlow(ScoState.Inactive)
-        override fun hasAvailableScoDevice(): Boolean = true
-        override suspend fun acquire(): Boolean = true
-        override fun isActive(): Boolean = false
-        override fun release() {}
+    @Test
+    fun sosUsesTheReceivingRuntimeProfileAndDoesNotAddressSiblingInstances() = runTest {
+        val host = RuntimeCapabilityHost(transcript = "unused")
+        val alpha = keyboardRuntime("alpha", "linux:us", host)
+        val bravo = keyboardRuntime("bravo", "windows:us", host)
+
+        bravo.runtime.handleSos()
+
+        assertTrue(alpha.runtime.snapshot.value.executionStatus != ChannelExecutionStatus.FAILED)
+        assertEquals(
+            listOf(TextKeyRequest(TextOutputKey.ENTER, TextOutputProfile("windows:us"))),
+            host.keyRequests,
+        )
     }
 
-    private class FakeOutput : PcmOutput {
-        override suspend fun playErrorBeep(coldStart: Boolean) {}
-        override suspend fun playReadyBeep(coldStart: Boolean) {}
-        override suspend fun play(recording: RecordedPcm) {}
+    @Test
+    fun debugTtsUsesSupertonicLanguageAndReturnsPlaybackOperationForTerminalOwnedDelivery() = runTest {
+        assertDebugModeDefersPlaybackOperation(DebugMode.TTS)
+    }
+
+    @Test
+    fun debugSttTtsUsesSupertonicLanguageAndReturnsPlaybackOperationForTerminalOwnedDelivery() = runTest {
+        assertDebugModeDefersPlaybackOperation(DebugMode.STT_TTS)
+    }
+
+    private fun keyboardRuntime(
+        id: String,
+        profile: String,
+        host: RuntimeCapabilityHost,
+        initialPreparation: ChannelPreparationAvailability = ChannelPreparationAvailability.Available,
+    ): RuntimeFixture {
+        val definition = ChannelDefinition(
+            id = id,
+            name = "Keyboard $id",
+            implementationId = BuiltInChannelImplementationIds.KEYBOARD,
+            enabled = true,
+            configSchemaVersion = 1,
+            configPayload = KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration(profile)),
+        )
+        val scope = RevocableChannelCapabilityScope(
+            identity = CapabilityScopeIdentity(id, RuntimeGeneration(0)),
+            declaredCapabilities = setOf(ChannelCapability.Transcription, ChannelCapability.TextOutput),
+            host = host,
+        )
+        return RuntimeFixture(
+            runtime = KeyboardRuntime(
+                definition = definition,
+                configuration = KeyboardProviderConfiguration(profile),
+                profile = TextOutputProfile(profile),
+                capabilities = scope,
+                initialPreparation = initialPreparation,
+            ),
+            scope = scope,
+        )
+    }
+
+    private suspend fun assertDebugModeDefersPlaybackOperation(mode: DebugMode) {
+        val operation = AudioOperationArtifact(
+            recording = RecordedPcm(shortArrayOf(27, -27), 16_000),
+            operationId = "deferred-${mode.name}",
+        )
+        val synthesis = RecordingSynthesis()
+        val host = RuntimeCapabilityHost(
+            transcript = "captured transcript",
+            synthesis = synthesis,
+            audioOperation = RecordingAudioOperation(operation),
+        )
+        val runtime = debugRuntime(mode, host)
+        val target = (runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+        val result = target.onInputReleased(RecordedPcm(shortArrayOf(1, 2), 16_000))
+
+        assertTrue(result is ChannelInputResult.PlaybackOperation)
+        assertEquals(operation, (result as ChannelInputResult.PlaybackOperation).operation)
+        assertEquals(listOf("en"), synthesis.requests.map(SpeechSynthesisRequest::languageTag))
+    }
+
+    private fun debugRuntime(mode: DebugMode, host: RuntimeCapabilityHost): DebugRuntime {
+        val definition = ChannelDefinition(
+            id = "debug-${mode.name}",
+            name = "Debug ${mode.name}",
+            implementationId = BuiltInChannelImplementationIds.DEBUG,
+            enabled = true,
+            configSchemaVersion = 1,
+            configPayload = DebugProviderConfigurationCodec.encode(DebugProviderConfiguration(mode)),
+        )
+        return DebugRuntime(
+            definition = definition,
+            configuration = DebugProviderConfiguration(mode),
+            capabilities = RevocableChannelCapabilityScope(
+                identity = CapabilityScopeIdentity(definition.id, RuntimeGeneration(0)),
+                declaredCapabilities = setOf(
+                    ChannelCapability.Transcription,
+                    ChannelCapability.Synthesis,
+                    ChannelCapability.AudioOperation,
+                ),
+                host = host,
+            ),
+            initialPreparation = ChannelPreparationAvailability.Available,
+        )
+    }
+
+    private data class RuntimeFixture(
+        val runtime: KeyboardRuntime,
+        val scope: RevocableChannelCapabilityScope,
+    )
+
+    private class RuntimeCapabilityHost(
+        private val transcript: String,
+        private val textOutput: TextOutputCapability = RecordingTextOutput(),
+        private val synthesis: SynthesisCapability? = null,
+        private val audioOperation: AudioOperationCapability? = null,
+        private val textInitiallyRecoverable: Boolean = false,
+    ) : ChannelCapabilityHost {
+        val textRequests: List<TextOutputRequest>
+            get() = (textOutput as? RecordingTextOutput)?.textRequests ?: emptyList()
+        val keyRequests: List<TextKeyRequest>
+            get() = (textOutput as? RecordingTextOutput)?.keyRequests ?: emptyList()
+        var preparedTextAcquisitions = 0
+            private set
+
+        override suspend fun availability(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<*>,
+        ): CapabilityAvailability = CapabilityAvailability.Available
+
+        override suspend fun <T : ChannelCapabilityPort> acquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+        ): HostedCapabilityAcquisition<T> = if (key == CapabilityKey.TextOutput && textInitiallyRecoverable) {
+            HostedCapabilityAcquisition.Recoverable(CapabilityUnavailableReason.HOST_NOT_READY)
+        } else {
+            availableFor(key, prepared = false)
+        }
+
+        override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+            timeoutMillis: Long,
+        ): HostedCapabilityAcquisition<T> = availableFor(key, prepared = true)
+
+        @Suppress("UNCHECKED_CAST")
+        private fun <T : ChannelCapabilityPort> availableFor(
+            key: CapabilityKey<T>,
+            prepared: Boolean,
+        ): HostedCapabilityAcquisition<T> = when (key) {
+            CapabilityKey.TextOutput -> {
+                if (prepared) preparedTextAcquisitions += 1
+                HostedCapabilityAcquisition.Available(textOutput) { _: CapabilityLeaseTermination -> } as HostedCapabilityAcquisition<T>
+            }
+            CapabilityKey.Transcription ->
+                HostedCapabilityAcquisition.Available(RecordingTranscription(transcript)) { _: CapabilityLeaseTermination -> }
+                    as HostedCapabilityAcquisition<T>
+            CapabilityKey.Synthesis -> synthesis?.let {
+                HostedCapabilityAcquisition.Available(it) { _: CapabilityLeaseTermination -> }
+                    as HostedCapabilityAcquisition<T>
+            } ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+            CapabilityKey.AudioOperation -> audioOperation?.let {
+                HostedCapabilityAcquisition.Available(it) { _: CapabilityLeaseTermination -> }
+                    as HostedCapabilityAcquisition<T>
+            } ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+            else -> HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        }
+    }
+
+    private class RecordingTextOutput : TextOutputCapability {
+        val textRequests = mutableListOf<TextOutputRequest>()
+        val keyRequests = mutableListOf<TextKeyRequest>()
+
+        override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
+            textRequests += request
+            return TextDeliveryOutcome.Delivered("text-${textRequests.size}")
+        }
+
+        override suspend fun sendKey(request: TextKeyRequest): TextDeliveryOutcome {
+            keyRequests += request
+            return TextDeliveryOutcome.Delivered("key-${keyRequests.size}")
+        }
+    }
+
+    private class RecordingTranscription(private val transcript: String) : TranscriptionCapability {
+        override suspend fun transcribe(
+            recording: dev.nilp0inter.subspace.channel.capability.OpaqueAudioRecording,
+        ): CapabilityOperationResult<Transcription> = CapabilityOperationResult.Success(Transcription(transcript))
+    }
+
+    private class RecordingSynthesis : SynthesisCapability {
+        val requests = mutableListOf<SpeechSynthesisRequest>()
+
+        override suspend fun synthesize(
+            request: SpeechSynthesisRequest,
+        ): CapabilityOperationResult<dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio> {
+            requests += request
+            return CapabilityOperationResult.Success(SynthesizedAudioArtifact(floatArrayOf(0.5f, -0.5f)))
+        }
+    }
+
+    private class RecordingAudioOperation(
+        private val operation: AudioOperationArtifact,
+    ) : AudioOperationCapability {
+        override suspend fun createPlaybackResult(
+            audio: dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio,
+        ): CapabilityOperationResult<dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation> =
+            CapabilityOperationResult.Success(operation)
+    }
+
+    private object EmptySession : ChannelAudioInputSession {
+        override val frames: Flow<ShortArray> = emptyFlow()
+        override val sampleRate: Int = 16_000
+    }
+
+    private class CloseCountingConnection : SleepwalkerBleConnection() {
+        var disconnectCount = 0
+
+        fun setState(state: KeyboardConnectionState) {
+            _connectionState.value = state
+        }
+
+        override fun disconnect() {
+            disconnectCount += 1
+            _connectionState.value = KeyboardConnectionState.Disconnected
+        }
+
+        override suspend fun sendOp(op: LowLevelOp) = error("closed runtime must not emit transport operations")
     }
 }

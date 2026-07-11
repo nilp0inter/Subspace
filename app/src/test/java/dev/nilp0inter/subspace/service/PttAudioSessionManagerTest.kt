@@ -17,9 +17,17 @@ import dev.nilp0inter.subspace.audio.RouteGateResult
 import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.ResponsePlayer
+import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.model.ScoState
+import io.mockk.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
@@ -29,10 +37,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import dev.nilp0inter.subspace.audio.CaptureCompletion
+import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.audio.CaptureSession
+import dev.nilp0inter.subspace.audio.CaptureStartResult
+import dev.nilp0inter.subspace.audio.CaptureStartupEvidence
+import dev.nilp0inter.subspace.service.CommittedTargetLeaseOwner
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -170,7 +185,7 @@ class PttAudioSessionManagerTest {
         advanceUntilIdle()
 
         assertEquals(1, route.output.releaseRouteCount)
-        assertEquals(listOf("cancelled:Cancelled"), fixture.router.events)
+        assertEquals(listOf("cancelled:connection-ended"), fixture.router.events)
         assertEquals(null, fixture.manager.activeSession)
     }
 
@@ -192,7 +207,7 @@ class PttAudioSessionManagerTest {
         advanceUntilIdle()
 
         assertEquals(1, route.output.releaseRouteCount)
-        assertEquals(listOf("cancelled:Cancelled"), fixture.router.events)
+        assertEquals(listOf("cancelled:connection-ended"), fixture.router.events)
         assertEquals(null, fixture.manager.activeSession)
     }
 
@@ -308,8 +323,8 @@ class PttAudioSessionManagerTest {
         acquireGate.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals(1, route.sco.releaseCount)
-        assertEquals(0, route.output.releaseRouteCount)
+        assertEquals(0, route.sco.releaseCount)
+        assertEquals(1, route.output.releaseRouteCount)
         assertEquals(null, fixture.manager.activeSession)
     }
 
@@ -493,7 +508,7 @@ class PttAudioSessionManagerTest {
         fixture.router.preparationGate?.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals(listOf("cancelled:Released"), fixture.router.events)
+        assertTrue(fixture.router.events.isEmpty())
         assertEquals(0, source.openCount)
         assertEquals(0, route.output.readyBeepCount)
         assertEquals(0, route.output.errorBeepCount)
@@ -523,7 +538,7 @@ class PttAudioSessionManagerTest {
         fixture.router.preparationGate?.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals(listOf("cancelled:Released"), fixture.router.events)
+        assertTrue(fixture.router.events.isEmpty())
         assertEquals(0, source.openCount)
         assertEquals(0, route.output.readyBeepCount)
         assertEquals(0, route.output.errorBeepCount)
@@ -828,6 +843,349 @@ class PttAudioSessionManagerTest {
         assertEquals(null, manager.activeSession)
     }
 
+    @Test
+    fun normalReleaseKeepsFirstClaimWhenTargetRouteLeaseAndCompletionThrow() = runTest {
+        val events = mutableListOf<String>()
+        val releaseGate = CompletableDeferred<Unit>()
+        val target = TerminalTarget(
+            events = events,
+            releaseGate = releaseGate,
+            releaseFailure = IllegalStateException("target release failed"),
+            leaseFailure = IllegalStateException("lease release failed"),
+        )
+        val output = TerminalOutput(events, releaseFailure = IllegalStateException("route release failed"))
+        var completionCount = 0
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = output,
+            events = events,
+            onTerminalCompleted = {
+                completionCount += 1
+                throw IllegalStateException("completion observer failed")
+            },
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+
+        fixture.manager.release(PttSource.Phone)
+        runCurrent()
+        fixture.manager.cancelActive("connection ended")
+        fixture.manager.release(PttSource.Phone)
+        releaseGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-stop", "target-release", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.releaseCount)
+        assertEquals(0, target.cancelCount)
+        assertEquals(1, output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(1, completionCount)
+        assertEquals(null, fixture.manager.activeSession)
+        assertEquals(
+            listOf("target release", "route release", "committed target lease release"),
+            fixture.completions.single().failures.map { it.phase },
+        )
+    }
+
+    @Test
+    fun captureStopFailureStillNotifiesFailureAndRunsRemainingTerminalEffectsOnce() = runTest {
+        val events = mutableListOf<String>()
+        val target = TerminalTarget(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events, stopFailure = IllegalStateException("capture stop failed")),
+            output = TerminalOutput(events),
+            events = events,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-stop", "target-failed", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.failureCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, fixture.completions.size)
+        assertEquals(listOf("capture stop"), fixture.completions.single().failures.map { it.phase })
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun playbackCompletionFailureDoesNotSkipRouteLeaseOrCompletion() = runTest {
+        val events = mutableListOf<String>()
+        val target = TerminalTarget(
+            events = events,
+            releasedResult = ChannelInputResult.Playback(RecordedPcm(shortArrayOf(9), 16_000)),
+            playbackCompletionFailure = IllegalStateException("playback completion failed"),
+        )
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                "capture-stop",
+                "target-release",
+                "playback",
+                "target-playback-complete",
+                "route-release",
+                "lease-release",
+                "completion",
+            ),
+            events,
+        )
+        assertEquals(1, target.playbackCompletionCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(
+            listOf("playback completion"),
+            fixture.completions.single().failures.map { it.phase },
+        )
+    }
+
+    @Test
+    fun playbackOperationDeliversHostArtifactPcmOnceThenCompletesTarget() = runTest {
+        val events = mutableListOf<String>()
+        val expectedPcm = RecordedPcm(shortArrayOf(29, -31, 37), 16_000)
+        val target = TerminalTarget(
+            events = events,
+            releasedResult = ChannelInputResult.PlaybackOperation(
+                AudioOperationArtifact(expectedPcm, operationId = "deferred-playback"),
+            ),
+        )
+        val output = TerminalOutput(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = output,
+            events = events,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "debug", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                "capture-stop",
+                "target-release",
+                "playback",
+                "target-playback-complete",
+                "route-release",
+                "lease-release",
+                "completion",
+            ),
+            events,
+        )
+        assertEquals(1, output.played.size)
+        assertEquals(expectedPcm.sampleRate, output.played.single().sampleRate)
+        assertEquals(expectedPcm.samples.toList(), output.played.single().samples.toList())
+        assertEquals(1, target.playbackCompletionCount)
+        assertEquals(1, output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(1, fixture.completions.size)
+        assertTrue(fixture.completions.single().failures.isEmpty())
+    }
+
+    @Test
+    fun terminalCleanupSurvivesCallerScopeCancellation() = runTest {
+        val events = mutableListOf<String>()
+        val serviceJob = SupervisorJob()
+        val releaseGate = CompletableDeferred<Unit>()
+        val target = TerminalTarget(events, releaseGate = releaseGate)
+        val fixture = TerminalFixture(
+            scope = CoroutineScope(coroutineContext + serviceJob),
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        runCurrent()
+        serviceJob.cancel()
+        releaseGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-stop", "target-release", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, fixture.completions.size)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun slowInputReleaseReturnsItsEffectBeforeRouteLeaseAndCompletionCleanup() = runTest {
+        val events = mutableListOf<String>()
+        val target = object : ChannelInputTarget, CommittedTargetLeaseOwner {
+            override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+            override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+                events += "target-release-started"
+                delay(6_000)
+                events += "target-effect-returned"
+                return ChannelInputResult.None
+            }
+
+            override fun onInputCancelled(reason: String) = Unit
+
+            override fun onInputFailed(reason: String) = Unit
+
+            override suspend fun releaseCommittedTargetLease() {
+                events += "lease-release"
+            }
+        }
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+            targetReleaseTimeoutMillis = 7_000,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "keyboard", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        runCurrent()
+
+        assertEquals(listOf("capture-stop", "target-release-started"), events)
+        advanceTimeBy(5_001)
+        runCurrent()
+        assertEquals(listOf("capture-stop", "target-release-started"), events)
+        assertEquals(0, fixture.output.releaseCount)
+        assertTrue(fixture.completions.isEmpty())
+
+        advanceTimeBy(999)
+        advanceUntilIdle()
+        assertEquals(
+            listOf(
+                "capture-stop",
+                "target-release-started",
+                "target-effect-returned",
+                "route-release",
+                "lease-release",
+                "completion",
+            ),
+            events,
+        )
+        assertTrue(fixture.completions.single().failures.isEmpty())
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun targetReleaseDeadlineTimesOutThenReleasesRouteLeaseAndPublishesOnce() = runTest {
+        val events = mutableListOf<String>()
+        val target = TerminalTarget(events, releaseGate = CompletableDeferred())
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+            targetReleaseTimeoutMillis = 7_000,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        fixture.manager.release(PttSource.Phone)
+        runCurrent()
+        advanceTimeBy(6_999)
+        runCurrent()
+        assertEquals(listOf("capture-stop", "target-release"), events)
+        assertEquals(0, fixture.output.releaseCount)
+        assertEquals(0, target.leaseReleaseCount)
+        assertTrue(fixture.completions.isEmpty())
+        advanceTimeBy(1)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-stop", "target-release", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.releaseCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(1, fixture.completions.size)
+        assertEquals(
+            listOf("target release"),
+            fixture.completions.single().failures.map { it.phase },
+        )
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun shutdownAwaitsClaimedCleanupInsteadOfStartingAnotherTerminalSequence() = runTest {
+        val events = mutableListOf<String>()
+        val cancellationGate = CompletableDeferred<Unit>()
+        val target = TerminalTarget(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+            cancellationGate = cancellationGate,
+        )
+
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        events.clear()
+        val shutdown = async { fixture.manager.shutdownAndAwait("service teardown") }
+        runCurrent()
+        assertFalse(shutdown.isCompleted)
+        assertEquals(listOf("capture-cancel"), events)
+
+        fixture.manager.cancelActive("late callback")
+        fixture.manager.release(PttSource.Phone)
+        cancellationGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(shutdown.isCompleted)
+        assertEquals(
+            listOf("capture-cancel", "target-cancelled", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.cancelCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(1, fixture.completions.size)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
     private data class TerminalCompletionObservation(
         val activeSession: PttAudioSessionManager.SessionSnapshot?,
         val routeReleaseCount: Int,
@@ -1002,6 +1360,155 @@ class PttAudioSessionManagerTest {
         override suspend fun play(recording: RecordedPcm) = Unit
         override suspend fun releaseRoute() {
             releaseRouteCount += 1
+        }
+    }
+
+    private class TerminalFixture(
+        scope: CoroutineScope,
+        target: ChannelInputTarget,
+        capture: TerminalCaptureSession,
+        val output: TerminalOutput,
+        events: MutableList<String>,
+        onTerminalCompleted: (PttAudioSessionManager.TerminalCompletion) -> Unit = {},
+        cancellationGate: CompletableDeferred<Unit>? = null,
+        targetReleaseTimeoutMillis: Long = 20_000,
+    ) {
+        val completions = mutableListOf<PttAudioSessionManager.TerminalCompletion>()
+        private val captureService = mockk<CaptureService>()
+        val manager: PttAudioSessionManager
+
+        init {
+            coEvery {
+                captureService.startSession(
+                    source = any(),
+                    sco = any(),
+                    output = any(),
+                    shouldProceed = any(),
+                )
+            } returns CaptureStartResult.Started(capture, CaptureStartupEvidence())
+            coEvery { captureService.cancelSession(capture) } coAnswers {
+                events += "capture-cancel"
+                cancellationGate?.await()
+                RecordedPcm(shortArrayOf(), 16_000)
+            }
+            manager = PttAudioSessionManager(
+                scope = scope,
+                captureService = captureService,
+                channelRouter = object : ChannelRouter {
+                    override suspend fun prepareInput(channelId: String): ChannelInputAcceptance =
+                        ChannelInputAcceptance.Accepted(target)
+                },
+                resolvePttAudioRoute = {
+                    ResolvedAudioRoute(
+                        sco = RecordingScoRoute(AudioRouteEndpoint.Local),
+                        output = output,
+                        source = CaptureServiceFakes.singleShotSource(
+                            shortArrayOf(1),
+                            sourceId = CaptureSourceId.Mic,
+                        ),
+                        endpoint = AudioRouteEndpoint.Local,
+                    )
+                },
+                onTerminalCompleted = { completion ->
+                    completions += completion
+                    events += "completion"
+                    onTerminalCompleted(completion)
+                },
+                targetReleaseTimeoutMillis = targetReleaseTimeoutMillis,
+            )
+        }
+    }
+
+    private class TerminalCaptureSession(
+        private val events: MutableList<String>,
+        private val stopFailure: Throwable? = null,
+    ) : CaptureSession {
+        override val frames = MutableSharedFlow<ShortArray>()
+        override val completion = CompletableDeferred<CaptureCompletion>()
+        override val sampleRate: Int = 16_000
+        var stopCount = 0
+            private set
+
+        override suspend fun stop(): RecordedPcm {
+            stopCount += 1
+            events += "capture-stop"
+            stopFailure?.let { throw it }
+            val recording = RecordedPcm(shortArrayOf(1, 2, 3), sampleRate)
+            completion.complete(CaptureCompletion.Stopped(recording))
+            return recording
+        }
+    }
+
+    private class TerminalTarget(
+        private val events: MutableList<String>,
+        private val releaseGate: CompletableDeferred<Unit>? = null,
+        private val releasedResult: ChannelInputResult = ChannelInputResult.None,
+        private val releaseFailure: Throwable? = null,
+        private val playbackCompletionFailure: Throwable? = null,
+        private val leaseFailure: Throwable? = null,
+    ) : ChannelInputTarget, CommittedTargetLeaseOwner {
+        var releaseCount = 0
+            private set
+        var cancelCount = 0
+            private set
+        var failureCount = 0
+            private set
+        var playbackCompletionCount = 0
+            private set
+        var leaseReleaseCount = 0
+            private set
+
+        override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+        override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+            releaseCount += 1
+            events += "target-release"
+            releaseGate?.await()
+            releaseFailure?.let { throw it }
+            return releasedResult
+        }
+
+        override fun onInputPlaybackCompleted() {
+            playbackCompletionCount += 1
+            events += "target-playback-complete"
+            playbackCompletionFailure?.let { throw it }
+        }
+
+        override fun onInputCancelled(reason: String) {
+            cancelCount += 1
+            events += "target-cancelled"
+        }
+
+        override fun onInputFailed(reason: String) {
+            failureCount += 1
+            events += "target-failed"
+        }
+
+        override suspend fun releaseCommittedTargetLease() {
+            leaseReleaseCount += 1
+            events += "lease-release"
+            leaseFailure?.let { throw it }
+        }
+    }
+
+    private class TerminalOutput(
+        private val events: MutableList<String>,
+        private val releaseFailure: Throwable? = null,
+    ) : PcmOutput {
+        var releaseCount = 0
+            private set
+        val played = mutableListOf<RecordedPcm>()
+
+        override suspend fun playReadyBeep(coldStart: Boolean) = Unit
+        override suspend fun playErrorBeep(coldStart: Boolean) = Unit
+        override suspend fun play(recording: RecordedPcm) {
+            events += "playback"
+            played += recording
+        }
+        override suspend fun releaseRoute() {
+            releaseCount += 1
+            events += "route-release"
+            releaseFailure?.let { throw it }
         }
     }
     private class ReadyAfterBeepCaptureSource(

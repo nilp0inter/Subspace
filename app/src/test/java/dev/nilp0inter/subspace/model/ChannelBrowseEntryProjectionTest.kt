@@ -1,199 +1,150 @@
 package dev.nilp0inter.subspace.model
 
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
+import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
+import dev.nilp0inter.subspace.service.ChannelPreparationReason
 import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ChannelBrowseEntryProjectionTest {
-
-    private fun createMockState(
-        journalReady: Boolean = true,
-        debugReady: Boolean = true,
-        keyboardReady: Boolean = false,
-        activeChannelId: String = "captains-log"
-    ): AppState {
-        val journal = ChannelRuntimeSnapshot(
-            id = "captains-log",
-            name = "Journal",
-            kind = ChannelKind.JOURNAL,
-            enabled = true,
-            isReady = journalReady,
-            executionStatus = ChannelExecutionStatus.IDLE
-        )
-        val debug = ChannelRuntimeSnapshot(
-            id = "debug-channel",
-            name = "Debug Channel",
-            kind = ChannelKind.DEBUG,
-            enabled = true,
-            isReady = debugReady,
-            executionStatus = ChannelExecutionStatus.IDLE
-        )
-        val keyboard = ChannelRuntimeSnapshot(
-            id = "keyboard-channel",
-            name = "Keyboard Channel",
-            kind = ChannelKind.KEYBOARD,
-            enabled = true,
-            isReady = keyboardReady,
-            executionStatus = ChannelExecutionStatus.IDLE
-        )
-        return AppState(
-            channels = listOf(journal, debug, keyboard),
-            activeChannelId = activeChannelId
-        )
-    }
-
     @Test
-    fun projectsActiveChannelAsActiveKind() {
-        val state = createMockState(
-            journalReady = true,
-            activeChannelId = "captains-log"
+    fun `every persisted instance remains Auto-playable while unavailable states retain recovery metadata`() {
+        val state = AppState(
+            channels = listOf(
+                snapshot("instance-alpha", "Alpha", "test:shared", ChannelPreparationAvailability.Available),
+                snapshot(
+                    "instance-missing",
+                    "Missing implementation",
+                    "package:missing",
+                    ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.RuntimeClosed),
+                ),
+                snapshot(
+                    "instance-recovering",
+                    "Recovering implementation",
+                    "test:shared",
+                    ChannelPreparationAvailability.Recoverable(ChannelPreparationReason.ProviderInitialising),
+                ),
+                snapshot(
+                    "instance-disabled",
+                    "Disabled channel",
+                    "test:shared",
+                    ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.Disabled),
+                    enabled = false,
+                ),
+            ),
+            activeChannelId = "instance-alpha",
         )
 
         val entries = projectChannelBrowseEntries(state)
 
-        assertEquals(3, entries.size)
-        val journal = entries.first { it.id == "captains-log" }
-        val debug = entries.first { it.id == "debug-channel" }
-        val keyboard = entries.first { it.id == "keyboard-channel" }
-        
-        assertEquals(ChannelStatusKind.Active, journal.statusKind)
-        assertEquals(ChannelStatusKind.Ready, debug.statusKind)
-        assertEquals(ChannelStatusKind.Standby, keyboard.statusKind)
+        assertEquals(
+            listOf("instance-alpha", "instance-missing", "instance-recovering", "instance-disabled"),
+            entries.map(ChannelBrowseEntry::id),
+        )
+        assertEquals(
+            listOf("Alpha", "Missing implementation", "Recovering implementation", "Disabled channel"),
+            entries.map(ChannelBrowseEntry::name),
+        )
+        assertTrue(entries.all(ChannelBrowseEntry::isPlayable))
+        assertEquals(ChannelStatusKind.Active, entries[0].statusKind)
+        assertEquals(ChannelStatusKind.Unavailable, entries[1].statusKind)
+        assertEquals(
+            "Channel is no longer available. Recover or remove this channel on your phone.",
+            entries[1].recoveryMessage,
+        )
+        assertEquals(ChannelStatusKind.Unavailable, entries[2].statusKind)
+        assertEquals(
+            "Channel is initialising. Recover or remove this channel on your phone.",
+            entries[2].recoveryMessage,
+        )
+        assertEquals(ChannelStatusKind.Unavailable, entries[3].statusKind)
+        assertEquals(
+            "Channel is disabled. Recover or remove this channel on your phone.",
+            entries[3].recoveryMessage,
+        )
     }
 
     @Test
-    fun projectsReadyChannelAsReadyWhenNotActive() {
-        val state = createMockState(
-            journalReady = true,
-            activeChannelId = "debug-channel"
+    fun `multiple instances of one provider remain distinct and active selection is instance scoped`() {
+        val state = AppState(
+            channels = listOf(
+                snapshot("first-instance", "Shared provider one", "test:shared", ChannelPreparationAvailability.Available),
+                snapshot("second-instance", "Shared provider two", "test:shared", ChannelPreparationAvailability.Available),
+            ),
+            activeChannelId = "second-instance",
         )
 
         val entries = projectChannelBrowseEntries(state)
 
-        val journal = entries.first { it.id == "captains-log" }
-        val debug = entries.first { it.id == "debug-channel" }
-        val keyboard = entries.first { it.id == "keyboard-channel" }
-        
-        assertEquals(ChannelStatusKind.Ready, journal.statusKind)
-        assertEquals(ChannelStatusKind.Active, debug.statusKind)
-        assertEquals(ChannelStatusKind.Standby, keyboard.statusKind)
+        assertEquals(listOf("first-instance", "second-instance"), entries.map(ChannelBrowseEntry::id))
+        assertEquals(listOf(ChannelStatusKind.Ready, ChannelStatusKind.Active), entries.map(ChannelBrowseEntry::statusKind))
+        assertTrue(entries.all(ChannelBrowseEntry::isPlayable))
     }
 
     @Test
-    fun projectsUnconfiguredChannelAsStandby() {
-        val state = createMockState(
-            journalReady = false,
-            activeChannelId = "debug-channel"
+    fun `availability recovery invalidates only projection state without changing media identity`() {
+        val unavailable = AppState(
+            channels = listOf(
+                snapshot(
+                    "retained-instance",
+                    "Retained channel",
+                    "test:recovering",
+                    ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.ProviderInitialising),
+                ),
+            ),
+            activeChannelId = "retained-instance",
+        )
+        val recovered = unavailable.copy(
+            channels = listOf(
+                snapshot(
+                    "retained-instance",
+                    "Retained channel",
+                    "test:recovering",
+                    ChannelPreparationAvailability.Available,
+                ),
+            ),
         )
 
-        val entries = projectChannelBrowseEntries(state)
+        val before = projectChannelBrowseEntries(unavailable).single()
+        val after = projectChannelBrowseEntries(recovered).single()
 
-        val journal = entries.first { it.id == "captains-log" }
-        val keyboard = entries.first { it.id == "keyboard-channel" }
-        assertEquals(ChannelStatusKind.Standby, journal.statusKind)
-        assertEquals(ChannelStatusKind.Standby, keyboard.statusKind)
+        assertTrue(before.isPlayable)
+        assertEquals(ChannelStatusKind.Unavailable, before.statusKind)
+        assertTrue(after.isPlayable)
+        assertEquals(ChannelStatusKind.Active, after.statusKind)
+        assertNull(after.recoveryMessage)
     }
 
     @Test
-    fun projectsActiveChannelStandbyWhenUnconfigured() {
-        // Wait, under active mutual exclusivity: "Active channel id matches activeChannelId"
-        // Active is ALWAYS Active status, even if unready. Let's verify that.
-        val state = createMockState(
-            journalReady = false,
-            activeChannelId = "captains-log"
+    fun `pending count follows stable instance identity rather than provider identity`() {
+        val state = AppState(
+            channels = listOf(
+                snapshot("shared-one", "First", "test:shared", ChannelPreparationAvailability.Available),
+                snapshot("shared-two", "Second", "test:shared", ChannelPreparationAvailability.Available),
+            ),
+            activeChannelId = "shared-one",
         )
 
-        val entries = projectChannelBrowseEntries(state)
+        val entries = projectChannelBrowseEntries(state, pendingCounts = mapOf("shared-two" to 4))
 
-        val journal = entries.first { it.id == "captains-log" }
-        assertEquals(ChannelStatusKind.Active, journal.statusKind)
-        val debug = entries.first { it.id == "debug-channel" }
-        assertEquals(ChannelStatusKind.Ready, debug.statusKind)
-        val keyboard = entries.first { it.id == "keyboard-channel" }
-        assertEquals(ChannelStatusKind.Standby, keyboard.statusKind)
+        assertEquals(listOf(0, 4), entries.map(ChannelBrowseEntry::pendingCount))
     }
 
-    @Test
-    fun orderingMatchesCatalogueSnapshotOrder() {
-        val state = createMockState()
-
-        val entries = projectChannelBrowseEntries(state)
-
-        assertEquals(listOf("captains-log", "debug-channel", "keyboard-channel"), entries.map { it.id })
-    }
-
-    @Test
-    fun pendingCountDefaultsToZeroWhenMapMissingChannel() {
-        val state = createMockState()
-
-        val entries = projectChannelBrowseEntries(state, pendingCounts = emptyMap())
-
-        entries.forEach { assertEquals(0, it.pendingCount) }
-    }
-
-    @Test
-    fun pendingCountPulledFromMapWhenSupplied() {
-        val state = createMockState(activeChannelId = "debug-channel")
-
-        val entries = projectChannelBrowseEntries(
-            state,
-            pendingCounts = mapOf("captains-log" to 5, "debug-channel" to 2),
-        )
-
-        assertEquals(5, entries.first { it.id == "captains-log" }.pendingCount)
-        assertEquals(2, entries.first { it.id == "debug-channel" }.pendingCount)
-    }
-
-    @Test
-    fun orderedChannelIdsSharesProjectionOrder() {
-        val state = createMockState()
-
-        val ids = orderedChannelIds(state)
-
-        assertEquals(projectChannelBrowseEntries(state).map { it.id }, ids)
-        assertEquals(listOf("captains-log", "debug-channel", "keyboard-channel"), ids)
-    }
-
-    @Test
-    fun selectChannelByOffsetSaturatesWithoutWraparound() {
-        val ordered = listOf("captains-log", "debug-channel", "keyboard-channel")
-
-        assertEquals("captains-log", selectChannelByOffset(ordered, "captains-log", -1))
-        assertEquals("captains-log", selectChannelByOffset(ordered, "captains-log", -10))
-        assertEquals("keyboard-channel", selectChannelByOffset(ordered, "keyboard-channel", +1))
-        assertEquals("keyboard-channel", selectChannelByOffset(ordered, "keyboard-channel", +10))
-        assertEquals("debug-channel", selectChannelByOffset(ordered, "captains-log", +1))
-        assertEquals("keyboard-channel", selectChannelByOffset(ordered, "debug-channel", +1))
-        assertEquals("captains-log", selectChannelByOffset(ordered, "debug-channel", -1))
-    }
-
-    @Test
-    fun selectChannelByOffsetReturnsNullForEmptyChannelList() {
-        val empty = emptyList<String>()
-        assertEquals(null, selectChannelByOffset(empty, "anything", +1))
-        assertEquals(null, selectChannelByOffset(empty, "anything", -1))
-    }
-
-    @Test
-    fun selectChannelByOffsetSaturatesAtBoundsWhenCurrentIdUnknown() {
-        val ordered = listOf("captains-log", "debug-channel", "keyboard-channel")
-
-        assertEquals("captains-log", selectChannelByOffset(ordered, "missing", 0))
-        assertEquals("debug-channel", selectChannelByOffset(ordered, "missing", +1))
-        assertEquals("keyboard-channel", selectChannelByOffset(ordered, "missing", +2))
-        assertEquals("captains-log", selectChannelByOffset(ordered, "missing", -10))
-    }
-
-    @Test
-    fun projectionNameUsesChannelDisplayName() {
-        val state = createMockState()
-
-        val entries = projectChannelBrowseEntries(state)
-
-        assertTrue(entries.any { it.name == "Journal" })
-        assertTrue(entries.any { it.name == "Debug Channel" })
-        assertTrue(entries.any { it.name == "Keyboard Channel" })
-    }
+    private fun snapshot(
+        id: String,
+        name: String,
+        implementationId: String,
+        preparation: ChannelPreparationAvailability,
+        enabled: Boolean = true,
+    ) = ChannelRuntimeSnapshot(
+        id = id,
+        name = name,
+        implementationId = ChannelImplementationId(implementationId),
+        enabled = enabled,
+        preparation = preparation,
+        executionStatus = ChannelExecutionStatus.IDLE,
+    )
 }

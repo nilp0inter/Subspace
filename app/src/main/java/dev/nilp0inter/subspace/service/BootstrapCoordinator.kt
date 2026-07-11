@@ -4,12 +4,10 @@ import android.content.Context
 import dev.nilp0inter.subspace.audio.ModelAssetRepository
 import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
-import dev.nilp0inter.subspace.audio.SttController
 import dev.nilp0inter.subspace.audio.TtsController
-import dev.nilp0inter.subspace.audio.SttTtsController
 import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.channel.JournalController
-import dev.nilp0inter.subspace.channel.KeyboardPttController
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.BootstrapState
@@ -54,6 +52,7 @@ class BootstrapCoordinator(
     private val modelRepository: ModelAssetRepository,
     private val coreInit: CoreInit,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val hasManageExternalStorage: () -> Boolean = RequiredPermissions::hasManageExternalStorage,
 ) {
     private val _state = MutableStateFlow<BootstrapState>(BootstrapState.ConnectingService)
     val state: StateFlow<BootstrapState> = _state.asStateFlow()
@@ -105,7 +104,7 @@ class BootstrapCoordinator(
      * assets. Used after a permission result or a model-acquisition retry.
      */
     fun refreshPrerequisites() {
-        launchAttempt()
+        if (_state.value is BootstrapState.NeedsSetup) launchAttempt()
     }
 
     /**
@@ -114,6 +113,8 @@ class BootstrapCoordinator(
      * sets through the model repository.
      */
     fun startModelAcquisition() {
+        val setup = _state.value as? BootstrapState.NeedsSetup ?: return
+        if (setup.missingPermissions.isNotEmpty() || setup.needsManageExternalStorage) return
         scope.launch {
             _state.value = BootstrapState.AcquiringModels(
                 progress = modelRepository.progress.value,
@@ -185,9 +186,13 @@ class BootstrapCoordinator(
         val missingPermissions = withContext(ioDispatcher) {
             RequiredPermissions.missing(context)
         }
-        if (missingPermissions.isNotEmpty()) {
+        val needsManageExternalStorage = withContext(ioDispatcher) {
+            !hasManageExternalStorage()
+        }
+        if (missingPermissions.isNotEmpty() || needsManageExternalStorage) {
             _state.value = BootstrapState.NeedsSetup(
                 missingPermissions = missingPermissions,
+                needsManageExternalStorage = needsManageExternalStorage,
             )
             return
         }
@@ -252,9 +257,6 @@ class BootstrapCoordinator(
             _state.value = BootstrapState.PreparingCore(
                 BootstrapStage.ConstructingControllers,
             )
-            val transcriber = (sttResult as PrepareResult.Success).transcriber
-            val synthesizer = (ttsResult as PrepareResult.SuccessTts).synthesizer
-            coreInit.constructSttTtsController(transcriber, synthesizer)
             coreInit.constructJournalPttController()
 
             _state.value = BootstrapState.PreparingCore(
@@ -316,20 +318,19 @@ class BootstrapCoordinator(
 
     /**
      * Core readiness predicate: verified model assets, ready native STT and
-     * TTS engines, constructed required controllers, and every required
-     * announcement phrase cached as non-empty SCO-ready audio.
+     * TTS engines, initialized host services, initialized semantic text output, and every
+     * required announcement phrase cached as non-empty SCO-ready audio.
      *
-     * RSM, SPP, HFP, Keyboard BLE, Android Auto, Telecom, reconnect, and
-     * journal-recovery are explicitly excluded.
+     * RSM, SPP, HFP, physical text-output connection, Android Auto, Telecom, reconnect, and
+     * journal-recovery are explicitly excluded. A semantic text capability may be recoverable
+     * without making bootstrap fail; bounded connection preparation belongs to PTT handling.
      */
     private fun isCoreReady(): Boolean {
         return coreInit.sttTranscriber != null &&
             coreInit.ttsSynthesizer != null &&
-            coreInit.sttController != null &&
             coreInit.ttsController != null &&
-            coreInit.sttTtsController != null &&
             coreInit.journalController != null &&
-            coreInit.keyboardController != null &&
+            coreInit.textOutputAvailability !is CapabilityAvailability.Unavailable &&
             coreInit.announcer != null &&
             coreInit.announcer?.precomputeState?.value is AnnouncementResult.Ready
     }
@@ -338,11 +339,9 @@ class BootstrapCoordinator(
         val checks = listOf(
             "sttTranscriber=${coreInit.sttTranscriber != null}",
             "ttsSynthesizer=${coreInit.ttsSynthesizer != null}",
-            "sttController=${coreInit.sttController != null}",
             "ttsController=${coreInit.ttsController != null}",
-            "sttTtsController=${coreInit.sttTtsController != null}",
             "journalController=${coreInit.journalController != null}",
-            "keyboardController=${coreInit.keyboardController != null}",
+            "textOutputAvailability=${coreInit.textOutputAvailability}",
             "announcer=${coreInit.announcer != null}",
             "announcerState=${coreInit.announcer?.precomputeState?.value}",
         )
@@ -350,8 +349,8 @@ class BootstrapCoordinator(
     }
 
     /**
-     * Prepare STT: construct JNI transcriber via [CoreInit], wait for Ready
-     * or Failed, construct SttController and KeyboardPttController.
+     * Prepare STT: construct the JNI transcriber, wait for Ready or Failed,
+     * then initialize semantic text output.
      */
     private suspend fun prepareStt(): PrepareResult {
         return try {
@@ -371,8 +370,7 @@ class BootstrapCoordinator(
                     else -> delay(STT_MODEL_POLL_MS)
                 }
             }
-            coreInit.constructSttController(transcriber)
-            coreInit.constructKeyboardController(transcriber)
+            coreInit.initializeTextOutputCapability()
             PrepareResult.Success(transcriber)
         } catch (e: Exception) {
             PrepareResult.Failed("STT initialization failed: ${e.message}")
@@ -380,8 +378,8 @@ class BootstrapCoordinator(
     }
 
     /**
-     * Prepare TTS: construct JNI synthesizer via [CoreInit], wait for Ready
-     * or Failed, construct TtsController and SystemAnnouncer.
+     * Prepare TTS: construct the JNI synthesizer, wait for Ready or Failed,
+     * then construct the host diagnostic TTS controller and SystemAnnouncer.
      */
     private suspend fun prepareTts(): PrepareResult {
         return try {
@@ -430,11 +428,9 @@ class BootstrapCoordinator(
 interface CoreInit {
     val sttTranscriber: SttTranscriber?
     val ttsSynthesizer: TtsSynthesizer?
-    val sttController: SttController?
     val ttsController: TtsController?
-    val sttTtsController: SttTtsController?
     val journalController: JournalController?
-    val keyboardController: KeyboardPttController?
+    val textOutputAvailability: CapabilityAvailability
     val announcer: SystemAnnouncer?
 
     /** Construct the STT JNI transcriber and return it, or null on failure. */
@@ -443,23 +439,16 @@ interface CoreInit {
     /** Construct the TTS JNI synthesizer and return it, or null on failure. */
     fun constructTtsSynthesizer(): TtsSynthesizer?
 
-    /** Construct the SttController and start its status poller. */
-    fun constructSttController(transcriber: SttTranscriber)
 
     /** Construct the TtsController and start its status poller. */
     fun constructTtsController(synthesizer: TtsSynthesizer)
 
-    /** Construct the SttTtsController from both ready engines. */
-    fun constructSttTtsController(
-        transcriber: SttTranscriber,
-        synthesizer: TtsSynthesizer,
-    )
 
-    /** Construct the JournalPttController. */
+    /** Construct the Journal host controller. */
     fun constructJournalPttController()
 
-    /** Construct the KeyboardPttController from the ready STT transcriber. */
-    fun constructKeyboardController(transcriber: SttTranscriber)
+    /** Initialize host-owned semantic text output without exposing transport state. */
+    fun initializeTextOutputCapability()
 
     /** Construct the SystemAnnouncer from the ready TTS synthesizer. */
     fun constructAnnouncer(synthesizer: TtsSynthesizer)

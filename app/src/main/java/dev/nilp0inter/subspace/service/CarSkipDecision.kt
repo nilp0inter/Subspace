@@ -49,13 +49,13 @@ internal object CarSkipDecision {
      *
      * | `CarMediaPttState` | `Next`         | `Prev`           |
      * |---|---|---|
-     * | `NotReady`  | `NoOp`         | `NoOp`           |
+     * | `NotReady`  | `NextChannel`  | `PrevChannel`   |
      * | `Ready`     | `NextChannel`  | `PrevChannel`   |
      * | `Recording` | `NoOp`         | `NoOp`           |
      * | `Finalizing`| `SkipMessage`  | `ReplayMessage`  |
      */
     fun fromState(state: CarMediaPttState): Pair<CarSkipAction, CarSkipAction> = when (state) {
-        CarMediaPttState.NotReady -> CarSkipAction.NoOp to CarSkipAction.NoOp
+        CarMediaPttState.NotReady -> CarSkipAction.NextChannel to CarSkipAction.PrevChannel
         CarMediaPttState.Ready -> CarSkipAction.NextChannel to CarSkipAction.PrevChannel
         CarMediaPttState.Recording -> CarSkipAction.NoOp to CarSkipAction.NoOp
         CarMediaPttState.Finalizing -> CarSkipAction.SkipMessage to CarSkipAction.ReplayMessage

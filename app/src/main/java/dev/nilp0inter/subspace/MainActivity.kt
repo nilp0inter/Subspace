@@ -5,57 +5,49 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Bundle
-import android.os.IBinder
 import android.provider.Settings
-import dev.nilp0inter.subspace.channel.StoragePathResolver
-import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import dev.nilp0inter.subspace.model.ChannelKind
-import dev.nilp0inter.subspace.model.JournalConfig
-import dev.nilp0inter.subspace.model.DebugConfig
-import dev.nilp0inter.subspace.model.KeyboardConfig
-import dev.nilp0inter.subspace.model.toLegacyChannel
+import dev.nilp0inter.subspace.channel.StoragePathResolver
 import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.BootstrapState
+import dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.BootstrapLoadingScreen
 import dev.nilp0inter.subspace.ui.BootstrapRootSurface
-import dev.nilp0inter.subspace.ui.bootstrapRootSurface
+import dev.nilp0inter.subspace.ui.ChannelConfigurationScreen
 import dev.nilp0inter.subspace.ui.ConnectionScreen
-import dev.nilp0inter.subspace.ui.DebugChannelConfigScreen
+import dev.nilp0inter.subspace.ui.DirectorySelection
 import dev.nilp0inter.subspace.ui.InitialSetupScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.PttUiActions
+import dev.nilp0inter.subspace.ui.bootstrapRootSurface
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
 
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<PttForegroundService?>(null)
     private var bound = false
-    private var pendingJournalDirectory: Pair<String, String>? = null
 
     private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+        override fun onServiceConnected(name: ComponentName, binder: android.os.IBinder) {
             service = (binder as PttForegroundService.LocalBinder).service().also { connectedService ->
-                pendingJournalDirectory?.let { (channelId, path) ->
-                    connectedService.setJournalDirectory(channelId, path)
-                    pendingJournalDirectory = null
-                }
                 connectedService.refreshReadiness()
+                connectedService.refreshBootstrapPrerequisites()
             }
             bound = true
         }
@@ -80,43 +72,47 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(0f) }
             val isCapturing by currentService?.isCapturing?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(false) }
-
-            // Bootstrap state from the service — the authoritative source
-            // for loading, setup, recovery, and dashboard routing.
             val bootstrapState by currentService?.bootstrapState?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(BootstrapState.ConnectingService) }
-            val modelProgress by currentService?.modelAcquisitionProgress
-                ?.collectAsStateWithLifecycle()
+            val modelProgress by currentService?.modelAcquisitionProgress?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(dev.nilp0inter.subspace.model.ModelAcquisitionProgress()) }
+            val providerDescriptors by currentService?.channelDescriptors?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(emptyList()) }
 
-            var dashboardRoute by remember { mutableStateOf(DashboardRoute.Main) }
-            var configuredChannelId by remember { mutableStateOf<String?>(null) }
-            var journalDirectoryTargetId by remember { mutableStateOf<String?>(null) }
-            val scope = rememberCoroutineScope()
+            var dashboardRoute by rememberSaveable { mutableStateOf(DashboardRoute.Main) }
+            var configuredChannelId by rememberSaveable { mutableStateOf<String?>(null) }
+            var creatingImplementationId by rememberSaveable { mutableStateOf<String?>(null) }
+            var creatingDisplayName by rememberSaveable { mutableStateOf("") }
+            var pendingDirectoryOwnerId by rememberSaveable { mutableStateOf<String?>(null) }
+            var pendingDirectoryFieldId by rememberSaveable { mutableStateOf<String?>(null) }
+            var selectedDirectoryOwnerId by rememberSaveable { mutableStateOf<String?>(null) }
+            var selectedDirectoryFieldId by rememberSaveable { mutableStateOf<String?>(null) }
+            var selectedDirectoryPath by rememberSaveable { mutableStateOf<String?>(null) }
+            val directorySelection = selectedDirectoryOwnerId?.let { ownerId ->
+                selectedDirectoryFieldId?.let { fieldId ->
+                    selectedDirectoryPath?.let { path -> DirectorySelection(ownerId, fieldId, path) }
+                }
+            }
 
-            // Derive the root surface from bootstrap state.
             val rootSurface = bootstrapRootSurface(bootstrapState)
-
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
             val permissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestMultiplePermissions(),
             ) {
-                // Route permission results to prerequisite refresh.
                 currentServiceState?.refreshBootstrapPrerequisites()
             }
             val directoryLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocumentTree(),
             ) { uri ->
-                val channelId = journalDirectoryTargetId
-                journalDirectoryTargetId = null
+                val ownerId = pendingDirectoryOwnerId
+                val fieldId = pendingDirectoryFieldId
+                pendingDirectoryOwnerId = null
+                pendingDirectoryFieldId = null
                 val path = uri?.let(StoragePathResolver::resolveTreeUri)
-                if (channelId != null && path != null) {
-                    val connectedService = currentServiceState
-                    if (connectedService == null) {
-                        pendingJournalDirectory = channelId to path
-                    } else {
-                        connectedService.setJournalDirectory(channelId, path)
-                    }
+                if (ownerId != null && fieldId != null && path != null) {
+                    selectedDirectoryOwnerId = ownerId
+                    selectedDirectoryFieldId = fieldId
+                    selectedDirectoryPath = path
                 }
             }
 
@@ -130,8 +126,9 @@ class MainActivity : ComponentActivity() {
                         startActivity(RequiredPermissions.manageExternalStorageIntent(this@MainActivity))
                     }
 
-                    override fun pickJournalDirectory(channelId: String) {
-                        journalDirectoryTargetId = channelId
+                    override fun pickDirectory(configurationOwnerId: String, fieldId: String) {
+                        pendingDirectoryOwnerId = configurationOwnerId
+                        pendingDirectoryFieldId = fieldId
                         directoryLauncher.launch(null)
                     }
 
@@ -164,118 +161,62 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.disconnectSerial()
                     }
 
-                    override fun setJournalSaveVoice(channelId: String, enabled: Boolean) {
-                        currentServiceState?.setJournalSaveVoice(channelId, enabled)
-                    }
-
-                    override fun setJournalSaveText(channelId: String, enabled: Boolean) {
-                        currentServiceState?.setJournalSaveText(channelId, enabled)
-                    }
-
                     override fun setActiveChannel(id: String) {
-                        currentServiceState?.setActiveChannelId(id)
+                        currentServiceState?.selectChannel(id)
                     }
 
                     override fun setInputMode(mode: InputMode) {
                         currentServiceState?.setInputMode(mode)
                     }
 
-                    override fun setDebugChannelMode(
-                        channelId: String,
-                        mode: dev.nilp0inter.subspace.model.DebugMode,
-                    ) {
-                        currentServiceState?.setDebugChannelMode(channelId, mode)
-                    }
-
-                    override fun setKeyboardHostProfile(
-                        channelId: String,
-                        profile: io.sleepwalker.core.keymap.HostProfile,
-                    ) {
-                        currentServiceState?.setKeyboardHostProfile(channelId, profile)
-                    }
-
-                    override fun connectKeyboardBridge() {
-                        currentServiceState?.connectKeyboardBridge()
-                    }
-
-                    override fun disconnectKeyboardBridge() {
-                        currentServiceState?.disconnectKeyboardBridge()
-                    }
-
                     override fun navigateToRsmSetup() {
                         dashboardRoute = if (currentReadyForMonitor) DashboardRoute.Monitor else DashboardRoute.Connection
                     }
 
-                    override fun navigateToJournalConfig(channelId: String) {
+                    override fun navigateToChannelConfiguration(channelId: String) {
                         configuredChannelId = channelId
-                        dashboardRoute = DashboardRoute.JournalConfig
+                        creatingImplementationId = null
+                        dashboardRoute = DashboardRoute.ChannelConfiguration
                     }
 
-                    override fun navigateToDebugConfig(channelId: String) {
-                        configuredChannelId = channelId
-                        dashboardRoute = DashboardRoute.DebugChannelConfig
-                    }
-
-                    override fun navigateToKeyboardConfig(channelId: String) {
-                        configuredChannelId = channelId
-                        dashboardRoute = DashboardRoute.KeyboardConfig
+                    override fun navigateToChannelCreation(
+                        implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId,
+                        displayName: String,
+                    ) {
+                        configuredChannelId = null
+                        creatingImplementationId = implementationId.value
+                        creatingDisplayName = displayName
+                        dashboardRoute = DashboardRoute.ChannelCreation
                     }
 
                     override fun navigateBack() {
                         configuredChannelId = null
+                        creatingImplementationId = null
                         dashboardRoute = DashboardRoute.Main
                     }
 
-                    override fun setTtsText(text: String) {
-                        currentServiceState?.setTtsText(text)
-                    }
-
-                    override fun setTtsVoiceStyle(style: String) {
-                        currentServiceState?.setTtsVoiceStyle(style)
-                    }
-
-                    override fun setTtsLang(lang: String) {
-                        currentServiceState?.setTtsLang(lang)
-                    }
-
-                    override fun setTtsTotalSteps(steps: Int) {
-                        currentServiceState?.setTtsTotalSteps(steps)
-                    }
-
-                    override fun setTtsSpeed(speed: Float) {
-                        currentServiceState?.setTtsSpeed(speed)
-                    }
-
-                    override fun requestTtsSynthesis() {
-                        currentServiceState?.requestTtsSynthesis()
-                    }
-
-                    override fun setSttTtsVoiceStyle(style: String) {
-                        currentServiceState?.setSttTtsVoiceStyle(style)
-                    }
-
-                    override fun setSttTtsLang(lang: String) {
-                        currentServiceState?.setSttTtsLang(lang)
-                    }
-
-                    override fun setSttTtsTotalSteps(steps: Int) {
-                        currentServiceState?.setSttTtsTotalSteps(steps)
-                    }
-
-                    override fun setSttTtsSpeed(speed: Float) {
-                        currentServiceState?.setSttTtsSpeed(speed)
-                    }
-
                     override fun phonePttPressed(channelId: String) {
-                        currentServiceState?.phonePttPressed(channelId)
+                        currentServiceState?.startPhonePtt(channelId)
                     }
 
                     override fun phonePttReleased(channelId: String) {
                         currentServiceState?.phonePttReleased(channelId)
                     }
-                    override fun addChannel(definition: dev.nilp0inter.subspace.model.ChannelDefinition) {
-                        currentServiceState?.repository?.addChannel(definition)
-                    }
+
+                    override fun createChannel(
+                        implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId,
+                        displayName: String,
+                        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
+                    ): String? = currentServiceState
+                        ?.createChannel(implementationId, displayName, payload)
+                        .failureMessage()
+
+                    override fun updateChannelConfiguration(
+                        channelId: String,
+                        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
+                    ): String? = currentServiceState
+                        ?.updateChannelConfiguration(channelId, payload)
+                        .failureMessage()
 
                     override fun removeChannel(id: String) {
                         currentServiceState?.repository?.removeChannel(id)
@@ -286,8 +227,8 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun renameChannel(id: String, newName: String) {
-                        currentServiceState?.repository?.updateChannel(id) { old ->
-                            old.copy(name = newName)
+                        currentServiceState?.repository?.updateChannel(id) { definition ->
+                            definition.copy(name = newName)
                         }
                     }
                 }
@@ -297,7 +238,6 @@ class MainActivity : ComponentActivity() {
                 Surface {
                     when (rootSurface) {
                         BootstrapRootSurface.Loading -> {
-                            val needsSetup = bootstrapState is BootstrapState.NeedsSetup
                             BackHandler(enabled = false) { }
                             BootstrapLoadingScreen(
                                 state = bootstrapState,
@@ -311,69 +251,78 @@ class MainActivity : ComponentActivity() {
                             BackHandler(enabled = false) { }
                             InitialSetupScreen(
                                 missingPermissions = setup.missingPermissions,
+                                needsManageExternalStorage = setup.needsManageExternalStorage,
                                 invalidModelSets = setup.invalidModelSets,
                                 error = setup.error,
                                 onGrantPermissions = {
                                     permissionLauncher.launch(RequiredPermissions.runtimePermissions())
                                 },
-                                onStartModelDownload = {
-                                    // Move to loading: the coordinator handles
-                                    // acquisition and returns to setup only on
-                                    // failure.
-                                    currentServiceState?.startModelAcquisition()
-                                },
+                                onGrantManageExternalStorage = actions::requestManageExternalStorage,
+                                onStartModelDownload = { currentServiceState?.startModelAcquisition() },
                             )
                         }
 
                         BootstrapRootSurface.Dashboard -> {
-                            BackHandler(enabled = dashboardRoute != DashboardRoute.Main) {
-                                actions.navigateBack()
-                            }
-
+                            BackHandler(enabled = dashboardRoute != DashboardRoute.Main) { actions.navigateBack() }
                             when (dashboardRoute) {
                                 DashboardRoute.Main -> MainDashboardScreen(
                                     appState = state,
                                     level = level,
                                     isCapturing = isCapturing,
+                                    providerDescriptors = providerDescriptors,
                                     actions = actions,
                                 )
 
                                 DashboardRoute.Connection -> ConnectionScreen(state.connection, actions)
                                 DashboardRoute.Monitor -> MonitorScreen(state.monitor, actions)
-                                DashboardRoute.JournalConfig -> {
-                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
-                                    val config = def?.config as? JournalConfig
-                                    if (config != null) {
-                                        dev.nilp0inter.subspace.ui.JournalConfigScreen(
-                                            channel = config.toLegacyChannel(def.name, def.id),
-                                            actions = actions,
-                                            onBack = actions::navigateBack,
-                                        )
+                                DashboardRoute.ChannelConfiguration -> {
+                                    val definition = catalogue?.definitions?.firstOrNull { it.id == configuredChannelId }
+                                    val descriptor = definition?.let { target ->
+                                        providerDescriptors.firstOrNull {
+                                            it.implementationId == target.implementationId
+                                        }
                                     }
-                                }
-                                DashboardRoute.DebugChannelConfig -> {
-                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
-                                    val config = def?.config as? DebugConfig
-                                    if (config != null) {
-                                        dev.nilp0inter.subspace.ui.DebugChannelConfigScreen(
-                                            channel = config.toLegacyChannel(def.name, def.id),
-                                            monitorState = state.monitor,
-                                            actions = actions,
-                                            onBack = actions::navigateBack,
-                                        )
-                                    }
-                                }
-                                DashboardRoute.KeyboardConfig -> {
-                                    val def = catalogue?.definitions?.find { it.id == configuredChannelId }
-                                    val config = def?.config as? KeyboardConfig
-                                    if (config != null) {
-                                        dev.nilp0inter.subspace.ui.KeyboardChannelConfigScreen(
-                                            channel = config.toLegacyChannel(def.name, def.id) {
-                                                service?.sleepwalkerConnection?.connectionState?.value == dev.nilp0inter.subspace.model.KeyboardConnectionState.Connected
+                                    if (definition != null && descriptor != null) {
+                                        ChannelConfigurationScreen(
+                                            title = definition.name,
+                                            configurationOwnerId = definition.id,
+                                            descriptor = descriptor,
+                                            initialPayload = definition.configPayload,
+                                            submitLabel = "Save configuration",
+                                            onSubmit = { payload ->
+                                                actions.updateChannelConfiguration(definition.id, payload).also { error ->
+                                                    if (error == null) actions.navigateBack()
+                                                }
                                             },
-                                            monitorState = state.monitor,
-                                            actions = actions,
-                                            keymapProfiles = service?.getKeymapProfiles() ?: emptyList(),
+                                            directorySelection = directorySelection,
+                                            onPickDirectory = actions::pickDirectory,
+                                            onBack = actions::navigateBack,
+                                        )
+                                    }
+                                }
+
+                                DashboardRoute.ChannelCreation -> {
+                                    val descriptor = providerDescriptors.firstOrNull {
+                                        it.implementationId.value == creatingImplementationId
+                                    }
+                                    if (descriptor != null) {
+                                        ChannelConfigurationScreen(
+                                            title = "New ${descriptor.presentation.label}",
+                                            configurationOwnerId = "new:${descriptor.implementationId.value}:$creatingDisplayName",
+                                            descriptor = descriptor,
+                                            initialPayload = descriptor.configuration.defaultPayload(),
+                                            submitLabel = "Create channel",
+                                            onSubmit = { payload ->
+                                                actions.createChannel(
+                                                    descriptor.implementationId,
+                                                    creatingDisplayName,
+                                                    payload,
+                                                ).also { error ->
+                                                    if (error == null) actions.navigateBack()
+                                                }
+                                            },
+                                            directorySelection = directorySelection,
+                                            onPickDirectory = actions::pickDirectory,
                                             onBack = actions::navigateBack,
                                         )
                                     }
@@ -414,5 +363,11 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class DashboardRoute { Main, Connection, Monitor, JournalConfig, DebugChannelConfig, KeyboardConfig }
+    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation }
+}
+
+internal fun ChannelRepositoryMutationResult?.failureMessage(): String? = when (this) {
+    null -> "Channel service is unavailable."
+    ChannelRepositoryMutationResult.Success -> null
+    is ChannelRepositoryMutationResult.Failure -> error.message
 }

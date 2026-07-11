@@ -31,13 +31,17 @@ import dev.nilp0inter.subspace.service.RequiredPermissions
 @Composable
 fun InitialSetupScreen(
     missingPermissions: List<String>,
+    needsManageExternalStorage: Boolean,
     invalidModelSets: List<String>,
     error: String?,
     onGrantPermissions: () -> Unit,
+    onGrantManageExternalStorage: () -> Unit,
     onStartModelDownload: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val permissionsDone = missingPermissions.isEmpty()
+    val storageDone = !needsManageExternalStorage
+    val setupPrerequisitesDone = permissionsDone && storageDone
 
     Column(
         modifier = modifier
@@ -48,7 +52,7 @@ fun InitialSetupScreen(
     ) {
         TerminalHeader(
             title = "SUBSPACE SETUP",
-            subtitle = "Grant permissions and download speech models to continue.",
+            subtitle = "Grant permissions, allow storage access, and download speech models to continue.",
         )
 
         PermissionsStep(
@@ -56,10 +60,16 @@ fun InitialSetupScreen(
             onRequest = onGrantPermissions,
         )
 
+        StorageAccessStep(
+            done = storageDone,
+            permissionsDone = permissionsDone,
+            onRequest = onGrantManageExternalStorage,
+        )
+
         ModelDownloadStep(
             done = invalidModelSets.isEmpty(),
             error = error,
-            permissionsDone = permissionsDone,
+            prerequisitesDone = setupPrerequisitesDone,
             onStart = onStartModelDownload,
         )
     }
@@ -91,10 +101,43 @@ private fun PermissionsStep(done: Boolean, onRequest: () -> Unit) {
 }
 
 @Composable
+private fun StorageAccessStep(
+    done: Boolean,
+    permissionsDone: Boolean,
+    onRequest: () -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("STEP 2 — STORAGE ACCESS", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Journal writes to a user-selected filesystem directory. Android all-files access is required for these real paths.",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(12.dp))
+            if (done) {
+                Text("✓ Granted", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+            } else {
+                Button(
+                    onClick = onRequest,
+                    enabled = permissionsDone,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Allow storage access")
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ModelDownloadStep(
     done: Boolean,
     error: String?,
-    permissionsDone: Boolean,
+    prerequisitesDone: Boolean,
     onStart: () -> Unit,
 ) {
     Card(
@@ -102,7 +145,7 @@ private fun ModelDownloadStep(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(16.dp)) {
-            Text("STEP 2 — SPEECH MODELS", style = MaterialTheme.typography.titleLarge)
+            Text("STEP 3 — SPEECH MODELS", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(8.dp))
             Text(
                 "Download the Parakeet (STT) and Supertonic (TTS) models (~950 MB). A network connection is required.",
@@ -125,7 +168,7 @@ private fun ModelDownloadStep(
                 Spacer(Modifier.height(12.dp))
                 Button(
                     onClick = onStart,
-                    enabled = permissionsDone,
+                    enabled = prerequisitesDone,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text("Download models")

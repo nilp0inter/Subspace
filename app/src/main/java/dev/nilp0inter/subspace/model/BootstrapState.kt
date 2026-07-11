@@ -41,17 +41,19 @@ sealed interface BootstrapState {
     ) : BootstrapState
 
     /**
-     * One or more user-resolvable prerequisites are missing: runtime
-     * permissions or model assets that require explicit download or repair.
+     * One or more user-resolvable prerequisites are missing: runtime permissions, all-files
+     * storage access, or model assets that require explicit download or repair.
      *
-     * [missingPermissions] lists the exact missing permission strings.
-     * [invalidModelSets] lists the model set directory names that are
-     * absent, version-mismatched, or hash-invalid.
-     * [error] carries a diagnostic from a failed acquisition attempt so
-     * the setup surface can display it alongside the retry action.
+     * [missingPermissions] lists the exact missing runtime permission strings.
+     * [needsManageExternalStorage] identifies Android's separate all-files settings grant; it
+     * cannot be requested through the runtime-permission dialog.
+     * [invalidModelSets] lists the model set directory names that are absent,
+     * version-mismatched, or hash-invalid. [error] carries a diagnostic from a failed
+     * acquisition attempt so the setup surface can display it alongside the retry action.
      */
     data class NeedsSetup(
         val missingPermissions: List<String> = emptyList(),
+        val needsManageExternalStorage: Boolean = false,
         val invalidModelSets: List<String> = emptyList(),
         val error: String? = null,
     ) : BootstrapState

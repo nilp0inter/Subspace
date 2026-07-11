@@ -11,153 +11,59 @@ class CarNowPlayingMetadataBuilderTest {
         recordingResId = 1003,
         finalizingResId = 1004,
     )
-    private val artist = "Subspace"
-    private val notReadyTitle = "Subspace not ready"
 
     @Test
-    fun readyWithActiveChannelEmitsActivePillAndChannelTitle() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = "Captain's Log",
-            state = CarMediaPttState.Ready,
-            pendingCount = 0,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
-            drawables = drawables,
-        )
-
-        assertEquals("Captain's Log", meta.title)
-        assertEquals("Subspace", meta.artist)
-        assertEquals("ACTIVE", meta.subtitle)
-        assertEquals(1002, meta.drawableResId)
-    }
-
-    @Test
-    fun recordingWithActiveChannelEmitsRecordingPillAndChannelTitle() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = "Captain's Log",
-            state = CarMediaPttState.Recording,
-            pendingCount = 0,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
-            drawables = drawables,
-        )
-
-        assertEquals("Captain's Log", meta.title)
-        assertEquals("RECORDING", meta.subtitle)
-        assertEquals(1003, meta.drawableResId)
-    }
-
-    @Test
-    fun finalizingEmitsFinalizingPillAndFinalizingDrawable() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = "Journal",
-            state = CarMediaPttState.Finalizing,
-            pendingCount = 0,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
-            drawables = drawables,
-        )
-
-        assertEquals("FINALIZING", meta.subtitle)
-        assertEquals(1004, meta.drawableResId)
-    }
-
-    @Test
-    fun notReadyWithNullChannelFallsBackToNotReadyTitle() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = null,
+    fun `unavailable active channel retains its name but presents non-ready metadata`() {
+        val metadata = buildCarNowPlayingMetadata(
+            activeChannelName = "Unavailable but retained",
             state = CarMediaPttState.NotReady,
-            pendingCount = 0,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
+            pendingCount = 7,
+            appArtist = "Subspace",
+            notReadyFallbackTitle = "No channel",
             drawables = drawables,
         )
 
-        assertEquals(notReadyTitle, meta.title)
-        assertEquals("NOT READY", meta.subtitle)
-        assertEquals(1001, meta.drawableResId)
+        assertEquals("Unavailable but retained", metadata.title)
+        assertEquals("Subspace", metadata.artist)
+        assertEquals("NOT READY · 7 pending", metadata.subtitle)
+        assertEquals(1001, metadata.drawableResId)
     }
 
     @Test
-    fun notReadyWithActiveChannelKeepsChannelTitleAndNotReadyPill() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = "Captain's Log",
-            state = CarMediaPttState.NotReady,
-            pendingCount = 0,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
-            drawables = drawables,
+    fun `metadata status and artwork change with runtime state without changing active instance presentation`() {
+        data class Case(
+            val state: CarMediaPttState,
+            val subtitle: String,
+            val drawable: Int,
         )
 
-        assertEquals("Captain's Log", meta.title)
-        assertEquals("NOT READY", meta.subtitle)
-    }
-
-    @Test
-    fun pendingGreaterThanZeroAppendsPendingSummary() {
-        val meta = buildCarNowPlayingMetadata(
-            activeChannelName = "Captain's Log",
-            state = CarMediaPttState.Ready,
-            pendingCount = 3,
-            appArtist = artist,
-            notReadyFallbackTitle = notReadyTitle,
-            drawables = drawables,
-        )
-
-        assertEquals("ACTIVE · 3 pending", meta.subtitle)
-    }
-
-    @Test
-    fun pendingZeroOmitsPendingSummaryAcrossAllStates() {
-        CarMediaPttState.values().forEach { state ->
-            val meta = buildCarNowPlayingMetadata(
-                activeChannelName = "Channel",
-                state = state,
+        listOf(
+            Case(CarMediaPttState.NotReady, "NOT READY", 1001),
+            Case(CarMediaPttState.Ready, "ACTIVE", 1002),
+            Case(CarMediaPttState.Recording, "RECORDING", 1003),
+            Case(CarMediaPttState.Finalizing, "FINALIZING", 1004),
+        ).forEach { case ->
+            val metadata = buildCarNowPlayingMetadata(
+                activeChannelName = "Stable active instance",
+                state = case.state,
                 pendingCount = 0,
-                appArtist = artist,
-                notReadyFallbackTitle = notReadyTitle,
+                appArtist = "Subspace",
+                notReadyFallbackTitle = "No channel",
                 drawables = drawables,
             )
-            assertEquals(statePillText(state), meta.subtitle)
+
+            assertEquals(case.state.name, "Stable active instance", metadata.title)
+            assertEquals(case.state.name, case.subtitle, metadata.subtitle)
+            assertEquals(case.state.name, case.drawable, metadata.drawableResId)
         }
     }
 
     @Test
-    fun subtitleTruncatesPendingPortionFirstWhenBudgetExceeded() {
-        // Today's Int-typed active-channel pending count cannot overflow a
-        // <= 9-char state pill, so we drive the rule directly with an oversized
-        // pill (the spec's truncation guarantee applies to future inactive-
-        // channel suffixes such as "3 pending on Captain's Log").
-        val longPillThatWouldOverflow = "X".repeat(CAR_NOW_PLAYING_SUBTITLE_LIMIT + 5)
-        val wouldOverflow = longPillThatWouldOverflow +
-            CAR_NOW_PLAYING_PENDING_PREFIX_SEPARATOR + "3 pending"
-        assertTrue(wouldOverflow.length > CAR_NOW_PLAYING_SUBTITLE_LIMIT)
+    fun `pending suffix is omitted rather than truncating the status pill when it exceeds metadata budget`() {
+        val oversizedPill = "P".repeat(CAR_NOW_PLAYING_SUBTITLE_LIMIT)
 
-        assertEquals(longPillThatWouldOverflow, appendPending(longPillThatWouldOverflow, 3))
-
-        assertTrue("ACTIVE · 3 pending".length <= CAR_NOW_PLAYING_SUBTITLE_LIMIT)
-        assertEquals("ACTIVE · 3 pending", appendPending("ACTIVE", 3))
-        assertEquals("ACTIVE", appendPending("ACTIVE", 0))
-    }
-
-    @Test
-    fun drawableSelectionSwitchesByState() {
-        CarMediaPttState.values().forEach { state ->
-            val meta = buildCarNowPlayingMetadata(
-                activeChannelName = "Channel",
-                state = state,
-                pendingCount = 0,
-                appArtist = artist,
-                notReadyFallbackTitle = notReadyTitle,
-                drawables = drawables,
-            )
-            val expected = when (state) {
-                CarMediaPttState.NotReady -> 1001
-                CarMediaPttState.Ready -> 1002
-                CarMediaPttState.Recording -> 1003
-                CarMediaPttState.Finalizing -> 1004
-            }
-            assertEquals("drawable for $state", expected, meta.drawableResId)
-        }
+        assertEquals(oversizedPill, appendPending(oversizedPill, 1))
+        assertEquals("ACTIVE · 2 pending", appendPending("ACTIVE", 2))
+        assertTrue(appendPending("ACTIVE", 2).length <= CAR_NOW_PLAYING_SUBTITLE_LIMIT)
     }
 }

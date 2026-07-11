@@ -21,7 +21,7 @@ internal fun Modifier.phonePttInput(
     lockThresholdPx: Float,
     onSelect: (String) -> Unit,
     onPhonePttTransition: (PhonePttGestureTransition) -> Unit,
-): Modifier = pointerInput(channelId, lockThresholdPx, onSelect, onPhonePttTransition) {
+): Modifier = pointerInput(channelId, lockThresholdPx) {
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
         val initialX = down.position.x

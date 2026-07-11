@@ -1,43 +1,34 @@
 package dev.nilp0inter.subspace.ui
 
+import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.OpaqueJsonObject
 
+/** Host-owned UI intents. Provider configuration is always addressed by stable IDs and opaque data. */
 interface PttUiActions {
     fun requestPermissions()
     fun requestManageExternalStorage()
-    fun pickJournalDirectory(channelId: String)
+    fun pickDirectory(configurationOwnerId: String, fieldId: String)
     fun openBluetoothSettings()
     fun scanForDevice()
     fun pairTarget()
     fun connectSerial()
     fun retry()
     fun disconnectSerial()
-    fun setJournalSaveVoice(channelId: String, enabled: Boolean)
-    fun setJournalSaveText(channelId: String, enabled: Boolean)
     fun setActiveChannel(id: String)
     fun setInputMode(mode: InputMode)
-    fun setDebugChannelMode(channelId: String, mode: dev.nilp0inter.subspace.model.DebugMode)
-    fun setKeyboardHostProfile(channelId: String, profile: io.sleepwalker.core.keymap.HostProfile)
-    fun connectKeyboardBridge()
-    fun disconnectKeyboardBridge()
     fun navigateToRsmSetup()
-    fun navigateToJournalConfig(channelId: String)
-    fun navigateToDebugConfig(channelId: String)
-    fun navigateToKeyboardConfig(channelId: String)
+    fun navigateToChannelConfiguration(channelId: String)
+    fun navigateToChannelCreation(implementationId: ChannelImplementationId, displayName: String)
     fun navigateBack()
-    fun setTtsText(text: String)
-    fun setTtsVoiceStyle(style: String)
-    fun setTtsLang(lang: String)
-    fun setTtsTotalSteps(steps: Int)
-    fun setTtsSpeed(speed: Float)
-    fun requestTtsSynthesis()
-    fun setSttTtsVoiceStyle(style: String)
-    fun setSttTtsLang(lang: String)
-    fun setSttTtsTotalSteps(steps: Int)
-    fun setSttTtsSpeed(speed: Float)
     fun phonePttPressed(channelId: String)
     fun phonePttReleased(channelId: String)
-    fun addChannel(definition: dev.nilp0inter.subspace.model.ChannelDefinition)
+    fun createChannel(
+        implementationId: ChannelImplementationId,
+        displayName: String,
+        payload: OpaqueJsonObject,
+    ): String?
+    fun updateChannelConfiguration(channelId: String, payload: OpaqueJsonObject): String?
     fun removeChannel(id: String)
     fun moveChannel(id: String, toIndex: Int)
     fun renameChannel(id: String, newName: String)

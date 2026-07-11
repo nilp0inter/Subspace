@@ -25,7 +25,6 @@ data class MonitorState(
     val sttTtsLang: String = DEFAULT_TTS_LANG,
     val sttTtsTotalSteps: Int = DEFAULT_TTS_TOTAL_STEPS,
     val sttTtsSpeed: Float = DEFAULT_TTS_SPEED,
-    val keyboardStatus: KeyboardStatus = KeyboardStatus.Idle,
     val keyboardConnectionState: KeyboardConnectionState = KeyboardConnectionState.Disconnected,
 )
 
