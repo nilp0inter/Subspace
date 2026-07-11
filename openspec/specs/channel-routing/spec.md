@@ -1,47 +1,29 @@
-## Purpose
-
-TBD. Defines the active channel routing, mutual exclusivity, and readiness evaluation before dispatching PTT audio.
-
-## Requirements
-
-### Requirement: Active channel mutual exclusivity
-The system SHALL maintain a single valid `activeChannelId` selected from the persisted ordered channel catalogue. Activating a channel instance SHALL inherently make every other instance inactive. Catalogue mutation SHALL preserve or atomically repair this invariant.
-
-#### Scenario: Switching active channel
-- **WHEN** the user selects a different catalogue instance from any supported surface
-- **THEN** the system SHALL set that instance ID as the active channel
-- **AND** all other instances SHALL become inactive
-
-#### Scenario: Unknown channel selected
-- **WHEN** a selection request references an ID absent from the current catalogue
-- **THEN** the system SHALL reject the request
-- **AND** it SHALL preserve the existing valid active channel ID
+## MODIFIED Requirements
 
 ### Requirement: Channel readiness state
-The system SHALL obtain readiness from the runtime entry associated with each channel instance. Readiness SHALL include valid enabled configuration plus live dependencies required by that instance's kind. Readiness evaluation SHALL be instance-specific even when multiple instances share a kind.
-
-For a Keyboard instance, readiness SHALL be true only when its host profile is configured and the Sleepwalker BLE bridge is connected. For a Journal instance, readiness SHALL be true only when its output directory is valid and at least one save option is enabled. A Debug instance SHALL additionally require the resources needed by its configured debug mode.
+The system SHALL obtain readiness from the runtime entry associated with each channel instance. Readiness SHALL combine valid enabled provider configuration with the provider/runtime-declared availability of semantic capabilities required by that instance. Readiness and preparation eligibility SHALL be instance-specific even when multiple instances reference the same provider. Core routing SHALL NOT inspect provider identity, a built-in channel kind, or platform transport state to derive readiness.
 
 #### Scenario: Ready instance
-- **WHEN** an enabled channel instance has valid configuration and every live dependency required by its kind
+- **WHEN** an enabled channel instance has provider-validated configuration and its runtime reports every required semantic capability available
 - **THEN** its runtime readiness SHALL be true
 
 #### Scenario: Instance dependency unavailable
-- **WHEN** a channel instance lacks valid configuration or a required live dependency becomes unavailable
+- **WHEN** a channel instance lacks valid configuration or its runtime reports a required semantic capability unavailable
 - **THEN** its runtime readiness SHALL be false
 - **AND** readiness of other instances SHALL be evaluated independently
 
-#### Scenario: Inactive Debug instance retains dependency readiness
-- **WHEN** an enabled Debug instance has valid configuration and all dependencies for its configured mode but is not active
+#### Scenario: Inactive instance retains dependency readiness
+- **WHEN** an enabled inactive instance has valid configuration and its runtime reports all required semantic capabilities available
 - **THEN** its runtime readiness SHALL remain true
-- **AND** shared-controller activation state SHALL NOT be treated as dependency availability
+- **AND** active selection or shared-controller activation state SHALL NOT be treated as dependency availability
 
-#### Scenario: Keyboard bridge disconnected
-- **WHEN** a Keyboard instance has a host profile but the Sleepwalker BLE bridge is disconnected
-- **THEN** that Keyboard runtime SHALL be not ready
+#### Scenario: Provider is unavailable
+- **WHEN** an instance's referenced provider is missing, incompatible, or failed to initialize
+- **THEN** its runtime entry SHALL report unavailable rather than ready
+- **AND** core routing SHALL preserve and identify the instance without attempting provider-specific readiness logic
 
 ### Requirement: PTT routing respects readiness
-The system SHALL evaluate the active catalogue instance's runtime readiness before dispatching a PTT capture, regardless of which input mode or actuator initiated PTT. Route resolution SHALL remain based on active `InputMode`, not `PttSource`. Ready input SHALL be prepared through the ID-keyed runtime registry rather than fixed built-in ID branches. An enabled and configured Keyboard instance whose only unavailable live dependency is a disconnected or connecting Sleepwalker bridge SHALL enter pending input preparation so the runtime can attempt connection recovery; every other not-ready instance SHALL follow the immediate problem-feedback path.
+The system SHALL evaluate the active catalogue instance's runtime readiness and preparation availability before dispatching a PTT capture, regardless of which input mode or actuator initiated PTT. Route resolution SHALL remain based on active `InputMode`, not `PttSource`. Ready or recoverable input SHALL be prepared through the ID-keyed runtime registry. A not-ready runtime whose provider/runtime reports recoverable preparation available SHALL enter pending input preparation; every other not-ready or unavailable runtime SHALL follow the immediate problem-feedback path. Core routing SHALL NOT use Keyboard, provider, implementation, hardware, or connection-state checks to choose recovery.
 
 #### Scenario: PTT on a ready active instance in Work mode
 - **WHEN** PTT is pressed while `Work` is active and the selected runtime is ready
@@ -58,128 +40,74 @@ The system SHALL evaluate the active catalogue instance's runtime readiness befo
 - **THEN** the system SHALL resolve the local audio route
 - **AND** request a committed input target from the same ID-keyed runtime registry
 
-#### Scenario: Disconnected Keyboard enters recoverable preparation
-- **WHEN** PTT is pressed while the selected instance is an enabled and configured Keyboard channel
-- **AND** the Sleepwalker bridge is not `Connected`
+#### Scenario: Not-ready runtime enters recoverable preparation
+- **WHEN** PTT is pressed while the selected runtime is not ready
+- **AND** that runtime reports recoverable input preparation available
 - **THEN** the system SHALL reserve one pending audio input session
-- **AND** request recoverable input preparation from that Keyboard runtime
-- **AND** SHALL NOT select the immediate not-ready problem-feedback path solely because the bridge is disconnected
+- **AND** request recoverable input preparation from that runtime
+- **AND** it SHALL NOT select the immediate not-ready problem-feedback path solely because a required capability is currently unavailable
 
-#### Scenario: Non-Keyboard instance is not ready
-- **WHEN** PTT is pressed while the selected non-Keyboard runtime is not ready
+#### Scenario: Not-ready runtime does not offer recovery
+- **WHEN** PTT is pressed while the selected runtime is not ready or unavailable
+- **AND** that runtime does not report recoverable input preparation available
 - **THEN** the system SHALL select the immediate problem-feedback path
-- **AND** SHALL NOT request channel input preparation
+- **AND** it SHALL NOT request channel input preparation
 
-#### Scenario: Phone PTT selects an instance
-- **WHEN** the user starts phone PTT from a ready functional channel card
+#### Scenario: Phone PTT selects an instance before readiness admission
+- **WHEN** the user starts phone PTT from any persisted functional channel card
 - **THEN** the system SHALL transition to `OnAPinch`
-- **AND** set that card's instance ID as active
-- **AND** route capture through the matching runtime entry
+- **AND** set that card's stable instance ID as active regardless of preparation state
+- **AND** route PTT admission through the matching runtime entry
+- **AND** a non-recoverable unavailable runtime SHALL produce host-owned problem feedback without capture
 
 #### Scenario: RSM PTT auto-transitions to Work mode
 - **WHEN** RSM PTT is pressed while Work mode is available
 - **THEN** the system SHALL transition to `Work`
-- **AND** route capture to the active runtime instance
+- **AND** route preparation to the active runtime instance
 
 #### Scenario: Android Auto PTT auto-transitions to On-the-road mode
 - **WHEN** Android Auto PTT is initiated while On-the-road mode is available
 - **THEN** the system SHALL transition to `OnTheRoad`
-- **AND** route capture to the active runtime instance
+- **AND** route preparation to the active runtime instance
 
 #### Scenario: Runtime refuses preparation
-- **WHEN** the active runtime becomes unavailable, fails recoverable preparation, or refuses input after route gating but before capture starts
-- **THEN** the system SHALL NOT start capture
+- **WHEN** the active runtime becomes unavailable, recoverable preparation fails, or the runtime refuses input after route gating but before capture starts
+- **THEN** the system SHALL NOT start capture or play the ready beep
 - **AND** host-owned error feedback and route cleanup SHALL follow the existing audio session policy
 
-### Requirement: Work SCO endpoint ownership is proven by target RSM HFP
-The system SHALL prove Work/RSM SCO ownership with the target `B02PTT-FF01` `BluetoothDevice` in the `BluetoothHeadset` profile before treating any generic `TYPE_BLUETOOTH_SCO` `AudioDeviceInfo` as the Work transport.
-
-#### Scenario: Target RSM owns anonymous SCO transport
-- **WHEN** Work route acquisition calls `BluetoothHeadset.startVoiceRecognition(targetRsm)`
-- **AND** `BluetoothHeadset.isAudioConnected(targetRsm)` becomes true
-- **AND** `AudioManager.communicationDevice` is `TYPE_BLUETOOTH_SCO` but its product name does not identify `B02PTT-FF01`
-- **THEN** the system SHALL treat that SCO device as the Work transport owned by the target RSM
-- **AND** the system SHALL route Work ready beep, capture, and playback through that transport
-
-#### Scenario: Anonymous SCO without target RSM ownership
-- **WHEN** a `TYPE_BLUETOOTH_SCO` device is available
-- **BUT** `BluetoothHeadset.isAudioConnected(targetRsm)` is false or cannot be queried
-- **THEN** the system SHALL NOT treat the SCO device as a Work/RSM transport
-- **AND** the system SHALL NOT fall back to the first available SCO device
-
-#### Scenario: Target HFP ownership diagnostics
-- **WHEN** Work route acquisition starts, succeeds, fails, or releases
-- **THEN** the system SHALL log target RSM HFP state, `startVoiceRecognition` result, `isAudioConnected(targetRsm)` state, selected SCO transport, and release result
-- **AND** the system SHALL NOT log Bluetooth MAC addresses or PCM/audio payloads
-#### Scenario: PTT on a ready active channel in Work mode
-- **WHEN** PTT is pressed while in `Work` mode and the active channel's `isReady` state is true
-- **THEN** the system SHALL resolve the audio route for `Work` mode (SCO via RSM headset)
-- **AND** dispatch the capture to the active channel's designated controller
-
-#### Scenario: PTT on a ready active channel in On-the-road mode
-- **WHEN** PTT is pressed while in `OnTheRoad` mode and the active channel's `isReady` state is true
-- **THEN** the system SHALL resolve the audio route for `OnTheRoad` mode (Telecom self-call for SCO)
-- **AND** dispatch the capture to the active channel's designated controller
-
-#### Scenario: PTT on a ready active channel in On-a-pinch mode
-- **WHEN** PTT is pressed while in `OnAPinch` mode and the active channel's `isReady` state is true
-- **THEN** the system SHALL resolve the audio route for `OnAPinch` mode (default audio route, not SCO)
-- **AND** dispatch the capture to the active channel's designated controller
-
-#### Scenario: Phone PTT on a ready channel card
-- **WHEN** a functional channel card is long-pressed and that channel's `isReady` state is true
-- **THEN** the system SHALL transition to `OnAPinch` mode
-- **AND** set that channel as the active channel
-- **AND** resolve the audio route for `OnAPinch` mode
-- **AND** dispatch the capture to that channel's designated controller
-
-#### Scenario: RSM PTT auto-transitions to Work mode
-- **WHEN** the RSM PTT button is pressed while in any mode
-- **AND** `Work` mode is available
-- **THEN** the system SHALL transition to `Work` mode
-- **AND** resolve the audio route for `Work` mode
-- **AND** dispatch the capture to the active channel's designated controller
-
-#### Scenario: Android Auto play/pause auto-transitions to On-the-road mode
-- **WHEN** the Android Auto play/pause signal is received while in any mode
-- **AND** `OnTheRoad` mode is available
-- **THEN** the system SHALL transition to `OnTheRoad` mode
-- **AND** resolve the audio route for `OnTheRoad` mode
-- **AND** dispatch the capture to the active channel's designated controller
-
 ### Requirement: Two-tone error beep on not-ready PTT
-The system SHALL emit a characteristic two-tone error beep over the resolved audio route if PTT is pressed while the target channel is not ready and the channel is not eligible for recoverable input preparation. If recoverable Keyboard preparation is attempted, the system SHALL defer the error decision until that preparation fails or times out. The audio route SHALL be resolved based on the active `InputMode`.
+The system SHALL emit a characteristic two-tone error beep over the host-resolved audio route if PTT is pressed while the target runtime is not ready and does not offer recoverable input preparation. If provider/runtime-driven recoverable preparation is attempted, the system SHALL defer the error decision until preparation fails or times out. The audio route SHALL be resolved from the active `InputMode`, and the host SHALL remain responsible for beep playback and route cleanup.
 
 #### Scenario: PTT on a non-recoverable not-ready active channel in Work mode
-- **WHEN** PTT is pressed while in `Work` mode and the active channel is not ready and is not eligible for recovery
-- **THEN** the system SHALL play a two-tone error beep on the Work mode audio route (SCO)
-- **AND** drop the PTT capture without routing to a controller
+- **WHEN** PTT is pressed while in `Work` mode and the active runtime is not ready and does not offer recovery
+- **THEN** the system SHALL play a two-tone error beep on the Work mode audio route when possible
+- **AND** drop the PTT capture without requesting a committed channel target
 
 #### Scenario: PTT on a non-recoverable not-ready active channel in On-the-road mode
-- **WHEN** PTT is pressed while in `OnTheRoad` mode and the active channel is not ready and is not eligible for recovery
+- **WHEN** PTT is pressed while in `OnTheRoad` mode and the active runtime is not ready and does not offer recovery
 - **THEN** the system SHALL play a two-tone error beep on the On-the-road mode audio route when possible
-- **AND** drop the PTT capture without routing to a controller
+- **AND** drop the PTT capture without requesting a committed channel target
 
 #### Scenario: PTT on a non-recoverable not-ready active channel in On-a-pinch mode
-- **WHEN** PTT is pressed while in `OnAPinch` mode and the active channel is not ready and is not eligible for recovery
-- **THEN** the system SHALL play a two-tone error beep on the On-a-pinch mode audio route (media/local output)
-- **AND** drop the PTT capture without routing to a controller
+- **WHEN** PTT is pressed while in `OnAPinch` mode and the active runtime is not ready and does not offer recovery
+- **THEN** the system SHALL play a two-tone error beep on the On-a-pinch mode audio route when possible
+- **AND** drop the PTT capture without requesting a committed channel target
 
 #### Scenario: Phone PTT on a non-recoverable not-ready channel card
-- **WHEN** a functional channel card is long-pressed and that channel is not ready and is not eligible for recovery
-- **THEN** the system SHALL transition to `OnAPinch` mode
-- **AND** set that channel as the active channel
-- **AND** play a two-tone error beep on the On-a-pinch mode audio route
-- **AND** drop the PTT capture without routing to a controller
+- **WHEN** a functional channel card is long-pressed and that runtime is not ready and does not offer recovery
+- **THEN** the system SHALL transition to `OnAPinch`
+- **AND** set that channel's stable instance ID as active
+- **AND** play a two-tone error beep on the On-a-pinch mode audio route when possible
+- **AND** drop the PTT capture without requesting a committed channel target
 
-#### Scenario: Recoverable Keyboard connection succeeds
-- **WHEN** PTT is pressed for a recoverable Keyboard channel whose Sleepwalker bridge is disconnected
-- **AND** bridge preparation reaches `Connected`
+#### Scenario: Recoverable preparation succeeds
+- **WHEN** PTT is pressed for a not-ready runtime that offers recoverable preparation
+- **AND** preparation makes the required semantic capabilities available before timeout
 - **THEN** the system SHALL NOT play the two-tone error beep
-- **AND** SHALL continue through the normal ready beep and capture path
+- **AND** it SHALL continue through the normal ready beep and host-owned capture path
 
-#### Scenario: Recoverable Keyboard connection fails
-- **WHEN** PTT is pressed for a recoverable Keyboard channel whose Sleepwalker bridge is disconnected
-- **AND** bridge preparation fails or times out
+#### Scenario: Recoverable preparation fails
+- **WHEN** PTT is pressed for a not-ready runtime that offers recoverable preparation
+- **AND** preparation fails, is cancelled, or times out
 - **THEN** the system SHALL play the two-tone error beep on the resolved input-mode route when possible
-- **AND** SHALL drop the PTT capture without playing the ready beep
+- **AND** it SHALL drop the PTT capture without playing the ready beep

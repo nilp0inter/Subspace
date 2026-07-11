@@ -1,105 +1,28 @@
-## Purpose
-
-TBD. Defines the main device dashboard home surface and its relationship to the legacy connection and monitor views.
-
-## Requirements
-
-### Requirement: Dashboard is the default app view
-The system SHALL show the main dashboard as the default interactive app view after core bootstrap readiness completes. Before that readiness result, the system SHALL show passive loading, actionable setup, or bootstrap recovery according to authoritative bootstrap state. RSM and other optional external readiness SHALL NOT prevent dashboard entry after core readiness.
-
-#### Scenario: App starts while core bootstrap is incomplete
-- **WHEN** the app launches and core bootstrap has not completed successfully
-- **THEN** the system shows loading, setup, or recovery for the current bootstrap state
-- **AND** the system does not render the dashboard from default placeholder state
-
-#### Scenario: App starts while device is not ready
-- **WHEN** core bootstrap reaches ready and the RSM device readiness gate is false
-- **THEN** the system shows the main dashboard
-- **AND** the system does not automatically show the legacy connection screen
-- **AND** the Work/RSM tile reflects the unavailable or setup state
-
-#### Scenario: App starts while device is ready
-- **WHEN** core bootstrap reaches ready and the RSM device readiness gate is true
-- **THEN** the system shows the main dashboard
-- **AND** the system does not automatically show the legacy monitor screen
-
-#### Scenario: Optional peripheral remains unavailable
-- **WHEN** core bootstrap reaches ready while Keyboard BLE, Android Auto, or another optional external capability is unavailable
-- **THEN** the system shows the main dashboard
-- **AND** the optional capability continues to communicate its own readiness inside the dashboard or drill-down surface
-
-#### Scenario: Bootstrap completes after setup
-- **WHEN** a setup action returns to loading and all core readiness conditions subsequently complete
-- **THEN** the system shows the main dashboard automatically
-- **AND** no separate dashboard-entry acknowledgement is requested
-
-### Requirement: Dashboard shows device connection state
-The system SHALL show the RSM device connection state on the dashboard as a
-compact status indicator inside the Work/RSM input mode tile, using the existing
-full readiness gate as the connected state. The dashboard SHALL NOT render a
-standalone top-level device connection card as part of the primary dashboard
-surface.
-
-#### Scenario: Device is ready
-- **WHEN** permissions are granted, Bluetooth is enabled, the target device is bonded, SPP is connected, and Bluetooth SCO communication audio is available
-- **THEN** the Work/RSM tile shows the RSM as ready or connected
-- **AND** the dashboard does not render a separate top-level device connection card
-
-#### Scenario: Device is not ready
-- **WHEN** any readiness requirement is missing
-- **THEN** the Work/RSM tile shows the RSM as unavailable or requiring setup
-- **AND** the dashboard does not render a separate top-level device connection card
-
-### Requirement: Connection indicator opens legacy connection view when disconnected
-The system SHALL open the legacy connection view when the user activates setup
-from the Work/RSM mode tile while the device is not ready. The legacy connection
-view SHALL keep its existing permissions, Bluetooth, scan, pair, connect, retry,
-and settings actions.
-
-#### Scenario: Disconnected RSM tile setup activated
-- **WHEN** the dashboard is visible, the device readiness gate is false, and the user taps the Work/RSM tile
-- **THEN** the system shows the legacy connection view
-- **AND** the legacy connection view keeps its existing permissions, Bluetooth, scan, pair, connect, retry, and settings actions
-
-#### Scenario: Disconnected RSM tile long-pressed
-- **WHEN** the dashboard is visible, the device readiness gate is false, and the user long-presses the Work/RSM tile
-- **THEN** the system shows the legacy connection view
-- **AND** the legacy connection view keeps its existing permissions, Bluetooth, scan, pair, connect, retry, and settings actions
-
-### Requirement: Connection indicator opens legacy monitor view when connected
-The system SHALL open the legacy monitor view when the user activates setup from
-the Work/RSM mode tile while the device is ready. The legacy monitor view SHALL
-keep its existing button-state, hardware-mode, echo-control, audio-status, and
-disconnect actions.
-
-#### Scenario: Connected RSM tile long-pressed
-- **WHEN** the dashboard is visible, the device readiness gate is true, and the user long-presses the Work/RSM tile
-- **THEN** the system shows the legacy monitor view
-- **AND** the legacy monitor view keeps its existing button-state, hardware-mode, echo-control, audio-status, and disconnect actions
-
-### Requirement: Legacy views are secondary screens
-The system SHALL keep the dashboard as the home surface and treat the legacy connection and monitor views as drill-down screens opened from the dashboard.
-
-#### Scenario: Returning from a legacy view
-- **WHEN** the user is viewing a legacy connection or monitor screen opened from the dashboard and requests back navigation
-- **THEN** the system returns to the dashboard instead of switching directly between legacy screens
+## MODIFIED Requirements
 
 ### Requirement: Dashboard shows channels
-The system SHALL render one functional card per channel instance in the authoritative catalogue order. Each card SHALL use the instance's stable ID, display name, readiness, execution status, active state, and kind-specific summary. Functional cards SHALL remain mutually exclusive activation zones and phone-side PTT zones. Dedicated configuration and catalogue-management controls SHALL remain outside the phone PTT gesture surface.
+The system SHALL render one host-owned functional card per channel instance in the authoritative catalogue order, including instances whose implementation provider is absent, incompatible, or failed to load. Each card SHALL retain the instance's stable ID and display name and SHALL present its readiness, execution status, active state, and provider-defined presentation metadata when that metadata is available. The host SHALL interpret descriptor metadata into native Android UI and SHALL NOT allow a provider, configuration payload, or script to supply or control Android views, composables, navigation, or other platform UI objects. Functional cards for available instances SHALL remain mutually exclusive activation zones and phone-side PTT zones. Dedicated configuration and catalogue-management controls SHALL remain outside the phone PTT gesture surface.
 
-The channel panel SHALL provide access to add supported built-in instances, rename instances, reorder instances, and remove instances subject to catalogue invariants. Kind-specific configuration surfaces SHALL be addressed by instance ID rather than fixed singleton routes. The dashboard SHALL NOT render nonfunctional mock channel cards as catalogue entries.
+The channel panel SHALL discover creatable implementations and their labels, summaries, default configuration, configuration schema, and presentation metadata from registered provider descriptors rather than from a closed built-in-kind list. The host SHALL render native configuration forms from descriptor schemas, validate submitted values against the provider-owned schema before committing them, and address creation and configuration by implementation ID and instance ID. The panel SHALL provide access to add supported provider-backed instances, rename instances, reorder instances, and remove instances subject to catalogue invariants. An unavailable instance SHALL remain visible at its catalogue position with a host-rendered reason and an actionable recovery, reconfiguration, or removal affordance; it SHALL NOT become a script-controlled UI surface or be silently dropped. The dashboard SHALL NOT render nonfunctional mock channel cards as catalogue entries.
 
 #### Scenario: Ordered catalogue renders
-- **WHEN** the dashboard receives an ordered runtime snapshot containing channel instances
-- **THEN** it SHALL render exactly one functional card per instance
+- **WHEN** the dashboard receives an ordered runtime snapshot containing available and unavailable channel instances
+- **THEN** it SHALL render exactly one host-owned card per catalogue instance
+- **AND** each card SHALL retain the instance's stable ID
 - **AND** card order SHALL match the catalogue order
 
-#### Scenario: Channel selected for activation
-- **WHEN** the user taps the main surface area of a functional channel card
-- **THEN** the system SHALL set that card's stable instance ID as the single active channel
+#### Scenario: Descriptor metadata drives available presentation
+- **WHEN** a catalogue instance resolves to a registered provider descriptor
+- **THEN** the dashboard SHALL derive the card's provider label, summary, and presentation metadata from that descriptor
+- **AND** the Android host SHALL render those values through native dashboard components
+- **AND** the provider SHALL NOT supply an Android view, composable, navigation destination, or executable UI callback
 
-#### Scenario: Channel long-pressed for PTT
-- **WHEN** the user long-presses the main surface area of a functional channel card
+#### Scenario: Channel selected for activation
+- **WHEN** the user taps the main surface area of any persisted functional channel card
+- **THEN** the system SHALL set that card's stable instance ID as the single active channel regardless of preparation state
+
+#### Scenario: Ready channel long-pressed for PTT
+- **WHEN** the user long-presses the main surface area of a ready functional channel card
 - **THEN** the system SHALL set that card's instance ID as active
 - **AND** start a phone-originated PTT session for that instance
 - **AND** show held-recording feedback on that card
@@ -114,35 +37,59 @@ The channel panel SHALL provide access to add supported built-in instances, rena
 - **THEN** the dashboard SHALL show that the PTT session is locked on that card
 - **AND** it SHALL show an explicit stop affordance
 
-#### Scenario: Unready instance is visible
+#### Scenario: Unready instance remains selectable
 - **WHEN** a catalogue instance lacks valid configuration or a required live dependency
-- **THEN** its card SHALL remain visible at its catalogue position
-- **AND** it SHALL display its not-ready state and configuration access
+- **THEN** its card SHALL remain visible and selectable at its catalogue position with its stable ID and display name
+- **AND** it SHALL display its not-ready state and host-rendered configuration or recovery access
+- **AND** long-pressing its main surface SHALL set it active and attempt phone PTT admission
+- **AND** non-recoverable unavailability SHALL produce host-owned problem feedback without capture
+- **AND** a selected unready card SHALL use the same active color and `ACTIVE` status language as a selected ready card
+- **AND** an unselected unready card SHALL use the same standby color language as other unselected cards while retaining its unavailable diagnostic
+
+#### Scenario: Provider is absent or incompatible
+- **WHEN** a catalogue instance references an implementation provider that is absent or incompatible
+- **THEN** its card SHALL remain visible and selectable at its catalogue position with its stable ID and display name
+- **AND** the card SHALL identify the implementation as unavailable without exposing opaque configuration contents
+- **AND** the card SHALL provide host-owned recovery or removal actions
+- **AND** PTT SHALL produce host-owned problem feedback rather than executing provider code or starting capture
+
+#### Scenario: Provider fails to load
+- **WHEN** a registered provider fails while its descriptor or runtime is loaded
+- **THEN** the affected instance card SHALL remain visible at its catalogue position
+- **AND** the host SHALL present an actionable unavailable state without rendering provider-supplied UI
+- **AND** unaffected instance cards SHALL remain usable
 
 #### Scenario: Channel configured but inactive
 - **WHEN** a ready instance is not the active channel
 - **THEN** its card SHALL display a visually inactive Ready or Standby state
 
-#### Scenario: Channel card opens configuration
-- **WHEN** the user activates the dedicated configuration control on a functional channel card
-- **THEN** the system SHALL open the configuration surface for that instance ID and kind
+#### Scenario: Channel card opens descriptor-driven configuration
+- **WHEN** the user activates the dedicated configuration control on an instance whose provider descriptor is available
+- **THEN** the system SHALL open a host-rendered native configuration form for that instance ID using the descriptor's configuration schema
 - **AND** it SHALL preserve the active selection
 - **AND** it SHALL NOT start, lock, stop, or release phone PTT
+- **AND** it SHALL NOT execute provider-controlled Android UI
+
+#### Scenario: Invalid configuration submission
+- **WHEN** the user submits values that fail the provider descriptor's configuration schema
+- **THEN** the host SHALL reject the submission without committing catalogue changes
+- **AND** the native form SHALL identify the invalid fields or schema-level error
 
 #### Scenario: Add channel instance
-- **WHEN** the user chooses a supported built-in kind and submits valid initial configuration
-- **THEN** the dashboard SHALL request creation of a new catalogue instance
+- **WHEN** the user chooses a registered creatable provider descriptor and submits valid initial configuration through the host-rendered form
+- **THEN** the dashboard SHALL request creation of a new catalogue instance using that descriptor's stable implementation ID and validated configuration
 - **AND** the new card SHALL appear at the resulting catalogue position
 
-#### Scenario: Every supported kind remains reachable
+#### Scenario: Every registered creatable provider remains reachable
 - **WHEN** the catalogue-management form is rendered at the minimum supported phone width
-- **THEN** the creation control for every supported production kind SHALL remain visible and actionable
-- **AND** the presence or absence of an existing instance of that kind SHALL NOT hide or disable creation
+- **THEN** the creation control for every registered creatable production provider descriptor SHALL remain visible and actionable
+- **AND** the presence or absence of an existing instance for that implementation SHALL NOT hide or disable creation
 
 #### Scenario: Reorder channel instance
 - **WHEN** the user moves an instance through the catalogue-management surface
 - **THEN** the dashboard SHALL render the committed order
 - **AND** the active instance SHALL remain active
+- **AND** availability SHALL NOT change the instance's stable ID or catalogue position
 
 #### Scenario: Remove channel instance
 - **WHEN** the user confirms removal of a removable instance
@@ -155,55 +102,5 @@ The channel panel SHALL provide access to add supported built-in instances, rena
 
 #### Scenario: No mock catalogue entries
 - **WHEN** the dashboard renders the channel panel
-- **THEN** every channel card SHALL correspond to a functional catalogue instance
+- **THEN** every channel card SHALL correspond to a persisted catalogue instance
 - **AND** the dashboard SHALL NOT render the Command Uplink preview as a channel card
-
-### Requirement: Dashboard renders the VU meter during capture
-
-The main dashboard SHALL always render the VU meter (see `vu-meter` capability)
-at a stable dashboard position driven by the capture service's `level` and
-`isCapturing` signals. The dashboard SHALL obtain these signals from
-`PttForegroundService` via the existing binder, alongside the existing `appState`
-collection. The VU meter SHALL remain mounted and reserve its normal layout space
-while idle so the relative height and position of dashboard components do not
-shift when capture starts or stops.
-
-#### Scenario: Dashboard shows the meter while capturing
-- **WHEN** the dashboard is visible and `isCapturing` is true
-- **THEN** the dashboard renders the VU meter reflecting the live `level`
-- **AND** the VU meter occupies the same dashboard position and height as it does while idle
-
-#### Scenario: Dashboard shows standby meter while idle
-- **WHEN** the dashboard is visible and `isCapturing` is false
-- **THEN** the dashboard renders the VU meter in an idle standby state
-- **AND** the VU meter reserves its normal dashboard space
-- **AND** the dashboard does not shift channel cards or mode controls because capture is idle
-
-#### Scenario: Meter reflects any talk mode
-- **WHEN** the dashboard is visible and a capture session is active on any channel (journal, STT, or a future channel)
-- **THEN** the dashboard renders the VU meter driven by the unified capture signal, with no per-mode wiring
-
-### Requirement: Dashboard respects system status area
-The dashboard SHALL position the terminal header inside the safe drawing area so
-Android status-bar content such as the clock and system icons does not overlap
-the `SUBSPACE` title.
-
-#### Scenario: Dashboard starts under Android status bar
-- **WHEN** the dashboard is displayed on a device with a visible Android status bar
-- **THEN** the `SUBSPACE` title is fully below the status-bar content
-- **AND** the title remains readable without being obscured by system icons or the clock
-
-### Requirement: Dashboard primary sections preserve relative height
-The dashboard SHALL keep its primary sections mounted at stable relative
-positions. State changes SHALL be communicated through labels, colors,
-indicators, intensity, or animation inside an existing section rather than by
-conditionally inserting, removing, expanding, or collapsing primary sections.
-
-#### Scenario: Capture state changes
-- **WHEN** capture starts or stops
-- **THEN** the dashboard keeps the header, mode selector, VU meter, and channel panel in the same relative order and reserved heights
-
-#### Scenario: Device availability changes
-- **WHEN** RSM, car, or phone mode availability changes
-- **THEN** the dashboard keeps all three mode tiles visible at fixed relative size
-- **AND** availability is expressed inside the existing tiles

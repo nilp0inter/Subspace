@@ -1,22 +1,25 @@
-## Purpose
+## ADDED Requirements
 
-TBD. Defines the Debug Channel, a diagnostic channel that supports various test modes.
+### Requirement: Debug synthesized modes return host-routed playback
+The Debug Channel SHALL implement `TTS` and `STT↔TTS` through semantic synthesis and audio-operation capabilities. A successful synthesized result SHALL be returned as an opaque playback operation to the host audio-input terminal lifecycle. The Debug runtime SHALL NOT select or invoke an Android audio output directly, and the host SHALL play the resolved operation through the active session output before releasing that session's route.
 
-## Requirements
+#### Scenario: TTS produces audible playback
+- **WHEN** a committed Debug instance in `TTS` mode receives terminal input
+- **AND** synthesis and playback-operation creation succeed
+- **THEN** the runtime SHALL return the created opaque playback operation
+- **AND** the host SHALL play its PCM exactly once through the active session's resolved output
+- **AND** the runtime SHALL report success only after host playback completion
 
-### Requirement: Debug Channel configuration and state
-The system SHALL provide a built-in channel type named "Debug Channel" that acts as a diagnostic tool. The channel MUST have a single active mode of operation (Echo, STT, TTS, or STT↔TTS).
+#### Scenario: STT to TTS produces audible playback
+- **WHEN** a committed Debug instance in `STT↔TTS` mode receives terminal audio
+- **AND** transcription, synthesis, and playback-operation creation succeed
+- **THEN** the synthesized speech SHALL correspond to the successful transcript
+- **AND** the runtime SHALL return the created opaque playback operation
+- **AND** the host SHALL play its PCM exactly once through the active session's resolved output
 
-#### Scenario: Channel mode is configured
-- **WHEN** the user selects a debug mode for the Debug Channel
-- **THEN** the system SHALL store the selected mode in the channel configuration
-- **AND** the next time the channel is activated, it SHALL operate in that mode
-
-### Requirement: Debug Channel configuration screen
-The system SHALL provide a dedicated configuration screen for the Debug Channel.
-
-#### Scenario: Configuration screen opened
-- **WHEN** the user taps the Debug Channel card on the dashboard
-- **THEN** the system SHALL show the Debug Channel configuration screen
-- **AND** the screen SHALL display mutually exclusive selection controls for the debug modes (Echo, STT, TTS, STT↔TTS)
-- **AND** the screen SHALL provide an activate/deactivate control for the channel
+#### Scenario: Synthesized playback uses endpoint ordering
+- **WHEN** a Debug synthesized playback operation is returned on Work, On-a-pinch, or On-the-road
+- **THEN** the host SHALL use that session's resolved output rather than an ambient local output
+- **AND** Work playback SHALL remain on its acquired communication route
+- **AND** On-a-pinch playback SHALL use the normal local media route
+- **AND** On-the-road SHALL release the Telecom capture route before response playback
