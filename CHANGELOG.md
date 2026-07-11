@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-11
+
+### Added
+
+- Added a persistent, configurable channel catalogue: built-in Journal, Keyboard, and Debug channels now have dedicated runtime lifecycles and can be created, configured, and browsed consistently.
+- Added automatic Sleepwalker BLE reconnection before a Keyboard PTT session starts.
+
+### Changed
+
+- Centralized channel startup, PTT dispatch, and configuration persistence behind the channel runtime registry.
+
+### Fixed
+
+- Kept active RSM serial monitoring alive in the foreground service after the main activity moves to the background.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added
@@ -104,7 +119,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Fixed release workflow `apksigner` lookup by using the full Android build-tools path.
 - Fixed release build-type configuration for Android Gradle Plugin pre-created build types.
 
-[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/nilp0inter/Subspace/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nilp0inter/Subspace/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/nilp0inter/Subspace/compare/v0.2.0...v0.3.0
