@@ -10,3 +10,4 @@ rust/target/
 release.keystore
 *.keystore
 .wrangler/
+.direnv
