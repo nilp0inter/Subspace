@@ -5,6 +5,7 @@ import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
+import dev.nilp0inter.subspace.channel.capability.AgentOperationContext
 import dev.nilp0inter.subspace.channel.capability.CapabilityKey
 import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
@@ -14,6 +15,8 @@ import dev.nilp0inter.subspace.channel.capability.SpeechVoice
 import dev.nilp0inter.subspace.channel.capability.opaqueAudioRecording
 import dev.nilp0inter.subspace.channel.preparationFor
 import dev.nilp0inter.subspace.channel.useCapability
+import dev.nilp0inter.subspace.model.AgentOperationId
+import dev.nilp0inter.subspace.model.AgentRunId
 import dev.nilp0inter.subspace.model.BuiltInChannelDescriptors
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
 import dev.nilp0inter.subspace.model.ChannelProviderError
@@ -22,6 +25,7 @@ import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.DebugProviderConfiguration
 import dev.nilp0inter.subspace.model.DebugProviderConfigurationCodec
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -57,16 +61,21 @@ class DebugBuiltInProvider : ChannelImplementationProvider {
         configuration: DebugProviderConfiguration,
         capabilities: ChannelCapabilityScope,
     ): ChannelPreparationAvailability = when (configuration.mode) {
-        DebugMode.ECHO -> ChannelPreparationAvailability.Available
+        DebugMode.ECHO -> requireAvailable(
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
+        )
         DebugMode.STT -> capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false)
         DebugMode.TTS -> requireAvailable(
             capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
         DebugMode.STT_TTS -> requireAvailable(
             capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false),
             capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
     }
 
@@ -78,8 +87,9 @@ class DebugBuiltInProvider : ChannelImplementationProvider {
 }
 
 /**
- * Debug modes exercise generic input and semantic capability contracts. ECHO returns the host
- * recording for host-owned playback; STT and TTS modes neither access controllers nor paths.
+ * Debug modes exercise generic input and semantic capability contracts. ECHO and TTS/STT_TTS
+ * schedule host-owned deferred audio playback through the semantic audio port after terminal
+ * cleanup; STT neither accesses controllers nor paths.
  */
 class DebugRuntime(
     val definition: dev.nilp0inter.subspace.model.ChannelDefinition,
@@ -133,16 +143,21 @@ class DebugRuntime(
     }
 
     private suspend fun currentPreparation(): ChannelPreparationAvailability = when (configuration.mode) {
-        DebugMode.ECHO -> ChannelPreparationAvailability.Available
+        DebugMode.ECHO -> firstUnavailable(
+            capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
+        )
         DebugMode.STT -> capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false)
         DebugMode.TTS -> firstUnavailable(
             capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
         DebugMode.STT_TTS -> firstUnavailable(
             capabilities.preparationFor(CapabilityKey.Transcription, recoverable = false),
             capabilities.preparationFor(CapabilityKey.Synthesis, recoverable = false),
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
+            capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
     }
 
@@ -163,11 +178,11 @@ class DebugRuntime(
             if (closed.get()) return ChannelInputResult.None
             _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
             return when (configuration.mode) {
-                DebugMode.ECHO -> ChannelInputResult.Playback(recording)
+                DebugMode.ECHO -> scheduleDeferredPlayback(recording.toPlaybackOperation())
                 DebugMode.STT -> completeWithoutPlayback(processStt(recording))
-                DebugMode.TTS -> completeWithPlayback(synthesizeAndQueue(DEFAULT_DEBUG_TEXT))
+                DebugMode.TTS -> scheduleDeferredPlayback(synthesizeAndQueue(DEFAULT_DEBUG_TEXT))
                 DebugMode.STT_TTS -> when (val transcription = processTranscription(recording)) {
-                    is CapabilityOperationResult.Success -> completeWithPlayback(
+                    is CapabilityOperationResult.Success -> scheduleDeferredPlayback(
                         synthesizeAndQueue(transcription.value.text),
                     )
                     else -> completeWithoutPlayback(transcription)
@@ -194,6 +209,11 @@ class DebugRuntime(
         }
     }
 
+    private fun completeWithoutPlayback(result: CapabilityOperationResult<*>): ChannelInputResult {
+        publishCompletion(result)
+        return ChannelInputResult.None
+    }
+
     private suspend fun processStt(recording: RecordedPcm): CapabilityOperationResult<Unit> =
         processTranscription(recording).mapToUnit()
 
@@ -202,6 +222,11 @@ class DebugRuntime(
     ): CapabilityOperationResult<dev.nilp0inter.subspace.channel.capability.Transcription> =
         capabilities.useCapability(CapabilityKey.Transcription) { transcription ->
             transcription.transcribe(opaqueAudioRecording(recording))
+        }
+
+    private suspend fun RecordedPcm.toPlaybackOperation(): CapabilityOperationResult<OpaqueAudioOperation> =
+        capabilities.useCapability(CapabilityKey.AudioOperation) { audio ->
+            audio.createPlaybackResult(opaqueAudioRecording(this))
         }
 
     private suspend fun synthesizeAndQueue(text: String): CapabilityOperationResult<OpaqueAudioOperation> {
@@ -222,18 +247,41 @@ class DebugRuntime(
         }
     }
 
-    private fun completeWithoutPlayback(result: CapabilityOperationResult<*>): ChannelInputResult {
-        publishCompletion(result)
-        return ChannelInputResult.None
+    private suspend fun scheduleDeferredPlayback(
+        operation: CapabilityOperationResult<OpaqueAudioOperation>,
+    ): ChannelInputResult = when (operation) {
+        is CapabilityOperationResult.Success -> {
+            when (val scheduled = capabilities.useCapability(CapabilityKey.DeferredAudioPlayback) {
+                CapabilityOperationResult.Success(it.scheduleAudio(agentOperationContext(), operation.value))
+            }) {
+                is CapabilityOperationResult.Success -> publishPlaybackScheduled(scheduled.value)
+                else -> publishCompletion(scheduled)
+            }
+            ChannelInputResult.None
+        }
+        else -> completeWithoutPlayback(operation)
     }
 
-    private fun completeWithPlayback(
-        result: CapabilityOperationResult<OpaqueAudioOperation>,
-    ): ChannelInputResult = when (result) {
-        is CapabilityOperationResult.Success -> ChannelInputResult.PlaybackOperation(result.value)
-        else -> {
-            publishCompletion(result)
-            ChannelInputResult.None
+    private fun agentOperationContext(): AgentOperationContext = AgentOperationContext(
+        scope = capabilities.identity,
+        runId = AgentRunId(UUID.randomUUID().toString()),
+        operationId = AgentOperationId(UUID.randomUUID().toString()),
+    )
+
+    private fun publishPlaybackScheduled(result: dev.nilp0inter.subspace.model.DelayedPlaybackOutcome) {
+        if (!closed.get()) {
+            _snapshot.value = _snapshot.value.copy(
+                executionStatus = when (result) {
+                    is dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Pending,
+                    is dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Playing,
+                    is dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Heard,
+                    -> ChannelExecutionStatus.SUCCESS
+                    is dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Failed,
+                    dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Cancelled,
+                    dev.nilp0inter.subspace.model.DelayedPlaybackOutcome.Stale,
+                    -> ChannelExecutionStatus.FAILED
+                },
+            )
         }
     }
 

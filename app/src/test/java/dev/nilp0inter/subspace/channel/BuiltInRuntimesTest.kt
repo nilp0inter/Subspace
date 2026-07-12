@@ -7,10 +7,13 @@ import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerBleConnection
 import dev.nilp0inter.subspace.bluetooth.SleepwalkerConnectionResult
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.AgentOperationContext
 import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
 import dev.nilp0inter.subspace.channel.capability.AudioOperationCapability
 import dev.nilp0inter.subspace.channel.capability.CapabilityKey
 import dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination
+import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapability
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
 import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
 import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
@@ -38,6 +41,8 @@ import dev.nilp0inter.subspace.model.KeyboardProviderConfiguration
 import dev.nilp0inter.subspace.model.DebugMode
 import dev.nilp0inter.subspace.model.DebugProviderConfiguration
 import dev.nilp0inter.subspace.model.DebugProviderConfigurationCodec
+import dev.nilp0inter.subspace.model.DelayedPlaybackOperationId
+import dev.nilp0inter.subspace.model.DelayedPlaybackOutcome
 import dev.nilp0inter.subspace.model.KeyboardProviderConfigurationCodec
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
 import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
@@ -52,6 +57,12 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import dev.nilp0inter.subspace.channel.KeyboardRuntime
+import dev.nilp0inter.subspace.channel.SleepwalkerTextOutputService
+import dev.nilp0inter.subspace.channel.TextOutputAvailability
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioRecording
+import dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -139,64 +150,60 @@ class BuiltInRuntimesTest {
     }
 
     @Test
-    fun debugTtsUsesSupertonicLanguageAndReturnsPlaybackOperationForTerminalOwnedDelivery() = runTest {
-        assertDebugModeDefersPlaybackOperation(DebugMode.TTS)
+    fun debugEchoPreservesRawAudioOperationAndSchedulesDeferredPlayback() = runTest {
+        val operation = AudioOperationArtifact(
+            recording = RecordedPcm(shortArrayOf(27, -27), 16_000),
+            operationId = "echo-operation",
+        )
+        val deferred = RecordingDeferredAudioPlayback()
+        val host = RuntimeCapabilityHost(
+            transcript = "unused",
+            audioOperation = RecordingAudioOperation(operation),
+            deferredAudioPlayback = deferred,
+        )
+        val runtime = debugRuntime(DebugMode.ECHO, host)
+        val target = (runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+        val result = target.onInputReleased(RecordedPcm(shortArrayOf(1, 2), 16_000))
+
+        assertEquals(ChannelInputResult.None, result)
+        assertEquals(1, deferred.requests.size)
+        val scheduled = deferred.requests.single()
+        assertSame(operation, scheduled.audio)
+        assertEquals("debug-ECHO", scheduled.context.scope.channelInstanceId)
     }
 
     @Test
-    fun debugSttTtsUsesSupertonicLanguageAndReturnsPlaybackOperationForTerminalOwnedDelivery() = runTest {
-        assertDebugModeDefersPlaybackOperation(DebugMode.STT_TTS)
+    fun debugTtsUsesSupertonicLanguageAndSchedulesDeferredPlayback() = runTest {
+        assertDebugModeSchedulesDeferredPlayback(DebugMode.TTS)
     }
 
-    private fun keyboardRuntime(
-        id: String,
-        profile: String,
-        host: RuntimeCapabilityHost,
-        initialPreparation: ChannelPreparationAvailability = ChannelPreparationAvailability.Available,
-    ): RuntimeFixture {
-        val definition = ChannelDefinition(
-            id = id,
-            name = "Keyboard $id",
-            implementationId = BuiltInChannelImplementationIds.KEYBOARD,
-            enabled = true,
-            configSchemaVersion = 1,
-            configPayload = KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration(profile)),
-        )
-        val scope = RevocableChannelCapabilityScope(
-            identity = CapabilityScopeIdentity(id, RuntimeGeneration(0)),
-            declaredCapabilities = setOf(ChannelCapability.Transcription, ChannelCapability.TextOutput),
-            host = host,
-        )
-        return RuntimeFixture(
-            runtime = KeyboardRuntime(
-                definition = definition,
-                configuration = KeyboardProviderConfiguration(profile),
-                profile = TextOutputProfile(profile),
-                capabilities = scope,
-                initialPreparation = initialPreparation,
-            ),
-            scope = scope,
-        )
+    @Test
+    fun debugSttTtsUsesSupertonicLanguageAndSchedulesDeferredPlayback() = runTest {
+        assertDebugModeSchedulesDeferredPlayback(DebugMode.STT_TTS)
     }
 
-    private suspend fun assertDebugModeDefersPlaybackOperation(mode: DebugMode) {
+    private suspend fun assertDebugModeSchedulesDeferredPlayback(mode: DebugMode) {
         val operation = AudioOperationArtifact(
             recording = RecordedPcm(shortArrayOf(27, -27), 16_000),
             operationId = "deferred-${mode.name}",
         )
         val synthesis = RecordingSynthesis()
+        val deferred = RecordingDeferredAudioPlayback()
         val host = RuntimeCapabilityHost(
             transcript = "captured transcript",
             synthesis = synthesis,
             audioOperation = RecordingAudioOperation(operation),
+            deferredAudioPlayback = deferred,
         )
         val runtime = debugRuntime(mode, host)
         val target = (runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
 
         val result = target.onInputReleased(RecordedPcm(shortArrayOf(1, 2), 16_000))
 
-        assertTrue(result is ChannelInputResult.PlaybackOperation)
-        assertEquals(operation, (result as ChannelInputResult.PlaybackOperation).operation)
+        assertEquals(ChannelInputResult.None, result)
+        assertEquals(1, deferred.requests.size)
+        assertSame(operation, deferred.requests.single().audio)
         assertEquals(listOf("en"), synthesis.requests.map(SpeechSynthesisRequest::languageTag))
     }
 
@@ -218,10 +225,45 @@ class BuiltInRuntimesTest {
                     ChannelCapability.Transcription,
                     ChannelCapability.Synthesis,
                     ChannelCapability.AudioOperation,
+                    ChannelCapability.DeferredAudioPlayback,
                 ),
                 host = host,
             ),
             initialPreparation = ChannelPreparationAvailability.Available,
+        )
+    }
+
+    private fun keyboardRuntime(
+        id: String,
+        profile: String,
+        host: RuntimeCapabilityHost,
+        initialPreparation: ChannelPreparationAvailability = ChannelPreparationAvailability.Available,
+    ): RuntimeFixture {
+        val definition = ChannelDefinition(
+            id = id,
+            name = "Keyboard $id",
+            implementationId = BuiltInChannelImplementationIds.KEYBOARD,
+            enabled = true,
+            configSchemaVersion = 1,
+            configPayload = KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration(profile)),
+        )
+        val scope = RevocableChannelCapabilityScope(
+            identity = CapabilityScopeIdentity(definition.id, RuntimeGeneration(0)),
+            declaredCapabilities = setOf(
+                ChannelCapability.Transcription,
+                ChannelCapability.TextOutput,
+            ),
+            host = host,
+        )
+        return RuntimeFixture(
+            runtime = KeyboardRuntime(
+                definition = definition,
+                configuration = KeyboardProviderConfiguration(profile),
+                profile = TextOutputProfile(profile),
+                capabilities = scope,
+                initialPreparation = initialPreparation,
+            ),
+            scope = scope,
         )
     }
 
@@ -235,6 +277,7 @@ class BuiltInRuntimesTest {
         private val textOutput: TextOutputCapability = RecordingTextOutput(),
         private val synthesis: SynthesisCapability? = null,
         private val audioOperation: AudioOperationCapability? = null,
+        private val deferredAudioPlayback: DeferredAudioPlaybackCapability? = null,
         private val textInitiallyRecoverable: Boolean = false,
     ) : ChannelCapabilityHost {
         val textRequests: List<TextOutputRequest>
@@ -284,6 +327,10 @@ class BuiltInRuntimesTest {
                 HostedCapabilityAcquisition.Available(it) { _: CapabilityLeaseTermination -> }
                     as HostedCapabilityAcquisition<T>
             } ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+            CapabilityKey.DeferredAudioPlayback -> deferredAudioPlayback?.let {
+                HostedCapabilityAcquisition.Available(it) { _: CapabilityLeaseTermination -> }
+                    as HostedCapabilityAcquisition<T>
+            } ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
             else -> HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
         }
     }
@@ -305,7 +352,7 @@ class BuiltInRuntimesTest {
 
     private class RecordingTranscription(private val transcript: String) : TranscriptionCapability {
         override suspend fun transcribe(
-            recording: dev.nilp0inter.subspace.channel.capability.OpaqueAudioRecording,
+            recording: OpaqueAudioRecording,
         ): CapabilityOperationResult<Transcription> = CapabilityOperationResult.Success(Transcription(transcript))
     }
 
@@ -324,9 +371,28 @@ class BuiltInRuntimesTest {
         private val operation: AudioOperationArtifact,
     ) : AudioOperationCapability {
         override suspend fun createPlaybackResult(
-            audio: dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio,
-        ): CapabilityOperationResult<dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation> =
+            audio: OpaqueSynthesizedAudio,
+        ): CapabilityOperationResult<OpaqueAudioOperation> =
             CapabilityOperationResult.Success(operation)
+
+        override suspend fun createPlaybackResult(
+            recording: OpaqueAudioRecording,
+        ): CapabilityOperationResult<OpaqueAudioOperation> =
+            CapabilityOperationResult.Success(operation)
+    }
+
+    private class RecordingDeferredAudioPlayback : DeferredAudioPlaybackCapability {
+        data class ScheduledRequest(val context: AgentOperationContext, val audio: OpaqueAudioOperation)
+
+        val requests = mutableListOf<ScheduledRequest>()
+
+        override suspend fun scheduleAudio(
+            context: AgentOperationContext,
+            audio: OpaqueAudioOperation,
+        ): DelayedPlaybackOutcome {
+            requests += ScheduledRequest(context, audio)
+            return DelayedPlaybackOutcome.Pending(DelayedPlaybackOperationId("deferred-${requests.size}"))
+        }
     }
 
     private object EmptySession : ChannelAudioInputSession {

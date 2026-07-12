@@ -372,6 +372,12 @@ private fun CatalogueManagementPanel(
     var renameText by remember { mutableStateOf("") }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        OutlinedButton(
+            onClick = actions::navigateToOpenAiProfiles,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Manage OpenAI connection profiles")
+        }
         appState.channels.forEachIndexed { index, channel ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
@@ -475,10 +481,12 @@ internal fun channelCardPresentation(
     isAvailable: Boolean,
     isPttActive: Boolean,
     isLocked: Boolean,
+    playbackPaused: Boolean = false,
 ): ChannelCardPresentation = ChannelCardPresentation(
     statusLabel = when {
         isLocked -> "LOCKED"
         isPttActive -> "PTT"
+        playbackPaused -> "PAUSED"
         isActive -> "ACTIVE"
         !isAvailable -> "UNAVAILABLE"
         else -> "READY"
@@ -505,6 +513,7 @@ private fun ChannelCard(
         isAvailable = isImmediatelyAvailable,
         isPttActive = isPttActive,
         isLocked = phonePttGesture.isLocked && isPttActive,
+        playbackPaused = channel.playbackPaused,
     )
     val accent = when (presentation.tone) {
         ChannelCardTone.Primary -> MaterialTheme.colorScheme.primary

@@ -152,6 +152,36 @@ sealed interface ChannelConfigurationField {
         data class Choice(val id: String, val label: String)
     }
 
+    /**
+     * Provider-declared choice metadata resolved by the host at editor time. A provider retains
+     * only the selected scalar ID; it never receives a repository, SDK client, or UI state.
+     */
+    data class DynamicChoiceField(
+        override val id: String,
+        override val label: String,
+        val source: DynamicConfigurationChoiceSource,
+        val dependsOnFieldId: String? = null,
+        /** Optional scalar condition for rendering a dependent field. */
+        val visibleWhenFieldId: String? = null,
+        val visibleWhenValue: String? = null,
+        override val required: Boolean = true,
+    ) : ChannelConfigurationField {
+        init {
+            require(dependsOnFieldId?.isNotBlank() != false) {
+                "Dynamic choice dependency field ID must not be blank"
+            }
+            require(visibleWhenFieldId?.isNotBlank() != false) {
+                "Dynamic choice visibility field ID must not be blank"
+            }
+            require((visibleWhenFieldId == null) == (visibleWhenValue == null)) {
+                "Dynamic choice visibility requires both field ID and expected value"
+            }
+            require(source != DynamicConfigurationChoiceSource.OPENAI_MODELS || dependsOnFieldId != null) {
+                "OpenAI model choices must depend on a profile field"
+            }
+        }
+    }
+
     data class NumberField(
         override val id: String,
         override val label: String,
@@ -166,6 +196,51 @@ sealed interface ChannelConfigurationField {
         override val label: String,
         override val required: Boolean = true,
     ) : ChannelConfigurationField
+}
+
+/** Host-owned resources that providers may reference declaratively from configuration schema. */
+enum class DynamicConfigurationChoiceSource {
+    OPENAI_CONNECTION_PROFILES,
+    OPENAI_MODELS,
+    TEXT_OUTPUT_PROFILES,
+}
+
+/** Input passed by an editor to its host resolver; it carries scalar dependency values only. */
+data class DynamicConfigurationChoiceRequest(
+    val source: DynamicConfigurationChoiceSource,
+    val dependencyValue: String? = null,
+)
+
+/**
+ * Host-facing resolver for declarative choice sources. Providers declare sources but never hold
+ * this resolver, preventing repository, SDK, and UI-state injection into provider code.
+ */
+fun interface DynamicConfigurationChoiceResolver {
+    suspend fun resolve(request: DynamicConfigurationChoiceRequest): DynamicConfigurationChoiceResolution
+}
+
+data class DynamicConfigurationChoice(
+    val id: String,
+    val label: String,
+) {
+    init {
+        require(id.isNotBlank()) { "Dynamic configuration choice ID must not be blank" }
+        require(label.isNotBlank()) { "Dynamic configuration choice label must not be blank" }
+    }
+}
+
+/** Host-normalized state for asynchronous or unavailable choice sources. */
+sealed interface DynamicConfigurationChoiceResolution {
+    data object Loading : DynamicConfigurationChoiceResolution
+    data class Available(val choices: List<DynamicConfigurationChoice>) : DynamicConfigurationChoiceResolution
+    data class Unavailable(val reason: DynamicConfigurationChoiceUnavailableReason) : DynamicConfigurationChoiceResolution
+}
+
+enum class DynamicConfigurationChoiceUnavailableReason {
+    DEPENDENCY_MISSING,
+    SOURCE_UNAVAILABLE,
+    DISCOVERY_FAILED,
+    HOST_NOT_READY,
 }
 
 data class ChannelPreparationTraits(
@@ -192,6 +267,14 @@ data class ChannelImplementationDescriptor(
         }
         require(configurationFields.map { it.id }.distinct().size == configurationFields.size) {
             "Configuration field IDs must be unique"
+        }
+        val fieldIds = configurationFields.map(ChannelConfigurationField::id).toSet()
+        configurationFields.filterIsInstance<ChannelConfigurationField.DynamicChoiceField>().forEach { field ->
+            field.dependsOnFieldId?.let { dependencyId ->
+                require(dependencyId != field.id && dependencyId in fieldIds) {
+                    "Dynamic choice field ${field.id} must depend on another declared field"
+                }
+            }
         }
     }
 }
@@ -272,6 +355,7 @@ object BuiltInChannelImplementationIds {
     val JOURNAL = ChannelImplementationId("builtin:journal")
     val DEBUG = ChannelImplementationId("builtin:debug")
     val KEYBOARD = ChannelImplementationId("builtin:keyboard")
+    val OPENAI_AGENT = ChannelImplementationId("builtin:openai-agent")
 }
 
 interface ChannelConfigurationCodec<T> {
@@ -332,6 +416,45 @@ object KeyboardProviderConfigurationCodec : ChannelConfigurationCodec<KeyboardPr
 
     override fun encode(value: KeyboardProviderConfiguration): OpaqueJsonObject =
         OpaqueJsonObject.fromJsonObject(JSONObject().put("hostProfile", value.hostProfileKey))
+}
+
+/** Per-channel OpenAI Agent settings. Endpoint and bearer credentials remain profile-owned. */
+data class OpenAiAgentProviderConfiguration(
+    val connectionProfileId: String,
+    val modelId: String,
+    val systemPrompt: String,
+    val keyboardEnabled: Boolean,
+    val keyboardProfileId: String?,
+)
+
+object OpenAiAgentProviderConfigurationCodec : ChannelConfigurationCodec<OpenAiAgentProviderConfiguration> {
+    override fun decode(payload: OpaqueJsonObject): Result<OpenAiAgentProviderConfiguration> = runCatching {
+        val value = payload.toJsonObject()
+        val keyboardEnabled = value.requireBoolean("keyboardEnabled")
+        val keyboardProfileId = value.opt("keyboardProfileId").let { profile ->
+            when (profile) {
+                null, JSONObject.NULL -> null
+                is String -> profile
+                else -> error("keyboardProfileId must be a string or null")
+            }
+        }
+        OpenAiAgentProviderConfiguration(
+            connectionProfileId = value.requireString("connectionProfileId"),
+            modelId = value.requireString("modelId"),
+            systemPrompt = value.requireString("systemPrompt"),
+            keyboardEnabled = keyboardEnabled,
+            keyboardProfileId = keyboardProfileId,
+        )
+    }
+
+    override fun encode(value: OpenAiAgentProviderConfiguration): OpaqueJsonObject =
+        OpaqueJsonObject.fromJsonObject(JSONObject().apply {
+            put("connectionProfileId", value.connectionProfileId)
+            put("modelId", value.modelId)
+            put("systemPrompt", value.systemPrompt)
+            put("keyboardEnabled", value.keyboardEnabled)
+            if (value.keyboardEnabled) put("keyboardProfileId", value.keyboardProfileId)
+        })
 }
 
 private abstract class VersionOneConfigurationProvider<T>(
@@ -403,6 +526,27 @@ private object KeyboardConfigurationProvider : VersionOneConfigurationProvider<K
         KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration("linux:us"))
 }
 
+private object OpenAiAgentConfigurationProvider : VersionOneConfigurationProvider<OpenAiAgentProviderConfiguration>(
+    BuiltInChannelImplementationIds.OPENAI_AGENT,
+    OpenAiAgentProviderConfigurationCodec,
+    additionalValidation = { configuration ->
+        when {
+            configuration.connectionProfileId.isBlank() -> "connectionProfileId must not be blank"
+            configuration.modelId.isBlank() -> "modelId must not be blank"
+            configuration.systemPrompt.toByteArray(Charsets.UTF_8).size > OPENAI_AGENT_MAXIMUM_SYSTEM_PROMPT_BYTES ->
+                "systemPrompt exceeds $OPENAI_AGENT_MAXIMUM_SYSTEM_PROMPT_BYTES UTF-8 bytes"
+            configuration.keyboardEnabled && configuration.keyboardProfileId.isNullOrBlank() ->
+                "keyboardProfileId is required when keyboardEnabled"
+            else -> null
+        }
+    },
+) {
+    override fun defaultPayload(): OpaqueJsonObject =
+        OpenAiAgentProviderConfigurationCodec.encode(
+            OpenAiAgentProviderConfiguration("", "", "", keyboardEnabled = false, keyboardProfileId = null),
+        )
+}
+
 /** Built-in metadata is declarative; service composition supplies their runtime constructors. */
 object BuiltInChannelDescriptors {
     val journal = ChannelImplementationDescriptor(
@@ -435,6 +579,7 @@ object BuiltInChannelDescriptors {
             ChannelCapability.Transcription,
             ChannelCapability.Synthesis,
             ChannelCapability.AudioOperation,
+            ChannelCapability.DeferredAudioPlayback,
         ),
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
     )
@@ -456,7 +601,41 @@ object BuiltInChannelDescriptors {
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = true),
     )
 
-    val all: List<ChannelImplementationDescriptor> = listOf(journal, debug, keyboard)
+    val openAiAgent = ChannelImplementationDescriptor(
+        implementationId = BuiltInChannelImplementationIds.OPENAI_AGENT,
+        presentation = ChannelPresentationMetadata(
+            label = "OpenAI Agent",
+            summary = "ASYNC AGENT",
+            unavailableMessage = "Requires an available connection profile, discovered model, and agent capabilities.",
+        ),
+        configuration = OpenAiAgentConfigurationProvider,
+        configurationFields = listOf(
+            ChannelConfigurationField.DynamicChoiceField("connectionProfileId", "Connection profile", DynamicConfigurationChoiceSource.OPENAI_CONNECTION_PROFILES),
+            ChannelConfigurationField.DynamicChoiceField("modelId", "Model", DynamicConfigurationChoiceSource.OPENAI_MODELS, dependsOnFieldId = "connectionProfileId"),
+            ChannelConfigurationField.TextField("systemPrompt", "System prompt", multiline = true),
+            ChannelConfigurationField.BooleanField("keyboardEnabled", "Enable Keyboard tools"),
+            ChannelConfigurationField.DynamicChoiceField(
+                id = "keyboardProfileId",
+                label = "Keyboard profile",
+                source = DynamicConfigurationChoiceSource.TEXT_OUTPUT_PROFILES,
+                visibleWhenFieldId = "keyboardEnabled",
+                visibleWhenValue = "true",
+                required = false,
+            ),
+        ),
+        requiredCapabilities = setOf(
+            ChannelCapability.Transcription,
+            ChannelCapability.Synthesis,
+            ChannelCapability.OpenAiModelDiscovery,
+            ChannelCapability.OpenAiCompletion,
+            ChannelCapability.AsynchronousConversation,
+            ChannelCapability.DelayedPlayback,
+            ChannelCapability.TextOutput,
+        ),
+        preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = true),
+    )
+
+    val all: List<ChannelImplementationDescriptor> = listOf(journal, debug, keyboard, openAiAgent)
 
     val configurationResolver: ChannelImplementationDescriptorResolver = object : ChannelImplementationDescriptorResolver {
         private val descriptors = all.associateBy { it.implementationId }
@@ -531,3 +710,5 @@ private fun JSONObject.requireBoolean(name: String): Boolean =
 
 private fun JSONObject.requireString(name: String): String =
     opt(name).takeIf { it is String } as? String ?: error("$name must be a string")
+
+private const val OPENAI_AGENT_MAXIMUM_SYSTEM_PROMPT_BYTES = 16 * 1024

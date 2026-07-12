@@ -96,7 +96,9 @@ internal class CarTelecomStarter(
     private val publishInputMode: () -> Unit,
     private val isActivePttSession: () -> Boolean,
     private val decidePttDispatch: () -> PttDispatchDecision?,
-    private val reservePendingCarPtt: (String) -> Boolean,
+    private val reserveCaptureAdmission: () -> HostCaptureAdmission,
+    private val abandonCaptureAdmission: (HostCaptureLease) -> Boolean,
+    private val reservePendingCarPtt: (String, HostCaptureLease) -> Boolean,
     private val cancelPendingCarPtt: (String) -> Unit,
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
@@ -147,6 +149,21 @@ internal class CarTelecomStarter(
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=active-session")
             return
         }
+        val captureLease = when (val admission = reserveCaptureAdmission()) {
+            is HostCaptureAdmission.Granted -> admission.lease
+            HostCaptureAdmission.RejectedByPlayback -> {
+                Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=playback-active")
+                return
+            }
+            HostCaptureAdmission.Busy -> {
+                Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=host-audio-busy")
+                return
+            }
+            HostCaptureAdmission.Closed -> return
+        }
+        fun abandonAdmission() {
+            abandonCaptureAdmission(captureLease)
+        }
         val transitioned = inputModeController.autoTransitionFor(PttSource.CarTelecom)
         Log.d(
             ROUTE_LOG_TAG,
@@ -158,18 +175,24 @@ internal class CarTelecomStarter(
                 ROUTE_LOG_TAG,
                 "CAR_PTT_TRANSITION_FAILED mode=${inputModeController.mode}",
             )
+            abandonAdmission()
             playCarErrorBeep()
             return
         }
         publishInputMode()
-        val decision = decidePttDispatch() ?: return
+        val decision = decidePttDispatch()
+        if (decision == null) {
+            abandonAdmission()
+            return
+        }
         if (decision is PttDispatchDecision.ErrorBeep) {
+            abandonAdmission()
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_ERROR_BEEP reason=dispatch-decision mode=${inputModeController.mode}")
             playCarErrorBeep()
             return
         }
 
-        if (!reservePendingCarPtt(decision.channelId)) {
+        if (!reservePendingCarPtt(decision.channelId, captureLease)) {
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=pending-reservation-rejected")
             return
         }

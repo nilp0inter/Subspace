@@ -41,18 +41,25 @@ class ChannelRepositoryLoadException(val error: ChannelRepositoryError) : Illega
 class ChannelRepository(
     private val prefs: SharedPreferences,
     private val catalogueFile: File,
-    private val descriptorResolver: ChannelImplementationDescriptorResolver =
-        BuiltInChannelDescriptors.configurationResolver,
+    private val descriptorResolver: ChannelImplementationDescriptorResolver,
 ) {
-    constructor(context: Context) : this(
+    constructor(
+        context: Context,
+        descriptorResolver: ChannelImplementationDescriptorResolver,
+    ) : this(
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
         File(context.filesDir, "channels_catalogue.json"),
+        descriptorResolver,
     )
 
-    constructor(prefs: SharedPreferences) : this(
+    constructor(
+        prefs: SharedPreferences,
+        descriptorResolver: ChannelImplementationDescriptorResolver,
+    ) : this(
         prefs,
         File(System.getProperty("java.io.tmpdir"), "channels_catalogue_${System.nanoTime()}.json")
             .apply { deleteOnExit() },
+        descriptorResolver,
     )
 
     private val fileStore = ChannelCatalogueFileStore(catalogueFile)

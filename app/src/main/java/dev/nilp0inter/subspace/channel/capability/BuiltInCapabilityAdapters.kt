@@ -148,14 +148,33 @@ internal fun interface PlaybackResultFactory {
     suspend fun create(samples: FloatArray): OpaqueAudioOperation
 }
 
+internal fun interface RecordingPlaybackResultFactory {
+    suspend fun create(recording: RecordedPcm): OpaqueAudioOperation
+}
+
 internal class AudioOperationCapabilityAdapter(
     private val playbackResults: PlaybackResultFactory,
+    private val recordingPlaybackResults: RecordingPlaybackResultFactory? = null,
 ) : AudioOperationCapability {
     override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio): CapabilityOperationResult<OpaqueAudioOperation> {
         val synthesized = audio as? SynthesizedAudioArtifact
             ?: return CapabilityOperationResult.Failed(CapabilityFailureReason.INVALID_REQUEST)
         return try {
             CapabilityOperationResult.Success(playbackResults.create(synthesized.samples))
+        } catch (_: CancellationException) {
+            CapabilityOperationResult.Cancelled
+        } catch (_: Exception) {
+            CapabilityOperationResult.Failed(CapabilityFailureReason.HOST_FAILURE)
+        }
+    }
+
+    override suspend fun createPlaybackResult(recording: OpaqueAudioRecording): CapabilityOperationResult<OpaqueAudioOperation> {
+        val factory = recordingPlaybackResults
+            ?: return CapabilityOperationResult.Failed(CapabilityFailureReason.INVALID_REQUEST)
+        val pcm = recordedPcmOf(recording)
+            ?: return CapabilityOperationResult.Failed(CapabilityFailureReason.INVALID_REQUEST)
+        return try {
+            CapabilityOperationResult.Success(factory.create(pcm))
         } catch (_: CancellationException) {
             CapabilityOperationResult.Cancelled
         } catch (_: Exception) {

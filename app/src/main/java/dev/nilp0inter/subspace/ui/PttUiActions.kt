@@ -22,6 +22,7 @@ interface PttUiActions {
     fun navigateToChannelCreation(implementationId: ChannelImplementationId, displayName: String)
     fun navigateBack()
     fun navigateToLogAnalysis()
+    fun navigateToOpenAiProfiles()
     fun phonePttPressed(channelId: String)
     fun phonePttReleased(channelId: String)
     fun createChannel(
@@ -33,4 +34,9 @@ interface PttUiActions {
     fun removeChannel(id: String)
     fun moveChannel(id: String, toIndex: Int)
     fun renameChannel(id: String, newName: String)
+    fun createProfile(request: OpenAiProfileEditRequest): OpenAiProfileUiMutationResult
+    fun updateProfile(request: OpenAiProfileEditRequest): OpenAiProfileUiMutationResult
+    fun deleteProfile(id: String): OpenAiProfileUiMutationResult
+    fun testProfile(id: String)
+    fun refreshProfile(id: String)
 }

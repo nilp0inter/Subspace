@@ -37,6 +37,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.nilp0inter.subspace.model.ChannelConfigurationField
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceRequest
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolution
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import org.json.JSONObject
 
@@ -56,6 +59,11 @@ fun ChannelConfigurationScreen(
     initialPayload: OpaqueJsonObject,
     submitLabel: String,
     onSubmit: (OpaqueJsonObject) -> String?,
+    choiceResolver: DynamicConfigurationChoiceResolver = DynamicConfigurationChoiceResolver {
+        DynamicConfigurationChoiceResolution.Unavailable(
+            dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.HOST_NOT_READY,
+        )
+    },
     directorySelection: DirectorySelection?,
     onPickDirectory: (String, String) -> Unit,
     onBack: () -> Unit,
@@ -100,19 +108,23 @@ fun ChannelConfigurationScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text(descriptor.presentation.summary, style = MaterialTheme.typography.bodyMedium)
-
             descriptor.configurationFields.forEach { field ->
-                ChannelConfigurationFieldEditor(
-                    field = field,
-                    configurationOwnerId = configurationOwnerId,
-                    value = values[field.id],
-                    onValueChange = {
-                        values[field.id] = it
-                        submissionError = null
-                    },
-                    onPickDirectory = onPickDirectory,
-                )
+                if (field.isVisible(values)) {
+                    ChannelConfigurationFieldEditor(
+                        field = field,
+                        configurationOwnerId = configurationOwnerId,
+                        value = values[field.id],
+                        dependencyValue = (field as? ChannelConfigurationField.DynamicChoiceField)
+                            ?.dependsOnFieldId
+                            ?.let(values::get),
+                        choiceResolver = choiceResolver,
+                        onValueChange = {
+                            values[field.id] = it
+                            submissionError = null
+                        },
+                        onPickDirectory = onPickDirectory,
+                    )
+                }
             }
 
             submissionError?.let { error ->
@@ -141,6 +153,8 @@ private fun ChannelConfigurationFieldEditor(
     field: ChannelConfigurationField,
     value: String?,
     onValueChange: (String?) -> Unit,
+    dependencyValue: String?,
+    choiceResolver: DynamicConfigurationChoiceResolver,
     configurationOwnerId: String,
     onPickDirectory: (String, String) -> Unit,
 ) {
@@ -179,6 +193,14 @@ private fun ChannelConfigurationFieldEditor(
         )
 
         is ChannelConfigurationField.ChoiceField -> ChoiceEditor(field, value, onValueChange)
+
+        is ChannelConfigurationField.DynamicChoiceField -> DynamicChoiceEditor(
+            field = field,
+            value = value,
+            dependencyValue = dependencyValue,
+            choiceResolver = choiceResolver,
+            onValueChange = onValueChange,
+        )
 
         is ChannelConfigurationField.DirectoryField -> Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -229,6 +251,93 @@ private fun ChoiceEditor(
     }
 }
 
+internal fun ChannelConfigurationField.isVisible(values: Map<String, String?>): Boolean = when (this) {
+    is ChannelConfigurationField.DynamicChoiceField ->
+        visibleWhenFieldId == null || values[visibleWhenFieldId] == visibleWhenValue
+    else -> true
+}
+
+@Composable
+private fun DynamicChoiceEditor(
+    field: ChannelConfigurationField.DynamicChoiceField,
+    value: String?,
+    dependencyValue: String?,
+    choiceResolver: DynamicConfigurationChoiceResolver,
+    onValueChange: (String?) -> Unit,
+) {
+    var expanded by remember(field.id) { mutableStateOf(false) }
+    val resolution by androidx.compose.runtime.produceState<DynamicConfigurationChoiceResolution>(
+        initialValue = DynamicConfigurationChoiceResolution.Loading,
+        field.source,
+        dependencyValue,
+        choiceResolver,
+    ) {
+        this.value = try {
+            choiceResolver.resolve(DynamicConfigurationChoiceRequest(field.source, dependencyValue))
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            DynamicConfigurationChoiceResolution.Unavailable(
+                dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.DISCOVERY_FAILED,
+            )
+        }
+    }
+    val choices = (resolution as? DynamicConfigurationChoiceResolution.Available)?.choices.orEmpty()
+    val selected = choices.firstOrNull { it.id == value }
+    val selectedLabel = selected?.label ?: value?.let { "Unavailable: $it" }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(requiredLabel(field), style = MaterialTheme.typography.bodyLarge)
+        when (val state = resolution) {
+            DynamicConfigurationChoiceResolution.Loading -> Text(
+                "Loading ${field.label.lowercase()}…",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            is DynamicConfigurationChoiceResolution.Unavailable -> Text(
+                dynamicChoiceUnavailableMessage(state, dependencyValue),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+
+            is DynamicConfigurationChoiceResolution.Available -> Unit
+        }
+        OutlinedButton(
+            enabled = resolution is DynamicConfigurationChoiceResolution.Available,
+            onClick = { expanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(selectedLabel ?: "Select ${field.label}")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEach { choice ->
+                DropdownMenuItem(
+                    text = { Text(choice.label) },
+                    onClick = {
+                        onValueChange(choice.id)
+                        expanded = false
+                    },
+                )
+            }
+        }
+    }
+}
+
+internal fun dynamicChoiceUnavailableMessage(
+    resolution: DynamicConfigurationChoiceResolution.Unavailable,
+    dependencyValue: String?,
+): String = when (resolution.reason) {
+    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.DEPENDENCY_MISSING ->
+        if (dependencyValue == null) "Choose the required dependency first." else "The selected dependency is unavailable."
+    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.SOURCE_UNAVAILABLE ->
+        "Choices are currently unavailable."
+    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.DISCOVERY_FAILED ->
+        "Could not load choices. Refresh the source and try again."
+    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.HOST_NOT_READY ->
+        "Choices are unavailable until the host is ready."
+}
+
 private fun requiredLabel(field: ChannelConfigurationField): String =
     if (field.required) field.label else "${field.label} (optional)"
 
@@ -239,6 +348,7 @@ internal fun initialFieldValue(field: ChannelConfigurationField, payload: JSONOb
         is ChannelConfigurationField.BooleanField -> (raw as? Boolean)?.toString()
         is ChannelConfigurationField.TextField,
         is ChannelConfigurationField.ChoiceField,
+        is ChannelConfigurationField.DynamicChoiceField,
         is ChannelConfigurationField.DirectoryField,
         -> raw as? String
         is ChannelConfigurationField.NumberField -> (raw as? Number)?.toString()
@@ -262,6 +372,7 @@ internal fun payloadWithFieldValues(
             is ChannelConfigurationField.BooleanField -> payload.put(field.id, value == "true")
             is ChannelConfigurationField.TextField,
             is ChannelConfigurationField.ChoiceField,
+            is ChannelConfigurationField.DynamicChoiceField,
             is ChannelConfigurationField.DirectoryField,
             -> payload.put(field.id, value ?: JSONObject.NULL)
             is ChannelConfigurationField.NumberField -> {

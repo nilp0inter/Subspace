@@ -25,6 +25,14 @@ sealed interface ChannelPreparationReason {
     data class Provider(val error: ChannelProviderError) : ChannelPreparationReason {
         override val message: String = error.message
     }
+    data class ConnectionProfileUnavailable(
+        val reason: dev.nilp0inter.subspace.model.OpenAiAvailabilityReason,
+    ) : ChannelPreparationReason {
+        override val message: String = "Connection profile is unavailable"
+    }
+    data object ModelUnavailable : ChannelPreparationReason {
+        override val message: String = "Selected model is unavailable"
+    }
     data object RuntimeBusy : ChannelPreparationReason { override val message = "Channel is busy" }
     data object RuntimeTimedOut : ChannelPreparationReason { override val message = "Channel operation timed out" }
     data object RuntimeCancelled : ChannelPreparationReason { override val message = "Channel operation was cancelled" }
@@ -43,6 +51,7 @@ data class ChannelRuntimeSnapshot(
     val executionStatus: ChannelExecutionStatus,
     val summary: String? = null,
     val pendingCount: Int = 0,
+    val playbackPaused: Boolean = false,
 )
 
 interface ChannelRuntime {

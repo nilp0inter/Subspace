@@ -25,6 +25,7 @@ import dev.nilp0inter.subspace.model.AppState
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.BootstrapLoadingScreen
@@ -36,6 +37,10 @@ import dev.nilp0inter.subspace.ui.InitialSetupScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.LogAnalysisScreen
+import dev.nilp0inter.subspace.ui.OpenAiProfileManagementScreen
+import dev.nilp0inter.subspace.ui.OpenAiProfileUiError
+import dev.nilp0inter.subspace.ui.OpenAiProfileUiItem
+import dev.nilp0inter.subspace.ui.OpenAiProfileUiMutationResult
 import dev.nilp0inter.subspace.ui.PttUiActions
 import dev.nilp0inter.subspace.ui.bootstrapRootSurface
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
@@ -79,6 +84,14 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(dev.nilp0inter.subspace.model.ModelAcquisitionProgress()) }
             val providerDescriptors by currentService?.channelDescriptors?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(emptyList()) }
+            val profileUiState by currentService?.profileUiState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(emptyList<OpenAiProfileUiItem>()) }
+            val dynamicChoiceResolver = currentService?.dynamicChoiceResolver
+                ?: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver {
+                    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolution.Unavailable(
+                        dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.HOST_NOT_READY,
+                    )
+                }
             val logEntries by currentService?.logEntries?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(emptyList()) }
             val currentGlobalLevel by currentService?.globalLogLevelFlow?.collectAsStateWithLifecycle()
@@ -206,6 +219,10 @@ class MainActivity : ComponentActivity() {
                         dashboardRoute = DashboardRoute.LogAnalysis
                     }
 
+                    override fun navigateToOpenAiProfiles() {
+                        dashboardRoute = DashboardRoute.OpenAiProfiles
+                    }
+
                     override fun phonePttPressed(channelId: String) {
                         currentServiceState?.startPhonePtt(channelId)
                     }
@@ -217,14 +234,14 @@ class MainActivity : ComponentActivity() {
                     override fun createChannel(
                         implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId,
                         displayName: String,
-                        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
+                        payload: OpaqueJsonObject,
                     ): String? = currentServiceState
                         ?.createChannel(implementationId, displayName, payload)
                         .failureMessage()
 
                     override fun updateChannelConfiguration(
                         channelId: String,
-                        payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
+                        payload: OpaqueJsonObject,
                     ): String? = currentServiceState
                         ?.updateChannelConfiguration(channelId, payload)
                         .failureMessage()
@@ -241,6 +258,27 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.repository?.updateChannel(id) { definition ->
                             definition.copy(name = newName)
                         }
+                    }
+                    override fun createProfile(
+                        request: dev.nilp0inter.subspace.ui.OpenAiProfileEditRequest,
+                    ): OpenAiProfileUiMutationResult = currentServiceState?.createProfile(request)
+                        ?: OpenAiProfileUiMutationResult.Failure(OpenAiProfileUiError.HostUnavailable)
+
+                    override fun updateProfile(
+                        request: dev.nilp0inter.subspace.ui.OpenAiProfileEditRequest,
+                    ): OpenAiProfileUiMutationResult = currentServiceState?.updateProfile(request)
+                        ?: OpenAiProfileUiMutationResult.Failure(OpenAiProfileUiError.HostUnavailable)
+
+                    override fun deleteProfile(id: String): OpenAiProfileUiMutationResult =
+                        currentServiceState?.deleteProfile(id)
+                            ?: OpenAiProfileUiMutationResult.Failure(OpenAiProfileUiError.HostUnavailable)
+
+                    override fun testProfile(id: String) {
+                        currentServiceState?.testProfile(id)
+                    }
+
+                    override fun refreshProfile(id: String) {
+                        currentServiceState?.refreshProfile(id)
                     }
                 }
             }
@@ -305,6 +343,7 @@ class MainActivity : ComponentActivity() {
                                                     if (error == null) actions.navigateBack()
                                                 }
                                             },
+                                            choiceResolver = dynamicChoiceResolver,
                                             directorySelection = directorySelection,
                                             onPickDirectory = actions::pickDirectory,
                                             onBack = actions::navigateBack,
@@ -332,6 +371,7 @@ class MainActivity : ComponentActivity() {
                                                     if (error == null) actions.navigateBack()
                                                 }
                                             },
+                                            choiceResolver = dynamicChoiceResolver,
                                             directorySelection = directorySelection,
                                             onPickDirectory = actions::pickDirectory,
                                             onBack = actions::navigateBack,
@@ -356,6 +396,18 @@ class MainActivity : ComponentActivity() {
                                         tagLevels = currentTagLevels,
                                     )
                                 }
+
+                                DashboardRoute.OpenAiProfiles -> OpenAiProfileManagementScreen(
+                                    profiles = profileUiState,
+                                    onSubmit = { request ->
+                                        if (request.id == null) actions.createProfile(request)
+                                        else actions.updateProfile(request)
+                                    },
+                                    onTest = actions::testProfile,
+                                    onRefreshModels = actions::refreshProfile,
+                                    onDelete = actions::deleteProfile,
+                                    onBack = actions::navigateBack,
+                                )
                             }
                         }
                     }
@@ -392,7 +444,7 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation, LogAnalysis }
+    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation, LogAnalysis, OpenAiProfiles }
 }
 
 internal fun ChannelRepositoryMutationResult?.failureMessage(): String? = when (this) {

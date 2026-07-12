@@ -165,7 +165,11 @@ class ChannelCatalogueTest {
         """.trimIndent()
         file.writeText(v1)
 
-        val repository = ChannelRepository(FakeSharedPreferences(), file)
+        val repository = ChannelRepository(
+            FakeSharedPreferences(),
+            file,
+            BuiltInChannelDescriptors.configurationResolver,
+        )
         val snapshot = repository.catalogueState.value
         val journal = snapshot.definitions[0]
         val debug = snapshot.definitions[1]
@@ -221,7 +225,11 @@ class ChannelCatalogueTest {
                 .commit()
         }
 
-        val repository = ChannelRepository(preferences, file)
+        val repository = ChannelRepository(
+            preferences,
+            file,
+            BuiltInChannelDescriptors.configurationResolver,
+        )
 
         assertEquals(persisted, repository.catalogueState.value)
         assertEquals(v2, file.readText())
@@ -260,6 +268,50 @@ class ChannelCatalogueTest {
         assertEquals("invalid-after-first", error.definitionId)
         assertTrue(error.error is ChannelProviderError.InvalidConfiguration)
         assertEquals(v2, file.readText())
+    }
+
+    @Test
+    fun authoritativeCustomProviderResolverMigratesLoadedAndMutatedDefinitions() = withTemporaryCatalogue { file ->
+        val provider = MigratingCustomProvider(ChannelImplementationId("test:authoritative"))
+        val registry = ChannelImplementationProviderRegistry()
+        assertEquals(ChannelProviderRegistrationResult.Registered, registry.register(provider))
+        val loaded = definition(
+            id = "loaded",
+            name = "Loaded custom channel",
+            implementationId = provider.descriptor.implementationId,
+            schemaVersion = 1,
+            payload = opaque("""{"stage":1,"token":"loaded","extension":"retain"}"""),
+        )
+        file.writeText(ChannelCatalogueCodec.toJson(ChannelCatalogueSnapshot(listOf(loaded), loaded.id)))
+
+        val repository = ChannelRepository(FakeSharedPreferences(), file, registry)
+        val added = definition(
+            id = "added",
+            name = "Added custom channel",
+            implementationId = provider.descriptor.implementationId,
+            schemaVersion = 1,
+            payload = opaque("""{"stage":1,"token":"added"}"""),
+        )
+
+        assertEquals(ChannelRepositoryMutationResult.Success, repository.addChannel(added))
+        assertEquals(
+            ChannelRepositoryMutationResult.Success,
+            repository.updateChannel("loaded") {
+                it.copy(
+                    configSchemaVersion = 1,
+                    configPayload = opaque("""{"stage":1,"token":"updated","extension":"retain"}"""),
+                )
+            },
+        )
+
+        val persisted = assertDecodeSuccess(ChannelCatalogueCodec.decode(file.readText())).snapshot
+        assertEquals(listOf("loaded", "added"), persisted.definitions.map(ChannelDefinition::id))
+        assertEquals(listOf(2, 2), persisted.definitions.map(ChannelDefinition::configSchemaVersion))
+        assertEquals(
+            listOf("updated", "added"),
+            persisted.definitions.map { it.configPayload.toJsonObject().getString("token") },
+        )
+        assertEquals("retain", persisted.definitions.first().configPayload.toJsonObject().getString("extension"))
     }
 
     @Test
@@ -389,6 +441,76 @@ class ChannelCatalogueTest {
             presentation = ChannelPresentationMetadata("Test", "TEST", "Unavailable"),
             configuration = configuration,
             configurationFields = listOf(ChannelConfigurationField.TextField("required", "Required")),
+            requiredCapabilities = emptySet(),
+            preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
+        )
+
+        override suspend fun constructRuntime(
+            request: ChannelRuntimeConstructionRequest,
+        ): ChannelRuntimeConstructionResult = ChannelRuntimeConstructionResult.Failure(
+            ChannelProviderError.RuntimeConstructionFailed(
+                descriptor.implementationId,
+                "Runtime construction is outside catalogue migration coverage",
+            ),
+        )
+    }
+
+    private class MigratingCustomProvider(
+        implementationId: ChannelImplementationId,
+    ) : ChannelImplementationProvider {
+        private val configuration = object : ChannelConfigurationProvider {
+            override val implementationId = implementationId
+            override val currentSchemaVersion = 2
+
+            override fun defaultPayload(): OpaqueJsonObject =
+                OpaqueJsonObject.parse("""{"stage":2,"token":"required"}""").getOrThrow()
+
+            override fun validate(
+                schemaVersion: Int,
+                payload: OpaqueJsonObject,
+            ): ProviderConfigurationResult {
+                val objectValue = payload.toJsonObject()
+                return if (
+                    schemaVersion == currentSchemaVersion &&
+                    objectValue.optInt("stage") == currentSchemaVersion &&
+                    objectValue.optString("token").isNotBlank()
+                ) {
+                    ProviderConfigurationResult.Success(
+                        ValidatedChannelConfiguration(implementationId, schemaVersion, payload),
+                    )
+                } else {
+                    ProviderConfigurationResult.Failure(
+                        ChannelProviderError.InvalidConfiguration(
+                            implementationId,
+                            schemaVersion,
+                            "stage must be current and token must be present",
+                        ),
+                    )
+                }
+            }
+
+            override fun migrateStep(
+                fromSchemaVersion: Int,
+                payload: OpaqueJsonObject,
+            ): ChannelConfigurationMigrationStep = when (fromSchemaVersion) {
+                1 -> ChannelConfigurationMigrationStep.Success(
+                    OpaqueJsonObject.fromJsonObject(payload.toJsonObject().put("stage", 2)),
+                )
+                else -> ChannelConfigurationMigrationStep.Failure(
+                    ChannelProviderError.UnsupportedSchemaVersion(
+                        implementationId,
+                        fromSchemaVersion,
+                        currentSchemaVersion,
+                    ),
+                )
+            }
+        }
+
+        override val descriptor = ChannelImplementationDescriptor(
+            implementationId = implementationId,
+            presentation = ChannelPresentationMetadata("Custom", "TEST", "Unavailable"),
+            configuration = configuration,
+            configurationFields = listOf(ChannelConfigurationField.TextField("token", "Token")),
             requiredCapabilities = emptySet(),
             preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
         )

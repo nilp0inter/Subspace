@@ -31,6 +31,9 @@ class SystemAnnouncer(
     private val _precomputeState = MutableStateFlow<AnnouncementResult>(AnnouncementResult.WaitingForTts)
     val precomputeState: StateFlow<AnnouncementResult> = _precomputeState.asStateFlow()
 
+    /** Host composition reads cached speech without receiving the synthesizer or a route. */
+    fun recordingFor(key: String): RecordedPcm? = cache[key]
+
     /**
      * Pre-render every phrase in [vocabulary] into non-empty SCO-ready PCM.
      * Publishes vocabulary-derived phrase progress through [precomputeState].

@@ -180,7 +180,7 @@ class CarMediaSessionService : MediaBrowserService() {
     }
 
     private fun mediaItemFor(entry: ChannelBrowseEntry): MediaItem {
-        val status = entry.recoveryMessage ?: statusKindPill(entry.statusKind)
+        val status = entry.recoveryMessage ?: if (entry.playbackPaused) "PLAYBACK PAUSED" else statusKindPill(entry.statusKind)
         val subtitle = appendPending(status, entry.pendingCount)
         return MediaItem(
             MediaDescription.Builder()

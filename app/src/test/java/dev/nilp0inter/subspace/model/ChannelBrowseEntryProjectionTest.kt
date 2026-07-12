@@ -133,6 +133,45 @@ class ChannelBrowseEntryProjectionTest {
         assertEquals(listOf(0, 4), entries.map(ChannelBrowseEntry::pendingCount))
     }
 
+    @Test
+    fun `queued processing and pending snapshots keep provider-neutral browse identity order and privacy`() {
+        val state = AppState(
+            channels = listOf(
+                snapshot("journal-instance", "Journal", "builtin:journal", ChannelPreparationAvailability.Available).copy(
+                    executionStatus = ChannelExecutionStatus.IDLE,
+                    summary = "journal private transcript",
+                ),
+                snapshot("debug-instance", "Debug", "builtin:debug", ChannelPreparationAvailability.Available).copy(
+                    executionStatus = ChannelExecutionStatus.PROCESSING,
+                    summary = "debug private payload",
+                ),
+                snapshot("keyboard-instance", "Keyboard", "builtin:keyboard", ChannelPreparationAvailability.Available).copy(
+                    executionStatus = ChannelExecutionStatus.SUCCESS,
+                    summary = "keyboard private text",
+                ),
+            ),
+            activeChannelId = "debug-instance",
+        )
+
+        val entries = projectChannelBrowseEntries(
+            state,
+            pendingCounts = mapOf("journal-instance" to 2, "debug-instance" to 1, "keyboard-instance" to 0),
+        )
+
+        assertEquals(
+            listOf("journal-instance", "debug-instance", "keyboard-instance"),
+            entries.map(ChannelBrowseEntry::id),
+        )
+        assertEquals(listOf(2, 1, 0), entries.map(ChannelBrowseEntry::pendingCount))
+        assertEquals(
+            listOf(ChannelStatusKind.Ready, ChannelStatusKind.Active, ChannelStatusKind.Ready),
+            entries.map(ChannelBrowseEntry::statusKind),
+        )
+        val visibleBrowse = entries.toString()
+        assertTrue(entries.all(ChannelBrowseEntry::isPlayable))
+        assertTrue("browse projection must not expose runtime summaries", "private" !in visibleBrowse)
+    }
+
     private fun snapshot(
         id: String,
         name: String,

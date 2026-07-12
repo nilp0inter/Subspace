@@ -55,6 +55,10 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
         getByName("release") {
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             isMinifyEnabled = false
             isShrinkResources = false
             signingConfig = signingConfigs.getByName("release")
@@ -117,12 +121,15 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.24.3")
     implementation(project(":sleepwalker-core"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // The host-only adapter package is the sole boundary permitted to import this SDK.
+    implementation("com.openai:openai-java:4.42.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("org.json:json:20231013")
     testImplementation("io.mockk:mockk:1.13.13")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 
     androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

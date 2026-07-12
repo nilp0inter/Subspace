@@ -1,4 +1,14 @@
 package dev.nilp0inter.subspace.channel.capability
+import dev.nilp0inter.subspace.model.AcceptedAgentRun
+import dev.nilp0inter.subspace.model.AgentConversationEnqueueRequest
+import dev.nilp0inter.subspace.model.AgentOperationId
+import dev.nilp0inter.subspace.model.AgentRunId
+import dev.nilp0inter.subspace.model.DelayedPlaybackOutcome
+import dev.nilp0inter.subspace.model.DelayedPlaybackRequest
+import dev.nilp0inter.subspace.model.OpenAiChatOutcome
+import dev.nilp0inter.subspace.model.OpenAiChatRequest
+import dev.nilp0inter.subspace.model.OpenAiConnectionProfileId
+import dev.nilp0inter.subspace.model.OpenAiModelDiscoveryOutcome
 
 /**
  * Stable semantic capabilities that a channel implementation may declare.
@@ -12,6 +22,11 @@ sealed interface ChannelCapability {
     data object AudioOperation : ChannelCapability { override val stableId = "audio-operation" }
     data object Journal : ChannelCapability { override val stableId = "journal" }
     data object TextOutput : ChannelCapability { override val stableId = "text-output" }
+    data object OpenAiModelDiscovery : ChannelCapability { override val stableId = "openai-model-discovery" }
+    data object OpenAiCompletion : ChannelCapability { override val stableId = "openai-completion" }
+    data object AsynchronousConversation : ChannelCapability { override val stableId = "asynchronous-conversation" }
+    data object DelayedPlayback : ChannelCapability { override val stableId = "delayed-playback" }
+    data object DeferredAudioPlayback : ChannelCapability { override val stableId = "deferred-audio-playback" }
 }
 
 /** A monotonically assigned runtime generation. It is scoped to one channel instance. */
@@ -80,10 +95,68 @@ sealed class CapabilityKey<T : ChannelCapabilityPort>(val capability: ChannelCap
     data object AudioOperation : CapabilityKey<AudioOperationCapability>(ChannelCapability.AudioOperation)
     data object Journal : CapabilityKey<JournalStorageCapability>(ChannelCapability.Journal)
     data object TextOutput : CapabilityKey<TextOutputCapability>(ChannelCapability.TextOutput)
+    data object OpenAiModelDiscovery : CapabilityKey<OpenAiModelDiscoveryCapability>(ChannelCapability.OpenAiModelDiscovery)
+    data object OpenAiCompletion : CapabilityKey<OpenAiCompletionCapability>(ChannelCapability.OpenAiCompletion)
+    data object AsynchronousConversation : CapabilityKey<AsynchronousConversationCapability>(ChannelCapability.AsynchronousConversation)
+    data object DelayedPlayback : CapabilityKey<DelayedPlaybackCapability>(ChannelCapability.DelayedPlayback)
+    data object DeferredAudioPlayback : CapabilityKey<DeferredAudioPlaybackCapability>(ChannelCapability.DeferredAudioPlayback)
 }
 
 /** A semantic port. It never carries Android, hardware, route, filesystem, or coroutine ownership. */
 interface ChannelCapabilityPort
+
+/**
+ * Generation-bound authorization for one host-owned agent operation. Its identifiers are opaque
+ * to runtimes: only the host may associate them with persistence, clients, or worker ownership.
+ */
+data class AgentOperationContext(
+    val scope: CapabilityScopeIdentity,
+    val runId: AgentRunId,
+    val operationId: AgentOperationId,
+)
+
+/** Profile-scoped model discovery without client, credential, or protocol objects. */
+interface OpenAiModelDiscoveryCapability : ChannelCapabilityPort {
+    suspend fun discover(profileId: OpenAiConnectionProfileId): OpenAiModelDiscoveryOutcome
+}
+
+/** Non-streaming completion port. The host owns request dispatch, cancellation, and retries. */
+interface OpenAiCompletionCapability : ChannelCapabilityPort {
+    suspend fun complete(
+        context: AgentOperationContext,
+        request: OpenAiChatRequest,
+    ): OpenAiChatOutcome
+}
+
+/** Durable queue admission that outlives the transient PTT callback. */
+interface AsynchronousConversationCapability : ChannelCapabilityPort {
+    suspend fun enqueue(
+        scope: CapabilityScopeIdentity,
+        request: AgentConversationEnqueueRequest,
+    ): CapabilityOperationResult<AcceptedAgentRun>
+    /** Atomically retires the current volatile conversation epoch for this runtime scope. */
+    suspend fun resetConversation(scope: CapabilityScopeIdentity) {}
+}
+
+/** Host-owned synthesis and selection-aware playback; audio artifacts and routes remain hidden. */
+interface DelayedPlaybackCapability : ChannelCapabilityPort {
+    suspend fun schedule(
+        context: AgentOperationContext,
+        request: DelayedPlaybackRequest,
+    ): DelayedPlaybackOutcome
+}
+
+/**
+ * Host-owned admission-time playback of an opaque pre-synthesized/captured audio operation.
+ * The artifact is held in memory only; the host retries after terminal cleanup using the same
+ * half-duplex admission and current-mode routing as text-based delayed playback.
+ */
+interface DeferredAudioPlaybackCapability : ChannelCapabilityPort {
+    suspend fun scheduleAudio(
+        context: AgentOperationContext,
+        audio: OpaqueAudioOperation,
+    ): DelayedPlaybackOutcome
+}
 
 /**
  * Result of acquiring a capability. Recoverable is returned only when the host can
@@ -288,6 +361,7 @@ value class SpeechVoice(val id: String) {
 
 interface AudioOperationCapability : ChannelCapabilityPort {
     suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio): CapabilityOperationResult<OpaqueAudioOperation>
+    suspend fun createPlaybackResult(recording: OpaqueAudioRecording): CapabilityOperationResult<OpaqueAudioOperation>
 }
 
 interface JournalStorageCapability : ChannelCapabilityPort {

@@ -15,6 +15,11 @@ import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
 import dev.nilp0inter.subspace.channel.capability.AudioOperationCapability
 import dev.nilp0inter.subspace.channel.capability.JournalStorageCapability
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.AsynchronousConversationCapability
+import dev.nilp0inter.subspace.channel.capability.DelayedPlaybackCapability
+import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapability
+import dev.nilp0inter.subspace.channel.capability.OpenAiCompletionCapability
+import dev.nilp0inter.subspace.channel.capability.OpenAiModelDiscoveryCapability
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
@@ -29,6 +34,11 @@ internal class ServiceChannelCapabilityHost(
     private val synthesis: (CapabilityScopeIdentity) -> SynthesisCapability?,
     private val audioOperation: (CapabilityScopeIdentity) -> AudioOperationCapability?,
     private val journal: (CapabilityScopeIdentity) -> JournalStorageCapability?,
+    private val openAiModelDiscovery: (CapabilityScopeIdentity) -> OpenAiModelDiscoveryCapability? = { null },
+    private val openAiCompletion: (CapabilityScopeIdentity) -> OpenAiCompletionCapability? = { null },
+    private val asynchronousConversation: (CapabilityScopeIdentity) -> AsynchronousConversationCapability? = { null },
+    private val delayedPlayback: (CapabilityScopeIdentity) -> DelayedPlaybackCapability? = { null },
+    private val deferredAudioPlayback: (CapabilityScopeIdentity) -> DeferredAudioPlaybackCapability? = { null },
 ) : ChannelCapabilityHost {
     override suspend fun availability(
         identity: CapabilityScopeIdentity,
@@ -39,6 +49,11 @@ internal class ServiceChannelCapabilityHost(
         CapabilityKey.Synthesis -> synthesis(identity).availability()
         CapabilityKey.AudioOperation -> audioOperation(identity).availability()
         CapabilityKey.Journal -> journal(identity).availability()
+        CapabilityKey.OpenAiModelDiscovery -> openAiModelDiscovery(identity).availability()
+        CapabilityKey.OpenAiCompletion -> openAiCompletion(identity).availability()
+        CapabilityKey.AsynchronousConversation -> asynchronousConversation(identity).availability()
+        CapabilityKey.DelayedPlayback -> delayedPlayback(identity).availability()
+        CapabilityKey.DeferredAudioPlayback -> deferredAudioPlayback(identity).availability()
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -52,6 +67,11 @@ internal class ServiceChannelCapabilityHost(
             CapabilityKey.Synthesis -> availableOrUnavailable(synthesis(identity))
             CapabilityKey.AudioOperation -> availableOrUnavailable(audioOperation(identity))
             CapabilityKey.Journal -> availableOrUnavailable(journal(identity))
+            CapabilityKey.OpenAiModelDiscovery -> availableOrUnavailable(openAiModelDiscovery(identity))
+            CapabilityKey.OpenAiCompletion -> availableOrUnavailable(openAiCompletion(identity))
+            CapabilityKey.AsynchronousConversation -> availableOrUnavailable(asynchronousConversation(identity))
+            CapabilityKey.DelayedPlayback -> availableOrUnavailable(delayedPlayback(identity))
+            CapabilityKey.DeferredAudioPlayback -> availableOrUnavailable(deferredAudioPlayback(identity))
         }
     ) as HostedCapabilityAcquisition<T>
 

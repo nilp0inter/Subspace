@@ -23,9 +23,8 @@ import kotlinx.coroutines.withContext
  */
 class TtsController(
     private val scope: CoroutineScope,
-    private val sco: ScoRoute,
-    private val output: PcmOutput,
     private val synthesizer: TtsSynthesizer,
+    private val play: suspend (RecordedPcm) -> Boolean,
     private val synthesisDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
     private val _status = MutableStateFlow<TtsStatus>(TtsStatus.Idle)
@@ -70,15 +69,8 @@ class TtsController(
         speed: Float,
         scoRate: Int,
     ) {
-        var acquired = false
         try {
             _status.value = TtsStatus.WaitingForModel
-            if (!sco.acquire()) {
-                _status.value = TtsStatus.Error("SCO unavailable")
-                return
-            }
-            acquired = true
-
             _status.value = TtsStatus.Synthesizing
             val request = SynthesisRequest(
                 text = text,
@@ -101,8 +93,11 @@ class TtsController(
                         _status.value = TtsStatus.Idle
                         return
                     }
-                    output.play(playback)
-                    _status.value = TtsStatus.Idle
+                    if (play(playback)) {
+                        _status.value = TtsStatus.Idle
+                    } else {
+                        _status.value = TtsStatus.Error("Audio unavailable")
+                    }
                 }
                 is SynthesisOutcome.ModelNotReady -> {
                     _status.value = TtsStatus.Error("TTS model not ready")
@@ -117,10 +112,6 @@ class TtsController(
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
             _status.value = TtsStatus.Error(error.message ?: "TTS session failed")
-        } finally {
-            if (acquired) {
-                output.releaseRoute()
-            }
         }
     }
 }

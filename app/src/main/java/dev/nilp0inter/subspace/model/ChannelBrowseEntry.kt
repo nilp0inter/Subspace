@@ -14,6 +14,7 @@ data class ChannelBrowseEntry(
     val pendingCount: Int,
     val isPlayable: Boolean,
     val recoveryMessage: String? = null,
+    val playbackPaused: Boolean = false,
 )
 
 enum class ChannelStatusKind { Active, Ready, Standby, Unavailable }
@@ -42,6 +43,7 @@ fun projectChannelBrowseEntries(
             else -> ChannelStatusKind.Ready
         },
         pendingCount = pendingCounts[channel.id] ?: 0,
+        playbackPaused = channel.playbackPaused,
         isPlayable = true,
         recoveryMessage = reason?.let { "$it. Recover or remove this channel on your phone." },
     )

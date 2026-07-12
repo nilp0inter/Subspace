@@ -19,6 +19,7 @@ internal class PttDispatcher(
     private val serviceScope: CoroutineScope,
     private val inputModeController: InputModeController,
     private val audioSessionManager: PttAudioSessionManager,
+    private val audioCoordinator: HostAudioCoordinator = HostAudioCoordinator(),
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
     private val cancelIdleTimer: () -> Unit,
@@ -26,22 +27,68 @@ internal class PttDispatcher(
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
 ) {
+    private val captureLeaseLock = Any()
+    private val captureLeases = mutableMapOf<Long, HostCaptureLease>()
+
     val activePttSession: PttAudioSessionManager.SessionSnapshot?
         get() = audioSessionManager.activeSession
 
-    fun reservePendingPtt(source: PttSource, channelId: String): Boolean =
-        audioSessionManager.reservePending(source, channelId, inputModeController.mode)
+    fun reserveCaptureAdmission(): HostCaptureAdmission = audioCoordinator.reserveCapture()
+
+    fun abandonCaptureAdmission(lease: HostCaptureLease): Boolean = audioCoordinator.releaseCapture(lease)
+
+    fun reservePendingPtt(source: PttSource, channelId: String): Boolean = when (val admission = reserveCaptureAdmission()) {
+        is HostCaptureAdmission.Granted -> reservePendingPtt(source, channelId, admission.lease)
+        HostCaptureAdmission.RejectedByPlayback,
+        HostCaptureAdmission.Busy,
+        HostCaptureAdmission.Closed,
+        -> false
+    }
+
+    fun reservePendingPtt(source: PttSource, channelId: String, lease: HostCaptureLease): Boolean {
+        if (!audioSessionManager.reservePending(source, channelId, inputModeController.mode)) {
+            abandonCaptureAdmission(lease)
+            return false
+        }
+        val sessionId = activePttSession?.id
+        if (sessionId == null || !attachCaptureLease(sessionId, lease)) {
+            audioSessionManager.cancelPending(source, "Host capture admission lost")
+            abandonCaptureAdmission(lease)
+            return false
+        }
+        return true
+    }
 
     fun dispatchPttPressed(source: PttSource): Boolean {
+        val pendingSameSource = activePttSession?.source == source
+        val captureLease = if (pendingSameSource) {
+            null
+        } else {
+            when (val admission = audioCoordinator.reserveCapture()) {
+                is HostCaptureAdmission.Granted -> admission.lease
+                HostCaptureAdmission.RejectedByPlayback -> {
+                    Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=playback-active")
+                    return false
+                }
+                HostCaptureAdmission.Busy -> {
+                    Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=host-audio-busy")
+                    return false
+                }
+                HostCaptureAdmission.Closed -> return false
+            }
+        }
+        fun reject() {
+            captureLease?.let(audioCoordinator::releaseCapture)
+        }
         Log.d(
             ROUTE_LOG_TAG,
             "PTT_PRESS_BEGIN source=$source activeSession=${audioSessionManager.isActive} " +
                 "modeBefore=${inputModeController.mode} availability=${inputModeController.availability}",
         )
         logAudioRouteSnapshot("ptt-press-begin-$source")
-        val pendingSameSource = activePttSession?.source == source
         if (audioSessionManager.isActive && !pendingSameSource) {
             Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=active-session")
+            reject()
             return false
         }
         val transitioned = inputModeController.autoTransitionFor(source)
@@ -55,6 +102,7 @@ internal class PttDispatcher(
                 ROUTE_LOG_TAG,
                 "PTT_ERROR_BEEP_SKIP source=$source reason=transition-failed mode=${inputModeController.mode}",
             )
+            reject()
             return false
         }
         publishInputMode()
@@ -62,10 +110,14 @@ internal class PttDispatcher(
         val decision = decidePttDispatch()
 
         Log.d(ROUTE_LOG_TAG, "PTT_DECIDE decision=${decision?.let { it::class.simpleName }} channel=${decision?.channelId}")
-        if (decision == null) return false
+        if (decision == null) {
+            reject()
+            return false
+        }
         val activeChannelId = decision.channelId
 
         if (decision is PttDispatchDecision.ErrorBeep) {
+            reject()
             val route = resolvePttAudioRoute(inputModeController.mode)
             Log.d(
                 ROUTE_LOG_TAG,
@@ -84,19 +136,38 @@ internal class PttDispatcher(
         )
         if (!started) {
             Log.d(ROUTE_LOG_TAG, "PTT_PRESS_SKIP source=$source reason=session-start-rejected")
+            reject()
             return false
         }
-
+        val sessionId = activePttSession?.id
+        if (sessionId == null || (captureLease != null && !attachCaptureLease(sessionId, captureLease))) {
+            audioSessionManager.cancelActive("Host capture admission lost")
+            reject()
+            return false
+        }
         Log.d(ROUTE_LOG_TAG, "PTT_DISPATCH channel=$activeChannelId mode=${inputModeController.mode}")
         updateCarMediaState()
         return true
     }
 
+    private fun attachCaptureLease(sessionId: Long, lease: HostCaptureLease): Boolean {
+        if (!audioCoordinator.commitCapture(lease)) return false
+        synchronized(captureLeaseLock) { captureLeases[sessionId] = lease }
+        return true
+    }
+
     fun dispatchPttReleased(source: PttSource) {
+        if (audioCoordinator.consumeRejectedPttRelease()) return
         val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
         audioSessionManager.release(source)
 
         updateCarMediaState()
+    }
+
+    /** Observes the existing terminal publication; it never performs input terminal cleanup. */
+    fun onTerminalCompleted(completion: PttAudioSessionManager.TerminalCompletion) {
+        val lease = synchronized(captureLeaseLock) { captureLeases.remove(completion.sessionId) } ?: return
+        audioCoordinator.releaseCapture(lease)
     }
 
     /** Forcefully abort the current PTT session (regardless of source). */

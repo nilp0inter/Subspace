@@ -4,6 +4,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class ChannelImplementationProviderTest {
@@ -160,6 +161,35 @@ class ChannelImplementationProviderTest {
         assertEquals(original.activeChannelId, migration.snapshot.activeChannelId)
         assertEquals(3, migrated.configSchemaVersion)
         assertEquals("value", migrated.configPayload.toJsonObject().getString("extension"))
+    }
+
+    @Test
+    fun OpenAiModelChoiceFieldsRequireAnExistingNonSelfProfileDependency() {
+        assertThrows(IllegalArgumentException::class.java) {
+            ChannelConfigurationField.DynamicChoiceField(
+                id = "model",
+                label = "Model",
+                source = DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            )
+        }
+
+        val implementationId = ChannelImplementationId("test:dynamic-choices")
+        val modelField = ChannelConfigurationField.DynamicChoiceField(
+            id = "model",
+            label = "Model",
+            source = DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            dependsOnFieldId = "profile",
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            ChannelImplementationDescriptor(
+                implementationId = implementationId,
+                presentation = ChannelPresentationMetadata("Dynamic", "TEST", "Unavailable"),
+                configuration = TestConfigurationProvider(implementationId),
+                configurationFields = listOf(modelField),
+                requiredCapabilities = emptySet(),
+                preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
+            )
+        }
     }
 
     private fun opaque(value: String): OpaqueJsonObject = OpaqueJsonObject.parse(value).getOrThrow()

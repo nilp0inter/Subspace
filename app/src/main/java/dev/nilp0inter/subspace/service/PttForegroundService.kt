@@ -72,12 +72,26 @@ import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.channel.capability.JournalStorageCapabilityAdapter
 import dev.nilp0inter.subspace.channel.capability.PlaybackResultFactory
+import dev.nilp0inter.subspace.channel.capability.RecordingPlaybackResultFactory
 import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisParameters
 import dev.nilp0inter.subspace.channel.capability.SynthesisCapabilityAdapter
 import dev.nilp0inter.subspace.channel.capability.TranscriptionCapabilityAdapter
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.JournalProviderConfigurationCodec
+import dev.nilp0inter.subspace.channel.OpenAiAgentBuiltInProvider
+import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
+import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
+import dev.nilp0inter.subspace.channel.capability.SpeechVoice
+import dev.nilp0inter.subspace.openai.AndroidKeystoreBearerCredentialStore
+import dev.nilp0inter.subspace.openai.OpenAiProfileMetadataStore
+import dev.nilp0inter.subspace.openai.OpenAiProfileOperations
+import dev.nilp0inter.subspace.openai.OpenAiProfileRepository
+import dev.nilp0inter.subspace.openai.adapter.OpenAiSdkClientRegistry
+import dev.nilp0inter.subspace.openai.adapter.OpenAiSdkCompletionService
+import dev.nilp0inter.subspace.openai.adapter.OpenAiSdkModelDiscoveryService
+import dev.nilp0inter.subspace.ui.OpenAiProfileEditRequest
+import dev.nilp0inter.subspace.ui.OpenAiProfileUiMutationResult
 import java.util.concurrent.ConcurrentHashMap
 import dev.nilp0inter.subspace.channel.TextOutputAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
@@ -121,6 +135,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -180,15 +195,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
      * [appState] via [projectChannelBrowseEntries]; the Android Auto Media
      * service collects this to populate `onLoadChildren` and drive
      * `notifyChildrenChanged` (see design D3).
-     *
-     * Pending counts are always 0 today (inbound backlog tracking is not yet
-     * implemented; see design non-goal "Pending unheard backlog accuracy on the first
-     * cut"). A future inbound-backlog tracker can supply the second argument
-     * to [projectChannelBrowseEntries] without changing this flow's shape.
+     * Pending counts are derived from provider-neutral runtime snapshots. The browse surface
+     * never receives a provider payload, transcript, credential, or SDK object.
      */
     val channelBrowseEntries: Flow<List<ChannelBrowseEntry>>
         get() = _appState
-            .map { projectChannelBrowseEntries(it) }
+            .map { state ->
+                projectChannelBrowseEntries(state, state.channels.associate { it.id to it.pendingCount })
+            }
             .distinctUntilChanged()
 
     private var bluetoothAdapter: BluetoothAdapter? = null
@@ -208,6 +222,16 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             }
         }
     }
+    private lateinit var openAiProfiles: OpenAiProfileRepository
+    private lateinit var openAiClients: OpenAiSdkClientRegistry
+    private lateinit var openAiModels: OpenAiSdkModelDiscoveryService
+    private lateinit var openAiProfileOperations: OpenAiProfileOperations
+    private lateinit var openAiProfileFacade: ServiceOpenAiProfileFacade
+    private lateinit var agentRuntimeGraph: ServiceAgentRuntimeGraph
+    val profileUiState
+        get() = openAiProfileFacade.profileUiState
+    val dynamicChoiceResolver
+        get() = openAiProfileFacade.dynamicChoiceResolver
     override var journalController: JournalController? = null
     private lateinit var providerRegistry: ChannelImplementationProviderRegistry
     private val _channelDescriptors = MutableStateFlow<List<ChannelImplementationDescriptor>>(emptyList())
@@ -257,6 +281,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var mediaResponsePlayer: MediaResponsePlayer
     private lateinit var carTelecomStarter: CarTelecomStarter
     private lateinit var audioSessionManager: PttAudioSessionManager
+    private lateinit var hostAudioCoordinator: HostAudioCoordinator
+    private lateinit var playbackRouteResolver: dev.nilp0inter.subspace.audio.ModePlaybackRouteResolver
     private lateinit var pttDispatcher: PttDispatcher
     private val inputModeController = InputModeController()
     private var idleTimerJob: Job? = null
@@ -308,6 +334,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     fun tagLogLevels(): Map<String, LogLevel> = SubspaceLogger.tagLevels()
 
     fun globalLogLevel(): LogLevel = SubspaceLogger.globalLevel()
+    fun createProfile(request: OpenAiProfileEditRequest): OpenAiProfileUiMutationResult = openAiProfileFacade.create(request)
+
+    fun updateProfile(request: OpenAiProfileEditRequest): OpenAiProfileUiMutationResult = openAiProfileFacade.update(request)
+
+    fun deleteProfile(id: String): OpenAiProfileUiMutationResult = openAiProfileFacade.delete(id)
+
+    fun testProfile(id: String) {
+        serviceScope.launch(Dispatchers.IO) { openAiProfileFacade.test(id) }
+    }
+
+    fun refreshProfile(id: String) {
+        serviceScope.launch(Dispatchers.IO) { openAiProfileFacade.refresh(id) }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -326,7 +365,39 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 sleepwalkerConnection.ensureConnected(bluetoothAdapter, this@PttForegroundService, timeoutMillis)
             },
         )
-        channelRepository = ChannelRepository(applicationContext)
+        val openAiCredentials = AndroidKeystoreBearerCredentialStore(applicationContext)
+        openAiProfiles = OpenAiProfileRepository(
+            OpenAiProfileMetadataStore(java.io.File(noBackupFilesDir, "openai-profiles.json")),
+            openAiCredentials,
+        )
+        openAiClients = OpenAiSdkClientRegistry(openAiProfiles, openAiCredentials)
+        openAiModels = OpenAiSdkModelDiscoveryService(openAiClients)
+        openAiProfileOperations = OpenAiProfileOperations(openAiProfiles, openAiClients, openAiModels)
+        openAiProfileFacade = ServiceOpenAiProfileFacade(
+            serviceScope,
+            openAiProfiles,
+            openAiCredentials,
+            openAiProfileOperations,
+            openAiModels,
+        ) {
+            (keymapDatabase.profiles.ifEmpty { listOf(io.sleepwalker.core.keymap.HostProfile.LINUX_US) }).distinctBy { it.key }.sortedBy { it.key }.map { p ->
+                val label = buildString {
+                    append(p.layout)
+                    p.variant?.let { append(" ($it)") }
+                    append(" [${p.hostOs}]")
+                }
+                dev.nilp0inter.subspace.model.DynamicConfigurationChoice(p.key, label)
+            }
+        }
+        val keyboardProvider = KeyboardBuiltInProvider()
+        providerRegistry = ChannelImplementationProviderRegistry().also { providers ->
+            check(providers.register(JournalBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+            check(providers.register(DebugBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+            check(providers.register(keyboardProvider) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+            check(providers.register(OpenAiAgentBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
+        }
+        _channelDescriptors.value = providerRegistry.descriptors()
+        channelRepository = ChannelRepository(applicationContext, providerRegistry)
         _appState.value = _appState.value.copy(channels = emptyList())
 
         audioManager = getSystemService(AudioManager::class.java)
@@ -349,6 +420,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         telecomRegistrar.register()
         mediaResponsePlayer = MediaResponsePlayer(audioManager, rawLocalOutput)
         localOutput = MediaResponsePcmOutput(rawLocalOutput, mediaResponsePlayer)
+        hostAudioCoordinator = HostAudioCoordinator()
+        playbackRouteResolver = dev.nilp0inter.subspace.audio.ModePlaybackRouteResolver(audioManager, sco)
         audioSessionManager = PttAudioSessionManager(
             scope = serviceScope,
             captureService = captureService,
@@ -357,20 +430,64 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
             onTerminalCompleted = ::onAudioSessionTerminalCompleted,
         )
+        agentRuntimeGraph = ServiceAgentRuntimeComposition.create(
+            context = applicationContext,
+            scope = serviceScope,
+            catalogue = { channelRepository.catalogueState.value },
+            selectedChannel = { channelRepository.catalogueState.value.activeChannelId },
+            modelDiscovery = openAiModels,
+            completion = OpenAiSdkCompletionService(openAiClients),
+            synthesize = { text ->
+                synthesisCapability(CapabilityScopeIdentity("agent-playback", dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)))
+                    ?.synthesize(SpeechSynthesisRequest(text, "en", SpeechVoice("default")))
+                    ?: CapabilityOperationResult.Unavailable(CapabilityUnavailableReason.MODEL_NOT_READY)
+            },
+            play = { _, recording ->
+                when (val result = hostAudioCoordinator.play(recording) {
+                    playbackRouteResolver.strategyFor(inputModeController.mode)
+                }) {
+                    HostPlaybackResult.Completed -> DelayedPlaybackAudioResult.Completed
+                    HostPlaybackResult.ExplicitlySkipped -> DelayedPlaybackAudioResult.ExplicitlySkipped
+                    HostPlaybackResult.Interrupted -> DelayedPlaybackAudioResult.Interrupted
+                    HostPlaybackResult.Busy -> DelayedPlaybackAudioResult.Busy
+                    HostPlaybackResult.Closed -> DelayedPlaybackAudioResult.Cancelled
+                    is HostPlaybackResult.Unavailable,
+                    is HostPlaybackResult.Failed,
+                    -> DelayedPlaybackAudioResult.Failed(dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason.PLAYBACK_FAILED)
+                }
+            },
+            playOperation = { _, operation ->
+                val recording = dev.nilp0inter.subspace.channel.capability.recordedPcmOf(operation)
+                    ?: return@create DelayedPlaybackAudioResult.Failed(dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason.PLAYBACK_FAILED)
+                when (val result = hostAudioCoordinator.play(recording) {
+                    playbackRouteResolver.strategyFor(inputModeController.mode)
+                }) {
+                    HostPlaybackResult.Completed -> DelayedPlaybackAudioResult.Completed
+                    HostPlaybackResult.ExplicitlySkipped -> DelayedPlaybackAudioResult.ExplicitlySkipped
+                    HostPlaybackResult.Interrupted -> DelayedPlaybackAudioResult.Interrupted
+                    HostPlaybackResult.Busy -> DelayedPlaybackAudioResult.Busy
+                    HostPlaybackResult.Closed -> DelayedPlaybackAudioResult.Cancelled
+                    is HostPlaybackResult.Unavailable,
+                    is HostPlaybackResult.Failed,
+                    -> DelayedPlaybackAudioResult.Failed(dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason.PLAYBACK_FAILED)
+                }
+            },
+            textOutput = { channelId -> textOutputService.capabilityFor(channelId) },
+            textOutputAvailable = { textOutputService.availability.value is TextOutputAvailability.Available }
+        )
+        serviceScope.launch { agentRuntimeGraph.coordinator.start() }
         capabilityHost = ServiceChannelCapabilityHost(
             textOutputService = textOutputService,
             transcription = ::transcriptionCapability,
             synthesis = ::synthesisCapability,
             audioOperation = ::audioOperationCapability,
             journal = ::journalCapability,
+            openAiModelDiscovery = { agentRuntimeGraph.modelDiscovery },
+            openAiCompletion = { agentRuntimeGraph.completion },
+            asynchronousConversation = { agentRuntimeGraph.coordinator },
+            delayedPlayback = { agentRuntimeGraph.playback },
+            deferredAudioPlayback = { agentRuntimeGraph.deferredAudioPlayback },
         )
-        val keyboardProvider = KeyboardBuiltInProvider()
-        providerRegistry = ChannelImplementationProviderRegistry().also { providers ->
-            check(providers.register(JournalBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
-            check(providers.register(DebugBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
-            check(providers.register(keyboardProvider) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
-        }
-        _channelDescriptors.value = providerRegistry.descriptors()
         serviceScope.launch(Dispatchers.Default) {
             keyboardProvider.updateHostProfiles(keymapDatabase.profiles)
             _channelDescriptors.value = providerRegistry.descriptors()
@@ -399,8 +516,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             publishInputMode = ::publishInputMode,
             isActivePttSession = { pttDispatcher.activePttSession != null },
             decidePttDispatch = { decidePttDispatch(runtimeRegistry.runtimeSnapshots.value) },
-            reservePendingCarPtt = { channelId ->
-                pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId)
+            reserveCaptureAdmission = { pttDispatcher.reserveCaptureAdmission() },
+            abandonCaptureAdmission = { lease -> pttDispatcher.abandonCaptureAdmission(lease) },
+            reservePendingCarPtt = { channelId, lease ->
+                pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId, lease)
             },
             cancelPendingCarPtt = { _ -> pttDispatcher.forceReleaseActivePtt() },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
@@ -410,6 +529,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             serviceScope = serviceScope,
             inputModeController = inputModeController,
             audioSessionManager = audioSessionManager,
+            audioCoordinator = hostAudioCoordinator,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
             cancelIdleTimer = ::cancelIdleTimer,
@@ -432,15 +552,52 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         CarPttCommandBus.setListener(this)
         TelecomCarPttCoordinator.setListener(this)
         serviceScope.launch {
-            runtimeRegistry.runtimeSnapshots.collect { aggregate ->
-                _appState.update {
-                    it.copy(channels = aggregate.entries, activeChannelId = aggregate.activeChannelId)
+            combine(runtimeRegistry.runtimeSnapshots, agentRuntimeGraph.coordinator.status) { aggregate, agentStatuses ->
+                aggregate to agentStatuses
+            }.collect { (aggregate, agentStatuses) ->
+                val projected = aggregate.entries.map { snapshot ->
+                    val status = agentStatuses[snapshot.id] ?: return@map snapshot
+                    snapshot.copy(
+                        pendingCount = status.pendingResponseCount,
+                        playbackPaused = status.playbackPaused,
+                        executionStatus = when (status.state) {
+                            dev.nilp0inter.subspace.model.AgentRunState.QUEUED -> ChannelExecutionStatus.IDLE
+                            dev.nilp0inter.subspace.model.AgentRunState.RUNNING,
+                            dev.nilp0inter.subspace.model.AgentRunState.WAITING_FOR_TOOL,
+                            dev.nilp0inter.subspace.model.AgentRunState.SYNTHESIZING,
+                            dev.nilp0inter.subspace.model.AgentRunState.PENDING_PLAYBACK -> ChannelExecutionStatus.PROCESSING
+                            dev.nilp0inter.subspace.model.AgentRunState.FAILED,
+                            dev.nilp0inter.subspace.model.AgentRunState.INDETERMINATE -> ChannelExecutionStatus.FAILED
+                            else -> ChannelExecutionStatus.SUCCESS
+                        },
+                    )
                 }
+                _appState.update { it.copy(channels = projected, activeChannelId = aggregate.activeChannelId) }
                 updateCarMediaState()
+                if (agentStatuses.values.any { it.pendingResponseCount > 0 }) {
+                    agentRuntimeGraph.playback.onAudioAvailable()
+                    agentRuntimeGraph.deferredAudioPlayback.onAudioAvailable()
+                }
             }
         }
         serviceScope.launch {
-            channelRepository.catalogueState.collect(runtimeRegistry::reconcile)
+            var previous = emptyMap<String, dev.nilp0inter.subspace.model.ChannelDefinition>()
+            channelRepository.catalogueState.collect { snapshot ->
+                val current = snapshot.definitions.associateBy { it.id }
+                previous.values
+                    .filter { it.implementationId == dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds.OPENAI_AGENT }
+                    .forEach { old ->
+                        val replacement = current[old.id]
+                        if (replacement == null || replacement != old) {
+                            agentRuntimeGraph.coordinator.replace(
+                                CapabilityScopeIdentity(old.id, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)),
+                                removed = replacement == null,
+                            )
+                        }
+                    }
+                previous = current
+                runtimeRegistry.reconcile(snapshot)
+            }
         }
         // Initialize the process-scoped model asset repository and bootstrap
         // coordinator. The coordinator owns the authoritative bootstrap state
@@ -496,6 +653,9 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         AudioOperationCapabilityAdapter(
             PlaybackResultFactory { samples ->
                 AudioOperationArtifact(dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, SCO_RATE))
+            },
+            RecordingPlaybackResultFactory { recording ->
+                AudioOperationArtifact(recording)
             },
         )
 
@@ -568,9 +728,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override fun constructTtsController(synthesizer: TtsSynthesizer) {
         ttsController = TtsController(
             scope = serviceScope,
-            sco = sco,
-            output = pcmOutput,
             synthesizer = synthesizer,
+            play = { recording ->
+                hostAudioCoordinator.play(recording) {
+                    playbackRouteResolver.strategyFor(InputMode.Work)
+                } is HostPlaybackResult.Completed
+            },
         )
         ttsModelStatusJob = serviceScope.launch {
             var lastStatus: dev.nilp0inter.subspace.model.TtsModelStatus? = null
@@ -715,7 +878,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             withContext(Dispatchers.Default) {
                 withTimeoutOrNull(45_000L) {
                     audioSessionManager.shutdownAndAwait()
+                    // Destruction is resumable: it cancels volatile workers but leaves the durable
+                    // ledger intact. Replacement/removal remains generation-retirement work.
+                    agentRuntimeGraph.coordinator.shutdown()
+                    hostAudioCoordinator.close()
+                    agentRuntimeGraph.playback.close()
+                    agentRuntimeGraph.deferredAudioPlayback.close()
                     runtimeRegistry.shutdownAndAwait()
+                    openAiProfileOperations.close()
                     textOutputService.close()
                     runtimeInvocationBoundary.close()
                 }
@@ -931,6 +1101,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val previousId = channelRepository.catalogueState.value.activeChannelId
         val result = channelRepository.selectChannel(id)
         val selected = result is dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult.Success
+        if (selected) {
+            agentRuntimeGraph.playback.onChannelSelected(id)
+            agentRuntimeGraph.deferredAudioPlayback.onChannelSelected(id)
+        }
         SubspaceLogger.d(ROUTE_LOG_TAG,
         "CHANNEL_SELECT requested=$id previous=$previousId selected=$selected " +
             "active=${channelRepository.catalogueState.value.activeChannelId}",)
@@ -945,7 +1119,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val orderedIds = orderedChannelIds(_appState.value)
         val newId = selectChannelByOffset(orderedIds, _appState.value.activeChannelId, offset)
             ?: return
-        if (newId == _appState.value.activeChannelId) return
         selectChannel(newId)
     }
 
@@ -988,7 +1161,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun setInputMode(mode: InputMode, by: InputModeSelection): Boolean {
         val changed = inputModeController.setInputMode(mode, by)
-        if (changed) publishInputMode()
+        if (changed) {
+            publishInputMode()
+            if (::agentRuntimeGraph.isInitialized) {
+                agentRuntimeGraph.playback.onAudioAvailable()
+                agentRuntimeGraph.deferredAudioPlayback.onAudioAvailable()
+            }
+        }
         return changed
     }
 
@@ -997,6 +1176,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val aaConnected = AndroidAutoPresenceBus.isConnected()
         inputModeController.updateInputs(readyForMonitor, aaConnected)
         publishInputMode()
+        if (::agentRuntimeGraph.isInitialized) {
+            agentRuntimeGraph.playback.onAudioAvailable()
+            agentRuntimeGraph.deferredAudioPlayback.onAudioAvailable()
+        }
     }
 
     private fun publishInputMode() {
@@ -1012,7 +1195,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun onAudioSessionTerminalCompleted(
         completion: PttAudioSessionManager.TerminalCompletion,
     ) {
+        pttDispatcher.onTerminalCompleted(completion)
         if (completion.mode == InputMode.OnTheRoad) startIdleTimer()
+        agentRuntimeGraph.playback.onAudioAvailable()
+        agentRuntimeGraph.deferredAudioPlayback.onAudioAvailable()
         updateCarMediaState()
     }
 
@@ -1116,16 +1302,33 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private fun voiceStyleFile(style: String, modelDir: java.io.File): java.io.File =
         java.io.File(modelDir, "$style.json")
 
+    private fun enqueueRsmAnnouncement(key: String) {
+        val activeAnnouncer = announcer ?: return
+        val recording = activeAnnouncer.recordingFor(key)
+            ?: dev.nilp0inter.subspace.audio.HostAudioFeedback.readyBeep()
+        serviceScope.launch {
+            hostAudioCoordinator.play(recording) {
+                playbackRouteResolver.strategyFor(InputMode.Work)
+            }
+        }
+    }
+
+    private fun enqueueRsmErrorBeep() {
+        serviceScope.launch {
+            hostAudioCoordinator.play(dev.nilp0inter.subspace.audio.HostAudioFeedback.errorBeep()) {
+                playbackRouteResolver.strategyFor(InputMode.Work)
+            }
+        }
+    }
+
     private fun cycleActiveChannel(offset: Int) {
         val previousId = _appState.value.activeChannelId
         setActiveChannelOffset(offset)
         val newId = _appState.value.activeChannelId
-        serviceScope.launch {
-            if (newId == previousId) {
-                announcer?.playErrorBeep(sco, pcmOutput)
-            } else {
-                announcer?.announce("chan.$newId.name", sco, pcmOutput)
-            }
+        if (newId == previousId) {
+            enqueueRsmErrorBeep()
+        } else {
+            enqueueRsmAnnouncement("chan.$newId.name")
         }
     }
 
@@ -1158,9 +1361,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         when (event) {
             RawButtonEvent.GroupPressed -> {
                 if (previousMode != HardwareMode.Control && snapshot.hardwareMode == HardwareMode.Control) {
-                    serviceScope.launch {
-                        announcer?.announce("sys.menu.channels", sco, pcmOutput)
-                    }
+                    enqueueRsmAnnouncement("sys.menu.channels")
                 }
             }
             RawButtonEvent.VolumeUpClicked,
@@ -1172,16 +1373,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             }
             RawButtonEvent.PttPressed -> {
                 if (previousMode == HardwareMode.Control) {
-                    serviceScope.launch {
-                        announcer?.announce("chan.${_appState.value.activeChannelId}.selected", sco, pcmOutput)
-                    }
+                    selectChannel(_appState.value.activeChannelId)
+                    enqueueRsmAnnouncement("chan.${_appState.value.activeChannelId}.selected")
                 } else {
                     pttDispatcher.dispatchPttPressed(PttSource.Rsm)
                 }
             }
             RawButtonEvent.PttReleased -> pttDispatcher.dispatchPttReleased(PttSource.Rsm)
             RawButtonEvent.SosPressed -> serviceScope.launch {
-                runtimeRegistry.dispatchSos(_appState.value.activeChannelId)
+                if (hostAudioCoordinator.consumeSosDuringPlayback() is HostSosDisposition.DispatchToChannel) {
+                    runtimeRegistry.dispatchSos(_appState.value.activeChannelId)
+                }
             }
             else -> Unit
         }
