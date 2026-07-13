@@ -174,6 +174,31 @@ class BuiltInRuntimesTest {
     }
 
     @Test
+    fun debugDelayedEchoPreservesRawAudioOperationAndForwardsEligibilityDelay() = runTest {
+        val operation = AudioOperationArtifact(
+            recording = RecordedPcm(shortArrayOf(27, -27), 16_000),
+            operationId = "delayed-echo-operation",
+        )
+        val deferred = RecordingDeferredAudioPlayback()
+        val host = RuntimeCapabilityHost(
+            transcript = "unused",
+            audioOperation = RecordingAudioOperation(operation),
+            deferredAudioPlayback = deferred,
+        )
+        val runtime = debugRuntime(DebugMode.DELAYED_ECHO, host)
+        val target = (runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+        val result = target.onInputReleased(RecordedPcm(shortArrayOf(1, 2), 16_000))
+
+        assertEquals(ChannelInputResult.None, result)
+        assertEquals(1, deferred.requests.size)
+        val scheduled = deferred.requests.single()
+        assertSame(operation, scheduled.audio)
+        assertEquals(5_000L, scheduled.eligibilityDelayMillis)
+        assertEquals("debug-DELAYED_ECHO", scheduled.context.scope.channelInstanceId)
+    }
+
+    @Test
     fun debugTtsUsesSupertonicLanguageAndSchedulesDeferredPlayback() = runTest {
         assertDebugModeSchedulesDeferredPlayback(DebugMode.TTS)
     }
@@ -382,15 +407,20 @@ class BuiltInRuntimesTest {
     }
 
     private class RecordingDeferredAudioPlayback : DeferredAudioPlaybackCapability {
-        data class ScheduledRequest(val context: AgentOperationContext, val audio: OpaqueAudioOperation)
+        data class ScheduledRequest(
+            val context: AgentOperationContext,
+            val audio: OpaqueAudioOperation,
+            val eligibilityDelayMillis: Long,
+        )
 
         val requests = mutableListOf<ScheduledRequest>()
 
         override suspend fun scheduleAudio(
             context: AgentOperationContext,
             audio: OpaqueAudioOperation,
+            eligibilityDelayMillis: Long,
         ): DelayedPlaybackOutcome {
-            requests += ScheduledRequest(context, audio)
+            requests += ScheduledRequest(context, audio, eligibilityDelayMillis)
             return DelayedPlaybackOutcome.Pending(DelayedPlaybackOperationId("deferred-${requests.size}"))
         }
     }

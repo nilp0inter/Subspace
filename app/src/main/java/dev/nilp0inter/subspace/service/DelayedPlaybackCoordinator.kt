@@ -14,6 +14,9 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -252,25 +255,57 @@ class DeferredAudioPlaybackCoordinator(
     private val operationIsCurrent: suspend (AgentOperationContext) -> Boolean,
     private val audio: DeferredAudioPlaybackAudioPort,
     private val onStateChanged: suspend () -> Unit = {},
+    private val nowMillis: () -> Long = { System.currentTimeMillis() },
 ) : DeferredAudioPlaybackCapability {
     private val mutex = Mutex()
     private val pending = mutableListOf<DeferredAudioEntry>()
+    private val wakeJobs = mutableMapOf<DelayedPlaybackOperationId, Job>()
     private var pumpJob: Job? = null
     @Volatile private var pumpRequested = false
     private var activeEntry: DeferredAudioEntry? = null
 
+    private val _pendingCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    /**
+     * Read-only per-channel deferred opaque-audio pending counts, keyed by stable channel ID.
+     * Zero entries are omitted. Updates are published atomically after queue add/remove/discard/
+     * close. Busy/interrupted/cancelled/failed entries remain counted; only completion, explicit
+     * skip, selection-discard, or close decrement/clear. Collecting this flow never schedules a
+     * pump, so projecting counts cannot wake the same queue.
+     */
+    val pendingCounts: StateFlow<Map<String, Int>> = _pendingCounts.asStateFlow()
+
+    private fun publishPendingCounts() {
+        val now = nowMillis()
+        _pendingCounts.value = synchronized(pending) {
+            pending.asSequence()
+                .filter { it.eligibleAtMillis <= now }
+                .groupingBy { it.channelInstanceId }
+                .eachCount()
+        }
+    }
+
     override suspend fun scheduleAudio(
         context: AgentOperationContext,
         audio: OpaqueAudioOperation,
+        eligibilityDelayMillis: Long,
     ): DelayedPlaybackOutcome {
         if (!operationIsCurrent(context)) return DelayedPlaybackOutcome.Stale
+        val now = nowMillis()
         val entry = DeferredAudioEntry(
             operationId = DelayedPlaybackOperationId(UUID.randomUUID().toString()),
             channelInstanceId = context.scope.channelInstanceId,
             audio = audio,
+            eligibleAtMillis = now + eligibilityDelayMillis,
         )
-        synchronized(pending) { pending.add(entry) }
-        requestPump()
+        synchronized(pending) {
+            pending.add(entry)
+        }
+        if (eligibilityDelayMillis > 0L) {
+            scheduleEligibilityWake(entry, eligibilityDelayMillis)
+        } else {
+            publishPendingCounts()
+            requestPump()
+        }
         return DelayedPlaybackOutcome.Pending(entry.operationId)
     }
 
@@ -285,8 +320,22 @@ class DeferredAudioPlaybackCoordinator(
     }
 
     fun close() {
-        synchronized(pending) { pending.clear() }
+        synchronized(pending) {
+            pending.clear()
+            wakeJobs.values.toList().also { wakeJobs.clear() }
+        }.forEach { it.cancel() }
         pumpJob?.cancel()
+        publishPendingCounts()
+    }
+
+    private fun scheduleEligibilityWake(entry: DeferredAudioEntry, delayMillis: Long) {
+        val job = scope.launch {
+            kotlinx.coroutines.delay(delayMillis)
+            synchronized(pending) { wakeJobs.remove(entry.operationId) }
+            publishPendingCounts()
+            requestPump()
+        }
+        synchronized(pending) { wakeJobs[entry.operationId] = job }
     }
 
     private fun requestPump() {
@@ -310,16 +359,24 @@ class DeferredAudioPlaybackCoordinator(
         }
     }
 
+    /**
+     * Returns the FIFO head of the selected channel's pending entries iff it is eligible
+     * (its host-side delay has elapsed). A not-yet-eligible head returns null so later
+     * same-channel entries cannot overtake it; determinism is preserved by strict FIFO.
+     */
     private suspend fun nextSelectedPendingEntry(): DeferredAudioEntry? {
         val selected = selectedChannel() ?: return null
+        val now = nowMillis()
         return synchronized(pending) {
-            pending.firstOrNull { it.channelInstanceId == selected }
+            val head = pending.firstOrNull { it.channelInstanceId == selected } ?: return@synchronized null
+            if (now >= head.eligibleAtMillis) head else null
         }
     }
 
     private suspend fun deliver(entry: DeferredAudioEntry): Boolean {
         if (selectedChannel() != entry.channelInstanceId) {
             synchronized(pending) { pending.remove(entry) }
+            publishPendingCounts()
             return false
         }
         val result = try {
@@ -334,6 +391,7 @@ class DeferredAudioPlaybackCoordinator(
             DelayedPlaybackAudioResult.ExplicitlySkipped,
             -> {
                 synchronized(pending) { pending.remove(entry) }
+                publishPendingCounts()
                 true
             }
             DelayedPlaybackAudioResult.Busy,
@@ -349,6 +407,7 @@ private data class DeferredAudioEntry(
     val operationId: DelayedPlaybackOperationId,
     val channelInstanceId: String,
     val audio: OpaqueAudioOperation,
+    val eligibleAtMillis: Long = 0L,
 )
 
 /**

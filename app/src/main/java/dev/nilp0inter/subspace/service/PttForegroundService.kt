@@ -552,25 +552,36 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         CarPttCommandBus.setListener(this)
         TelecomCarPttCoordinator.setListener(this)
         serviceScope.launch {
-            combine(runtimeRegistry.runtimeSnapshots, agentRuntimeGraph.coordinator.status) { aggregate, agentStatuses ->
-                aggregate to agentStatuses
-            }.collect { (aggregate, agentStatuses) ->
+            combine(
+                runtimeRegistry.runtimeSnapshots,
+                agentRuntimeGraph.coordinator.status,
+                agentRuntimeGraph.deferredAudioPlayback.pendingCounts,
+            ) { aggregate, agentStatuses, deferredPending ->
+                Triple(aggregate, agentStatuses, deferredPending)
+            }.collect { (aggregate, agentStatuses, deferredPending) ->
                 val projected = aggregate.entries.map { snapshot ->
-                    val status = agentStatuses[snapshot.id] ?: return@map snapshot
-                    snapshot.copy(
-                        pendingCount = status.pendingResponseCount,
-                        playbackPaused = status.playbackPaused,
-                        executionStatus = when (status.state) {
-                            dev.nilp0inter.subspace.model.AgentRunState.QUEUED -> ChannelExecutionStatus.IDLE
-                            dev.nilp0inter.subspace.model.AgentRunState.RUNNING,
-                            dev.nilp0inter.subspace.model.AgentRunState.WAITING_FOR_TOOL,
-                            dev.nilp0inter.subspace.model.AgentRunState.SYNTHESIZING,
-                            dev.nilp0inter.subspace.model.AgentRunState.PENDING_PLAYBACK -> ChannelExecutionStatus.PROCESSING
-                            dev.nilp0inter.subspace.model.AgentRunState.FAILED,
-                            dev.nilp0inter.subspace.model.AgentRunState.INDETERMINATE -> ChannelExecutionStatus.FAILED
-                            else -> ChannelExecutionStatus.SUCCESS
-                        },
-                    )
+                    val deferred = deferredPending[snapshot.id] ?: 0
+                    val status = agentStatuses[snapshot.id]
+                    if (status == null) {
+                        // Non-agent channel (e.g. Debug): no agent status to project, but the
+                        // deferred opaque-audio pending count still applies additively.
+                        snapshot.copy(pendingCount = deferred)
+                    } else {
+                        snapshot.copy(
+                            pendingCount = status.pendingResponseCount + deferred,
+                            playbackPaused = status.playbackPaused,
+                            executionStatus = when (status.state) {
+                                dev.nilp0inter.subspace.model.AgentRunState.QUEUED -> ChannelExecutionStatus.IDLE
+                                dev.nilp0inter.subspace.model.AgentRunState.RUNNING,
+                                dev.nilp0inter.subspace.model.AgentRunState.WAITING_FOR_TOOL,
+                                dev.nilp0inter.subspace.model.AgentRunState.SYNTHESIZING,
+                                dev.nilp0inter.subspace.model.AgentRunState.PENDING_PLAYBACK -> ChannelExecutionStatus.PROCESSING
+                                dev.nilp0inter.subspace.model.AgentRunState.FAILED,
+                                dev.nilp0inter.subspace.model.AgentRunState.INDETERMINATE -> ChannelExecutionStatus.FAILED
+                                else -> ChannelExecutionStatus.SUCCESS
+                            },
+                        )
+                    }
                 }
                 _appState.update { it.copy(channels = projected, activeChannelId = aggregate.activeChannelId) }
                 updateCarMediaState()

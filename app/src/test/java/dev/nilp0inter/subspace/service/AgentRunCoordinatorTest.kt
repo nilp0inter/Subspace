@@ -150,6 +150,37 @@ class AgentRunCoordinatorTest {
     }
 
     @Test
+    fun modelToolLoopStopsAtConfiguredTurnBoundInsteadOfDispatchingUnboundedCalls() = runTest {
+        withTemporaryDirectory { directory ->
+            var completionCalls = 0
+            val completion = object : OpenAiCompletionCapability {
+                override suspend fun complete(context: AgentOperationContext, request: OpenAiChatRequest): OpenAiChatOutcome {
+                    completionCalls += 1
+                    return OpenAiChatOutcome.ToolCalls(
+                        listOf(
+                            dev.nilp0inter.subspace.model.OpenAiToolCall(
+                                dev.nilp0inter.subspace.model.AgentToolCallId("call-$completionCalls"),
+                                dev.nilp0inter.subspace.model.OpenAiToolName("local_tool"),
+                                emptyMap(),
+                            ),
+                        ),
+                    )
+                }
+            }
+            val store = DurableAgentRunStore(File(directory, "runs.json"))
+            val limits = AgentRunLimits(maximumUserTextBytes = 100, maximumRequestBytes = 1_000, maximumAssistantTextBytes = 100, maximumModelTurns = 1, maximumToolCalls = 4, operationTimeoutMillis = 100, maximumRunElapsedMillis = 100)
+            val coordinator = coordinator(this, store, completion, limits = limits)
+
+            assertTrue(coordinator.enqueue(scope("bounded-loop"), request("request")) is CapabilityOperationResult.Success)
+            runCurrent()
+
+            assertEquals(1, completionCalls)
+            assertEquals(AgentRunState.FAILED, coordinator.status.value.getValue("bounded-loop").state)
+            coordinator.shutdown()
+        }
+    }
+
+    @Test
     fun admissionRejectsOversizeTextBeforeItCanEnterDurableOrRemoteWork() = runTest {
         withTemporaryDirectory { directory ->
             var completionCalled = false

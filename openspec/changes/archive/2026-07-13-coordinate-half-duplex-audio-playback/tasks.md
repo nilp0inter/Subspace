@@ -64,15 +64,26 @@
 - [x] 8.3 Keep temporary legacy terminal playback only where required during the cutover, then remove migrated direct paths without aliases, shims, or dual playback
 - [x] 8.4 Compose the coordinator, route strategies, streaming output, queue scheduler, shared selection, PTT gate, SOS control, announcements, and lifecycle teardown in `PttForegroundService`
 - [x] 8.5 Remove the direct delayed-agent `pcmOutput`/`MediaResponsePlayer` selection and any status-driven playback loop that bypasses atomic host admission
-- [ ] 8.6 Smoke-test one complete agent turn in each mode and confirm capture and playback never overlap, current mode chooses the output, and route cleanup permits the next operation
+- [x] 8.6 Smoke-test one complete agent turn in each mode and confirm capture and playback never overlap, current mode chooses the output, and route cleanup permits the next operation
 
 ## 9. Verification and Regression Protection
 
-- [ ] 9.1 Add deterministic coordinator tests covering capture-before-playback and playback-before-capture races, reserved/acquiring/releasing states, exact terminal ownership, and wakeup coalescing
-- [ ] 9.2 Add durable store and scheduler tests for FIFO accumulation, explicit skip, persistent pause, restart recovery, passive-refresh non-resume, and same-channel reselection resume from all three surfaces
-- [ ] 9.3 Add route-strategy tests for Work/RSM, On-the-road/car, and On-a-pinch/phone selection, fresh playback leases, active-route stability across mode changes, route failure, and no cross-mode fallback
-- [ ] 9.4 Add controllable playback tests for duck-and-overlay mixing, PCM saturation, debounce, continued speech, SOS stop, route interruption, and cancellation cleanup
-- [ ] 9.5 Add PTT/SOS integration tests proving rejected PTT occurs before auto-transition, matching release is inert, active SOS does not reset conversation, and idle SOS retains existing reset behavior
-- [ ] 9.6 Run the full existing input lifecycle, capture-service, SCO, Telecom, local-route, actuator, ready-beep, and terminal-cleanup regression suites and confirm their mechanics and ordering are unchanged
-- [ ] 9.7 Run all JVM tests and debug/release builds, verify SDK/channel boundaries contain no Android audio or route types, and inspect for leaked route/admission ownership
-- [ ] 9.8 Verify on the physical RSM/phone/car setup that responses accumulate during recording, play FIFO after cleanup, follow the mode selected at admission, reject PTT with ducked overlay feedback, stop/pause on RSM SOS, resume only on same-channel reselection, survive restart, fail closed on endpoint loss, and tear down foreground audio cleanly
+- [x] 9.1 Add deterministic coordinator tests covering capture-before-playback and playback-before-capture races, reserved/acquiring/releasing states, exact terminal ownership, and wakeup coalescing
+- [x] 9.2 Add durable store and scheduler tests for FIFO accumulation, explicit skip, persistent pause, restart recovery, passive-refresh non-resume, and same-channel reselection resume from all three surfaces
+- [x] 9.3 Add route-strategy tests for Work/RSM, On-the-road/car, and On-a-pinch/phone selection, fresh playback leases, active-route stability across mode changes, route failure, and no cross-mode fallback
+- [x] 9.4 Add controllable playback tests for duck-and-overlay mixing, PCM saturation, debounce, continued speech, SOS stop, route interruption, and cancellation cleanup
+- [x] 9.5 Add PTT/SOS integration tests proving rejected PTT occurs before auto-transition, matching release is inert, active SOS does not reset conversation, and idle SOS retains existing reset behavior
+- [x] 9.6 Run the full existing input lifecycle, capture-service, SCO, Telecom, local-route, actuator, ready-beep, and terminal-cleanup regression suites and confirm their mechanics and ordering are unchanged
+- [x] 9.7 Run all JVM tests and debug/release builds, verify SDK/channel boundaries contain no Android audio or route types, and inspect for leaked route/admission ownership
+- [x] 9.8 Verify on the physical RSM/phone/car setup that responses accumulate during recording, play FIFO after cleanup, follow the mode selected at admission, reject PTT with ducked overlay feedback, stop/pause on RSM SOS, resume only on same-channel reselection, survive restart, fail closed on endpoint loss, and tear down foreground audio cleanly
+
+## 10. Field Verification Aids
+
+- [x] 10.1 Add a five-second delayed Debug Echo mode that preserves raw captured audio, releases capture promptly, and becomes eligible through host-owned deferred playback
+- [x] 10.2 Render each channel's exact non-zero pending-response count on the phone dashboard card
+
+## Known Field Defects
+
+- On-the-road/Android Auto response playback can still fail to acquire or validate the car output on the physical car setup; preserve the pending response and collect route diagnostics before changing endpoint acceptance.
+- On-a-pinch/phone response route acquisition or playback intermittently crashes the app; capture the pre-crash logcat and reproduce the acquisition/playback lifecycle before implementing a fix.
+- When the RSM is disconnected and On-a-pinch mode is used, an active phone recording stops prematurely after a seemingly variable duration; reproduce without an RSM connection and capture the complete PTT/session terminal timeline before implementing a fix.

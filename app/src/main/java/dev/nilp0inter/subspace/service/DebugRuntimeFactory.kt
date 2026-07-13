@@ -61,7 +61,7 @@ class DebugBuiltInProvider : ChannelImplementationProvider {
         configuration: DebugProviderConfiguration,
         capabilities: ChannelCapabilityScope,
     ): ChannelPreparationAvailability = when (configuration.mode) {
-        DebugMode.ECHO -> requireAvailable(
+        DebugMode.ECHO, DebugMode.DELAYED_ECHO -> requireAvailable(
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
             capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
@@ -143,7 +143,7 @@ class DebugRuntime(
     }
 
     private suspend fun currentPreparation(): ChannelPreparationAvailability = when (configuration.mode) {
-        DebugMode.ECHO -> firstUnavailable(
+        DebugMode.ECHO, DebugMode.DELAYED_ECHO -> firstUnavailable(
             capabilities.preparationFor(CapabilityKey.AudioOperation, recoverable = false),
             capabilities.preparationFor(CapabilityKey.DeferredAudioPlayback, recoverable = false),
         )
@@ -179,6 +179,10 @@ class DebugRuntime(
             _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
             return when (configuration.mode) {
                 DebugMode.ECHO -> scheduleDeferredPlayback(recording.toPlaybackOperation())
+                DebugMode.DELAYED_ECHO -> scheduleDeferredPlayback(
+                    recording.toPlaybackOperation(),
+                    eligibilityDelayMillis = DELAYED_ECHO_ELIGIBILITY_DELAY_MILLIS,
+                )
                 DebugMode.STT -> completeWithoutPlayback(processStt(recording))
                 DebugMode.TTS -> scheduleDeferredPlayback(synthesizeAndQueue(DEFAULT_DEBUG_TEXT))
                 DebugMode.STT_TTS -> when (val transcription = processTranscription(recording)) {
@@ -249,10 +253,17 @@ class DebugRuntime(
 
     private suspend fun scheduleDeferredPlayback(
         operation: CapabilityOperationResult<OpaqueAudioOperation>,
+        eligibilityDelayMillis: Long = 0L,
     ): ChannelInputResult = when (operation) {
         is CapabilityOperationResult.Success -> {
             when (val scheduled = capabilities.useCapability(CapabilityKey.DeferredAudioPlayback) {
-                CapabilityOperationResult.Success(it.scheduleAudio(agentOperationContext(), operation.value))
+                CapabilityOperationResult.Success(
+                    it.scheduleAudio(
+                        agentOperationContext(),
+                        operation.value,
+                        eligibilityDelayMillis,
+                    ),
+                )
             }) {
                 is CapabilityOperationResult.Success -> publishPlaybackScheduled(scheduled.value)
                 else -> publishCompletion(scheduled)
@@ -310,6 +321,8 @@ class DebugRuntime(
         const val DEFAULT_DEBUG_TEXT = "Debug synthesis test"
         const val DEFAULT_LANGUAGE_TAG = "en"
         const val DEFAULT_VOICE_ID = "default"
+        /** Host-side eligibility delay before a DELAYED_ECHO capture may be admitted. */
+        const val DELAYED_ECHO_ELIGIBILITY_DELAY_MILLIS = 5_000L
     }
 }
 

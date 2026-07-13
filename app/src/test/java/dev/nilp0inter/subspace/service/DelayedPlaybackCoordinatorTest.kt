@@ -190,7 +190,7 @@ class DelayedPlaybackCoordinatorTest {
             ),
         )
 
-        cases.forEachIndexed { index, failure ->
+        for ((index, failure) in cases.withIndex()) {
             withTemporaryDirectory { directory ->
                 val store = DurableAgentRunStore(File(directory, "ledger.json"))
                 val response = pendingResponse(store, "failure-$index", channel = "alpha", text = failure.name, createdAtMillis = 10)

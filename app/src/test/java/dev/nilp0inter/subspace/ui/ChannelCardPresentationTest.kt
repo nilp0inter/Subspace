@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class ChannelCardPresentationTest {
@@ -74,6 +75,21 @@ class ChannelCardPresentationTest {
             assertEquals("${case.name} label", case.expectedLabel, presentation.statusLabel)
             assertEquals("${case.name} tone", case.expectedTone, presentation.tone)
         }
+    }
+
+    @Test
+    fun `pending response label omits zero renders singular for one and plural for many`() {
+        assertNull("zero pending must not render a pill", pendingResponseLabel(0))
+        assertEquals("1 pending response", pendingResponseLabel(1))
+        assertEquals("2 pending responses", pendingResponseLabel(2))
+        assertEquals("3 pending responses", pendingResponseLabel(3))
+        assertEquals("42 pending responses", pendingResponseLabel(42))
+    }
+
+    @Test
+    fun `pending response label treats negative counts as zero`() {
+        assertNull(pendingResponseLabel(-1))
+        assertNull(pendingResponseLabel(-100))
     }
 
     private data class Case(

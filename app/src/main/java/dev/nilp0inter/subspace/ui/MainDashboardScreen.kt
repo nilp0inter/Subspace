@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +43,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -494,6 +496,12 @@ internal fun channelCardPresentation(
     tone = if (isActive && !isPttActive) ChannelCardTone.Primary else ChannelCardTone.Secondary,
 )
 
+internal fun pendingResponseLabel(count: Int): String? = when {
+    count <= 0 -> null
+    count == 1 -> "1 pending response"
+    else -> "$count pending responses"
+}
+
 @Composable
 private fun ChannelCard(
     channel: ChannelRuntimeSnapshot,
@@ -576,6 +584,16 @@ private fun ChannelCard(
                 LockedPhonePttStop(channelId, phonePttGesture, onPhonePttTransition)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                pendingResponseLabel(channel.pendingCount)?.let { label ->
+                    StatusPill(
+                        label = label,
+                        accent = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.clickable(
+                            role = Role.Button,
+                            onClick = { actions.setActiveChannel(channel.id) },
+                        ),
+                    )
+                }
                 StatusPill(
                     label = presentation.statusLabel,
                     accent = accent,
@@ -635,9 +653,13 @@ private fun LockedPhonePttStop(
 
 
 @Composable
-private fun StatusPill(label: String, accent: Color) {
+private fun StatusPill(
+    label: String,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .clip(RoundedCornerShape(999.dp))
             .padding(horizontal = 10.dp, vertical = 6.dp),
         contentAlignment = Alignment.Center,

@@ -12,6 +12,18 @@ android {
     compileSdk = 35
     buildToolsVersion = "35.0.0"
     ndkVersion = "29.0.14206865"
+    val releaseKeystorePath = System.getenv("ANDROID_RELEASE_KEYSTORE_PATH")
+    val releaseKeystorePassword = System.getenv("ANDROID_RELEASE_KEYSTORE_PASSWORD")
+    val releaseKeyPassword = System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+    val releaseSigningValues = listOf(
+        releaseKeystorePath,
+        releaseKeystorePassword,
+        releaseKeyPassword,
+    )
+    val releaseSigningConfigured = releaseSigningValues.all { !it.isNullOrBlank() }
+    require(releaseSigningValues.none { !it.isNullOrBlank() } || releaseSigningConfigured) {
+        "Release signing requires keystore path, keystore password, and key password together"
+    }
 
     defaultConfig {
         applicationId = "dev.nilp0inter.subspace"
@@ -42,11 +54,13 @@ android {
             keyAlias = "androiddebugkey"
             keyPassword = "android"
         }
-        create("release") {
-            storeFile = System.getenv("ANDROID_RELEASE_KEYSTORE_PATH")?.let(::file)
-            storePassword = System.getenv("ANDROID_RELEASE_KEYSTORE_PASSWORD") ?: ""
-            keyAlias = "subspace-release"
-            keyPassword = System.getenv("ANDROID_RELEASE_KEY_PASSWORD") ?: ""
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(requireNotNull(releaseKeystorePath))
+                storePassword = requireNotNull(releaseKeystorePassword)
+                keyAlias = "subspace-release"
+                keyPassword = requireNotNull(releaseKeyPassword)
+            }
         }
     }
 
@@ -61,7 +75,9 @@ android {
             )
             isMinifyEnabled = false
             isShrinkResources = false
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

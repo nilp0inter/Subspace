@@ -152,9 +152,18 @@ interface DelayedPlaybackCapability : ChannelCapabilityPort {
  * half-duplex admission and current-mode routing as text-based delayed playback.
  */
 interface DeferredAudioPlaybackCapability : ChannelCapabilityPort {
+    /**
+     * Schedules [audio] for host-owned, selection-aware playback.
+     *
+     * [eligibilityDelayMillis] is a host-side delay before the entry becomes eligible for
+     * admission. A value of zero (the default) preserves immediate-eligibility behavior.
+     * The call returns promptly after scheduling; the delay is enforced by the coordinator's
+     * pump, never by blocking the caller.
+     */
     suspend fun scheduleAudio(
         context: AgentOperationContext,
         audio: OpaqueAudioOperation,
+        eligibilityDelayMillis: Long = 0L,
     ): DelayedPlaybackOutcome
 }
 
