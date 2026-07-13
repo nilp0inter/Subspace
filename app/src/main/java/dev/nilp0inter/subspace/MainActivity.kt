@@ -29,6 +29,7 @@ import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.BootstrapLoadingScreen
+import dev.nilp0inter.subspace.ui.CarHfpConfigurationScreen
 import dev.nilp0inter.subspace.ui.BootstrapRootSurface
 import dev.nilp0inter.subspace.ui.ChannelConfigurationScreen
 import dev.nilp0inter.subspace.ui.ConnectionScreen
@@ -164,6 +165,14 @@ class MainActivity : ComponentActivity() {
                         currentServiceState?.pairTarget()
                     }
 
+                    override fun refreshCarHfpConfiguration() {
+                        currentServiceState?.refreshCarHfpConfiguration()
+                    }
+
+                    override fun selectCarHfpCandidate(selectionId: String) {
+                        currentServiceState?.selectCarHfpCandidate(selectionId)
+                    }
+
                     override fun connectSerial() {
                         ContextCompat.startForegroundService(
                             this@MainActivity,
@@ -191,6 +200,11 @@ class MainActivity : ComponentActivity() {
 
                     override fun navigateToRsmSetup() {
                         dashboardRoute = if (currentReadyForMonitor) DashboardRoute.Monitor else DashboardRoute.Connection
+                    }
+
+                    override fun navigateToCarSetup() {
+                        currentServiceState?.refreshCarHfpConfiguration()
+                        dashboardRoute = DashboardRoute.CarConfiguration
                     }
 
                     override fun navigateToChannelConfiguration(channelId: String) {
@@ -324,6 +338,10 @@ class MainActivity : ComponentActivity() {
 
                                 DashboardRoute.Connection -> ConnectionScreen(state.connection, actions)
                                 DashboardRoute.Monitor -> MonitorScreen(state.monitor, actions)
+                                DashboardRoute.CarConfiguration -> CarHfpConfigurationScreen(
+                                    state = state.carHfpConfiguration,
+                                    actions = actions,
+                                )
                                 DashboardRoute.ChannelConfiguration -> {
                                     val definition = catalogue?.definitions?.firstOrNull { it.id == configuredChannelId }
                                     val descriptor = definition?.let { target ->
@@ -444,7 +462,16 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
-    private enum class DashboardRoute { Main, Connection, Monitor, ChannelConfiguration, ChannelCreation, LogAnalysis, OpenAiProfiles }
+    private enum class DashboardRoute {
+        Main,
+        Connection,
+        Monitor,
+        CarConfiguration,
+        ChannelConfiguration,
+        ChannelCreation,
+        LogAnalysis,
+        OpenAiProfiles,
+    }
 }
 
 internal fun ChannelRepositoryMutationResult?.failureMessage(): String? = when (this) {

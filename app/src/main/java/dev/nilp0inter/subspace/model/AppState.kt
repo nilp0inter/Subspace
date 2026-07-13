@@ -10,6 +10,7 @@ data class AppState(
     val inputModeSelectedBy: InputModeSelection = InputModeSelection.User,
     // setupState removed: bootstrap state is now owned by BootstrapCoordinator
     val inputModeAvailability: InputModeAvailability = InputModeAvailability(),
+    val carHfpConfiguration: CarHfpConfigurationState = CarHfpConfigurationState(),
 ) {
     val readyForMonitor: Boolean
         get() = connection.readyForMonitor

@@ -218,7 +218,7 @@ private fun ModeSegment(
             .height(118.dp)
             .combinedClickable(
                 onClick = { onTileAction(dashboardModeTileTapAction(mode, isAvailable)) },
-                onLongClick = if (mode == InputMode.Work) {
+                onLongClick = if (mode != InputMode.OnAPinch) {
                     { onTileAction(dashboardModeTileLongPressAction(mode)) }
                 } else {
                     null
@@ -257,10 +257,25 @@ private fun handleModeTileAction(
     action: DashboardModeTileAction,
     mode: InputMode,
     actions: PttUiActions,
+) = dispatchDashboardModeTileAction(
+    action = action,
+    mode = mode,
+    onModeSelected = actions::setInputMode,
+    onRsmSetupRequested = actions::navigateToRsmSetup,
+    onCarSetupRequested = actions::navigateToCarSetup,
+)
+
+internal fun dispatchDashboardModeTileAction(
+    action: DashboardModeTileAction,
+    mode: InputMode,
+    onModeSelected: (InputMode) -> Unit,
+    onRsmSetupRequested: () -> Unit,
+    onCarSetupRequested: () -> Unit,
 ) {
     when (action) {
-        DashboardModeTileAction.SelectMode -> actions.setInputMode(mode)
-        DashboardModeTileAction.OpenRsmSetup -> actions.navigateToRsmSetup()
+        DashboardModeTileAction.SelectMode -> onModeSelected(mode)
+        DashboardModeTileAction.OpenRsmSetup -> onRsmSetupRequested()
+        DashboardModeTileAction.OpenCarSetup -> onCarSetupRequested()
         DashboardModeTileAction.Ignore -> Unit
     }
 }
@@ -686,6 +701,7 @@ fun dashboardVuMeterState(isCapturing: Boolean, level: Float): DashboardVuMeterS
 enum class DashboardModeTileAction {
     SelectMode,
     OpenRsmSetup,
+    OpenCarSetup,
     Ignore,
 }
 
@@ -695,5 +711,8 @@ fun dashboardModeTileTapAction(mode: InputMode, isAvailable: Boolean): Dashboard
     else -> DashboardModeTileAction.Ignore
 }
 
-fun dashboardModeTileLongPressAction(mode: InputMode): DashboardModeTileAction =
-    if (mode == InputMode.Work) DashboardModeTileAction.OpenRsmSetup else DashboardModeTileAction.Ignore
+fun dashboardModeTileLongPressAction(mode: InputMode): DashboardModeTileAction = when (mode) {
+    InputMode.Work -> DashboardModeTileAction.OpenRsmSetup
+    InputMode.OnTheRoad -> DashboardModeTileAction.OpenCarSetup
+    InputMode.OnAPinch -> DashboardModeTileAction.Ignore
+}

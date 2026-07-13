@@ -1,14 +1,29 @@
 package dev.nilp0inter.subspace.service
 
+import android.content.Context
+import android.media.AudioManager
+import android.os.SystemClock
+import android.telecom.TelecomManager
+import dev.nilp0inter.subspace.audio.ScoAudioController
+import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
+import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
+import io.mockk.verify
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -188,85 +203,255 @@ class CarTelecomStarterTest {
     }
 
     @Test
-    fun selectUnambiguousCarHfpDeviceExcludesExactTargetRsmAndReturnsSoleCar() {
-        val targetRsm = TestDevice(address = "rsm-address", name = "shared-name")
-        val connectedRsm = TestDevice(address = "rsm-address", name = "renamed-rsm")
-        val car = TestDevice(address = "car-address", name = "shared-name")
+    fun unconfiguredCarStopsBeforeCaptureRouteAndTelecomEffects() = runTest {
+        val downstreamEffects = mutableListOf<String>()
+        val hardwareInspections = mutableListOf<String>()
+        var captureReservations = 0
+        val sco = mockk<ScoAudioController>(relaxed = true)
+        val telecomRegistrar = mockk<SubspacePhoneAccountRegistrar>(relaxed = true)
+        val context = mockk<Context>(relaxed = true)
 
-        val selected = selectUnambiguousCarHfpDevice(
-            connectedDevices = listOf(connectedRsm, car),
-            targetRsm = targetRsm,
-            isConnected = { true },
-        )
+        mockkStatic(SystemClock::class)
+        every { SystemClock.elapsedRealtime() } returns 1_000L
+        try {
+            val starter = CarTelecomStarter(
+                context = context,
+                serviceScope = this,
+                sco = sco,
+                audioManager = mockk<AudioManager>(relaxed = true),
+                headsetProxyProvider = {
+                    hardwareInspections += "headset profile"
+                    error("unconfigured car must not inspect the headset profile")
+                },
+                targetRsm = {
+                    hardwareInspections += "target RSM"
+                    error("unconfigured car must not inspect the target RSM")
+                },
+                inputModeController = InputModeController(),
+                carConfigurationStore = FakeCarHfpConfigurationStore(null),
+                telecomRegistrar = telecomRegistrar,
+                resolvePttAudioRoute = {
+                    downstreamEffects += "error route resolution"
+                    error("unconfigured car must not resolve an error route")
+                },
+                publishInputMode = { downstreamEffects += "input mode publication" },
+                isActivePttSession = { false },
+                decidePttDispatch = {
+                    downstreamEffects += "PTT dispatch"
+                    PttDispatchDecision.Dispatch("car-ptt")
+                },
+                reserveCaptureAdmission = {
+                    captureReservations += 1
+                    downstreamEffects += "capture reservation"
+                    HostCaptureAdmission.Busy
+                },
+                abandonCaptureAdmission = {
+                    downstreamEffects += "capture abandonment"
+                    true
+                },
+                reservePendingCarPtt = { _, _ ->
+                    downstreamEffects += "pending car PTT reservation"
+                    true
+                },
+                cancelPendingCarPtt = { downstreamEffects += "pending car PTT cancellation" },
+                logAudioRouteSnapshot = {},
+                updateCarMediaState = { downstreamEffects += "car media update" },
+            )
 
-        assertSame(car, selected)
+            starter.startTelecomCarPtt()
+            advanceUntilIdle()
+
+            assertEquals("unconfigured car must not reserve capture", 0, captureReservations)
+            assertTrue(
+                "unconfigured car must not trigger downstream lifecycle callbacks: $downstreamEffects",
+                downstreamEffects.isEmpty(),
+            )
+            assertTrue(
+                "unconfigured car must not inspect Bluetooth hardware: $hardwareInspections",
+                hardwareInspections.isEmpty(),
+            )
+            coVerify(exactly = 0) { sco.releaseImmediately(any()) }
+            verify(exactly = 0) { telecomRegistrar.register() }
+            verify(exactly = 0) { context.getSystemService(TelecomManager::class.java) }
+        } finally {
+            unmockkStatic(SystemClock::class)
+        }
     }
 
     @Test
-    fun selectUnambiguousCarHfpDeviceReturnsNullWhenTargetRsmIdentityIsUnavailableAndTwoDevicesAreConnected() {
-        val firstDevice = TestDevice(address = "first-address", name = "shared-name")
-        val secondDevice = TestDevice(address = "second-address", name = "shared-name")
+    fun configuredResolverSelectsOnlyExactConfiguredEndpointAmongMultipleConnectedDevices() {
+        val configuredCar = TestDevice(CONFIGURED_CAR_ADDRESS)
+        val targetRsm = TestDevice(TARGET_RSM_ADDRESS)
+        val otherEndpoint = TestDevice(OTHER_ENDPOINT_ADDRESS)
 
-        val selected = selectUnambiguousCarHfpDevice(
-            connectedDevices = listOf(firstDevice, secondDevice),
-            targetRsm = null,
+        val resolution = resolveConfiguredCarHfpDevice(
+            configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+            inspection = CarHfpProfileInspection.Available(
+                listOf(otherEndpoint, targetRsm, configuredCar),
+            ),
+            targetRsmAddress = TARGET_RSM_ADDRESS,
+            addressOf = TestDevice::address,
             isConnected = { true },
         )
 
-        assertNull(selected)
+        assertSame(configuredCar, resolvedDevice(resolution))
     }
 
     @Test
-    fun selectUnambiguousCarHfpDeviceReturnsNullForMultipleNonRsmCandidates() {
-        val targetRsm = TestDevice("rsm")
-        val firstCar = TestDevice("first-car")
-        val secondCar = TestDevice("second-car")
+    fun configuredResolverNeverFallsBackWhenTheConfiguredEndpointCannotBeUsed() {
+        val configuredCar = TestDevice(CONFIGURED_CAR_ADDRESS)
+        val fallbackEndpoint = TestDevice(OTHER_ENDPOINT_ADDRESS)
+        val cases = listOf(
+            ResolutionCase(
+                name = "no configured car",
+                configuredCar = null,
+                inspection = CarHfpProfileInspection.Available(listOf(fallbackEndpoint)),
+                expected = ConfiguredCarResolution.Unconfigured,
+            ),
+            ResolutionCase(
+                name = "configured car absent from profile",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Available(listOf(fallbackEndpoint)),
+                expected = ConfiguredCarResolution.Absent,
+            ),
+            ResolutionCase(
+                name = "configured car disconnected",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Available(listOf(configuredCar, fallbackEndpoint)),
+                isConnected = { device -> device === fallbackEndpoint },
+                expected = ConfiguredCarResolution.Disconnected,
+            ),
+            ResolutionCase(
+                name = "configured car conflicts with target RSM",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Available(listOf(configuredCar, fallbackEndpoint)),
+                targetRsmAddress = CONFIGURED_CAR_ADDRESS,
+                expected = ConfiguredCarResolution.TargetRsmConflict,
+            ),
+            ResolutionCase(
+                name = "bluetooth permission inspection unavailable",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Unavailable(
+                    CarHfpInspectionFailure.PermissionUnavailable,
+                ),
+                expected = ConfiguredCarResolution.InspectionFailed(
+                    CarHfpInspectionFailure.PermissionUnavailable,
+                ),
+            ),
+            ResolutionCase(
+                name = "headset profile inspection unavailable",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Unavailable(
+                    CarHfpInspectionFailure.ProfileUnavailable,
+                ),
+                expected = ConfiguredCarResolution.InspectionFailed(
+                    CarHfpInspectionFailure.ProfileUnavailable,
+                ),
+            ),
+            ResolutionCase(
+                name = "profile query inspection unavailable",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Unavailable(CarHfpInspectionFailure.QueryFailed),
+                expected = ConfiguredCarResolution.InspectionFailed(CarHfpInspectionFailure.QueryFailed),
+            ),
+            ResolutionCase(
+                name = "configured identity invalid",
+                configuredCar = ConfiguredCar("not-a-device-identity", "Configured car"),
+                inspection = CarHfpProfileInspection.Available(listOf(fallbackEndpoint)),
+                expected = ConfiguredCarResolution.InspectionFailed(
+                    CarHfpInspectionFailure.InvalidConfiguredIdentity,
+                ),
+            ),
+            ResolutionCase(
+                name = "configured device connection inspection fails",
+                configuredCar = ConfiguredCar(CONFIGURED_CAR_ADDRESS, "Configured car"),
+                inspection = CarHfpProfileInspection.Available(listOf(configuredCar, fallbackEndpoint)),
+                isConnected = { throw SecurityException("connection state unavailable") },
+                expected = ConfiguredCarResolution.InspectionFailed(CarHfpInspectionFailure.QueryFailed),
+            ),
+        )
 
-        val selected = selectUnambiguousCarHfpDevice(
-            connectedDevices = listOf(targetRsm, firstCar, secondCar),
-            targetRsm = targetRsm,
+        cases.forEach { case ->
+            val resolution = resolveConfiguredCarHfpDevice(
+                configuredCar = case.configuredCar,
+                inspection = case.inspection,
+                targetRsmAddress = case.targetRsmAddress,
+                addressOf = TestDevice::address,
+                isConnected = case.isConnected,
+            )
+
+            assertEquals(case.name, case.expected, resolution)
+            assertFalse("${case.name} must not select another endpoint", resolution is ConfiguredCarResolution.Resolved)
+        }
+    }
+
+    @Test
+    fun resolvedEndpointSnapshotSurvivesStoreReplacementUntilTheNextResolution() {
+        val firstCar = TestDevice(CONFIGURED_CAR_ADDRESS)
+        val replacementCar = TestDevice(OTHER_ENDPOINT_ADDRESS)
+        val store = FakeCarHfpConfigurationStore(ConfiguredCar(CONFIGURED_CAR_ADDRESS, "First car"))
+        val inspection = CarHfpProfileInspection.Available(listOf(firstCar, replacementCar))
+
+        val firstResolution = resolveConfiguredCarHfpDevice(
+            configuredCar = store.configuredCar.value,
+            inspection = inspection,
+            targetRsmAddress = null,
+            addressOf = TestDevice::address,
+            isConnected = { true },
+        )
+        assertTrue(store.replace(OTHER_ENDPOINT_ADDRESS, "Replacement car"))
+        val laterResolution = resolveConfiguredCarHfpDevice(
+            configuredCar = store.configuredCar.value,
+            inspection = inspection,
+            targetRsmAddress = null,
+            addressOf = TestDevice::address,
             isConnected = { true },
         )
 
-        assertNull(selected)
+        assertSame(firstCar, resolvedDevice(firstResolution))
+        assertSame(replacementCar, resolvedDevice(laterResolution))
     }
 
-    @Test
-    fun selectUnambiguousCarHfpDeviceIgnoresDisconnectedNonRsmCandidates() {
-        val connectedCar = TestDevice(address = "connected-address", name = "shared-name")
-        val disconnectedCar = TestDevice(address = "disconnected-address", name = "shared-name")
-
-        val selected = selectUnambiguousCarHfpDevice(
-            connectedDevices = listOf(connectedCar, disconnectedCar),
-            targetRsm = null,
-            isConnected = { device -> device === connectedCar },
-        )
-
-        assertSame(connectedCar, selected)
-    }
-
-    @Test
-    fun selectUnambiguousCarHfpDeviceReturnsLoneConnectedCar() {
-        val car = TestDevice("car")
-
-        val selected = selectUnambiguousCarHfpDevice(
-            connectedDevices = listOf(car),
-            targetRsm = null,
-            isConnected = { true },
-        )
-
-        assertSame(car, selected)
+    private fun resolvedDevice(
+        resolution: ConfiguredCarResolution<TestDevice>,
+    ): TestDevice {
+        assertTrue("expected configured endpoint to resolve", resolution is ConfiguredCarResolution.Resolved)
+        return (resolution as ConfiguredCarResolution.Resolved).device
     }
 
     private companion object {
         const val TIMEOUT_MS = 100L
         const val POLL_MS = 10L
+        const val CONFIGURED_CAR_ADDRESS = "AA:BB:CC:DD:EE:01"
+        const val OTHER_ENDPOINT_ADDRESS = "AA:BB:CC:DD:EE:02"
+        const val TARGET_RSM_ADDRESS = "AA:BB:CC:DD:EE:03"
     }
 
-    private class TestDevice(
-        val address: String,
-        val name: String = address,
-    ) {
+    private data class ResolutionCase(
+        val name: String,
+        val configuredCar: ConfiguredCar?,
+        val inspection: CarHfpProfileInspection<TestDevice>,
+        val targetRsmAddress: String? = null,
+        val isConnected: (TestDevice) -> Boolean = { true },
+        val expected: ConfiguredCarResolution<TestDevice>,
+    )
+
+    private class FakeCarHfpConfigurationStore(initial: ConfiguredCar?) : CarHfpConfigurationStore {
+        private val state = MutableStateFlow(initial)
+
+        override val configuredCar: StateFlow<ConfiguredCar?> = state.asStateFlow()
+
+        override fun replace(address: String, displayLabel: String?): Boolean {
+            val canonicalAddress = canonicalBluetoothAddress(address) ?: return false
+            state.value = ConfiguredCar(
+                canonicalAddress = canonicalAddress,
+                displayLabel = displayLabel?.trim()?.takeIf(String::isNotEmpty),
+            )
+            return true
+        }
+    }
+
+    private class TestDevice(val address: String) {
         override fun equals(other: Any?): Boolean =
             other is TestDevice && address == other.address
 

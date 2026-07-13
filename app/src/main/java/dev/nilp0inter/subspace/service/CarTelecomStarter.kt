@@ -62,19 +62,6 @@ internal suspend fun <D> primeHfpDeviceForTelecom(
     }
 }
 
-internal fun <D : Any> selectUnambiguousCarHfpDevice(
-    connectedDevices: List<D>,
-    targetRsm: D?,
-    isConnected: (D) -> Boolean,
-): D? {
-    var car: D? = null
-    for (device in connectedDevices) {
-        if (!isConnected(device) || device == targetRsm) continue
-        if (car != null) return null
-        car = device
-    }
-    return car
-}
 
 /**
  * Encapsulates the car-telecom PTT lifecycle that was previously inlined in
@@ -91,6 +78,7 @@ internal class CarTelecomStarter(
     private val headsetProxyProvider: () -> BluetoothHeadset?,
     private val targetRsm: () -> BluetoothDevice?,
     private val inputModeController: InputModeController,
+    private val carConfigurationStore: CarHfpConfigurationStore,
     private val telecomRegistrar: SubspacePhoneAccountRegistrar,
     private val resolvePttAudioRoute: (InputMode) -> ResolvedAudioRoute,
     private val publishInputMode: () -> Unit,
@@ -103,6 +91,10 @@ internal class CarTelecomStarter(
     private val logAudioRouteSnapshot: (String) -> Unit,
     private val updateCarMediaState: () -> Unit,
 ) {
+    private data class ResolvedCarHfpEndpoint(
+        val proxy: BluetoothHeadset,
+        val device: BluetoothDevice,
+    )
     /** Tracks whether a telecom disconnect is pending / has completed. */
     var telecomDisconnected = CompletableDeferred<Unit>().apply { complete(Unit) }
         private set
@@ -149,6 +141,7 @@ internal class CarTelecomStarter(
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=active-session")
             return
         }
+        val carEndpoint = resolveConfiguredCarHfpEndpoint() ?: return
         val captureLease = when (val admission = reserveCaptureAdmission()) {
             is HostCaptureAdmission.Granted -> admission.lease
             HostCaptureAdmission.RejectedByPlayback -> {
@@ -208,7 +201,7 @@ internal class CarTelecomStarter(
                 return
             }
         }
-        val car = primeCarHfpForTelecom()
+        val car = primeCarHfpForTelecom(carEndpoint)
         if (car == null) {
             Log.d(ROUTE_LOG_TAG, "CAR_PTT_SKIP reason=car-hfp-prime-failed")
             cancelPendingCarPtt("car-hfp-prime-failed")
@@ -255,26 +248,67 @@ internal class CarTelecomStarter(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun primeCarHfpForTelecom(): BluetoothDevice? {
-        val proxy = headsetProxyProvider() ?: return null
-        val rsm = targetRsm()
-        val connectedDevices = runCatching { proxy.connectedDevices }.getOrNull() ?: return null
-        val car = selectUnambiguousCarHfpDevice(
-            connectedDevices = connectedDevices,
-            targetRsm = rsm,
-            isConnected = { device ->
-                runCatching { proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED }
-                    .getOrDefault(false)
-            },
-        )
-        if (car == null) {
+    private fun resolveConfiguredCarHfpEndpoint(): ResolvedCarHfpEndpoint? {
+        val configuredCar = carConfigurationStore.configuredCar.value
+        if (configuredCar == null) {
             Log.d(
                 ROUTE_LOG_TAG,
-                "CAR_HFP_PRIME_SKIP reason=no-unambiguous-car-hfp-device " +
-                    "connected=${connectedDevices.size} rsmKnown=${rsm != null}",
+                "CAR_HFP_RESOLUTION outcome=unconfigured configured=false profileCount=unavailable rsmKnown=false",
             )
             return null
         }
+        var profileCount: Int? = null
+        val rsm = targetRsm()
+        val proxy = headsetProxyProvider()
+        val resolution: ConfiguredCarResolution<BluetoothDevice> = when {
+            !RequiredPermissions.hasBluetoothConnect(context) -> ConfiguredCarResolution.InspectionFailed(
+                CarHfpInspectionFailure.PermissionUnavailable,
+            )
+            proxy == null -> ConfiguredCarResolution.InspectionFailed(CarHfpInspectionFailure.ProfileUnavailable)
+            else -> {
+                val devicesResult = runCatching { proxy.connectedDevices }
+                val targetAddressResult = runCatching { rsm?.address }
+                if (devicesResult.isFailure || targetAddressResult.isFailure) {
+                    ConfiguredCarResolution.InspectionFailed(CarHfpInspectionFailure.QueryFailed)
+                } else {
+                    val devices = devicesResult.getOrThrow()
+                    profileCount = devices.size
+                    resolveConfiguredCarHfpDevice(
+                        configuredCar = configuredCar,
+                        inspection = CarHfpProfileInspection.Available(devices),
+                        targetRsmAddress = targetAddressResult.getOrThrow(),
+                        addressOf = { it.address },
+                        isConnected = { device ->
+                            proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED
+                        },
+                    )
+                }
+            }
+        }
+        val outcome = when (resolution) {
+            ConfiguredCarResolution.Unconfigured -> "unconfigured"
+            ConfiguredCarResolution.Absent -> "configured-absent"
+            ConfiguredCarResolution.Disconnected -> "configured-disconnected"
+            ConfiguredCarResolution.TargetRsmConflict -> "target-rsm-conflict"
+            is ConfiguredCarResolution.InspectionFailed ->
+                "inspection-${resolution.reason.name.lowercase().replace('_', '-')}"
+            is ConfiguredCarResolution.Resolved -> "resolved"
+        }
+        Log.d(
+            ROUTE_LOG_TAG,
+            "CAR_HFP_RESOLUTION outcome=$outcome configured=true " +
+                "profileCount=${profileCount ?: "unavailable"} rsmKnown=${rsm != null}",
+        )
+        return if (resolution is ConfiguredCarResolution.Resolved && proxy != null) {
+            ResolvedCarHfpEndpoint(proxy, resolution.device)
+        } else {
+            null
+        }
+    }
+
+    private suspend fun primeCarHfpForTelecom(endpoint: ResolvedCarHfpEndpoint): BluetoothDevice? {
+        val proxy = endpoint.proxy
+        val car = endpoint.device
         Log.d(
             ROUTE_LOG_TAG,
             "CAR_HFP_PRIME_BEGIN target='${car.name}' audioBefore=${runCatching { proxy.isAudioConnected(car) }.getOrDefault(false)} " +

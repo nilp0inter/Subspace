@@ -280,6 +280,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var telecomRegistrar: SubspacePhoneAccountRegistrar
     private lateinit var mediaResponsePlayer: MediaResponsePlayer
     private lateinit var carTelecomStarter: CarTelecomStarter
+    private lateinit var carHfpConfigurationStore: CarHfpConfigurationStore
+    private lateinit var carHfpConfigurationController: CarHfpConfigurationController<BluetoothDevice>
     private lateinit var audioSessionManager: PttAudioSessionManager
     private lateinit var hostAudioCoordinator: HostAudioCoordinator
     private lateinit var playbackRouteResolver: dev.nilp0inter.subspace.audio.ModePlaybackRouteResolver
@@ -333,6 +335,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun tagLogLevels(): Map<String, LogLevel> = SubspaceLogger.tagLevels()
 
+    fun refreshCarHfpConfiguration() {
+        if (!::carHfpConfigurationController.isInitialized) return
+        val configuration = carHfpConfigurationController.refresh()
+        _appState.update { it.copy(carHfpConfiguration = configuration) }
+    }
+
+    fun selectCarHfpCandidate(selectionId: String) {
+        if (!::carHfpConfigurationController.isInitialized) return
+        val configuration = carHfpConfigurationController.select(selectionId)
+        _appState.update { it.copy(carHfpConfiguration = configuration) }
+    }
+
     fun globalLogLevel(): LogLevel = SubspaceLogger.globalLevel()
     fun createProfile(request: OpenAiProfileEditRequest): OpenAiProfileUiMutationResult = openAiProfileFacade.create(request)
 
@@ -354,6 +368,17 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         readinessProbe = ReadinessProbe(this, scanner, bluetoothAdapter, { headsetProxy })
+        carHfpConfigurationStore = SharedPreferencesCarHfpConfigurationStore(applicationContext)
+        carHfpConfigurationController = CarHfpConfigurationController(
+            store = carHfpConfigurationStore,
+            hasBluetoothConnect = { RequiredPermissions.hasBluetoothConnect(this) },
+            profileDevicesProvider = { headsetProxy?.connectedDevices },
+            targetRsmProvider = ::targetRsm,
+            addressOf = { it.address },
+            displayNameOf = { it.name },
+            isConnected = { device -> headsetProxy?.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED },
+            log = { message -> SubspaceLogger.d(ROUTE_LOG_TAG, message) },
+        )
         bluetoothAdapter?.getProfileProxy(this, headsetServiceListener, BluetoothProfile.HEADSET)
         sleepwalkerConnection = SleepwalkerBleConnection()
         textOutputService = SleepwalkerTextOutputService(
@@ -511,6 +536,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             headsetProxyProvider = { headsetProxy },
             targetRsm = ::targetRsm,
             inputModeController = inputModeController,
+            carConfigurationStore = carHfpConfigurationStore,
             telecomRegistrar = telecomRegistrar,
             resolvePttAudioRoute = ::resolvePttAudioRoute,
             publishInputMode = ::publishInputMode,
@@ -983,6 +1009,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 headsetAudio = snapshot.headsetAudio,
             )
         }
+        refreshCarHfpConfiguration()
         updateInputMode()
 
         if (::runtimeRegistry.isInitialized) {
