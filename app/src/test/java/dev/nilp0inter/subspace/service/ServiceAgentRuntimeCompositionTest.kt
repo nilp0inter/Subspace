@@ -109,7 +109,7 @@ class ServiceAgentRuntimeCompositionTest {
                 textOutput.textRequests,
             )
             assertEquals(listOf(AGENT_ID), played.map { it.first })
-            assertEquals(listOf(16_383.toShort()), played.single().second.samples.toList())
+            assertEquals(listOf(16_384.toShort()), played.single().second.samples.toList())
 
             val durable = graph.store.snapshot()
             assertEquals(1, durable.runs.size)

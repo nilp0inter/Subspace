@@ -11,9 +11,9 @@ class TtsAudioTest {
         val out = TtsAudio.f32ToPcm16(input)
         assertEquals(0, out[0].toInt())
         assertEquals(32767, out[1].toInt())
-        assertEquals(-32767, out[2].toInt())
-        assertEquals(16383, out[3].toInt())
-        assertEquals(-16383, out[4].toInt())
+        assertEquals(-32768, out[2].toInt())
+        assertEquals(16384, out[3].toInt())
+        assertEquals(-16384, out[4].toInt())
     }
 
     @Test
@@ -21,7 +21,7 @@ class TtsAudioTest {
         val input = floatArrayOf(2.0f, -2.0f, 100.0f)
         val out = TtsAudio.f32ToPcm16(input)
         assertEquals(32767, out[0].toInt())
-        assertEquals(-32767, out[1].toInt())
+        assertEquals(-32768, out[1].toInt())
         assertEquals(32767, out[2].toInt())
     }
 
