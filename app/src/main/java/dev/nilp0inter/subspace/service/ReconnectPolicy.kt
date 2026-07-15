@@ -22,6 +22,32 @@ sealed interface ReconnectDecision {
     data class Blocked(val reason: ReconnectBlockReason) : ReconnectDecision
 }
 
+internal enum class RsmReconnectDisposition {
+    Scheduled,
+    Stopped,
+    BlockedMissingPermissions,
+    BlockedBluetoothDisabled,
+    BlockedTargetUnavailable,
+    NoAction,
+    StartAttempt,
+    AlreadyInProgress,
+}
+
+internal fun ReconnectDecision.toRsmReconnectDisposition(): RsmReconnectDisposition = when (this) {
+    is ReconnectDecision.Schedule,
+    is ReconnectDecision.Wait,
+    -> RsmReconnectDisposition.Scheduled
+    ReconnectDecision.NoAction -> RsmReconnectDisposition.NoAction
+    ReconnectDecision.StartAttempt -> RsmReconnectDisposition.StartAttempt
+    ReconnectDecision.AlreadyInProgress -> RsmReconnectDisposition.AlreadyInProgress
+    is ReconnectDecision.Blocked -> when (reason) {
+        ReconnectBlockReason.MonitoringNotRequested -> RsmReconnectDisposition.Stopped
+        ReconnectBlockReason.MissingPermissions -> RsmReconnectDisposition.BlockedMissingPermissions
+        ReconnectBlockReason.BluetoothDisabled -> RsmReconnectDisposition.BlockedBluetoothDisabled
+        ReconnectBlockReason.TargetUnavailable -> RsmReconnectDisposition.BlockedTargetUnavailable
+    }
+}
+
 class ReconnectPolicy(
     private val retryDelayMs: Long = DEFAULT_RECONNECT_RETRY_DELAY_MS,
 ) {

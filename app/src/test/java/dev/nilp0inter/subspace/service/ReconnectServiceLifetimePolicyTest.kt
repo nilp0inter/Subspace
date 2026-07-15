@@ -1,5 +1,6 @@
 package dev.nilp0inter.subspace.service
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -44,5 +45,57 @@ class ReconnectServiceLifetimePolicyTest {
             "MonitoringNotRequested is an explicit disconnect and must allow the service to leave foreground and stopSelf",
             shouldRetainMonitoringService(ReconnectBlockReason.MonitoringNotRequested),
         )
+    }
+
+    @Test
+    fun explicitSerialDisconnectDefersShutdownUntilNoPttSessionRemains() {
+        data class Case(
+            val name: String,
+            val serialDisconnectPending: Boolean,
+            val monitoringRequested: Boolean,
+            val hasActivePttSession: Boolean,
+            val shouldStop: Boolean,
+        )
+
+        listOf(
+            Case(
+                "pending disconnect retains active phone or car input",
+                serialDisconnectPending = true,
+                monitoringRequested = false,
+                hasActivePttSession = true,
+                shouldStop = false,
+            ),
+            Case(
+                "active reconnect monitoring retains the service",
+                serialDisconnectPending = true,
+                monitoringRequested = true,
+                hasActivePttSession = false,
+                shouldStop = false,
+            ),
+            Case(
+                "no explicit serial disconnect does not stop the service",
+                serialDisconnectPending = false,
+                monitoringRequested = false,
+                hasActivePttSession = false,
+                shouldStop = false,
+            ),
+            Case(
+                "terminal completion after explicit disconnect stops the service",
+                serialDisconnectPending = true,
+                monitoringRequested = false,
+                hasActivePttSession = false,
+                shouldStop = true,
+            ),
+        ).forEach { case ->
+            assertEquals(
+                case.name,
+                case.shouldStop,
+                shouldStopAfterSerialDisconnect(
+                    serialDisconnectPending = case.serialDisconnectPending,
+                    monitoringRequested = case.monitoringRequested,
+                    hasActivePttSession = case.hasActivePttSession,
+                ),
+            )
+        }
     }
 }

@@ -70,7 +70,11 @@ class ServicePlatformCompositionTest {
 
         manager.release(PttSource.Phone)
         runCurrent()
-        manager.cancelActive("late competing terminal signal")
+        manager.cancelBySource(
+            PttSource.Phone,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "late competing terminal signal",
+        )
         releaseGate.complete(Unit)
         advanceUntilIdle()
 

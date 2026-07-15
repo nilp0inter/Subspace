@@ -1,8 +1,16 @@
 package dev.nilp0inter.subspace.service
 
 import java.io.File
+import dev.nilp0inter.subspace.audio.CaptureService
+import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.model.PttSource
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import io.mockk.mockk
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -112,11 +120,14 @@ class SubspaceLoggerTest {
     fun logsSurviveReinitialize() {
         SubspaceLogger.i("PersistTest", "entry before restart")
 
-        runBlocking {
-            delay(300)
+        val persisted = runBlocking {
+            withTimeout(5_000) {
+                SubspaceLogger.entries.first { entries ->
+                    entries.any { it.tag == "PersistTest" && it.message == "entry before restart" }
+                }
+            }
         }
-
-        assertEquals(1, SubspaceLogger.entries.value.size)
+        assertTrue(persisted.any { it.tag == "PersistTest" && it.message == "entry before restart" })
 
         // Re-initialize from the same directory
         SubspaceLogger.initialize(tempDir)
@@ -158,5 +169,73 @@ class SubspaceLoggerTest {
         assertEquals(LogLevel.Warn, SubspaceLogger.perTagLevelFlow.value["FlowTag"])
         SubspaceLogger.clearTagLevel("FlowTag")
         assertFalse(SubspaceLogger.perTagLevelFlow.value.containsKey("FlowTag"))
+    }
+
+    @Test
+    fun cancellationDiagnosticReasonsKeepOnlyApprovedSemanticCategories() {
+        data class Case(
+            val reason: String,
+            val expected: String,
+        )
+
+        listOf(
+            Case("RSM serial session ended", "rsm-serial-session-ended"),
+            Case("Telecom route timeout", "telecom-route-timeout"),
+            Case("Explicit RSM serial disconnect", "explicit-rsm-serial-disconnect"),
+            Case("work-route-release-failed", "work-route-release-failed"),
+        ).forEach { case ->
+            assertEquals(case.expected, case.reason.toCancellationLogValue())
+        }
+
+        val sensitiveReason =
+            "Bluetooth AA:BB:CC:DD:EE:FF device B02PTT-FF01 pcm 0102 transcript meet at nine " +
+                "credential token-secret channel private-message"
+        assertEquals("unspecified", sensitiveReason.toCancellationLogValue())
+    }
+
+    @Test
+    fun terminalCancellationDiagnosticsUseClaimCategoryInsteadOfDynamicReasonContent() {
+        val manager = PttAudioSessionManager(
+            scope = CoroutineScope(Dispatchers.Unconfined),
+            captureService = mockk<CaptureService>(relaxed = true),
+            channelRouter = mockk<ChannelRouter>(relaxed = true),
+            resolvePttAudioRoute = { error("pending session must not resolve an audio route") },
+        )
+        val sensitiveReason =
+            "Bluetooth AA:BB:CC:DD:EE:FF device B02PTT-FF01 pcm 0102 transcript meet at nine " +
+                "credential token-secret channel private-message"
+        assertTrue(manager.reservePending(PttSource.Rsm, "private-message", InputMode.Work))
+
+        assertEquals(
+            PttAudioSessionManager.CancellationDisposition.Accepted,
+            manager.cancelBySource(
+                source = PttSource.Rsm,
+                eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+                reason = sensitiveReason,
+            ).disposition,
+        )
+
+        val terminalMessages = runBlocking {
+            withTimeout(5_000) {
+                SubspaceLogger.entries.first { entries ->
+                    entries.count { it.message.startsWith("AUDIO_SESSION_TERMINAL_") } == 2
+                }
+            }
+        }.filter { it.message.startsWith("AUDIO_SESSION_TERMINAL_") }.map { it.message }
+
+        assertEquals(
+            listOf(
+                "AUDIO_SESSION_TERMINAL_CLAIM id=1 source=Rsm claim=Cancellation reason=cancelled",
+                "AUDIO_SESSION_TERMINAL_COMPLETION id=1 source=Rsm claim=Cancellation " +
+                    "reason=cancelled cleanupFailures=None",
+            ),
+            terminalMessages,
+        )
+        assertFalse(terminalMessages.joinToString().contains("AA:BB:CC:DD:EE:FF"))
+        assertFalse(terminalMessages.joinToString().contains("B02PTT-FF01"))
+        assertFalse(terminalMessages.joinToString().contains("0102"))
+        assertFalse(terminalMessages.joinToString().contains("meet at nine"))
+        assertFalse(terminalMessages.joinToString().contains("token-secret"))
+        assertFalse(terminalMessages.joinToString().contains("private-message"))
     }
 }

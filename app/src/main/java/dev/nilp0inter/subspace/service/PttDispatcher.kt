@@ -10,6 +10,17 @@ import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
+internal enum class PttCancellationCaller {
+    RsmSerialSessionEnded,
+    ExplicitSerialDisconnect,
+    CarSetupFailure,
+    TelecomRouteTimeout,
+    TelecomConnectionEnded,
+    ChannelRuntimeShutdown,
+    CaptureAdmissionLost,
+    ServiceTeardown,
+}
+
 /**
  * Encapsulates PTT press/release dispatch and session tracking.
  *
@@ -52,7 +63,12 @@ internal class PttDispatcher(
         }
         val sessionId = activePttSession?.id
         if (sessionId == null || !attachCaptureLease(sessionId, lease)) {
-            audioSessionManager.cancelPending(source, "Host capture admission lost")
+            cancelPttBySource(
+                source = source,
+                caller = PttCancellationCaller.CaptureAdmissionLost,
+                reason = "Host capture admission lost",
+                eligibility = PttAudioSessionManager.CancellationEligibility.PendingOnly,
+            )
             abandonCaptureAdmission(lease)
             return false
         }
@@ -141,7 +157,11 @@ internal class PttDispatcher(
         }
         val sessionId = activePttSession?.id
         if (sessionId == null || (captureLease != null && !attachCaptureLease(sessionId, captureLease))) {
-            audioSessionManager.cancelActive("Host capture admission lost")
+            cancelPttBySource(
+                source = source,
+                caller = PttCancellationCaller.CaptureAdmissionLost,
+                reason = "Host capture admission lost",
+            )
             reject()
             return false
         }
@@ -156,12 +176,11 @@ internal class PttDispatcher(
         return true
     }
 
-    fun dispatchPttReleased(source: PttSource) {
-        if (audioCoordinator.consumeRejectedPttRelease()) return
-        val session = activePttSession?.takeIf { ownsPttRelease(it.source, source) } ?: return
-        audioSessionManager.release(source)
-
-        updateCarMediaState()
+    fun dispatchPttReleased(source: PttSource): Boolean {
+        if (audioCoordinator.consumeRejectedPttRelease()) return false
+        val released = audioSessionManager.release(source)
+        if (released) updateCarMediaState()
+        return released
     }
 
     /** Observes the existing terminal publication; it never performs input terminal cleanup. */
@@ -170,23 +189,108 @@ internal class PttDispatcher(
         audioCoordinator.releaseCapture(lease)
     }
 
-    /** Forcefully abort the current PTT session (regardless of source). */
-    fun forceReleaseActivePtt() {
-        val session = activePttSession ?: return
+    fun cancelPttBySource(
+        source: PttSource,
+        caller: PttCancellationCaller,
+        reason: String,
+        eligibility: PttAudioSessionManager.CancellationEligibility =
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+    ): PttAudioSessionManager.CancellationOutcome {
+        return audioSessionManager.cancelBySource(source, eligibility, reason) { decision ->
+            logCancellationRequest(scope = "source", caller = caller, outcome = decision)
+            handleAcceptedCancellation(decision)
+        }
+    }
+
+    suspend fun cancelAnyActivePttForServiceTeardown(
+        caller: PttCancellationCaller,
+        reason: String,
+    ): PttAudioSessionManager.CancellationOutcome {
+        require(
+            caller == PttCancellationCaller.ServiceTeardown ||
+                caller == PttCancellationCaller.ChannelRuntimeShutdown,
+        ) { "All-source cancellation is reserved for service teardown" }
+        return audioSessionManager.shutdownAndAwait(reason) { decision ->
+            logCancellationRequest(scope = "global", caller = caller, outcome = decision)
+            handleAcceptedCancellation(decision)
+        }
+    }
+
+    private fun handleAcceptedCancellation(outcome: PttAudioSessionManager.CancellationOutcome) {
+        if (outcome.disposition != PttAudioSessionManager.CancellationDisposition.Accepted) return
         cancelIdleTimer()
-        audioSessionManager.cancelActive("Force release")
-        if (session.source == PttSource.CarTelecom) {
+        if (outcome.sessionSource == PttSource.CarTelecom) {
             TelecomCarPttCoordinator.forceAbort()
         }
         updateCarMediaState()
     }
-    /** Cancel only a pending/pre-capture session for the requested source. */
-    fun cancelPending(
-        source: PttSource,
-        reason: String = "Telecom connection ended",
-    ): Boolean = audioSessionManager.cancelPending(source, reason)
+
+    private fun logCancellationRequest(
+        scope: String,
+        caller: PttCancellationCaller,
+        outcome: PttAudioSessionManager.CancellationOutcome,
+    ) {
+        Log.d(
+            ROUTE_LOG_TAG,
+            "PTT_CANCELLATION_REQUEST scope=$scope caller=$caller " +
+                "requestedSource=${outcome.requestedSource ?: "Any"} " +
+                "currentSessionId=${outcome.sessionId ?: "None"} " +
+                "currentSource=${outcome.sessionSource ?: "None"} " +
+                "currentPhase=${outcome.sessionPhase ?: "None"} eligibility=${outcome.eligibility} " +
+                "disposition=${outcome.disposition} reason=${outcome.reason.toCancellationLogValue()}",
+        )
+    }
 
     fun isTerminalCarSource(): Boolean =
         activePttSession?.source == PttSource.CarTelecom
 
 }
+
+internal fun String.toCancellationLogValue(): String {
+    val normalized = buildString(length.coerceAtMost(64)) {
+        var separatorPending = false
+        for (character in this@toCancellationLogValue) {
+            when {
+                character.isLetterOrDigit() -> {
+                    if (separatorPending && isNotEmpty()) append('-')
+                    append(character.lowercaseChar())
+                    separatorPending = false
+                }
+                isNotEmpty() -> separatorPending = true
+            }
+            if (length == 64) break
+        }
+    }.ifEmpty { "unspecified" }
+    return normalized.takeIf { it in semanticDiagnosticValues } ?: "unspecified"
+}
+
+private val semanticDiagnosticValues = setOf(
+    "host-capture-admission-lost",
+    "explicit-rsm-serial-disconnect",
+    "rsm-serial-session-ended",
+    "telecom-route-timeout",
+    "telecom-connection-ended",
+    "work-route-release-failed",
+    "car-hfp-prime-failed",
+    "telecom-account-disabled",
+    "telecom-manager-unavailable",
+    "telecom-connection-prepare-failed",
+    "channel-runtime-shutdown",
+    "service-teardown",
+    "setup-cancellation",
+    "problem-feedback",
+    "playback-resolution",
+    "playback",
+    "playback-completion",
+    "capture-stop",
+    "capture-cancellation",
+    "target-release",
+    "target-failure",
+    "target-cancellation",
+    "route-release",
+    "committed-target-lease-release",
+    "late-target-cancellation",
+    "late-capture-cancellation",
+    "late-route-release",
+    "terminal-completion-publication",
+)

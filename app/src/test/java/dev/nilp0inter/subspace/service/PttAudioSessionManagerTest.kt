@@ -79,18 +79,208 @@ class PttAudioSessionManagerTest {
     }
 
     @Test
-    fun forceCancelReleasesActiveRouteExactlyOnce() = runTest {
+    fun serviceTeardownReleasesActiveRouteExactlyOnce() = runTest {
         val fixture = Fixture(this)
         val route = fixture.route(InputMode.Work)
 
         assertTrue(fixture.manager.start(PttSource.Rsm, "echo", InputMode.Work))
         runCurrent()
-        fixture.manager.cancelActive("teardown")
+        fixture.manager.shutdownAndAwait("teardown")
         advanceUntilIdle()
 
         assertEquals(1, route.output.releaseRouteCount)
         assertEquals(listOf("started", "cancelled:teardown"), fixture.router.events)
         assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun matchingSourceCancellationAcceptsPendingAndActiveSessions() = runTest {
+        val pendingFixture = Fixture(this)
+        assertTrue(pendingFixture.manager.reservePending(PttSource.Rsm, "echo", InputMode.Work))
+
+        val pendingOutcome = pendingFixture.manager.cancelBySource(
+            source = PttSource.Rsm,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            reason = "rsm serial session ended",
+        )
+
+        assertEquals(PttAudioSessionManager.CancellationDisposition.Accepted, pendingOutcome.disposition)
+        assertEquals(PttSource.Rsm, pendingOutcome.sessionSource)
+        assertEquals(PttAudioSessionManager.CancellationSessionPhase.Pending, pendingOutcome.sessionPhase)
+        advanceUntilIdle()
+        assertEquals(null, pendingFixture.manager.activeSession)
+
+        val activeFixture = Fixture(this)
+        val route = activeFixture.route(InputMode.OnAPinch)
+        assertTrue(activeFixture.manager.start(PttSource.Phone, "echo", InputMode.OnAPinch))
+        runCurrent()
+
+        val activeOutcome = activeFixture.manager.cancelBySource(
+            source = PttSource.Phone,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            reason = "phone cancelled",
+        )
+
+        assertEquals(PttAudioSessionManager.CancellationDisposition.Accepted, activeOutcome.disposition)
+        assertEquals(PttSource.Phone, activeOutcome.sessionSource)
+        assertEquals(PttAudioSessionManager.CancellationSessionPhase.Active, activeOutcome.sessionPhase)
+        advanceUntilIdle()
+        assertEquals(listOf("started", "cancelled:phone cancelled"), activeFixture.router.events)
+        assertEquals(1, route.output.releaseRouteCount)
+        assertEquals(null, activeFixture.manager.activeSession)
+    }
+
+    @Test
+    fun rsmAndCarCancellationCannotClaimPhoneCaptureAndPhoneCleanupIsExactlyOnce() = runTest {
+        val events = mutableListOf<String>()
+        val capture = TerminalCaptureSession(events)
+        val target = TerminalTarget(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = capture,
+            output = TerminalOutput(events),
+            events = events,
+        )
+        assertTrue(fixture.manager.start(PttSource.Phone, "journal", InputMode.OnAPinch))
+        runCurrent()
+        val phoneSession = fixture.manager.activeSession
+        events.clear()
+
+        listOf(PttSource.Rsm, PttSource.CarTelecom).forEach { requestingSource ->
+            val outcome = fixture.manager.cancelBySource(
+                source = requestingSource,
+                eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+                reason = "unrelated lifecycle",
+            )
+            assertEquals(PttAudioSessionManager.CancellationDisposition.SourceMismatch, outcome.disposition)
+            assertEquals(PttSource.Phone, outcome.sessionSource)
+            assertEquals(phoneSession, fixture.manager.activeSession)
+        }
+        assertTrue(events.isEmpty())
+
+        assertEquals(
+            PttAudioSessionManager.CancellationDisposition.Accepted,
+            fixture.manager.cancelBySource(
+                source = PttSource.Phone,
+                eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+                reason = "phone cancelled",
+            ).disposition,
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-cancel", "target-cancelled", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.cancelCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+        assertEquals(null, fixture.manager.activeSession)
+    }
+
+    @Test
+    fun pendingOnlyCancellationRejectsAnActiveCaptureWithoutTerminalEffects() = runTest {
+        val events = mutableListOf<String>()
+        val target = TerminalTarget(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+        )
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        events.clear()
+
+        val rejected = fixture.manager.cancelBySource(
+            source = PttSource.CarTelecom,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOnly,
+            reason = "car setup failed",
+        )
+
+        assertEquals(PttAudioSessionManager.CancellationDisposition.NotPending, rejected.disposition)
+        assertEquals(PttAudioSessionManager.CancellationSessionPhase.Active, rejected.sessionPhase)
+        assertEquals(PttSource.CarTelecom, fixture.manager.activeSession?.source)
+        assertTrue(events.isEmpty())
+
+        fixture.manager.cancelBySource(
+            source = PttSource.CarTelecom,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            reason = "telecom connection ended",
+        )
+        advanceUntilIdle()
+        assertEquals(1, target.cancelCount)
+        assertEquals(1, fixture.output.releaseCount)
+    }
+
+    @Test
+    fun repeatedCancellationDuringAbortRecursionIsAlreadyTerminalAndDoesNotRepeatEffects() = runTest {
+        val events = mutableListOf<String>()
+        val cancellationGate = CompletableDeferred<Unit>()
+        val target = TerminalTarget(events)
+        val fixture = TerminalFixture(
+            scope = this,
+            target = target,
+            capture = TerminalCaptureSession(events),
+            output = TerminalOutput(events),
+            events = events,
+            cancellationGate = cancellationGate,
+        )
+        assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
+        runCurrent()
+        events.clear()
+
+        val first = fixture.manager.cancelBySource(
+            source = PttSource.CarTelecom,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            reason = "telecom route timeout",
+        )
+        runCurrent()
+        val recursiveAbort = fixture.manager.cancelBySource(
+            source = PttSource.CarTelecom,
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            reason = "telecom abort callback",
+        )
+
+        assertEquals(PttAudioSessionManager.CancellationDisposition.Accepted, first.disposition)
+        assertEquals(PttAudioSessionManager.CancellationDisposition.AlreadyTerminal, recursiveAbort.disposition)
+        assertEquals(listOf("capture-cancel"), events)
+
+        cancellationGate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("capture-cancel", "target-cancelled", "route-release", "lease-release", "completion"),
+            events,
+        )
+        assertEquals(1, target.cancelCount)
+        assertEquals(1, fixture.output.releaseCount)
+        assertEquals(1, target.leaseReleaseCount)
+    }
+
+    @Test
+    fun serviceTeardownCancelsEachSourceRegardlessOfOwnership() = runTest {
+        listOf(
+            PttSource.Rsm to InputMode.Work,
+            PttSource.Phone to InputMode.OnAPinch,
+            PttSource.CarTelecom to InputMode.OnTheRoad,
+        ).forEach { (source, mode) ->
+            val fixture = Fixture(this)
+            val route = fixture.route(mode)
+            assertTrue(fixture.manager.start(source, "echo", mode))
+            runCurrent()
+
+            val outcome = fixture.manager.shutdownAndAwait("service teardown")
+
+            assertEquals(PttAudioSessionManager.CancellationDisposition.Accepted, outcome.disposition)
+            assertEquals(null, outcome.requestedSource)
+            assertEquals(source, outcome.sessionSource)
+            assertEquals(listOf("started", "cancelled:service teardown"), fixture.router.events)
+            assertEquals(1, route.output.releaseRouteCount)
+            assertEquals(null, fixture.manager.activeSession)
+        }
     }
     @Test
     fun normalCarReleaseNotifiesCompletionAfterCleanupWhenConnectionEndedArrivesEarly() = runTest {
@@ -125,7 +315,11 @@ class PttAudioSessionManagerTest {
 
         fixture.manager.release(PttSource.CarTelecom)
         runCurrent()
-        fixture.manager.cancelActive("connection-ended")
+        fixture.manager.cancelBySource(
+            PttSource.CarTelecom,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "connection-ended",
+        )
         runCurrent()
         assertEquals(
             PttAudioSessionManager.SessionPhase.TerminalWork,
@@ -160,7 +354,11 @@ class PttAudioSessionManagerTest {
 
         assertTrue(fixture.manager.start(PttSource.CarTelecom, "journal", InputMode.OnTheRoad))
         runCurrent()
-        fixture.manager.cancelActive("connection-ended")
+        fixture.manager.cancelBySource(
+            PttSource.CarTelecom,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "connection-ended",
+        )
         gate.complete(RouteGateResult.Success("car route ready"))
         advanceUntilIdle()
 
@@ -180,7 +378,11 @@ class PttAudioSessionManagerTest {
         runCurrent()
         assertTrue(source.openStarted.isCompleted)
 
-        fixture.manager.cancelActive("connection-ended")
+        fixture.manager.cancelBySource(
+            PttSource.CarTelecom,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "connection-ended",
+        )
         source.allowOpen.complete(Unit)
         advanceUntilIdle()
 
@@ -202,7 +404,11 @@ class PttAudioSessionManagerTest {
         runCurrent()
         assertTrue(beepStarted.isCompleted)
 
-        fixture.manager.cancelActive("connection-ended")
+        fixture.manager.cancelBySource(
+            PttSource.CarTelecom,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "connection-ended",
+        )
         allowBeep.complete(Unit)
         advanceUntilIdle()
 
@@ -338,7 +544,11 @@ class PttAudioSessionManagerTest {
 
         assertTrue(fixture.manager.start(PttSource.CarTelecom, "echo", InputMode.OnTheRoad))
         runCurrent()
-        fixture.manager.cancelActive("timeout")
+        fixture.manager.cancelBySource(
+            PttSource.CarTelecom,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "timeout",
+        )
         advanceUntilIdle()
 
         assertEquals(null, fixture.manager.activeSession)
@@ -530,8 +740,22 @@ class PttAudioSessionManagerTest {
         runCurrent()
         assertTrue(fixture.router.preparationStarted?.isCompleted == true)
 
-        assertTrue(fixture.manager.cancelPending(PttSource.Phone, "source lost"))
-        assertFalse(fixture.manager.cancelPending(PttSource.Phone, "source lost"))
+        assertEquals(
+            PttAudioSessionManager.CancellationDisposition.Accepted,
+            fixture.manager.cancelBySource(
+                PttSource.Phone,
+                PttAudioSessionManager.CancellationEligibility.PendingOnly,
+                "source lost",
+            ).disposition,
+        )
+        assertEquals(
+            PttAudioSessionManager.CancellationDisposition.AlreadyTerminal,
+            fixture.manager.cancelBySource(
+                PttSource.Phone,
+                PttAudioSessionManager.CancellationEligibility.PendingOnly,
+                "source lost",
+            ).disposition,
+        )
         fixture.manager.release(PttSource.Phone)
         assertEquals(PttAudioSessionManager.SessionPhase.TerminalWork, fixture.manager.activeSession?.phase)
 
@@ -873,7 +1097,11 @@ class PttAudioSessionManagerTest {
 
         fixture.manager.release(PttSource.Phone)
         runCurrent()
-        fixture.manager.cancelActive("connection ended")
+        fixture.manager.cancelBySource(
+            PttSource.Phone,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "connection ended",
+        )
         fixture.manager.release(PttSource.Phone)
         releaseGate.complete(Unit)
         advanceUntilIdle()
@@ -1169,7 +1397,11 @@ class PttAudioSessionManagerTest {
         assertFalse(shutdown.isCompleted)
         assertEquals(listOf("capture-cancel"), events)
 
-        fixture.manager.cancelActive("late callback")
+        fixture.manager.cancelBySource(
+            PttSource.Phone,
+            PttAudioSessionManager.CancellationEligibility.PendingOrActive,
+            "late callback",
+        )
         fixture.manager.release(PttSource.Phone)
         cancellationGate.complete(Unit)
         advanceUntilIdle()

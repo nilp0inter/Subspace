@@ -107,37 +107,114 @@ internal class PttAudioSessionManager(
         return true
     }
 
-    fun release(source: PttSource) {
-        val session = synchronized(lock) { active?.takeIf { ownsPttRelease(it.source, source) } } ?: return
-        requestTerminal(session, TerminalClaim.NormalRelease, "Released")
-    }
-
-    fun cancelActive(reason: String) {
-        val session = synchronized(lock) { active } ?: return
-        requestTerminal(session, TerminalClaim.Cancellation, reason)
-    }
-
-    fun cancelPending(source: PttSource, reason: String): Boolean {
-        val session = synchronized(lock) {
-            active?.takeIf { it.source == source && it.captureSession == null }
+    fun release(source: PttSource): Boolean {
+        val request = synchronized(lock) {
+            val session = active ?: return false
+            if (!ownsPttRelease(session.source, source)) return false
+            claimTerminalLocked(session, TerminalClaim.NormalRelease, "Released")
         } ?: return false
-        return requestTerminal(session, TerminalClaim.Cancellation, reason)
+        request.start()
+        return true
     }
 
+    fun cancelBySource(
+        source: PttSource,
+        eligibility: CancellationEligibility,
+        reason: String,
+        onDecision: (CancellationOutcome) -> Unit = {},
+    ): CancellationOutcome {
+        val decision = synchronized(lock) {
+            val session = active ?: return@synchronized CancellationDecision(
+                outcome = CancellationOutcome(
+                    sessionId = null,
+                    requestedSource = source,
+                    sessionSource = null,
+                    sessionPhase = null,
+                    eligibility = eligibility,
+                    reason = reason,
+                    disposition = CancellationDisposition.NoActiveSession,
+                ),
+            )
+            val phase = session.cancellationPhase()
+            val disposition = when {
+                session.terminalClaim != TerminalClaim.None -> CancellationDisposition.AlreadyTerminal
+                session.source != source -> CancellationDisposition.SourceMismatch
+                eligibility == CancellationEligibility.PendingOnly && session.captureSession != null ->
+                    CancellationDisposition.NotPending
+                else -> CancellationDisposition.Accepted
+            }
+            val outcome = CancellationOutcome(
+                sessionId = session.id,
+                requestedSource = source,
+                sessionSource = session.source,
+                sessionPhase = phase,
+                eligibility = eligibility,
+                reason = reason,
+                disposition = disposition,
+            )
+            CancellationDecision(
+                outcome = outcome,
+                request = if (disposition == CancellationDisposition.Accepted) {
+                    checkNotNull(claimTerminalLocked(session, TerminalClaim.Cancellation, reason))
+                } else {
+                    null
+                },
+            )
+        }
+        runCatching { onDecision(decision.outcome) }
+        decision.request?.start()
+        return decision.outcome
+    }
     /**
-     * Stops admission, claims cancellation only when no terminal owner exists, and awaits the
-     * same cleanup sequence an earlier terminal signal already owns. The non-cancellable wait is
-     * bounded and the actual effects run in [cleanupScope], not in the caller's service job.
+     * Stops admission, atomically claims all-source cancellation when no terminal owner exists,
+     * and awaits the same cleanup sequence an earlier terminal signal already owns.
      */
-    suspend fun shutdownAndAwait(reason: String = "Service teardown") {
+    suspend fun shutdownAndAwait(
+        reason: String = "Service teardown",
+        onDecision: (CancellationOutcome) -> Unit = {},
+    ): CancellationOutcome {
         val shutdownState = synchronized(lock) {
             shutdown = true
             val session = active
-            TerminalShutdown(
-                request = session?.let { claimTerminalLocked(it, TerminalClaim.Cancellation, reason) },
-                completion = session?.terminalCompletion,
-            )
+            if (session == null) {
+                TerminalShutdown(
+                    outcome = CancellationOutcome(
+                        sessionId = null,
+                        requestedSource = null,
+                        sessionSource = null,
+                        sessionPhase = null,
+                        eligibility = CancellationEligibility.PendingOrActive,
+                        reason = reason,
+                        disposition = CancellationDisposition.NoActiveSession,
+                    ),
+                )
+            } else {
+                val phase = session.cancellationPhase()
+                val disposition = if (session.terminalClaim == TerminalClaim.None) {
+                    CancellationDisposition.Accepted
+                } else {
+                    CancellationDisposition.AlreadyTerminal
+                }
+                TerminalShutdown(
+                    outcome = CancellationOutcome(
+                        sessionId = session.id,
+                        requestedSource = null,
+                        sessionSource = session.source,
+                        sessionPhase = phase,
+                        eligibility = CancellationEligibility.PendingOrActive,
+                        reason = reason,
+                        disposition = disposition,
+                    ),
+                    request = if (disposition == CancellationDisposition.Accepted) {
+                        checkNotNull(claimTerminalLocked(session, TerminalClaim.Cancellation, reason))
+                    } else {
+                        null
+                    },
+                    completion = session.terminalCompletion,
+                )
+            }
         }
+        runCatching { onDecision(shutdownState.outcome) }
         shutdownState.request?.start()
         try {
             withContext(NonCancellable) {
@@ -148,6 +225,7 @@ internal class PttAudioSessionManager(
         } finally {
             cleanupScope.cancel()
         }
+        return shutdownState.outcome
     }
 
     private suspend fun runSetup(
@@ -279,6 +357,10 @@ internal class PttAudioSessionManager(
     }
 
     private fun TerminalRequest.start() {
+        logRoute(
+            "AUDIO_SESSION_TERMINAL_CLAIM id=${session.id} source=${session.source} " +
+                "claim=${session.terminalClaim} reason=${session.terminalReasonLogValue()}",
+        )
         setupJob?.cancel()
         cleanupScope.launch { runTerminal(session, setupJob) }
     }
@@ -477,7 +559,10 @@ internal class PttAudioSessionManager(
         synchronized(lock) {
             session.failures += TerminalFailure(phase, message)
         }
-        logRoute("AUDIO_SESSION_TERMINAL_FAILURE id=${session.id} phase=$phase reason=$message")
+        logRoute(
+            "AUDIO_SESSION_TERMINAL_FAILURE id=${session.id} source=${session.source} " +
+                "claim=${session.terminalClaim} phase=${phase.toCancellationLogValue()}",
+        )
     }
 
     private fun clearAndPublish(session: ActiveSession) {
@@ -492,6 +577,19 @@ internal class PttAudioSessionManager(
         } catch (error: Throwable) {
             recordFailure(session, "terminal completion publication", error.message ?: error::class.simpleName.orEmpty())
         } finally {
+            val failureCategories = synchronized(lock) {
+                session.failures
+                    .map { it.phase.toCancellationLogValue() }
+                    .distinct()
+                    .joinToString(",")
+                    .ifEmpty { "None" }
+            }
+            logRoute(
+                "AUDIO_SESSION_TERMINAL_COMPLETION id=${session.id} source=${session.source} " +
+                    "claim=${session.terminalClaim} " +
+                    "reason=${session.terminalReasonLogValue()} " +
+                    "cleanupFailures=$failureCategories",
+            )
             session.terminalCompletion.complete(completion)
         }
     }
@@ -522,6 +620,27 @@ internal class PttAudioSessionManager(
     )
 
     enum class SessionPhase { PttHeld, TerminalWork }
+    enum class CancellationEligibility { PendingOrActive, PendingOnly }
+
+    enum class CancellationDisposition {
+        Accepted,
+        NoActiveSession,
+        SourceMismatch,
+        NotPending,
+        AlreadyTerminal,
+    }
+
+    enum class CancellationSessionPhase { Pending, Active, TerminalWork }
+
+    data class CancellationOutcome(
+        val sessionId: Long?,
+        val requestedSource: PttSource?,
+        val sessionSource: PttSource?,
+        val sessionPhase: CancellationSessionPhase?,
+        val eligibility: CancellationEligibility,
+        val reason: String,
+        val disposition: CancellationDisposition,
+    )
 
     private enum class TerminalClaim {
         None,
@@ -541,8 +660,13 @@ internal class PttAudioSessionManager(
         val setupJob: Job?,
     )
     private data class TerminalShutdown(
-        val request: TerminalRequest?,
-        val completion: CompletableDeferred<TerminalCompletion>?,
+        val outcome: CancellationOutcome,
+        val request: TerminalRequest? = null,
+        val completion: CompletableDeferred<TerminalCompletion>? = null,
+    )
+    private data class CancellationDecision(
+        val outcome: CancellationOutcome,
+        val request: TerminalRequest? = null,
     )
 
     private data class ActiveSession(
@@ -573,6 +697,19 @@ internal class PttAudioSessionManager(
             mode = mode,
             phase = if (terminalClaim == TerminalClaim.None) SessionPhase.PttHeld else SessionPhase.TerminalWork,
         )
+        fun cancellationPhase(): CancellationSessionPhase = when {
+            terminalClaim != TerminalClaim.None -> CancellationSessionPhase.TerminalWork
+            captureSession == null -> CancellationSessionPhase.Pending
+            else -> CancellationSessionPhase.Active
+        }
+        fun terminalReasonLogValue(): String = when (terminalClaim) {
+            TerminalClaim.None -> "none"
+            TerminalClaim.NormalRelease -> "released"
+            TerminalClaim.Cancellation -> "cancelled"
+            TerminalClaim.Failure -> "failure"
+        }
+
+
 
         fun terminalCompletion(): TerminalCompletion = TerminalCompletion(
             sessionId = id,

@@ -97,6 +97,45 @@ class ReconnectPolicyTest {
         assertEquals(ReconnectDecision.StartAttempt, policy.beginAttempt(nowMillis = now, prerequisites = prerequisites()))
     }
 
+    @Test
+    fun reconnectDecisionsMapToStableSemanticDiagnosticDispositions() {
+        data class Case(
+            val name: String,
+            val decision: ReconnectDecision,
+            val expected: RsmReconnectDisposition,
+        )
+
+        listOf(
+            Case("scheduled", ReconnectDecision.Schedule(10), RsmReconnectDisposition.Scheduled),
+            Case("waiting", ReconnectDecision.Wait(10), RsmReconnectDisposition.Scheduled),
+            Case("no action", ReconnectDecision.NoAction, RsmReconnectDisposition.NoAction),
+            Case("attempt starting", ReconnectDecision.StartAttempt, RsmReconnectDisposition.StartAttempt),
+            Case("attempt in progress", ReconnectDecision.AlreadyInProgress, RsmReconnectDisposition.AlreadyInProgress),
+            Case(
+                "monitoring stopped",
+                ReconnectDecision.Blocked(ReconnectBlockReason.MonitoringNotRequested),
+                RsmReconnectDisposition.Stopped,
+            ),
+            Case(
+                "permissions blocked",
+                ReconnectDecision.Blocked(ReconnectBlockReason.MissingPermissions),
+                RsmReconnectDisposition.BlockedMissingPermissions,
+            ),
+            Case(
+                "bluetooth blocked",
+                ReconnectDecision.Blocked(ReconnectBlockReason.BluetoothDisabled),
+                RsmReconnectDisposition.BlockedBluetoothDisabled,
+            ),
+            Case(
+                "target blocked",
+                ReconnectDecision.Blocked(ReconnectBlockReason.TargetUnavailable),
+                RsmReconnectDisposition.BlockedTargetUnavailable,
+            ),
+        ).forEach { case ->
+            assertEquals(case.name, case.expected, case.decision.toRsmReconnectDisposition())
+        }
+    }
+
     private fun prerequisites(
         permissionsGranted: Boolean = true,
         bluetoothEnabled: Boolean = true,

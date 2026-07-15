@@ -161,6 +161,12 @@ internal fun rsmChannelOffset(event: RawButtonEvent): Int? = when (event) {
 internal fun shouldRetainMonitoringService(reason: ReconnectBlockReason): Boolean =
     reason != ReconnectBlockReason.MonitoringNotRequested
 
+internal fun shouldStopAfterSerialDisconnect(
+    serialDisconnectPending: Boolean,
+    monitoringRequested: Boolean,
+    hasActivePttSession: Boolean,
+): Boolean = serialDisconnectPending && !monitoringRequested && !hasActivePttSession
+
 class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoordinator.Listener, ChannelRouter, CoreInit {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -298,6 +304,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private var reconnectJob: Job? = null
     private var readinessRefreshJob: Job? = null
     private var foreground = false
+    private var stopWhenPttIdleAfterSerialDisconnect = false
 
 
     @SuppressLint("MissingPermission")
@@ -526,7 +533,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             invocationBoundary = runtimeInvocationBoundary,
             runtimeScope = serviceScope,
             closeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-            onPttSessionCancelRequested = { pttDispatcher.forceReleaseActivePtt() },
+            onPttSessionCancelRequested = {
+                pttDispatcher.cancelAnyActivePttForServiceTeardown(
+                    caller = PttCancellationCaller.ChannelRuntimeShutdown,
+                    reason = "Channel runtime shutdown",
+                )
+            }
         )
         carTelecomStarter = CarTelecomStarter(
             context = this,
@@ -547,7 +559,14 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             reservePendingCarPtt = { channelId, lease ->
                 pttDispatcher.reservePendingPtt(PttSource.CarTelecom, channelId, lease)
             },
-            cancelPendingCarPtt = { _ -> pttDispatcher.forceReleaseActivePtt() },
+            cancelPendingCarPtt = { reason ->
+                pttDispatcher.cancelPttBySource(
+                    source = PttSource.CarTelecom,
+                    caller = PttCancellationCaller.CarSetupFailure,
+                    reason = reason,
+                    eligibility = PttAudioSessionManager.CancellationEligibility.PendingOnly,
+                )
+            },
             logAudioRouteSnapshot = ::logAudioRouteSnapshot,
             updateCarMediaState = ::updateCarMediaState,
         )
@@ -914,7 +933,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         runBlocking {
             withContext(Dispatchers.Default) {
                 withTimeoutOrNull(45_000L) {
-                    audioSessionManager.shutdownAndAwait()
+                    pttDispatcher.cancelAnyActivePttForServiceTeardown(
+                        caller = PttCancellationCaller.ServiceTeardown,
+                        reason = "Service teardown",
+                    )
                     // Destruction is resumable: it cancels volatile workers but leaves the durable
                     // ledger intact. Replacement/removal remains generation-retirement work.
                     agentRuntimeGraph.coordinator.shutdown()
@@ -1062,6 +1084,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun connectSerial() {
         if (serialJob?.isActive == true) return
+        stopWhenPttIdleAfterSerialDisconnect = false
         reconnectPolicy.startMonitoring()
         reconnectJob?.cancel()
         reconnectJob = null
@@ -1069,8 +1092,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     fun disconnectSerial() {
-        pttDispatcher.forceReleaseActivePtt()
+        pttDispatcher.cancelPttBySource(
+            source = PttSource.Rsm,
+            caller = PttCancellationCaller.ExplicitSerialDisconnect,
+            reason = "Explicit RSM serial disconnect",
+        )
         reconnectPolicy.clearMonitoring()
+        stopWhenPttIdleAfterSerialDisconnect = true
         reconnectJob?.cancel()
         stopReadinessRefreshLoop()
         serialJob?.cancel()
@@ -1079,8 +1107,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         sppClient = null
         updateConnection { it.copy(spp = SppState.Disconnected) }
         ttsController?.cancelAndRelease()
-        stopForegroundIfNeeded()
-        stopSelf()
+        reevaluateSerialDisconnectShutdown()
         refreshReadiness()
     }
 
@@ -1238,6 +1265,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         agentRuntimeGraph.playback.onAudioAvailable()
         agentRuntimeGraph.deferredAudioPlayback.onAudioAvailable()
         updateCarMediaState()
+        reevaluateSerialDisconnectShutdown()
     }
 
     private fun startIdleTimer() {
@@ -1266,23 +1294,30 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     override fun onTelecomCaptureStart() {
         pttDispatcher.dispatchPttPressed(PttSource.CarTelecom)
-        updateCarMediaState()
     }
 
     override fun onTelecomCaptureStop() {
         pttDispatcher.dispatchPttReleased(PttSource.CarTelecom)
-        updateCarMediaState()
     }
     override fun onTelecomRouteTimeout() {
-        pttDispatcher.forceReleaseActivePtt()
-        carTelecomStarter.playCarErrorBeep()
+        val cancellation = pttDispatcher.cancelPttBySource(
+            source = PttSource.CarTelecom,
+            caller = PttCancellationCaller.TelecomRouteTimeout,
+            reason = "Telecom route timeout",
+        )
+        if (cancellation.disposition == PttAudioSessionManager.CancellationDisposition.Accepted) {
+            carTelecomStarter.playCarErrorBeep()
+        }
         carTelecomStarter.notifyTelecomDisconnected()
-        updateCarMediaState()
     }
     override fun onTelecomConnectionEnded() {
-        pttDispatcher.cancelPending(PttSource.CarTelecom, "Telecom connection ended")
+        pttDispatcher.cancelPttBySource(
+            source = PttSource.CarTelecom,
+            caller = PttCancellationCaller.TelecomConnectionEnded,
+            reason = "Telecom connection ended",
+            eligibility = PttAudioSessionManager.CancellationEligibility.PendingOnly,
+        )
         carTelecomStarter.notifyTelecomDisconnected()
-        updateCarMediaState()
     }
 
 
@@ -1529,11 +1564,20 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     }
 
     private fun handleSerialSessionEnded(automatic: Boolean, connected: Boolean) {
-        pttDispatcher.forceReleaseActivePtt()
+        pttDispatcher.cancelPttBySource(
+            source = PttSource.Rsm,
+            caller = PttCancellationCaller.RsmSerialSessionEnded,
+            reason = "RSM serial session ended",
+        )
         ttsController?.cancelAndRelease()
         refreshReadiness()
 
         if (!reconnectPolicy.monitoringRequested) {
+            logRsmSppTermination(
+                automatic = automatic,
+                everConnected = connected,
+                reconnectDisposition = RsmReconnectDisposition.Stopped,
+            )
             stopForegroundIfNeeded()
             stopSelf()
             return
@@ -1547,7 +1591,25 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             reconnectPolicy.cancelAttempt()
             reconnectPolicy.scheduleAfterUnexpectedLoss(nowMillis = now, prerequisites = prerequisites)
         }
+        logRsmSppTermination(
+            automatic = automatic,
+            everConnected = connected,
+            reconnectDisposition = decision.toRsmReconnectDisposition(),
+        )
         handleReconnectDecision(decision)
+    }
+
+    private fun logRsmSppTermination(
+        automatic: Boolean,
+        everConnected: Boolean,
+        reconnectDisposition: RsmReconnectDisposition,
+    ) {
+        SubspaceLogger.d(
+            ROUTE_LOG_TAG,
+            "RSM_SPP_SESSION_TERMINATION mode=${if (automatic) "Automatic" else "Manual"} " +
+                "everConnected=$everConnected monitoringRequested=${reconnectPolicy.monitoringRequested} " +
+                "reconnectDisposition=$reconnectDisposition",
+        )
     }
 
     private fun handleReconnectDecision(decision: ReconnectDecision) {
@@ -1678,6 +1740,18 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             foreground = false
             stopSelf()
         }
+    }
+
+    private fun reevaluateSerialDisconnectShutdown() {
+        if (!shouldStopAfterSerialDisconnect(
+                serialDisconnectPending = stopWhenPttIdleAfterSerialDisconnect,
+                monitoringRequested = reconnectPolicy.monitoringRequested,
+                hasActivePttSession = pttDispatcher.activePttSession != null,
+            )
+        ) return
+        stopWhenPttIdleAfterSerialDisconnect = false
+        stopForegroundIfNeeded()
+        stopSelf()
     }
 
     private fun stopForegroundIfNeeded() {
