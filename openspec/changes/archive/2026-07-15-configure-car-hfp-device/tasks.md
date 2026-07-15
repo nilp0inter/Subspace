@@ -32,5 +32,5 @@
 - [x] 5.3 Add dashboard action and navigation tests proving CAR long-press works in available and unavailable states, changes no mode, and does not also dispatch the tap action.
 - [x] 5.4 Extend `CarTelecomStarter` tests to prove only the configured live device is primed among multiple endpoints, failure occurs before side effects, configuration replacement does not redirect an in-flight operation, and existing exact-device cleanup/handoff behavior remains intact.
 - [x] 5.5 Run the focused modified JVM test targets and build/install the debug application in the repository devshell.
-- [ ] 5.6 On the physical Android device, connect the car and competing HFP endpoints, select the car through CAR long-press, restart the app/service, and verify Android Auto PTT uses the saved exact car while missing/disconnected configuration fails without routing to another device.
-- [ ] 5.7 Inspect in-app persisted logs from successful and rejected attempts to verify semantic resolution outcomes are present and no full or partial Bluetooth addresses are recorded.
+- [x] 5.6 On the physical Android device, connect the car and competing HFP endpoints, select the car through CAR long-press, restart the app/service, and verify Android Auto PTT uses the saved exact car while missing/disconnected configuration fails without routing to another device.
+- [x] 5.7 Inspect in-app persisted logs from successful and rejected attempts to verify semantic resolution outcomes are present and no full or partial Bluetooth addresses are recorded.
