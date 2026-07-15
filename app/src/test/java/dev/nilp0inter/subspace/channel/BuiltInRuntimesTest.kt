@@ -85,8 +85,38 @@ class BuiltInRuntimesTest {
         assertEquals(ChannelExecutionStatus.SUCCESS, alpha.runtime.snapshot.value.executionStatus)
         assertEquals(ChannelExecutionStatus.IDLE, bravo.runtime.snapshot.value.executionStatus)
         assertEquals(
-            listOf(TextOutputRequest("captured text", TextOutputProfile("linux:us"))),
-            host.textRequests,
+            TextOutputRequest("captured text ", TextOutputProfile("linux:us")),
+            host.textRequests.single(),
+        )
+    }
+
+    @Test
+    fun keyboardRuntimeAppendsTrailingSpaceAfterTranscriptionWithoutTrailingSpace() = runTest {
+        val host = RuntimeCapabilityHost(transcript = "captured text")
+        val runtime = keyboardRuntime("append-space", "linux:us", host)
+        val target = (runtime.runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+        target.onInputStarted(EmptySession)
+        target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000))
+
+        assertEquals(
+            TextOutputRequest("captured text ", TextOutputProfile("linux:us")),
+            host.textRequests.single(),
+        )
+    }
+
+    @Test
+    fun keyboardRuntimePreservesTrailingSpaceAfterTranscriptionWithTrailingSpace() = runTest {
+        val host = RuntimeCapabilityHost(transcript = "captured text ")
+        val runtime = keyboardRuntime("append-space-existing", "linux:us", host)
+        val target = (runtime.runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+        target.onInputStarted(EmptySession)
+        target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000))
+
+        assertEquals(
+            TextOutputRequest("captured text ", TextOutputProfile("linux:us")),
+            host.textRequests.single(),
         )
     }
 

@@ -207,19 +207,27 @@ class KeyboardRuntime(
                 capability.transcribe(opaqueAudioRecording(recording))
             }
             val text = (transcription as? CapabilityOperationResult.Success)?.value?.text
-            Log.i(
-                CHANNEL_EFFECT_TAG,
-                "KEYBOARD_TRANSCRIPTION_RESULT instance=$id outcome=${transcription.diagnosticName()} text_length=${text?.length ?: 0}",
-            )
             if (text == null) {
                 if (!closed.get()) {
                     _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.FAILED)
                 }
                 return ChannelInputResult.None
             }
-
+            if (text.isEmpty()) {
+                _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.FAILED)
+                return ChannelInputResult.None
+            }
+            val textToType = if (text.last() == ' ') {
+                text
+            } else {
+                "$text "
+            }
+            Log.i(
+                CHANNEL_EFFECT_TAG,
+                "KEYBOARD_TRANSCRIPTION_RESULT instance=$id outcome=${transcription.diagnosticName()} text_length=${text.length}"
+            )
             val delivery = capabilities.useCapability(CapabilityKey.TextOutput) { output ->
-                CapabilityOperationResult.Success(output.sendText(TextOutputRequest(text, profile)))
+                CapabilityOperationResult.Success(output.sendText(TextOutputRequest(textToType, profile)))
             }
             Log.i(
                 CHANNEL_EFFECT_TAG,
