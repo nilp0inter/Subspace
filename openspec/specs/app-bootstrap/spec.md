@@ -7,7 +7,7 @@ Define the app bootstrap lifecycle, passive loading, readiness gates, visual ide
 ## Requirements
 
 ### Requirement: Launch starts with passive bootstrap loading
-The system SHALL render a passive loading surface from cold activity creation until prerequisite checking determines the next valid root state. The system SHALL NOT represent unknown permission, model, service, or core-initialization state as an actionable setup state.
+The system SHALL render a passive loading surface from cold activity creation until prerequisite checking determines the next valid root state. The system SHALL NOT represent unknown permission, model, service, voice, or core-initialization state as an actionable setup state.
 
 #### Scenario: Returning user cold launch
 - **WHEN** the app is cold-launched with all setup prerequisites already satisfied
@@ -20,56 +20,50 @@ The system SHALL render a passive loading surface from cold activity creation un
 - **AND** the dashboard is not rendered from a default placeholder application state
 
 #### Scenario: Missing prerequisite discovered
-- **WHEN** prerequisite checking identifies a missing permission or invalid model set with a known user remedy
+- **WHEN** prerequisite checking identifies a missing permission, invalid model set, or missing offline navigation voice with a known user remedy
 - **THEN** the system replaces loading with the actionable setup surface
+
+#### Scenario: Missing offline navigation voice discovered
+- **WHEN** prerequisite checking identifies an absent Android TTS engine, a missing or incomplete offline English voice, a failed voice selection, a failed synthesis probe, or a probe timeout
+- **THEN** the system replaces loading with the actionable setup surface exposing the Android TTS settings or voice install action
+- **AND** the system classifies the prerequisite as `NeedsSetup`
 
 ### Requirement: Bootstrap state is authoritative
 The system SHALL expose one lifecycle-aware bootstrap state as the source of truth for loading, setup, recovery, and dashboard eligibility. Activity recreation or rebinding SHALL reconstruct the root surface from that state rather than defaulting to setup or dashboard.
 
 #### Scenario: Activity is recreated during checking
-- **WHEN** the activity is recreated while prerequisite checking is in progress
+- **WHEN** the activity is recreated while prerequisite checking, including offline navigation voice probing, is in progress
 - **THEN** the recreated activity shows loading for the current observed stage
 - **AND** it does not show setup unless the coordinator has identified a missing user action
 
 #### Scenario: Activity is recreated during core preparation
-- **WHEN** the activity is recreated while model acquisition, native initialization, controller construction, or announcement rendering is in progress
+- **WHEN** the activity is recreated while model acquisition, native STT initialization, Supertonic initialization, or controller construction is in progress
 - **THEN** the recreated activity shows the current loading stage and available real progress
 - **AND** it does not start a duplicate bootstrap operation
 
 ### Requirement: Core readiness gates dashboard entry
-The system SHALL enter the dashboard only after all required core readiness conditions have completed successfully: runtime permissions are granted, all required model assets pass full verification, native STT and TTS engines report `Ready`, required model-backed controllers are constructed, and every required system-announcement phrase is cached as non-empty SCO-ready audio. Validated persisted announcement PCM SHALL satisfy the phrase-cache condition only after it has been hydrated into the in-memory announcement map; persistent cache reuse SHALL NOT bypass native STT/TTS readiness, controller construction, or complete-vocabulary validation.
+The system SHALL enter the dashboard only after all required core readiness conditions have completed successfully: runtime permissions are granted, all required model assets pass full verification, a proven installed offline English navigation voice has been successfully selected and probed during prerequisite checking and retained through core preparation, native STT reports `Ready`, Supertonic reports `Ready`, and required model-backed controllers are constructed. Supertonic readiness SHALL remain a hard bootstrap gate. A proven offline English navigation voice SHALL be a hard bootstrap gate: a missing engine, missing or incomplete offline voice, failed voice selection, failed synthesis probe, or probe timeout SHALL transition bootstrap to `NeedsSetup` and SHALL NOT enter the dashboard. The retained Android TTS renderer SHALL never perform network synthesis or engine-owned audible playback. The system SHALL NOT require any system-announcement phrase to be pre-rendered or cached for dashboard entry.
 
 #### Scenario: Disk assets valid but native engine loading
 - **WHEN** model files pass integrity verification but either native speech engine has not reported `Ready`
 - **THEN** the loading surface remains visible
 - **AND** the dashboard is not shown
 
+#### Scenario: Offline navigation voice not proven
+- **WHEN** prerequisite checking identifies a missing or unusable offline English navigation voice
+- **THEN** the system transitions to `NeedsSetup` with the Android TTS settings or voice install action exposed
+- **AND** the dashboard is not shown
+- **AND** native STT and Supertonic initialization do not proceed
+
 #### Scenario: Engines ready but controllers pending
-- **WHEN** STT and TTS engines are ready but any required controller has not been successfully constructed
+- **WHEN** STT and TTS engines are ready and the offline navigation voice is proven but any required controller has not been successfully constructed
 - **THEN** the loading surface remains visible
 - **AND** the dashboard is not shown
 
-#### Scenario: Announcements partially rendered
-- **WHEN** fewer than all required system-announcement phrases are cached as non-empty SCO-ready audio
-- **THEN** bootstrap is not considered ready
-- **AND** the loading surface reports announcement-rendering progress
-
 #### Scenario: Core readiness complete
-- **WHEN** every core readiness condition completes successfully
+- **WHEN** every core readiness condition completes successfully including the proven offline navigation voice from prerequisite checking
 - **THEN** the system automatically replaces loading with the dashboard
 - **AND** it does not wait for an acknowledgement or for a loading animation to finish
-
-#### Scenario: Valid disk hydration completes the announcement gate
-- **WHEN** the authoritative announcement manifest contains valid current PCM for every vocabulary key and the native engines, permissions, models, and controllers are ready
-- **THEN** the coordinator hydrates every phrase into the in-memory announcement map
-- **AND** the announcement gate completes without invoking synthesis
-- **AND** the dashboard is shown only after the complete hydrated map satisfies the existing SCO-ready condition
-
-#### Scenario: Invalid disk hydration does not complete readiness
-- **WHEN** one or more persisted announcement entries are missing, malformed, empty, or fail fingerprint or WAV integrity validation
-- **THEN** those entries are treated as synthesis misses
-- **AND** the loading surface remains visible until replacement non-empty SCO PCM is installed for every current key
-- **AND** the dashboard is not shown from a partial or stale persisted map
 
 ### Requirement: Optional external readiness does not block bootstrap
 The system SHALL NOT require RSM bonding, SPP connection, HFP availability, Keyboard BLE connection, Android Auto presence, Telecom routing, serial reconnection, or journal recovery to complete global bootstrap.
@@ -90,31 +84,15 @@ The system SHALL NOT require RSM bonding, SPP connection, HFP availability, Keyb
 - **AND** journal recovery continues outside the global bootstrap gate
 
 ### Requirement: Loading reports observed work
-The loading surface SHALL identify the current observed bootstrap stage and SHALL display measurable progress only when the underlying operation reports a real count or byte total. The system SHALL NOT manufacture a combined percentage, random log output, or fictional initialization activity. Announcement rendering progress SHALL count validated disk-hydrated logical keys as completed units, SHALL preserve vocabulary iteration order, and SHALL report grouped exact-text misses using the first key in each group without inflating synthesis-call counts.
+The loading surface SHALL identify the current observed bootstrap stage and SHALL display measurable progress only when the underlying operation reports a real count or byte total. The system SHALL NOT manufacture a combined percentage, random log output, or fictional initialization activity.
 
 #### Scenario: Model file download reports bytes
 - **WHEN** a model file download reports bytes read and a positive total byte count
 - **THEN** loading displays the current file or model set and corresponding measurable progress
 
-#### Scenario: Announcement rendering reports phrase count
-- **WHEN** system announcements are being rendered
-- **THEN** loading displays the number of successfully rendered phrases and the vocabulary-derived total
-
 #### Scenario: Stage has no measurable total
 - **WHEN** a bootstrap stage reports no meaningful total
 - **THEN** loading identifies the stage without presenting a fabricated percentage
-
-#### Scenario: Disk hits seed logical-key progress
-- **WHEN** a vocabulary has validated persisted hits for some logical keys before its remaining phrases are rendered
-- **THEN** loading reports those hit logical keys as already completed
-- **AND** the first miss starts from that completed count against the full vocabulary-derived total
-- **AND** an all-hit vocabulary transitions from `WaitingForTts` directly to ready without a rendering stage
-
-#### Scenario: Exact-text misses report grouped progress
-- **WHEN** multiple missing logical keys have identical phrase text and occur in first-occurrence vocabulary order
-- **THEN** loading reports one rendering unit with the first logical key in that text group
-- **AND** after non-empty PCM is installed for every key in the group, completed progress increases by that group's logical-key count
-- **AND** a failed group is not included in completed progress
 
 ### Requirement: Loading follows the Subspace visual identity
 The loading surface SHALL use the existing Night Ops and Daylight Material color schemes, Chakra Petch and Inter typography, and a restrained animated Analog-to-Routed Wave motif representing voice becoming routed digital signal. Ordinary loading SHALL use the theme primary accent and SHALL reserve warning/error treatment for actual failures.
@@ -139,7 +117,7 @@ The loading surface SHALL use the existing Night Ops and Daylight Material color
 - **AND** it does not render starfields, spacecraft, CRT flicker, fictional telemetry, or scrolling fake logs
 
 ### Requirement: Bootstrap failures terminate in recovery
-The system SHALL convert prerequisite inspection errors, native engine failures, controller construction failures, announcement rendering failures, and finite-stage timeouts into an explicit recovery state containing the failed stage, a concrete diagnostic, and a retry action when retry is safe. It SHALL NOT leave the user on an infinite loading indicator or misclassify an autonomous failure as initial setup. Retry SHALL cancel and join the prior structured bootstrap attempt before discarding its controllers or starting replacement prerequisite/core work, and a canceled prior attempt SHALL NOT commit announcement cache state after its replacement begins.
+The system SHALL convert prerequisite inspection errors, native engine failures, controller construction failures, and finite-stage timeouts into an explicit recovery state containing the failed stage, a concrete diagnostic, and a retry action when retry is safe. It SHALL NOT leave the user on an infinite loading indicator. A missing or unusable offline navigation voice SHALL NOT be classified as a recovery failure; it SHALL be classified as `NeedsSetup` with the Android TTS settings or voice install action exposed. Retry SHALL cancel and join the prior structured bootstrap attempt before discarding its controllers or starting replacement prerequisite/core work.
 
 #### Scenario: Native model reports failure
 - **WHEN** either native speech engine reports `Failed`
@@ -152,29 +130,53 @@ The system SHALL convert prerequisite inspection errors, native engine failures,
 - **THEN** loading changes to recovery with the timed-out stage identified
 - **AND** retry does not leave jobs or controllers from the previous attempt active
 
-#### Scenario: Announcement phrase fails
-- **WHEN** any required announcement phrase fails to produce non-empty SCO-ready audio
-- **THEN** bootstrap changes to recovery with the failed phrase or stage identified
-- **AND** a runtime beep fallback does not cause bootstrap to report success
+#### Scenario: Offline voice probe timeout is classified as setup
+- **WHEN** the offline English navigation voice probe exceeds its configured timeout
+- **THEN** the system does not enter recovery
+- **AND** the system classifies the prerequisite as `NeedsSetup` with the Android TTS settings or voice install action exposed
 
 #### Scenario: Retry succeeds
 - **WHEN** the user retries a recoverable bootstrap failure and all core conditions subsequently complete
 - **THEN** the system automatically enters the dashboard
 
 #### Scenario: Retry waits for the prior attempt to finish cancellation
-- **WHEN** a prior bootstrap attempt is synthesizing with a blocking operation that ignores cancellation until it returns and the user requests retry
+- **WHEN** a prior bootstrap attempt is in a blocking operation that ignores cancellation until it returns and the user requests retry
 - **THEN** the retry job calls `cancelAndJoin` on the prior attempt before discarding controllers
 - **AND** the replacement attempt starts only after the prior attempt has completed cancellation and cleanup
 - **AND** the loading state does not report replacement progress before that handoff is complete
 
-#### Scenario: Stale attempt cannot commit after replacement starts
-- **WHEN** a canceled prior attempt returns from blocking synthesis after a replacement retry has been scheduled
-- **THEN** the prior attempt observes cancellation before entry or manifest promotion
-- **AND** it cannot replace the authoritative announcement manifest
-- **AND** only the replacement attempt may publish cache state and reach dashboard readiness
-
 #### Scenario: Concurrent retries share one replacement attempt
 - **WHEN** multiple retry actions occur while the first retry job is joining the prior attempt
 - **THEN** subsequent retry actions do not create another replacement attempt
-- **AND** controller discard and cache publication occur once for the tracked replacement
+- **AND** controller discard occurs once for the tracked replacement
 - **AND** a cancellation clears both tracked attempt and retry jobs
+
+### Requirement: Runtime TTS renderer hard-gate loss is bounded
+After bootstrap completes, a runtime Android TTS renderer failure SHALL trigger at most one bounded reinitialization, offline-voice probe, and retry of only the newest pending navigation announcement. Every outcome of the bounded recovery SHALL be exhaustive and SHALL NOT leave the system in a degraded `Ready` state with navigation unavailable. If the bounded recovery probe and retry both succeed, the system SHALL remain `Ready` and resume navigation synthesis. If the recovery probe reveals a missing or unusable Android TTS engine or offline English voice, the bootstrap state SHALL transition to `NeedsSetup` with the Android TTS settings or voice install action exposed. If the recovery probe succeeds but the newest pending announcement retry fails, or if the renderer's file access, decoder, or PCM normalization infrastructure fails, the bootstrap state SHALL transition out of `Ready` to a retryable `BootstrapState.Failed` with a concrete diagnostic and SHALL drop the failed generation entirely. The budget of one bounded recovery cycle SHALL apply per independent failure chain: a recovery retry failure within the same chain SHALL NOT trigger a second cycle, and a later independent announcement failure after a fully successful recovery SHALL be eligible for one new bounded recovery cycle.
+
+#### Scenario: Bounded recovery succeeds
+- **WHEN** a runtime TTS renderer failure triggers one bounded reinitialization and voice probe
+- **AND** the probe succeeds and the newest pending announcement retry is synthesized
+- **THEN** the system remains `Ready` and navigation synthesis resumes
+
+#### Scenario: Recovery reveals missing or unusable voice
+- **WHEN** the bounded recovery probe reveals a missing or unusable Android TTS engine or offline English voice
+- **THEN** the bootstrap state transitions to `NeedsSetup`
+- **AND** the Android TTS settings or voice install action is exposed
+
+#### Scenario: Recovery probe succeeds but announcement retry fails
+- **WHEN** the bounded recovery probe succeeds and a proven offline English voice is available
+- **AND** the retry of the newest pending announcement fails to produce valid normalized PCM
+- **THEN** the bootstrap state transitions out of `Ready` to a retryable `BootstrapState.Failed` with a concrete diagnostic
+- **AND** the failed generation is dropped entirely
+
+#### Scenario: Renderer infrastructure fails during recovery
+- **WHEN** the bounded recovery fails due to a renderer file access, decoder, or PCM normalization infrastructure error
+- **THEN** the bootstrap state transitions out of `Ready` to a retryable `BootstrapState.Failed` with a concrete diagnostic
+- **AND** the failed generation is dropped entirely
+
+#### Scenario: One bounded recovery per independent failure chain
+- **WHEN** a runtime TTS renderer failure triggers a bounded reinitialization, voice probe, and pending-announcement retry
+- **THEN** the system SHALL NOT attempt a second reinitialization, probe, or retry within that same failure chain
+- **AND** a recovery retry failure within the same chain SHALL transition to `BootstrapState.Failed` without triggering another recovery cycle
+- **AND** after a fully successful recovery and retry, a later independent announcement failure SHALL be eligible for one new bounded recovery cycle
