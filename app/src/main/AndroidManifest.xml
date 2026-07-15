@@ -23,6 +23,12 @@
         android:name="android.hardware.microphone"
         android:required="true" />
 
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:extractNativeLibs="true"

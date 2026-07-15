@@ -35,7 +35,7 @@ internal class ModePlaybackRouteResolver(
                     usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
                     routeEndpoint = AudioRouteEndpoint.Rsm,
                 ),
-                release = workSco::release,
+                releaseUnderlying = workSco::release,
             ),
         )
     }
@@ -78,7 +78,7 @@ internal class ModePlaybackRouteResolver(
 
     private class ReleasingPlaybackRoute(
         private val delegate: AcquiredPlaybackRoute,
-        private val release: () -> Unit,
+        private val releaseUnderlying: () -> Unit,
     ) : AcquiredPlaybackRoute {
         private var released = false
 
@@ -93,7 +93,7 @@ internal class ModePlaybackRouteResolver(
             try {
                 delegate.release()
             } finally {
-                release()
+                releaseUnderlying.invoke()
             }
         }
     }

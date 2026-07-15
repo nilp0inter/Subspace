@@ -3,11 +3,10 @@ package dev.nilp0inter.subspace.audio
 import kotlin.math.PI
 import kotlin.math.sin
 
-/** Precomputed-style feedback PCM for host-owned controllable playback fallbacks. */
+/** Error feedback PCM for host-owned controllable playback. */
 object HostAudioFeedback {
     private const val SAMPLE_RATE = 16_000
 
-    fun readyBeep(): RecordedPcm = RecordedPcm(tone(880.0, 150), SAMPLE_RATE)
 
     fun errorBeep(): RecordedPcm = RecordedPcm(
         tone(400.0, 150) + tone(300.0, 150),

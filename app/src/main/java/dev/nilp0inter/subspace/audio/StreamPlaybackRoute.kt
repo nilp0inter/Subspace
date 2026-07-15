@@ -155,15 +155,17 @@ class ActiveStreamPcmPlayback internal constructor(
     init {
         val scope = CoroutineScope(dispatcher)
         pumpJob = scope.launch(dispatcher) {
+            var terminal: PlaybackCompletion = PlaybackCompletion.Interrupted
             try {
-                pump()
+                terminal = pump()
             } catch (ce: CancellationException) {
-                complete(PlaybackCompletion.Interrupted)
+                terminal = PlaybackCompletion.Interrupted
                 throw ce
             } catch (t: Throwable) {
-                complete(PlaybackCompletion.Failed(t.message ?: t::class.java.simpleName))
+                terminal = PlaybackCompletion.Failed(t.message ?: t::class.java.simpleName)
             } finally {
                 try { cleanup() } catch (_: Throwable) { /* best-effort teardown */ }
+                complete(terminal)
             }
         }
     }
@@ -192,12 +194,9 @@ class ActiveStreamPcmPlayback internal constructor(
      * Pumps the recording through the stream, overlaying rejection tones when
      * requested. Uses two reusable frame buffers; no allocation in the loop.
      */
-    private suspend fun pump() {
+    private suspend fun pump(): PlaybackCompletion {
         val samples = recording.samples
-        if (recording.isEmpty) {
-            complete(PlaybackCompletion.Completed)
-            return
-        }
+        if (recording.isEmpty) return PlaybackCompletion.Completed
 
         val frameSize = STREAM_BUFFER_FRAMES
         val bufA = ShortArray(frameSize)
@@ -211,17 +210,13 @@ class ActiveStreamPcmPlayback internal constructor(
         try {
             track.play()
         } catch (t: Throwable) {
-            complete(PlaybackCompletion.Failed(t.message ?: "play() failed"))
-            return
+            return PlaybackCompletion.Failed(t.message ?: "play() failed")
         }
 
         while (pos < totalFrames) {
             coroutineContext.ensureActive()
 
-            if (skipRequested) {
-                complete(PlaybackCompletion.ExplicitlySkipped)
-                return
-            }
+            if (skipRequested) return PlaybackCompletion.ExplicitlySkipped
 
             val len = min(frameSize, totalFrames - pos)
             val buf = if (which == 0) bufA else bufB
@@ -246,29 +241,20 @@ class ActiveStreamPcmPlayback internal constructor(
             // Blocking write of the full frame buffer.
             var off = 0
             while (off < frameSize) {
-                if (skipRequested) {
-                    complete(PlaybackCompletion.ExplicitlySkipped)
-                    return
-                }
+                if (skipRequested) return PlaybackCompletion.ExplicitlySkipped
                 val n = track.write(buf, off, frameSize - off, AudioTrack.WRITE_BLOCKING)
-                if (n <= 0) {
-                    complete(PlaybackCompletion.Failed("write error: $n"))
-                    return
-                }
+                if (n <= 0) return PlaybackCompletion.Failed("write error: $n")
                 off += n
             }
 
             pos += len
         }
 
-        if (skipRequested) {
-            complete(PlaybackCompletion.ExplicitlySkipped)
-            return
-        }
+        if (skipRequested) return PlaybackCompletion.ExplicitlySkipped
         // Let the framework drain its buffered tail before stopping, avoiding a
         // truncation click. The drain is bounded; cleanup() is authoritative.
         drainTail()
-        complete(PlaybackCompletion.Completed)
+        return PlaybackCompletion.Completed
     }
 
     private fun complete(result: PlaybackCompletion) {
@@ -283,11 +269,7 @@ class ActiveStreamPcmPlayback internal constructor(
         while ((track.playbackHeadPosition - startHead).toLong() < writtenFrames) {
             if (skipRequested) return
             if ((System.nanoTime() - start) / 1_000_000L >= deadlineMs) return
-            try {
-                delay(10)
-            } catch (_: CancellationException) {
-                return
-            }
+            delay(10)
         }
     }
 

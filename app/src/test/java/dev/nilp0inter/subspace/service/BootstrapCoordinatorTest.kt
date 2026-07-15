@@ -2,16 +2,19 @@ package dev.nilp0inter.subspace.service
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.speech.tts.TextToSpeech
 import dev.nilp0inter.subspace.audio.FakeSttTranscriber
 import dev.nilp0inter.subspace.audio.FakeTtsSynthesizer
 import dev.nilp0inter.subspace.audio.ModelAssetRepository
+import dev.nilp0inter.subspace.audio.NavigationSynthesisResult
+import dev.nilp0inter.subspace.audio.NavigationTtsEngine
+import dev.nilp0inter.subspace.audio.NavigationTtsFailure
+import dev.nilp0inter.subspace.audio.PrepareResult
 import dev.nilp0inter.subspace.audio.SttTranscriber
-import dev.nilp0inter.subspace.audio.SystemAnnouncer
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
-import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.SttModelStatus
@@ -21,7 +24,6 @@ import io.mockk.mockk
 import io.mockk.unmockkAll
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -39,7 +41,7 @@ class BootstrapCoordinatorTest {
     }
 
     @Test
-    fun `ready native engines and host services complete bootstrap`() = runTest {
+    fun `proved navigation voice and native engines complete bootstrap without announcement precomputation`() = runTest {
         val coreInit = FakeCoreInit()
         val coordinator = coordinator(coreInit)
 
@@ -47,6 +49,35 @@ class BootstrapCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals(BootstrapState.Ready, coordinator.state.value)
+        assertEquals(1, coreInit.navigationTtsPreparationCount)
+    }
+
+    @Test
+    fun `navigation TTS preparation completes before native STT and Supertonic initialization`() = runTest {
+        val events = mutableListOf<String>()
+        val coreInit = FakeCoreInit(
+            navigationTtsBehavior = {
+                events += "navigation TTS prepared"
+                preparedNavigationTts()
+            },
+            sttFactory = {
+                events += "STT constructed"
+                FakeSttTranscriber()
+            },
+            ttsFactory = {
+                events += "Supertonic constructed"
+                FakeTtsSynthesizer()
+            },
+        )
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+        assertEquals("navigation TTS prepared", events.first())
+        assertTrue(events.indexOf("navigation TTS prepared") < events.indexOf("STT constructed"))
+        assertTrue(events.indexOf("navigation TTS prepared") < events.indexOf("Supertonic constructed"))
     }
 
     @Test
@@ -158,29 +189,114 @@ class BootstrapCoordinatorTest {
     }
 
     @Test
-    fun `announcement rendering failure identifies the phrase and blocks readiness`() = runTest {
-        val coreInit = FakeCoreInit(
-            announcementBehavior = {
-                AnnouncementResult.Failed(
-                    completed = 0,
-                    total = 1,
-                    failedKey = "sys.error",
-                    reason = "empty PCM",
-                )
-            },
-        )
-        val coordinator = coordinator(coreInit)
+    fun `exhausted navigation engine recovery maps to retryable failure`() = runTest {
+        val coordinator = coordinator(FakeCoreInit())
 
         coordinator.startBootstrap()
         advanceUntilIdle()
-
-        assertEquals(
-            BootstrapState.Failed(
-                BootstrapStage.RenderingAnnouncements,
-                "Announcement 'sys.error' failed: empty PCM",
+        coordinator.onNavigationSynthesisResult(
+            NavigationSynthesisResult.EngineServiceFailure(
+                failure = NavigationTtsFailure.EngineServiceFailure.SynthesisTimeout,
+                exhausted = true,
             ),
-            coordinator.state.value,
         )
+
+        val state = coordinator.state.value
+        assertTrue(state is BootstrapState.Failed)
+        state as BootstrapState.Failed
+        assertEquals(BootstrapStage.ProbingNavigationVoice, state.stage)
+        assertTrue(state.retryable)
+        assertTrue(state.diagnostic.contains("recovery exhausted"))
+    }
+
+    @Test
+    fun `navigation voice setup failures expose the offline voice issue and skip core initialization`() = runTest {
+        data class SetupCase(
+            val name: String,
+            val failure: NavigationTtsFailure.BootstrapSetupFailure,
+            val diagnostic: String,
+        )
+
+        val cases = listOf(
+            SetupCase(
+                name = "engine unavailable",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.EngineUnavailable,
+                diagnostic = "No Android text-to-speech engine is installed or active.",
+            ),
+            SetupCase(
+                name = "engine initialization failed",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.EngineInitFailed("service crashed"),
+                diagnostic = "Android text-to-speech engine initialization failed: service crashed",
+            ),
+            SetupCase(
+                name = "engine initialization timed out",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.EngineInitTimeout,
+                diagnostic = "Android text-to-speech engine initialization timed out.",
+            ),
+            SetupCase(
+                name = "offline voice missing",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.VoiceMissing,
+                diagnostic = "Install an offline English voice for the active text-to-speech engine.",
+            ),
+            SetupCase(
+                name = "voice selection failed",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.VoiceSelectionFailed,
+                diagnostic = "The active text-to-speech engine could not select its offline English voice.",
+            ),
+            SetupCase(
+                name = "voice probe failed",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.VoiceProbeFailed("empty PCM"),
+                diagnostic = "The offline English voice failed its synthesis probe: empty PCM",
+            ),
+            SetupCase(
+                name = "voice probe timed out",
+                failure = NavigationTtsFailure.BootstrapSetupFailure.VoiceProbeTimeout,
+                diagnostic = "The offline English voice synthesis probe timed out.",
+            ),
+        )
+
+        for (case in cases) {
+            val coreInit = FakeCoreInit(
+                navigationTtsBehavior = {
+                    PrepareResult.Failure(case.failure, "dev.example.tts")
+                },
+            )
+            val coordinator = coordinator(coreInit)
+
+            coordinator.startBootstrap()
+            advanceUntilIdle()
+
+            val state = coordinator.state.value
+            assertTrue("${case.name} should require setup", state is BootstrapState.NeedsSetup)
+            state as BootstrapState.NeedsSetup
+            assertEquals(case.diagnostic, state.offlineNavigationVoiceIssue?.diagnostic)
+            assertEquals("dev.example.tts", state.offlineNavigationVoiceIssue?.enginePackage)
+            assertEquals(0, coreInit.sttConstructionCount)
+            assertEquals(0, coreInit.ttsConstructionCount)
+            assertEquals(0, coreInit.journalConstructionCount)
+            assertEquals(0, coreInit.textOutputInitializationCount)
+        }
+    }
+
+    @Test
+    fun `renderer infrastructure failure leaves ready state retryably failed`() = runTest {
+        val coordinator = coordinator(FakeCoreInit())
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+
+        coordinator.onNavigationSynthesisResult(
+            NavigationSynthesisResult.InfrastructureFailure(
+                NavigationTtsFailure.RendererInfrastructureFailure.FileIoFailure("cache file unreadable"),
+            ),
+        )
+
+        val state = coordinator.state.value
+        assertTrue(state is BootstrapState.Failed)
+        state as BootstrapState.Failed
+        assertEquals(BootstrapStage.ProbingNavigationVoice, state.stage)
+        assertTrue(state.retryable)
+        assertTrue(state.diagnostic.contains("infrastructure failure"))
+        assertTrue(state.diagnostic.contains("cache file unreadable"))
     }
 
     @Test
@@ -219,6 +335,40 @@ class BootstrapCoordinatorTest {
         )
         assertEquals(1, coreInit.discardCount)
         assertEquals(BootstrapState.Ready, coordinator.state.value)
+    }
+
+    @Test
+    fun `retry discards the retained navigation TTS engine before preparing its replacement`() = runTest {
+        val events = mutableListOf<String>()
+        val firstEngine = mockk<NavigationTtsEngine>(relaxed = true)
+        val replacementEngine = mockk<NavigationTtsEngine>(relaxed = true)
+        coEvery { firstEngine.shutdown() } coAnswers { events += "first engine shut down" }
+        coEvery { replacementEngine.shutdown() } coAnswers { events += "replacement engine shut down" }
+        var engineIndex = 0
+        val coreInit = FakeCoreInit(
+            navigationTtsEngineFactory = {
+                when (engineIndex++) {
+                    0 -> firstEngine.also { events += "first engine prepared" }
+                    else -> replacementEngine.also { events += "replacement engine prepared" }
+                }
+            },
+        )
+        val coordinator = coordinator(coreInit)
+
+        coordinator.startBootstrap()
+        advanceUntilIdle()
+        coordinator.retry()
+        advanceUntilIdle()
+
+        assertEquals(BootstrapState.Ready, coordinator.state.value)
+        assertEquals(
+            listOf(
+                "first engine prepared",
+                "first engine shut down",
+                "replacement engine prepared",
+            ),
+            events,
+        )
     }
 
     @Test
@@ -279,19 +429,24 @@ class BootstrapCoordinatorTest {
     }
 
     /**
-     * Host-boundary fake matching the current [CoreInit] contract. Construction methods publish
-     * the same observable services that production readiness consumes; retry clears all of them.
+     * Host-boundary fake matching the current [CoreInit] contract. It owns a retained
+     * navigation engine exactly as the service does, so retry disposal is observable.
      */
     private class FakeCoreInit(
         private val sttFactory: () -> SttTranscriber? = { FakeSttTranscriber() },
         private val ttsFactory: () -> TtsSynthesizer? = { FakeTtsSynthesizer() },
         private val textOutputAfterInitialization: CapabilityAvailability =
             CapabilityAvailability.Available,
-        private val announcementBehavior: suspend () -> AnnouncementResult = {
-            AnnouncementResult.Ready(setOf("sys.ready"))
+        private val navigationTtsBehavior: suspend () -> PrepareResult = {
+            preparedNavigationTts()
+        },
+        private val navigationTtsEngineFactory: () -> NavigationTtsEngine = {
+            mockk(relaxed = true)
         },
         private val onDiscard: () -> Unit = {},
     ) : CoreInit {
+        override var navigationTtsEngine: NavigationTtsEngine? = null
+            private set
         override var sttTranscriber: SttTranscriber? = null
             private set
         override var ttsSynthesizer: TtsSynthesizer? = null
@@ -305,15 +460,30 @@ class BootstrapCoordinatorTest {
                 dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
             )
             private set
-        override var announcer: SystemAnnouncer? = null
-            private set
 
         var discardCount: Int = 0
+            private set
+        var navigationTtsPreparationCount: Int = 0
             private set
         var sttConstructionCount: Int = 0
             private set
         var ttsConstructionCount: Int = 0
             private set
+        var journalConstructionCount: Int = 0
+            private set
+        var textOutputInitializationCount: Int = 0
+            private set
+
+        override suspend fun prepareNavigationTts(): PrepareResult {
+            navigationTtsEngine?.shutdown()
+            navigationTtsEngine = null
+            navigationTtsPreparationCount += 1
+            return navigationTtsBehavior().also { result ->
+                if (result is PrepareResult.Success) {
+                    navigationTtsEngine = navigationTtsEngineFactory()
+                }
+            }
+        }
 
         override fun constructSttTranscriber(): SttTranscriber? = sttFactory().also {
             sttConstructionCount += 1
@@ -330,29 +500,19 @@ class BootstrapCoordinatorTest {
         }
 
         override fun constructJournalPttController() {
+            journalConstructionCount += 1
             journalController = mockk(relaxed = true)
         }
 
         override fun initializeTextOutputCapability() {
+            textOutputInitializationCount += 1
             textOutputAvailability = textOutputAfterInitialization
         }
 
-        override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
-            val state = MutableStateFlow<AnnouncementResult>(AnnouncementResult.WaitingForTts)
-            announcer = mockk {
-                every { precomputeState } returns state
-                coEvery { precompute(any(), any(), any()) } coAnswers {
-                    announcementBehavior().also { state.value = it }
-                }
-            }
-        }
-
-        override fun buildVocabulary(): Map<String, String> = mapOf("sys.ready" to "Ready")
-
-        override fun voiceStylePath(): String = "/models/voice.json"
-
-        override fun discardControllers() {
+        override suspend fun discardControllers() {
             discardCount += 1
+            navigationTtsEngine?.shutdown()
+            navigationTtsEngine = null
             sttTranscriber = null
             ttsSynthesizer = null
             ttsController = null
@@ -360,8 +520,12 @@ class BootstrapCoordinatorTest {
             textOutputAvailability = CapabilityAvailability.Unavailable(
                 dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
             )
-            announcer = null
             onDiscard()
         }
+    }
+
+    private companion object {
+        fun preparedNavigationTts(): PrepareResult.Success =
+            PrepareResult.Success(mockk<TextToSpeech>(relaxed = true))
     }
 }

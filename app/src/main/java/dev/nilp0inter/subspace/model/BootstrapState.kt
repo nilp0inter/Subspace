@@ -42,20 +42,21 @@ sealed interface BootstrapState {
 
     /**
      * One or more user-resolvable prerequisites are missing: runtime permissions, all-files
-     * storage access, or model assets that require explicit download or repair.
+     * storage access, model assets that require explicit download or repair, or an installed
+     * offline English navigation voice.
      *
      * [missingPermissions] lists the exact missing runtime permission strings.
-     * [needsManageExternalStorage] identifies Android's separate all-files settings grant; it
-     * cannot be requested through the runtime-permission dialog.
-     * [invalidModelSets] lists the model set directory names that are absent,
-     * version-mismatched, or hash-invalid. [error] carries a diagnostic from a failed
-     * acquisition attempt so the setup surface can display it alongside the retry action.
+     * [needsManageExternalStorage] identifies Android's separate all-files settings grant.
+     * [invalidModelSets] lists model sets that are absent, version-mismatched, or hash-invalid.
+     * [offlineNavigationVoiceIssue] identifies a failed Android TTS prerequisite and the engine
+     * package to target when available. [error] carries any setup diagnostic.
      */
     data class NeedsSetup(
         val missingPermissions: List<String> = emptyList(),
         val needsManageExternalStorage: Boolean = false,
         val invalidModelSets: List<String> = emptyList(),
         val error: String? = null,
+        val offlineNavigationVoiceIssue: OfflineNavigationVoiceIssue? = null,
     ) : BootstrapState
 
     /**
@@ -98,6 +99,11 @@ sealed interface BootstrapState {
     ) : BootstrapState
 }
 
+data class OfflineNavigationVoiceIssue(
+    val diagnostic: String,
+    val enginePackage: String? = null,
+)
+
 /**
  * Sub-stages within the bootstrap lifecycle. Used by [BootstrapState]
  * implementations and by the loading surface to report the current
@@ -111,7 +117,7 @@ enum class BootstrapStage {
     InitializingStt,
     InitializingTts,
     ConstructingControllers,
-    RenderingAnnouncements,
+    ProbingNavigationVoice,
     VerifyingReadiness,
 }
 
@@ -171,31 +177,4 @@ sealed interface ModelAssetResult {
         val dirName: String,
         val reason: String,
     ) : ModelAssetResult
-}
-
-/**
- * Terminal result of announcement precomputation.
- */
-sealed interface AnnouncementResult {
-
-    /** Every required phrase has non-empty SCO-ready PCM in the cache. */
-    data class Ready(val renderedKeys: Set<String>) : AnnouncementResult
-
-    /** Rendering is in progress: [completed] of [total] phrases done. */
-    data class Rendering(
-        val completed: Int,
-        val total: Int,
-        val currentKey: String,
-    ) : AnnouncementResult
-
-    /** Waiting for the TTS engine to report [TtsModelStatus.Ready]. */
-    data object WaitingForTts : AnnouncementResult
-
-    /** A required phrase failed to synthesize or produced empty PCM. */
-    data class Failed(
-        val completed: Int,
-        val total: Int,
-        val failedKey: String,
-        val reason: String,
-    ) : AnnouncementResult
 }

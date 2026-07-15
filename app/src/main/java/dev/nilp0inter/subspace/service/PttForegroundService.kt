@@ -44,10 +44,11 @@ import dev.nilp0inter.subspace.audio.ScoAudioController
 import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.ModelVerifier
 import dev.nilp0inter.subspace.audio.SupertonicJniSynthesizer
-import dev.nilp0inter.subspace.audio.SystemAnnouncer
-import dev.nilp0inter.subspace.audio.AnnouncementPcmCache
-import dev.nilp0inter.subspace.audio.AnnouncementCacheIdentity
-import android.content.pm.PackageManager
+import dev.nilp0inter.subspace.audio.DefaultTextToSpeechFactory
+import dev.nilp0inter.subspace.audio.NavigationTtsEngine
+import dev.nilp0inter.subspace.audio.NavigationTtsFailure
+import dev.nilp0inter.subspace.audio.PrepareResult
+import dev.nilp0inter.subspace.audio.StateLossCallback
 import dev.nilp0inter.subspace.audio.TtsController
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.TelecomCallScoRoute
@@ -97,9 +98,8 @@ import dev.nilp0inter.subspace.channel.TextOutputAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
 import kotlinx.coroutines.flow.update
 import dev.nilp0inter.subspace.model.AppState
-import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapState
-import dev.nilp0inter.subspace.model.BootstrapStage
+import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelBrowseEntry
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.InputModeAvailability
@@ -124,6 +124,7 @@ import dev.nilp0inter.subspace.protocol.ButtonParser
 import dev.nilp0inter.subspace.protocol.ButtonStateMachine
 import dev.nilp0inter.subspace.telecom.SubspacePhoneAccountRegistrar
 import dev.nilp0inter.subspace.telecom.TelecomCarPttCoordinator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -156,6 +157,22 @@ internal fun rsmChannelOffset(event: RawButtonEvent): Int? = when (event) {
     RawButtonEvent.VolumeUpClicked -> -1
     RawButtonEvent.VolumeDownClicked -> 1
     else -> null
+}
+
+internal fun resolveRsmAnnouncementText(
+    key: String,
+    catalogue: ChannelCatalogueSnapshot,
+): String? {
+    if (catalogue.definitions.isEmpty()) return null
+    if (key == "sys.menu.channels") return "Channels"
+
+    val selected = key.endsWith(".selected")
+    val suffix = if (selected) ".selected" else ".name"
+    if (!key.startsWith("chan.") || !key.endsWith(suffix)) return null
+
+    val channelId = key.removePrefix("chan.").removeSuffix(suffix)
+    val name = catalogue.definitions.firstOrNull { it.id == channelId }?.name ?: return null
+    return if (selected) "$name Selected" else name
 }
 
 internal fun shouldRetainMonitoringService(reason: ReconnectBlockReason): Boolean =
@@ -262,7 +279,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override var ttsController: TtsController? = null
     override var ttsSynthesizer: TtsSynthesizer? = null
     private var supertonicModelDir: java.io.File? = null
-    override var announcer: SystemAnnouncer? = null
+    override var navigationTtsEngine: NavigationTtsEngine? = null
     private var ttsModelStatusJob: Job? = null
     lateinit var sleepwalkerConnection: SleepwalkerBleConnection
     private val keymapDatabase: JsonKeymapDatabase by lazy { JsonKeymapDatabase(resources) }
@@ -372,6 +389,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override fun onCreate() {
         super.onCreate()
         SubspaceLogger.initialize(cacheDir)
+        serviceScope.launch(Dispatchers.IO) {
+            val legacyCache = java.io.File(noBackupFilesDir, "announcement-cache")
+            if (legacyCache.exists()) legacyCache.deleteRecursively()
+        }
         bluetoothAdapter = getSystemService(BluetoothManager::class.java)?.adapter
         scanner = DeviceScanner(applicationContext, bluetoothAdapter)
         readinessProbe = ReadinessProbe(this, scanner, bluetoothAdapter, { headsetProxy })
@@ -834,56 +855,43 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         check(::textOutputService.isInitialized) { "Text output host service must be initialized first" }
     }
 
-    override fun constructAnnouncer(synthesizer: TtsSynthesizer) {
-        val lastUpdateTime = try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0L))
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getPackageInfo(packageName, 0)
-            }.lastUpdateTime
-        } catch (e: Exception) {
-            0L
-        }
-
-        val persistentCache = try {
-            if (lastUpdateTime > 0L) {
-                val manifest = ModelVerifier.loadManifest(this)
-                val supertonicModelHash = manifest.set(ModelVerifier.SUPERTONIC_DIR)
-                val identity = AnnouncementCacheIdentity.build(lastUpdateTime, supertonicModelHash)
-                if (identity != AnnouncementCacheIdentity.DISABLED) {
-                    val cacheDir = java.io.File(noBackupFilesDir, "announcement-cache")
-                    AnnouncementPcmCache(cacheDir, identity)
-                } else {
-                    null
+    override suspend fun prepareNavigationTts(): PrepareResult {
+        navigationTtsEngine?.shutdown()
+        navigationTtsEngine = null
+        val engine = NavigationTtsEngine(
+            context = applicationContext,
+            factory = DefaultTextToSpeechFactory(applicationContext),
+            stateLossCallback = StateLossCallback { failure, enginePackage ->
+                bootstrapCoordinator.onNavigationVoiceStateLoss(failure, enginePackage)
+            },
+        )
+        return try {
+            when (val result = engine.prepare()) {
+                is PrepareResult.Success -> {
+                    navigationTtsEngine = engine
+                    result
                 }
-            } else {
-                null
+                is PrepareResult.Failure -> {
+                    engine.shutdown()
+                    result
+                }
             }
-        } catch (e: Exception) {
-            null
+        } catch (error: CancellationException) {
+            engine.shutdown()
+            throw error
+        } catch (error: Exception) {
+            engine.shutdown()
+            PrepareResult.Failure(
+                NavigationTtsFailure.BootstrapSetupFailure.EngineInitFailed(
+                    error.message ?: "Unable to initialize Android text-to-speech",
+                ),
+            )
         }
-
-        announcer = SystemAnnouncer(synthesizer, persistentCache)
     }
 
-    override fun buildVocabulary(): Map<String, String> {
-        val vocab = mutableMapOf<String, String>()
-        vocab["sys.menu.channels"] = "Channels"
-        val snapshot = channelRepository.catalogueState.value
-        for (def in snapshot.definitions) {
-            vocab["chan.${def.id}.name"] = def.name
-            vocab["chan.${def.id}.selected"] = "${def.name} Selected"
-        }
-        return vocab
-    }
-
-    override fun voiceStylePath(): String {
-        val styleDir = supertonicModelDir ?: java.io.File(filesDir, ModelVerifier.SUPERTONIC_DIR)
-        return java.io.File(styleDir, "${_appState.value.monitor.ttsVoiceStyle}.json").absolutePath
-    }
-
-    override fun discardControllers() {
+    override suspend fun discardControllers() {
+        navigationTtsEngine?.shutdown()
+        navigationTtsEngine = null
         sttModelStatusJob?.cancel()
         sttModelStatusJob = null
         ttsModelStatusJob?.cancel()
@@ -892,7 +900,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         ttsController = null
         journalController = null
         journalStorageBackends.clear()
-        announcer = null
         sttTranscriber = null
         ttsSynthesizer = null
         transcriptionService = null
@@ -940,6 +947,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     // Destruction is resumable: it cancels volatile workers but leaves the durable
                     // ledger intact. Replacement/removal remains generation-retirement work.
                     agentRuntimeGraph.coordinator.shutdown()
+                    navigationTtsEngine?.shutdown()
+                    navigationTtsEngine = null
                     hostAudioCoordinator.close()
                     agentRuntimeGraph.playback.close()
                     agentRuntimeGraph.deferredAudioPlayback.close()
@@ -1376,20 +1385,33 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         java.io.File(modelDir, "$style.json")
 
     private fun enqueueRsmAnnouncement(key: String) {
-        val activeAnnouncer = announcer ?: return
-        val recording = activeAnnouncer.recordingFor(key)
-            ?: dev.nilp0inter.subspace.audio.HostAudioFeedback.readyBeep()
+        val text = resolveRsmAnnouncementText(key, channelRepository.catalogueState.value) ?: return
+        val engine = navigationTtsEngine ?: return
         serviceScope.launch {
-            hostAudioCoordinator.play(recording) {
-                playbackRouteResolver.strategyFor(InputMode.Work)
+            val result = engine.request(text) { recording ->
+                hostAudioCoordinator.play(recording) {
+                    playbackRouteResolver.strategyFor(InputMode.Work)
+                }
             }
+            bootstrapCoordinator.onNavigationSynthesisResult(result)
         }
     }
 
     private fun enqueueRsmErrorBeep() {
         serviceScope.launch {
-            hostAudioCoordinator.play(dev.nilp0inter.subspace.audio.HostAudioFeedback.errorBeep()) {
-                playbackRouteResolver.strategyFor(InputMode.Work)
+            val recording = dev.nilp0inter.subspace.audio.HostAudioFeedback.errorBeep()
+            val engine = navigationTtsEngine
+            if (engine == null) {
+                hostAudioCoordinator.play(recording) {
+                    playbackRouteResolver.strategyFor(InputMode.Work)
+                }
+            } else {
+                val result = engine.requestPcm(recording) { pcm ->
+                    hostAudioCoordinator.play(pcm) {
+                        playbackRouteResolver.strategyFor(InputMode.Work)
+                    }
+                }
+                bootstrapCoordinator.onNavigationSynthesisResult(result)
             }
         }
     }

@@ -5,12 +5,15 @@ import dev.nilp0inter.subspace.audio.ModelAssetRepository
 import dev.nilp0inter.subspace.audio.SttTranscriber
 import dev.nilp0inter.subspace.audio.TtsSynthesizer
 import dev.nilp0inter.subspace.audio.TtsController
-import dev.nilp0inter.subspace.audio.SystemAnnouncer
+import dev.nilp0inter.subspace.audio.NavigationSynthesisResult
+import dev.nilp0inter.subspace.audio.NavigationTtsEngine
+import dev.nilp0inter.subspace.audio.NavigationTtsFailure
+import dev.nilp0inter.subspace.audio.PrepareResult
 import dev.nilp0inter.subspace.channel.JournalController
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
-import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.BootstrapState
+import dev.nilp0inter.subspace.model.OfflineNavigationVoiceIssue
 import dev.nilp0inter.subspace.model.ModelAssetResult
 import dev.nilp0inter.subspace.model.SttModelStatus
 import dev.nilp0inter.subspace.model.TtsModelStatus
@@ -68,7 +71,6 @@ class BootstrapCoordinator(
      */
     var sttTimeoutMs: Long = 60_000L
     var ttsTimeoutMs: Long = 60_000L
-    var announcementTimeoutMs: Long = 120_000L
 
     private fun launchAttempt() {
         if (attemptJob?.isActive == true || retryJob?.isActive == true) {
@@ -179,6 +181,35 @@ class BootstrapCoordinator(
         retryJob = null
     }
 
+    fun onNavigationVoiceStateLoss(
+        failure: NavigationTtsFailure.BootstrapSetupFailure,
+        enginePackage: String?,
+    ) {
+        _state.value = BootstrapState.NeedsSetup(
+            offlineNavigationVoiceIssue = failure.toSetupIssue(enginePackage),
+        )
+    }
+
+    fun onNavigationSynthesisResult(result: NavigationSynthesisResult) {
+        if (_state.value !is BootstrapState.Ready) return
+        when (result) {
+            is NavigationSynthesisResult.Success -> Unit
+            NavigationSynthesisResult.Superseded -> Unit
+            is NavigationSynthesisResult.EngineServiceFailure -> if (result.exhausted) {
+                _state.value = BootstrapState.Failed(
+                    BootstrapStage.ProbingNavigationVoice,
+                    "Navigation TTS recovery exhausted: ${result.failure}",
+                )
+            }
+            is NavigationSynthesisResult.InfrastructureFailure -> {
+                _state.value = BootstrapState.Failed(
+                    BootstrapStage.ProbingNavigationVoice,
+                    "Navigation TTS infrastructure failure: ${result.failure}",
+                )
+            }
+        }
+    }
+
     private suspend fun runAttempt() {
         _state.value = BootstrapState.CheckingPrerequisites(
             BootstrapStage.CheckingPermissions,
@@ -210,6 +241,21 @@ class BootstrapCoordinator(
             return
         }
 
+        _state.value = BootstrapState.CheckingPrerequisites(
+            BootstrapStage.ProbingNavigationVoice,
+        )
+        when (val navigationVoice = coreInit.prepareNavigationTts()) {
+            is PrepareResult.Success -> Unit
+            is PrepareResult.Failure -> {
+                _state.value = BootstrapState.NeedsSetup(
+                    offlineNavigationVoiceIssue = navigationVoice.failure.toSetupIssue(
+                        navigationVoice.enginePackage,
+                    ),
+                )
+                return
+            }
+        }
+
         _state.value = BootstrapState.PreparingCore(
             BootstrapStage.InitializingStt,
         )
@@ -225,14 +271,14 @@ class BootstrapCoordinator(
             val sttResult = withTimeoutOrNull(sttTimeoutMs) { sttDeferred.await() }
             val ttsResult = withTimeoutOrNull(ttsTimeoutMs) { ttsDeferred.await() }
 
-            if (sttResult is PrepareResult.Failed) {
+            if (sttResult is PrepareResultInternal.Failed) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingStt,
                     sttResult.reason,
                 )
                 return@coroutineScope
             }
-            if (ttsResult is PrepareResult.Failed) {
+            if (ttsResult is PrepareResultInternal.Failed) {
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.InitializingTts,
                     ttsResult.reason,
@@ -260,56 +306,20 @@ class BootstrapCoordinator(
             coreInit.constructJournalPttController()
 
             _state.value = BootstrapState.PreparingCore(
-                BootstrapStage.RenderingAnnouncements,
-            )
-            val announcer = coreInit.announcer
-            if (announcer != null) {
-                val vocab = coreInit.buildVocabulary()
-                val voiceStylePath = coreInit.voiceStylePath()
-                val announceResult = withTimeoutOrNull(announcementTimeoutMs) {
-                    announcer.precompute(vocab, voiceStylePath, SCO_RATE)
-                }
-                when (announceResult) {
-                    is AnnouncementResult.Ready -> { /* OK */ }
-                    is AnnouncementResult.Failed -> {
-                        _state.value = BootstrapState.Failed(
-                            BootstrapStage.RenderingAnnouncements,
-                            "Announcement '${announceResult.failedKey}' failed: ${announceResult.reason}",
-                        )
-                        return@coroutineScope
-                    }
-                    null -> {
-                        _state.value = BootstrapState.Failed(
-                            BootstrapStage.RenderingAnnouncements,
-                            "Announcement rendering timed out after ${announcementTimeoutMs}ms",
-                        )
-                        return@coroutineScope
-                    }
-                    else -> {
-                        _state.value = BootstrapState.Failed(
-                            BootstrapStage.RenderingAnnouncements,
-                            "Announcement rendering did not complete: $announceResult",
-                        )
-                        return@coroutineScope
-                    }
-                }
-            }
-
-            _state.value = BootstrapState.PreparingCore(
                 BootstrapStage.VerifyingReadiness,
             )
             if (isCoreReady()) {
                 _state.value = BootstrapState.Ready
             } else {
-                val diag = isCoreReadyDiagnostic()
+                val diagnostic = isCoreReadyDiagnostic()
                 try {
-                    android.util.Log.w("BootstrapCoordinator", "Core readiness failed: $diag")
-                } catch (e: Throwable) {
-                    println("[BootstrapCoordinator] Core readiness failed: $diag")
+                    android.util.Log.w("BootstrapCoordinator", "Core readiness failed: $diagnostic")
+                } catch (_: Throwable) {
+                    println("[BootstrapCoordinator] Core readiness failed: $diagnostic")
                 }
                 _state.value = BootstrapState.Failed(
                     BootstrapStage.VerifyingReadiness,
-                    "Core readiness verification failed: $diag",
+                    "Core readiness verification failed: $diagnostic",
                 )
             }
         }
@@ -326,24 +336,22 @@ class BootstrapCoordinator(
      * without making bootstrap fail; bounded connection preparation belongs to PTT handling.
      */
     private fun isCoreReady(): Boolean {
-        return coreInit.sttTranscriber != null &&
+        return coreInit.navigationTtsEngine != null &&
+            coreInit.sttTranscriber != null &&
             coreInit.ttsSynthesizer != null &&
             coreInit.ttsController != null &&
             coreInit.journalController != null &&
-            coreInit.textOutputAvailability !is CapabilityAvailability.Unavailable &&
-            coreInit.announcer != null &&
-            coreInit.announcer?.precomputeState?.value is AnnouncementResult.Ready
+            coreInit.textOutputAvailability !is CapabilityAvailability.Unavailable
     }
 
     private fun isCoreReadyDiagnostic(): String {
         val checks = listOf(
+            "navigationTtsEngine=${coreInit.navigationTtsEngine != null}",
             "sttTranscriber=${coreInit.sttTranscriber != null}",
             "ttsSynthesizer=${coreInit.ttsSynthesizer != null}",
             "ttsController=${coreInit.ttsController != null}",
             "journalController=${coreInit.journalController != null}",
             "textOutputAvailability=${coreInit.textOutputAvailability}",
-            "announcer=${coreInit.announcer != null}",
-            "announcerState=${coreInit.announcer?.precomputeState?.value}",
         )
         return checks.joinToString("; ")
     }
@@ -352,10 +360,10 @@ class BootstrapCoordinator(
      * Prepare STT: construct the JNI transcriber, wait for Ready or Failed,
      * then initialize semantic text output.
      */
-    private suspend fun prepareStt(): PrepareResult {
+    private suspend fun prepareStt(): PrepareResultInternal {
         return try {
             val transcriber = coreInit.constructSttTranscriber()
-                ?: return PrepareResult.Failed(
+                ?: return PrepareResultInternal.Failed(
                     "STT transcriber construction failed",
                 )
             // Wait for STT model Ready or Failed.
@@ -363,7 +371,7 @@ class BootstrapCoordinator(
                 when (transcriber.modelStatus) {
                     SttModelStatus.Ready -> break
                     SttModelStatus.Failed -> {
-                        return PrepareResult.Failed(
+                        return PrepareResultInternal.Failed(
                             "STT model failed to load: ${transcriber.loadError ?: "unknown"}",
                         )
                     }
@@ -371,20 +379,20 @@ class BootstrapCoordinator(
                 }
             }
             coreInit.initializeTextOutputCapability()
-            PrepareResult.Success(transcriber)
+            PrepareResultInternal.Success(transcriber)
         } catch (e: Exception) {
-            PrepareResult.Failed("STT initialization failed: ${e.message}")
+            PrepareResultInternal.Failed("STT initialization failed: ${e.message}")
         }
     }
 
     /**
-     * Prepare TTS: construct the JNI synthesizer, wait for Ready or Failed,
-     * then construct the host diagnostic TTS controller and SystemAnnouncer.
+     * Prepare Supertonic: construct the JNI synthesizer, wait for Ready or Failed,
+     * then construct the host diagnostic TTS controller.
      */
-    private suspend fun prepareTts(): PrepareResult {
+    private suspend fun prepareTts(): PrepareResultInternal {
         return try {
             val synthesizer = coreInit.constructTtsSynthesizer()
-                ?: return PrepareResult.Failed(
+                ?: return PrepareResultInternal.Failed(
                     "TTS synthesizer construction failed",
                 )
             // Wait for TTS model Ready or Failed.
@@ -392,7 +400,7 @@ class BootstrapCoordinator(
                 when (synthesizer.modelStatus) {
                     TtsModelStatus.Ready -> break
                     TtsModelStatus.Failed -> {
-                        return PrepareResult.Failed(
+                        return PrepareResultInternal.Failed(
                             "TTS model failed to load: ${synthesizer.loadError ?: "unknown"}",
                         )
                     }
@@ -400,25 +408,45 @@ class BootstrapCoordinator(
                 }
             }
             coreInit.constructTtsController(synthesizer)
-            coreInit.constructAnnouncer(synthesizer)
-            PrepareResult.SuccessTts(synthesizer)
+            PrepareResultInternal.SuccessTts(synthesizer)
         } catch (e: Exception) {
-            PrepareResult.Failed("TTS initialization failed: ${e.message}")
+            PrepareResultInternal.Failed("TTS initialization failed: ${e.message}")
         }
     }
 
-    private sealed interface PrepareResult {
-        data class Success(val transcriber: SttTranscriber) : PrepareResult
-        data class SuccessTts(val synthesizer: TtsSynthesizer) : PrepareResult
-        data class Failed(val reason: String) : PrepareResult
+    private sealed interface PrepareResultInternal {
+        data class Success(val transcriber: SttTranscriber) : PrepareResultInternal
+        data class SuccessTts(val synthesizer: TtsSynthesizer) : PrepareResultInternal
+        data class Failed(val reason: String) : PrepareResultInternal
     }
 
     companion object {
         private const val STT_MODEL_POLL_MS = 500L
         private const val TTS_MODEL_POLL_MS = 500L
-        private const val SCO_RATE = 16_000
     }
 }
+
+internal fun NavigationTtsFailure.BootstrapSetupFailure.toSetupIssue(
+    enginePackage: String?,
+): OfflineNavigationVoiceIssue = OfflineNavigationVoiceIssue(
+    diagnostic = when (this) {
+        NavigationTtsFailure.BootstrapSetupFailure.EngineUnavailable ->
+            "No Android text-to-speech engine is installed or active."
+        is NavigationTtsFailure.BootstrapSetupFailure.EngineInitFailed ->
+            "Android text-to-speech engine initialization failed: $reason"
+        NavigationTtsFailure.BootstrapSetupFailure.EngineInitTimeout ->
+            "Android text-to-speech engine initialization timed out."
+        NavigationTtsFailure.BootstrapSetupFailure.VoiceMissing ->
+            "Install an offline English voice for the active text-to-speech engine."
+        NavigationTtsFailure.BootstrapSetupFailure.VoiceSelectionFailed ->
+            "The active text-to-speech engine could not select its offline English voice."
+        is NavigationTtsFailure.BootstrapSetupFailure.VoiceProbeFailed ->
+            "The offline English voice failed its synthesis probe: $reason"
+        NavigationTtsFailure.BootstrapSetupFailure.VoiceProbeTimeout ->
+            "The offline English voice synthesis probe timed out."
+    },
+    enginePackage = enginePackage,
+)
 
 /**
  * Interface implemented by [PttForegroundService] to delegate native engine
@@ -426,12 +454,12 @@ class BootstrapCoordinator(
  * infrastructure, JNI bridges, and capture pipeline.
  */
 interface CoreInit {
+    val navigationTtsEngine: NavigationTtsEngine?
     val sttTranscriber: SttTranscriber?
     val ttsSynthesizer: TtsSynthesizer?
     val ttsController: TtsController?
     val journalController: JournalController?
     val textOutputAvailability: CapabilityAvailability
-    val announcer: SystemAnnouncer?
 
     /** Construct the STT JNI transcriber and return it, or null on failure. */
     fun constructSttTranscriber(): SttTranscriber?
@@ -450,15 +478,9 @@ interface CoreInit {
     /** Initialize host-owned semantic text output without exposing transport state. */
     fun initializeTextOutputCapability()
 
-    /** Construct the SystemAnnouncer from the ready TTS synthesizer. */
-    fun constructAnnouncer(synthesizer: TtsSynthesizer)
+    /** Construct, select, probe, and retain the Android navigation TTS engine. */
+    suspend fun prepareNavigationTts(): PrepareResult
 
-    /** Build the announcement vocabulary map. */
-    fun buildVocabulary(): Map<String, String>
-
-    /** Return the voice style file path for announcement rendering. */
-    fun voiceStylePath(): String
-
-    /** Discard all controllers, pollers, and transcriber/synthesizer for retry. */
-    fun discardControllers()
+    /** Discard all controllers, pollers, native engines, and navigation TTS for retry. */
+    suspend fun discardControllers()
 }

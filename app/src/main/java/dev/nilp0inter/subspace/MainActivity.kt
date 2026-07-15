@@ -4,8 +4,10 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
+import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -26,6 +28,7 @@ import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.OfflineNavigationVoiceIssue
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.ui.BootstrapLoadingScreen
@@ -135,6 +138,12 @@ class MainActivity : ComponentActivity() {
                     selectedDirectoryFieldId = fieldId
                     selectedDirectoryPath = path
                 }
+            }
+
+            val voiceSetupLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) {
+                currentServiceState?.refreshBootstrapPrerequisites()
             }
 
             val actions = remember(currentService, permissionLauncher, directoryLauncher) {
@@ -312,16 +321,26 @@ class MainActivity : ComponentActivity() {
                         BootstrapRootSurface.Setup -> {
                             val setup = bootstrapState as BootstrapState.NeedsSetup
                             BackHandler(enabled = false) { }
+                            val voiceIssue = setup.offlineNavigationVoiceIssue
+                            val voiceSetupIntent = remember(voiceIssue) {
+                                resolveVoiceSetupIntent(voiceIssue)
+                            }
                             InitialSetupScreen(
                                 missingPermissions = setup.missingPermissions,
                                 needsManageExternalStorage = setup.needsManageExternalStorage,
                                 invalidModelSets = setup.invalidModelSets,
                                 error = setup.error,
+                                offlineNavigationVoiceIssue = voiceIssue,
+                                voiceSetupRequiresManualNavigation =
+                                    voiceSetupIntent.action == Settings.ACTION_SETTINGS,
                                 onGrantPermissions = {
                                     permissionLauncher.launch(RequiredPermissions.runtimePermissions())
                                 },
                                 onGrantManageExternalStorage = actions::requestManageExternalStorage,
                                 onStartModelDownload = { currentServiceState?.startModelAcquisition() },
+                                onResolveVoiceSetup = {
+                                    voiceSetupLauncher.launch(voiceSetupIntent)
+                                },
                             )
                         }
 
@@ -471,6 +490,19 @@ class MainActivity : ComponentActivity() {
         ChannelCreation,
         LogAnalysis,
         OpenAiProfiles,
+    }
+
+    private fun resolveVoiceSetupIntent(issue: OfflineNavigationVoiceIssue?): Intent {
+        val enginePackage = issue?.enginePackage
+        if (enginePackage != null) {
+            val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+                .setPackage(enginePackage)
+            val handlers = packageManager.queryIntentActivities(installIntent, PackageManager.MATCH_DEFAULT_ONLY)
+            if (handlers.isNotEmpty()) {
+                return installIntent
+            }
+        }
+        return Intent(Settings.ACTION_SETTINGS)
     }
 }
 

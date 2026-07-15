@@ -4,6 +4,7 @@ import dev.nilp0inter.subspace.model.BootstrapStage
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.ModelAcquisitionProgress
 import dev.nilp0inter.subspace.model.ModelSetProgress
+import dev.nilp0inter.subspace.model.OfflineNavigationVoiceIssue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -37,6 +38,15 @@ class BootstrapStateProjectionTest {
     }
 
     @Test
+    fun `ProbingNavigationVoice remains a loading stage with no fabricated progress`() {
+        val state = BootstrapState.CheckingPrerequisites(BootstrapStage.ProbingNavigationVoice)
+
+        assertEquals(BootstrapRootSurface.Loading, bootstrapRootSurface(state))
+        assertEquals("Probing offline navigation voice", bootstrapStageText(state))
+        assertNull(bootstrapProgressDetail(state))
+    }
+
+    @Test
     fun `AcquiringModels maps to Loading`() {
         val state = BootstrapState.AcquiringModels(ModelAcquisitionProgress())
         assertEquals(BootstrapRootSurface.Loading, bootstrapRootSurface(state))
@@ -48,15 +58,6 @@ class BootstrapStateProjectionTest {
         assertEquals(BootstrapRootSurface.Loading, bootstrapRootSurface(state))
     }
 
-    @Test
-    fun `PreparingCore RenderingAnnouncements maps to Loading`() {
-        val state = BootstrapState.PreparingCore(
-            stage = BootstrapStage.RenderingAnnouncements,
-            completedUnits = 5,
-            totalUnits = 10,
-        )
-        assertEquals(BootstrapRootSurface.Loading, bootstrapRootSurface(state))
-    }
 
     @Test
     fun `Failed maps to Loading for recovery surface`() {
@@ -93,6 +94,19 @@ class BootstrapStateProjectionTest {
             error = "Download interrupted",
         )
         assertEquals(BootstrapRootSurface.Setup, bootstrapRootSurface(state))
+    }
+
+    @Test
+    fun `NeedsSetup with offline navigation voice issue routes to setup`() {
+        val state = BootstrapState.NeedsSetup(
+            offlineNavigationVoiceIssue = OfflineNavigationVoiceIssue(
+                diagnostic = "No installed offline English voice",
+                enginePackage = "com.example.tts",
+            ),
+        )
+
+        assertEquals(BootstrapRootSurface.Setup, bootstrapRootSurface(state))
+        assertEquals("Setup required", bootstrapStageText(state))
     }
 
     @Test
@@ -169,32 +183,6 @@ class BootstrapStateProjectionTest {
         assertEquals("50.0 MB / 100.0 MB (50%)", detail)
     }
 
-    // ============================================================
-    // Progress label tests — announcement phrases
-    // ============================================================
-
-    @Test
-    fun `PreparingCore RenderingAnnouncements with totalUnits produces phrase count`() {
-        val state = BootstrapState.PreparingCore(
-            stage = BootstrapStage.RenderingAnnouncements,
-            completedUnits = 3,
-            totalUnits = 8,
-        )
-
-        val detail = bootstrapProgressDetail(state)
-        assertEquals("3 / 8 phrases rendered", detail)
-    }
-
-    @Test
-    fun `PreparingCore RenderingAnnouncements with zero totalUnits produces null`() {
-        val state = BootstrapState.PreparingCore(
-            stage = BootstrapStage.RenderingAnnouncements,
-            completedUnits = 0,
-            totalUnits = 0,
-        )
-
-        assertNull(bootstrapProgressDetail(state))
-    }
 
     @Test
     fun `PreparingCore other stage produces null even with totalUnits`() {
@@ -260,12 +248,6 @@ class BootstrapStateProjectionTest {
         assertEquals("Initializing speech-to-text engine", text)
     }
 
-    @Test
-    fun `PreparingCore RenderingAnnouncements stage text`() {
-        val state = BootstrapState.PreparingCore(BootstrapStage.RenderingAnnouncements)
-        val text = bootstrapStageText(state)
-        assertEquals("Rendering navigation phrases", text)
-    }
 
     @Test
     fun `Failed stage text includes failed stage name`() {

@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.audio
 
+import kotlin.math.roundToInt
+
 /**
  * Audio conversion helpers for the TTS playback path.
  *
@@ -10,13 +12,15 @@ package dev.nilp0inter.subspace.audio
 object TtsAudio {
     /**
      * Convert `f32` samples in `[-1.0, 1.0]` to signed PCM16. Values outside the
-     * unit range are clamped to `[-32768, 32767]`.
+     * unit range are clamped to `[-1.0, 1.0]`, scaled by 32768, rounded to the
+     * nearest integer, and clamped to the signed 16-bit range `[-32768, 32767]`
+     * so that `+1.0` maps to `32767` and `-1.0` maps to `-32768`.
      */
     fun f32ToPcm16(samples: FloatArray): ShortArray {
         val out = ShortArray(samples.size)
         for (i in samples.indices) {
-            val clamped = samples[i].coerceIn(-1.0f, 1.0f)
-            out[i] = (clamped * 32767.0f).toInt().toShort()
+            val v = samples[i].coerceIn(-1.0f, 1.0f)
+            out[i] = (v * 32768.0f).roundToInt().coerceIn(-32768, 32767).toShort()
         }
         return out
     }
@@ -57,5 +61,24 @@ object TtsAudio {
         return RecordedPcm(f32ToPcm16(resampled), targetRate)
     }
 
+    /**
+     * Normalize a mono `f32` [samples] array at [inputRate] Hz to non-empty
+     * 16 kHz mono PCM16 for the navigation playback path: resample via
+     * [resample] to [NAVIGATION_TTS_TARGET_RATE], then convert to PCM16 via
+     * [f32ToPcm16]. Returns `null` when the input or resulting PCM is empty
+     * (empty-PCM rejection), never an empty [RecordedPcm].
+     */
+    fun toNavigationPcm(samples: FloatArray, inputRate: Int): RecordedPcm? {
+        if (samples.isEmpty()) return null
+        val resampled = resample(samples, inputRate, NAVIGATION_TTS_TARGET_RATE)
+        if (resampled.isEmpty()) return null
+        val pcm16 = f32ToPcm16(resampled)
+        if (pcm16.isEmpty()) return null
+        return RecordedPcm(pcm16, NAVIGATION_TTS_TARGET_RATE)
+    }
+
     const val SUPERTONIC_SAMPLE_RATE: Int = 44_100
+
+    /** Target output sample rate for normalized navigation TTS PCM. */
+    const val NAVIGATION_TTS_TARGET_RATE: Int = 16_000
 }

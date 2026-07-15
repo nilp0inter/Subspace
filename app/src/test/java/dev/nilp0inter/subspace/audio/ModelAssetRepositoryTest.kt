@@ -1,6 +1,5 @@
 package dev.nilp0inter.subspace.audio
 
-import dev.nilp0inter.subspace.model.AnnouncementResult
 import dev.nilp0inter.subspace.model.BootstrapState
 import dev.nilp0inter.subspace.model.ModelAssetResult
 import org.junit.Assert.assertEquals
@@ -95,45 +94,6 @@ class ModelAssetRepositoryTest {
         assertEquals(0L, progress.bytesRead)
     }
 
-    @Test
-    fun `AnnouncementResult Ready carries rendered keys`() {
-        val keys = setOf("sys.menu.channels", "chan.journal.name")
-        val result = AnnouncementResult.Ready(keys)
-        assertEquals(keys, result.renderedKeys)
-    }
-
-    @Test
-    fun `AnnouncementResult Failed identifies the failed phrase`() {
-        val result = AnnouncementResult.Failed(
-            completed = 2,
-            total = 5,
-            failedKey = "chan.journal.selected",
-            reason = "Synthesis produced empty PCM",
-        )
-        assertEquals(2, result.completed)
-        assertEquals(5, result.total)
-        assertEquals("chan.journal.selected", result.failedKey)
-        assertEquals("Synthesis produced empty PCM", result.reason)
-    }
-
-    @Test
-    fun `AnnouncementResult Rendering carries current phrase progress`() {
-        val result = AnnouncementResult.Rendering(
-            completed = 3,
-            total = 7,
-            currentKey = "sys.menu.channels",
-        )
-        assertEquals(3, result.completed)
-        assertEquals(7, result.total)
-        assertEquals("sys.menu.channels", result.currentKey)
-    }
-
-    @Test
-    fun `AnnouncementResult WaitingForTts is a distinct state`() {
-        val result = AnnouncementResult.WaitingForTts
-        assertTrue(result is AnnouncementResult.WaitingForTts)
-        assertTrue(result !is AnnouncementResult.Ready)
-    }
 
     @Test
     fun `BootstrapState transitions are exhaustive`() {
@@ -171,22 +131,22 @@ class ModelAssetRepositoryTest {
     @Test
     fun `BootstrapState Failed carries stage diagnostic and retryable`() {
         val state = BootstrapState.Failed(
-            dev.nilp0inter.subspace.model.BootstrapStage.RenderingAnnouncements,
-            "Announcement 'sys.menu.channels' failed: empty PCM",
+            dev.nilp0inter.subspace.model.BootstrapStage.ProbingNavigationVoice,
+            "Navigation TTS probe failed",
             retryable = true,
         )
         assertEquals(
-            dev.nilp0inter.subspace.model.BootstrapStage.RenderingAnnouncements,
+            dev.nilp0inter.subspace.model.BootstrapStage.ProbingNavigationVoice,
             state.stage,
         )
-        assertEquals("Announcement 'sys.menu.channels' failed: empty PCM", state.diagnostic)
+        assertEquals("Navigation TTS probe failed", state.diagnostic)
         assertTrue(state.retryable)
     }
 
     @Test
     fun `BootstrapState PreparingCore carries completedUnits and totalUnits`() {
         val state = BootstrapState.PreparingCore(
-            stage = dev.nilp0inter.subspace.model.BootstrapStage.RenderingAnnouncements,
+            stage = dev.nilp0inter.subspace.model.BootstrapStage.ConstructingControllers,
             completedUnits = 3,
             totalUnits = 7,
         )

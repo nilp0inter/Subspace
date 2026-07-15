@@ -8,6 +8,7 @@ import dev.nilp0inter.subspace.audio.PlaybackRouteAcquisition
 import dev.nilp0inter.subspace.audio.PlaybackRouteStrategy
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
@@ -180,6 +181,113 @@ class HostAudioCoordinatorTest {
         assertTrue(result is HostPlaybackResult.Failed)
         assertTrue(route.released)
         assertEquals(1, route.releaseCount)
+    }
+
+    @Test
+    fun cancellationDuringRouteAcquisitionClearsReservationBeforeRethrowing() = runTest {
+        val coordinator = HostAudioCoordinator()
+        val strategy = SuspendingAcquireRouteStrategy()
+        val play = async {
+            coordinator.play(RecordedPcm(ShortArray(1), 16_000)) { strategy }
+        }
+        strategy.acquireStarted.await()
+
+        // Reservation happens before route acquisition, so PTT remains rejected until cleanup.
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.RejectedByPlayback)
+
+        play.cancel()
+
+        val cancellation = runCatching { play.await() }.exceptionOrNull()
+        assertTrue(cancellation is CancellationException)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.Granted)
+    }
+
+    @Test
+    fun cancellationDuringRouteStartReleasesRouteBeforeRethrowingAndAdmittingCapture() = runTest {
+        val coordinator = HostAudioCoordinator()
+        val route = StartBlockingRoute()
+        val play = async {
+            coordinator.play(RecordedPcm(ShortArray(1), 16_000)) { FakeRouteStrategy(route) }
+        }
+        route.startEntered.await()
+
+        play.cancel()
+        route.releaseStarted.await()
+
+        // NonCancellable route cleanup is still in progress, so cancellation has not surfaced
+        // and the playback reservation remains the active owner.
+        assertFalse(play.isCompleted)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.RejectedByPlayback)
+
+        route.allowRelease.complete(Unit)
+
+        val cancellation = runCatching { play.await() }.exceptionOrNull()
+        assertTrue(cancellation is CancellationException)
+        assertTrue(route.released)
+        assertEquals(1, route.releaseCount)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.Granted)
+    }
+
+    @Test
+    fun cancellationDuringPlaybackWaitsForPhysicalCleanupThenRouteReleaseBeforeRethrowing() = runTest {
+        val coordinator = HostAudioCoordinator()
+        val playback = CleanupBlockingPlayback()
+        val route = BlockingReleaseRoute(playback)
+        val play = async {
+            coordinator.play(RecordedPcm(ShortArray(1), 16_000)) { FakeRouteStrategy(route) }
+        }
+        playback.started.await()
+
+        play.cancel()
+        playback.skipObserved.await()
+
+        // The pump has been asked to stop, but it has not physically cleaned up yet. Neither
+        // route release nor capture admission may get ahead of that terminal cleanup.
+        assertFalse(playback.physicalCleanupComplete)
+        assertFalse(route.releaseStarted.isCompleted)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.RejectedByPlayback)
+
+        playback.completeAfterPhysicalCleanup(PlaybackCompletion.ExplicitlySkipped)
+        route.releaseStarted.await()
+
+        assertTrue(playback.awaitReturned.isCompleted)
+        assertTrue(playback.physicalCleanupComplete)
+        assertFalse(play.isCompleted)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.RejectedByPlayback)
+
+        route.allowRelease.complete(Unit)
+
+        val cancellation = runCatching { play.await() }.exceptionOrNull()
+        assertTrue(cancellation is CancellationException)
+        assertTrue(route.released)
+        assertEquals(1, route.releaseCount)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.Granted)
+    }
+
+    @Test
+    fun failedPlaybackReleasesRouteOnlyAfterItsPhysicalCleanupAndThenFreesAdmission() = runTest {
+        val coordinator = HostAudioCoordinator()
+        val playback = CleanupBlockingPlayback()
+        val route = BlockingReleaseRoute(playback)
+        val play = async {
+            coordinator.play(RecordedPcm(ShortArray(1), 16_000)) { FakeRouteStrategy(route) }
+        }
+        playback.started.await()
+
+        playback.completeAfterPhysicalCleanup(PlaybackCompletion.Failed("track write failed"))
+        route.releaseStarted.await()
+
+        // A failed pump is still an owning playback until its cleanup and route release finish.
+        assertTrue(playback.awaitReturned.isCompleted)
+        assertTrue(playback.physicalCleanupComplete)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.RejectedByPlayback)
+
+        route.allowRelease.complete(Unit)
+
+        assertEquals(HostPlaybackResult.Failed("track write failed"), play.await())
+        assertTrue(route.released)
+        assertEquals(1, route.releaseCount)
+        assertTrue(coordinator.reserveCapture() is HostCaptureAdmission.Granted)
     }
 
     @Test
@@ -371,6 +479,96 @@ class HostAudioCoordinatorTest {
         override suspend fun release() {
             released = true
             releaseCount += 1
+        }
+    }
+
+    /** Holds route release open to prove cancellation cannot escape its NonCancellable cleanup. */
+    internal class BlockingReleaseRoute(
+        private val playback: ActivePcmPlayback,
+    ) : AcquiredPlaybackRoute {
+        override val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Unspecified
+
+        val releaseStarted = CompletableDeferred<Unit>()
+        val allowRelease = CompletableDeferred<Unit>()
+        var released = false
+            private set
+        var releaseCount = 0
+            private set
+
+        override suspend fun start(recording: RecordedPcm): ActivePcmPlayback = playback
+
+        override suspend fun release() {
+            releaseStarted.complete(Unit)
+            allowRelease.await()
+            released = true
+            releaseCount += 1
+        }
+    }
+
+    /** Acquires a route but suspends before returning a playback, exposing the start window. */
+    internal class StartBlockingRoute : AcquiredPlaybackRoute {
+        override val endpoint: AudioRouteEndpoint = AudioRouteEndpoint.Unspecified
+
+        val startEntered = CompletableDeferred<Unit>()
+        val releaseStarted = CompletableDeferred<Unit>()
+        val allowRelease = CompletableDeferred<Unit>()
+        var released = false
+            private set
+        var releaseCount = 0
+            private set
+
+        override suspend fun start(recording: RecordedPcm): ActivePcmPlayback {
+            startEntered.complete(Unit)
+            return CompletableDeferred<ActivePcmPlayback>().await()
+        }
+
+        override suspend fun release() {
+            releaseStarted.complete(Unit)
+            allowRelease.await()
+            released = true
+            releaseCount += 1
+        }
+    }
+
+    /** Reserves playback and then suspends while the coordinator is awaiting route acquisition. */
+    internal class SuspendingAcquireRouteStrategy : PlaybackRouteStrategy {
+        val acquireStarted = CompletableDeferred<Unit>()
+
+        override suspend fun acquire(): PlaybackRouteAcquisition {
+            acquireStarted.complete(Unit)
+            return CompletableDeferred<PlaybackRouteAcquisition>().await()
+        }
+    }
+
+    /**
+     * Models a pump that cannot publish completion until its physical AudioTrack cleanup is done.
+     * Tests control that terminal boundary directly rather than relying on wall-clock scheduling.
+     */
+    internal class CleanupBlockingPlayback : ActivePcmPlayback {
+        val started = CompletableDeferred<Unit>()
+        val skipObserved = CompletableDeferred<Unit>()
+        val awaitReturned = CompletableDeferred<Unit>()
+        private val completion = CompletableDeferred<PlaybackCompletion>()
+
+        var physicalCleanupComplete = false
+            private set
+
+        fun completeAfterPhysicalCleanup(result: PlaybackCompletion) {
+            physicalCleanupComplete = true
+            completion.complete(result)
+        }
+
+        override suspend fun awaitCompletion(): PlaybackCompletion {
+            started.complete(Unit)
+            return completion.await().also { awaitReturned.complete(Unit) }
+        }
+
+        override fun rejectPttWithTone(): Boolean = completion.isActive
+
+        override fun skip(): Boolean {
+            if (!completion.isActive) return false
+            skipObserved.complete(Unit)
+            return true
         }
     }
 

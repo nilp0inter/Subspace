@@ -1,11 +1,15 @@
 package dev.nilp0inter.subspace.service
 
+import dev.nilp0inter.subspace.audio.AcquiredPlaybackRoute
 import dev.nilp0inter.subspace.audio.ActivePcmPlayback
 import dev.nilp0inter.subspace.audio.PlaybackCompletion
 import dev.nilp0inter.subspace.audio.PlaybackRouteAcquisition
 import dev.nilp0inter.subspace.audio.PlaybackRouteStrategy
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 
 /**
  * The process-wide conversational-audio owner.
@@ -79,51 +83,68 @@ internal class HostAudioCoordinator(
             if (owner != null) return HostPlaybackResult.Busy
             Owner.Playback(newOperationId()).also { owner = it }
         }
-        val route = when (val acquired = strategy().acquire()) {
-            is PlaybackRouteAcquisition.Acquired -> acquired.route
-            PlaybackRouteAcquisition.Busy -> return releasePlaybackReservation(operation, HostPlaybackResult.Busy)
-            is PlaybackRouteAcquisition.Unavailable -> return releasePlaybackReservation(
-                operation,
-                HostPlaybackResult.Unavailable(acquired.reason),
-            )
-            is PlaybackRouteAcquisition.Failed -> return releasePlaybackReservation(
-                operation,
-                HostPlaybackResult.Failed(acquired.reason),
-            )
-        }
-        val playback = try {
-            route.start(recording)
+        var route: AcquiredPlaybackRoute? = null
+        var playback: ActivePcmPlayback? = null
+        var completion: PlaybackCompletion? = null
+        var result: HostPlaybackResult = HostPlaybackResult.Interrupted
+        try {
+            when (val acquired = strategy().acquire()) {
+                is PlaybackRouteAcquisition.Acquired -> route = acquired.route
+                PlaybackRouteAcquisition.Busy -> {
+                    result = HostPlaybackResult.Busy
+                    return result
+                }
+                is PlaybackRouteAcquisition.Unavailable -> {
+                    result = HostPlaybackResult.Unavailable(acquired.reason)
+                    return result
+                }
+                is PlaybackRouteAcquisition.Failed -> {
+                    result = HostPlaybackResult.Failed(acquired.reason)
+                    return result
+                }
+            }
+
+            val acquiredRoute = checkNotNull(route)
+            val startedPlayback = acquiredRoute.start(recording)
+            playback = startedPlayback
+            val skipOnStart = synchronized(lock) {
+                val current = owner as? Owner.Playback
+                if (current !== operation || closed) null else {
+                    activePlayback = startedPlayback
+                    current.terminating
+                }
+            }
+            if (skipOnStart == null || skipOnStart) startedPlayback.skip()
+
+            completion = startedPlayback.awaitCompletion()
+            result = if (skipOnStart == null) {
+                HostPlaybackResult.Closed
+            } else {
+                when (val terminal = completion) {
+                    PlaybackCompletion.Completed -> HostPlaybackResult.Completed
+                    PlaybackCompletion.ExplicitlySkipped -> HostPlaybackResult.ExplicitlySkipped
+                    PlaybackCompletion.Interrupted -> HostPlaybackResult.Interrupted
+                    is PlaybackCompletion.Failed -> HostPlaybackResult.Failed(terminal.reason)
+                    null -> HostPlaybackResult.Failed("Playback completed without a terminal result")
+                }
+            }
+        } catch (error: CancellationException) {
+            result = HostPlaybackResult.Interrupted
+            throw error
         } catch (error: Exception) {
-            runCatching { route.release() }
-            return releasePlaybackReservation(
-                operation,
-                HostPlaybackResult.Failed(error.message ?: "Unable to start playback"),
-            )
-        }
-        val skipOnStart = synchronized(lock) {
-            val current = owner as? Owner.Playback
-            if (current !== operation || closed) null else {
-                activePlayback = playback
-                current.terminating
-            }
-        }
-        if (skipOnStart == null) {
-            playback.skip()
-            runCatching { route.release() }
-            return releasePlaybackReservation(operation, HostPlaybackResult.Closed)
-        }
-        if (skipOnStart) playback.skip()
-        val result = try {
-            when (val completion = playback.awaitCompletion()) {
-                PlaybackCompletion.Completed -> HostPlaybackResult.Completed
-                PlaybackCompletion.ExplicitlySkipped -> HostPlaybackResult.ExplicitlySkipped
-                PlaybackCompletion.Interrupted -> HostPlaybackResult.Interrupted
-                is PlaybackCompletion.Failed -> HostPlaybackResult.Failed(completion.reason)
-            }
+            result = HostPlaybackResult.Failed(error.message ?: "Unable to play recording")
         } finally {
-            runCatching { route.release() }
+            withContext(NonCancellable) {
+                val active = playback
+                if (active != null && completion == null) {
+                    active.skip()
+                    runCatching { active.awaitCompletion() }
+                }
+                route?.let { acquired -> runCatching { acquired.release() } }
+                releasePlaybackReservation(operation, result)
+            }
         }
-        return releasePlaybackReservation(operation, result)
+        return result
     }
 
     suspend fun consumeSosDuringPlayback(): HostSosDisposition {
@@ -139,11 +160,8 @@ internal class HostAudioCoordinator(
     suspend fun close() {
         val playback = synchronized(lock) {
             closed = true
-            activePlayback.also {
-                activePlayback = null
-                owner = null
-                rejectedPressPendingRelease = false
-            }
+            (owner as? Owner.Playback)?.terminating = true
+            activePlayback
         }
         playback?.skip()
     }
@@ -153,9 +171,11 @@ internal class HostAudioCoordinator(
         result: HostPlaybackResult,
     ): HostPlaybackResult {
         synchronized(lock) {
-            if (owner == playback) owner = null
-            activePlayback = null
-            rejectedPressPendingRelease = false
+            if (owner == playback) {
+                owner = null
+                activePlayback = null
+                rejectedPressPendingRelease = false
+            }
         }
         return result
     }

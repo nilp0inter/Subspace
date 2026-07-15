@@ -42,6 +42,7 @@ fun bootstrapStageText(state: BootstrapState): String = when (state) {
     is BootstrapState.CheckingPrerequisites -> when (state.stage) {
         BootstrapStage.CheckingPermissions -> "Checking permissions"
         BootstrapStage.CheckingModels -> "Verifying model assets"
+        BootstrapStage.ProbingNavigationVoice -> "Probing offline navigation voice"
         else -> "Checking prerequisites"
     }
     is BootstrapState.AcquiringModels -> "Downloading speech packages"
@@ -49,7 +50,6 @@ fun bootstrapStageText(state: BootstrapState): String = when (state) {
         BootstrapStage.InitializingStt -> "Initializing speech-to-text engine"
         BootstrapStage.InitializingTts -> "Initializing text-to-speech engine"
         BootstrapStage.ConstructingControllers -> "Constructing controllers"
-        BootstrapStage.RenderingAnnouncements -> "Rendering navigation phrases"
         BootstrapStage.VerifyingReadiness -> "Verifying core readiness"
         else -> "Preparing core systems"
     }
@@ -64,8 +64,6 @@ fun bootstrapStageText(state: BootstrapState): String = when (state) {
  *
  * - [BootstrapState.AcquiringModels] with [modelProgress] `totalBytes > 0`
  *   produces byte progress text.
- * - [BootstrapState.PreparingCore] at [BootstrapStage.RenderingAnnouncements]
- *   with `totalUnits > 0` produces phrase count text.
  * - All other stages produce `null` (stage name only).
  */
 fun bootstrapProgressDetail(
@@ -79,12 +77,6 @@ fun bootstrapProgressDetail(
         return "${formatBytes(bytesRead)} / ${formatBytes(totalBytes)} (${(pct * 100).toInt()}%)"
     }
 
-    if (state is BootstrapState.PreparingCore &&
-        state.stage == BootstrapStage.RenderingAnnouncements &&
-        state.totalUnits > 0
-    ) {
-        return "${state.completedUnits} / ${state.totalUnits} phrases rendered"
-    }
 
     return null
 }
