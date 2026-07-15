@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## Requirements
 
 ### Requirement: Audio input terminal ownership is atomic
 The audio input subsystem SHALL assign exactly one terminal owner to each active audio input session before launching suspendable completion, cancellation, setup-failure, timeout, or shutdown work. A later terminal signal for the same session SHALL NOT replace the claimed terminal owner or repeat any terminal effect. For every claimed session, the subsystem SHALL invoke each applicable terminal effect exactly once: notify the committed target of its terminal event, release the session-owned route, release the committed-target lease, clear the matching active-session state, and publish terminal completion. The subsystem SHALL attempt the remaining effects in deterministic order even when target notification, route release, lease release, or another cleanup effect throws or is cancelled; it SHALL normalize such failures into the single published terminal outcome. Active-session clearance SHALL occur only after session-owned route and target-lease release have each been attempted, and terminal completion SHALL be published only after every applicable cleanup effect has been attempted. The terminal sequence SHALL run to completion despite caller cancellation, timeout, or service teardown, and late callbacks SHALL have no effect after completion is published.
@@ -54,3 +54,32 @@ The audio input subsystem SHALL assign exactly one terminal owner to each active
 - **AND** teardown SHALL join or await that terminal sequence rather than start a second cleanup sequence
 - **AND** target notification, route release, committed-target lease release, active-session clearance, and terminal completion publication SHALL each occur exactly once when applicable
 - **AND** no callback arriving after terminal completion SHALL revive the session or produce a late effect
+
+### Requirement: Non-global audio input cancellation is source-scoped
+Every cancellation signal caused by a source-specific lifecycle SHALL identify its expected `PttSource`. The audio input subsystem SHALL claim cancellation only when the current pending or active session is owned by that source. A source mismatch or absent session SHALL be a no-op for audio-session state, capture, committed channel target, route, and capture lease. Exactly one explicitly global teardown operation MAY cancel a session regardless of source and SHALL be reserved for whole-service shutdown or equivalent process-wide invalidation.
+
+#### Scenario: Matching source cancels its pending session
+- **WHEN** a source-specific lifecycle requests cancellation for a pending session owned by the same source
+- **THEN** cancellation SHALL claim terminal ownership exactly once
+- **AND** the pending session, route, target lease, and capture admission SHALL be cleaned according to the existing terminal sequence
+
+#### Scenario: Matching source cancels its active capture
+- **WHEN** a source-specific lifecycle requests cancellation for an active capture owned by the same source
+- **THEN** cancellation SHALL claim terminal ownership exactly once
+- **AND** the committed target SHALL receive the existing cancellation terminal event
+- **AND** route and lease cleanup SHALL remain exactly once
+
+#### Scenario: Mismatched source cannot cancel current session
+- **WHEN** a source-specific lifecycle requests cancellation for one source
+- **AND** the current pending or active session belongs to a different source
+- **THEN** the subsystem SHALL reject the cancellation request
+- **AND** SHALL leave the current session, capture, target, route, and lease unchanged
+
+#### Scenario: Source-specific cancellation arrives with no active session
+- **WHEN** a source-specific lifecycle requests cancellation while no pending or active session exists
+- **THEN** the subsystem SHALL perform no terminal effects
+
+#### Scenario: Whole-service shutdown remains global
+- **WHEN** whole-service teardown invalidates all application-owned audio work
+- **THEN** the subsystem MAY cancel the current session regardless of source
+- **AND** SHALL preserve the existing atomic terminal ownership and exactly-once cleanup guarantees

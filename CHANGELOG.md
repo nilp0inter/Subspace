@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added persistent, content-free diagnostics for PTT cancellation provenance, terminal ownership, cleanup failures, and RSM reconnect disposition.
+
+### Fixed
+
+- Isolated PTT cancellation by source so RSM serial teardown and stale Telecom callbacks cannot terminate unrelated Phone, RSM, or car input sessions.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added
