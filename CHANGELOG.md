@@ -6,13 +6,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-16
+
 ### Added
 
+- Added provider-backed OpenAI-compatible Agent channels with global connection profiles, Android Keystore-backed bearer credentials, model discovery, per-channel system prompts, durable asynchronous responses, and optional Keyboard tools.
+- Added a persistent in-app diagnostics viewer, opened by long-pressing the dashboard title, with severity and tag filters, search, compact and detailed layouts, font scaling, and runtime log-level controls.
+- Added explicit, persisted car HFP selection from the On-the-road mode tile so Telecom PTT resolves one configured Bluetooth device instead of inferring a car from connected devices.
+- Added an offline Android navigation-voice prerequisite with automatic setup rechecks and a direct path to Android TTS settings when no suitable voice is available.
 - Added persistent, content-free diagnostics for PTT cancellation provenance, terminal ownership, cleanup failures, and RSM reconnect disposition.
+
+### Changed
+
+- Generalized the channel catalogue and runtime around provider-owned configuration and host-owned capabilities, while keeping unavailable provider instances visible instead of dropping the catalogue entry.
+- Routed channel-produced audio through one host-owned, half-duplex FIFO coordinator that targets the currently selected Work, On-the-road, or On-a-pinch endpoint, queues responses while audio is busy, and fails closed instead of crossing modes.
+- PTT presses during response playback now produce rejection feedback without interrupting the queue; RSM SOS skips the active response and pauses that channel until it is deliberately reselected.
+- Replaced eager Supertonic navigation-phrase rendering and its persistent vocabulary cache with on-demand offline Android TTS, removing the 14–28 second first-boot announcement-rendering stage while preserving app-owned exact-device playback.
+- On-the-road PTT now requires the persisted configured car to be HFP-connected before priming or placing the Telecom call.
 
 ### Fixed
 
 - Isolated PTT cancellation by source so RSM serial teardown and stale Telecom callbacks cannot terminate unrelated Phone, RSM, or car input sessions.
+- Appended a word-separating space to successful Keyboard channel transcriptions before sending them through Sleepwalker.
+- Routed Debug channel echo and synthesized responses through the selected playback endpoint, corrected the Supertonic English language tag, restored safe BLE write pacing, and hardened terminal cleanup against late or duplicate effects.
 
 ## [0.6.0] - 2026-07-11
 
@@ -127,7 +143,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Fixed release workflow `apksigner` lookup by using the full Android build-tools path.
 - Fixed release build-type configuration for Android Gradle Plugin pre-created build types.
 
-[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/nilp0inter/Subspace/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/nilp0inter/Subspace/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nilp0inter/Subspace/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nilp0inter/Subspace/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nilp0inter/Subspace/compare/v0.3.0...v0.4.0
