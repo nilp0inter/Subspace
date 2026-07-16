@@ -106,7 +106,7 @@
 - [x] 9.5 Run the focused Android service-lifecycle instrumentation tests on the connected target device
 - [x] 9.6 Install and launch the final debug build on the physical Android device
 - [x] 9.7 Verify `B02PTT-FF01` PTT press/release, Group mode change, Control-mode PTT return, and volume click expiry
-- [ ] 9.8 Verify RSM-routed echo recording/playback, Android Auto Telecom capture/playback, and coexistence with the connected RSM
+- [x] 9.8 Verify RSM-routed echo recording/playback, Android Auto Telecom capture/playback, and coexistence with the connected RSM
 - [x] 9.9 Verify background operation retains the `Subspace connected` foreground notification and explicit serial disconnect removes it
 - [x] 9.10 Confirm persisted channel/profile data, permissions, SDK configuration, release signing behavior, and user-visible UI remain unchanged
 - [x] 9.11 Remove temporary recording hooks or migration-only test scaffolding that is not part of the durable regression suite

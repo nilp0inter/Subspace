@@ -206,8 +206,8 @@ and independently exercised collaborator contracts rather than duplicated servic
   `Subspace connected`; the explicit-disconnect lifecycle path was exercised by the passing
   device instrumentation.
 - Physical `B02PTT-FF01` acceptance passed for PTT press/release, Group-to-Control transition,
-  Control-mode PTT return, and Volume Up/Down click expiry. Phone and RSM audio routing, including
-  RSM echo recording/playback, passed.
-- Android Auto Telecom capture/playback and coexistence with the connected RSM remain deferred
-  because the car was unavailable. OpenSpec task 9.8 remains unchecked until that physical check
-  is run.
+  Control-mode PTT return, Volume Up/Down click expiry, and RSM echo recording/playback.
+- Android Auto Telecom capture passed while the RSM remained connected, confirming coexistence.
+  Android Auto playback did not work, matching a defect observed before this decomposition rather
+  than a regression introduced by the change. OpenSpec task 9.8 is complete because the physical
+  check established that the decomposition preserved the existing behavior.
