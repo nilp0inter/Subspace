@@ -38,8 +38,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * construction, and announcement rendering to [BootstrapState.Ready].
  *
  * The coordinator delegates native engine construction and controller wiring
- * to [CoreInit] (implemented by [PttForegroundService]) because the service
- * owns the audio infrastructure, JNI bridges, and capture pipeline.
+ * to [CoreInit] (implemented by [ServiceCoreInitializer]) because the
+ * initializer owns the audio infrastructure, JNI bridges, and capture
+ * pipeline.
  *
  * RSM, SPP, HFP, Keyboard BLE, Android Auto, Telecom, reconnect, and
  * journal-recovery readiness are explicitly excluded from the bootstrap
@@ -449,9 +450,9 @@ internal fun NavigationTtsFailure.BootstrapSetupFailure.toSetupIssue(
 )
 
 /**
- * Interface implemented by [PttForegroundService] to delegate native engine
- * construction and controller wiring to the service, which owns the audio
- * infrastructure, JNI bridges, and capture pipeline.
+ * Interface implemented by [ServiceCoreInitializer] to delegate native engine
+ * construction and controller wiring to the initializer, which owns the
+ * audio infrastructure, JNI bridges, and capture pipeline.
  */
 interface CoreInit {
     val navigationTtsEngine: NavigationTtsEngine?
