@@ -1,0 +1,45 @@
+# Internal proof crate for the Subspace embedded Lua 5.4 bridge.
+#
+# Native library: `subspace_lua_proof` (Android loads `libsubspace_lua_proof.so`).
+# Package: `dev.nilp0inter.subspace.lua` (Kotlin JNI object `LuaProofNative`).
+#
+# Pinned substrate: `mlua = =0.12.0`, features `lua54`, `vendored`, `send`.
+# `vendored` pulls `lua-src 550.1.1`, which vendors upstream Lua 5.4 source
+# (Lua 5.4.8 release line). See the workspace `Cargo.toml` for provenance notes.
+#
+# This crate is a `cdylib` (JNI native library) plus an `rlib` (so the parent
+# project or tests can link the Rust API directly when needed). It is a nested
+# standalone workspace member with its own `Cargo.lock` so it can use release
+# `panic = "unwind"` without affecting the parent `rust/` workspace.
+
+[package]
+name = "subspace-lua-proof"
+version = "0.1.0"
+edition = "2021"
+description = "Internal proof of an embedded stock Lua 5.4 substrate for the Subspace plugin runtime (JNI, restricted stdlib, no IO/OS/debug/FFI)"
+license = "MIT"
+publish = false
+
+# Lua 5.4.8 provenance: pinned via mlua 0.12.0 `vendored` -> lua-src 550.1.1,
+# which vendors the upstream Lua 5.4 source tree (5.4.8 release line).
+
+[lib]
+name = "subspace_lua_proof"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned: stock Lua 5.4 vendored and Send. Do not bump without re-checking the
+# restricted-stdlib surface and the instruction-hook semantics.
+mlua = { version = "=0.12.0", default-features = false, features = ["lua54", "vendored", "send"] }
+
+# JNI bridge. Pinned to match the rest of the Subspace native stack (jni 0.21).
+jni = { version = "=0.21.1", default-features = false }
+
+# JSON outcomes. serde_json is pulled transitively by mlua only when the
+# `serde` feature is on; we depend on it directly for outcome serialization.
+serde_json = { version = "=1.0.150", default-features = false, features = ["std"] }
+
+# (No once_cell or log dependency needed — outcomes use serde_json directly.)
+
+[features]
+default = []

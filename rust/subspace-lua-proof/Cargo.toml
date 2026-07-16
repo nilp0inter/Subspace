@@ -1,0 +1,30 @@
+# Subspace Lua proof bridge — standalone Cargo workspace.
+#
+# This is a nested, self-contained Cargo workspace (own Cargo.lock) so that the
+# proof crate can opt into release `panic = "unwind"` without affecting the
+# parent `rust/` workspace, which is pinned to `panic = "abort"` for its
+# existing JNI crates. The parent `rust/Cargo.toml` lists this directory under
+# `exclude`, not `members`.
+#
+# Pinned substrate: stock Lua 5.4.8 via `mlua = =0.12.0` with features
+# `lua54`, `vendored`, `send`. `vendored` builds lua-src 550.1.1, which vendors
+# upstream Lua 5.4 source (lua-5.4.0..5.4.8 compatible; lua-src tracks the
+# 5.4.8 release line). `send` makes `Lua`/`Thread`/values `Send` so native
+# worker candidates can move Lua state across threads safely.
+
+[workspace]
+resolver = "2"
+members = ["subspace-lua-proof"]
+
+# Proof crate needs `panic = "unwind"` so JNI entry points can defensively
+# `catch_unwind` and never propagate a Rust panic across the JNI boundary into
+# the JVM. The parent workspace keeps `panic = "abort"` for its crates.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"
