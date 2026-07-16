@@ -12,6 +12,7 @@ import io.mockk.verify
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
 import org.junit.After
@@ -21,6 +22,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.io.IOException
 import java.io.FileOutputStream
 import java.nio.file.Files
 import java.util.Locale
@@ -122,6 +124,17 @@ class NavigationTtsEngineTest {
             "higher-quality",
             (selectOfflineEnglishVoice(qualityTts.tts) as VoiceSelectionResult.Selected).voice.name,
         )
+    }
+
+    @Test
+    fun preparePropagatesFactoryConstructionFailureUnchanged() = runBlocking {
+        val factoryFailure = IllegalStateException("factory construction failed")
+
+        val thrown = runCatching {
+            engine(TextToSpeechFactory { throw factoryFailure }).prepare()
+        }.exceptionOrNull()
+
+        assertSame(factoryFailure, thrown)
     }
 
     @Test
@@ -227,6 +240,40 @@ class NavigationTtsEngineTest {
         verify(exactly = 0) {
             tts.tts.speak(any<CharSequence>(), any<Int>(), any<Bundle>(), any<String>())
         }
+    }
+
+    @Test
+    fun requestPcmSupersedesActiveSynthesisAndDeliversOnlyItsCallerOwnedPcm() = runBlocking {
+        val runtimeQueued = kotlinx.coroutines.CompletableDeferred<SynthesisCall>()
+        val tts = ttsDouble().apply {
+            onSynthesize = { call ->
+                if (call.text == "Subspace") {
+                    writePcm16Wav(call.file)
+                    emitDone(call.utteranceId)
+                } else {
+                    runtimeQueued.complete(call)
+                }
+                TextToSpeech.SUCCESS
+            }
+        }
+        val engine = engine(factoryOf(tts))
+        assertTrue(engine.prepare() is PrepareResult.Success)
+        val synthesizedPlayback = mutableListOf<RecordedPcm>()
+        val synthesis = async { engine.request("Alpha", synthesizedPlayback::add) }
+        val alpha = runtimeQueued.await()
+        val bypass = RecordedPcm(shortArrayOf(-1_024, 0, 2_048), 16_000)
+        val bypassPlayback = mutableListOf<RecordedPcm>()
+
+        val result = engine.requestPcm(bypass, bypassPlayback::add)
+
+        assertTrue(result is NavigationSynthesisResult.Success)
+        assertSame(bypass, (result as NavigationSynthesisResult.Success).pcm)
+        assertTrue(synthesis.isCancelled)
+        assertFalse(alpha.file.exists())
+        assertTrue(synthesizedPlayback.isEmpty())
+        assertEquals(1, bypassPlayback.size)
+        assertEquals(bypass.samples.toList(), bypassPlayback.single().samples.toList())
+        assertEquals(bypass.sampleRate, bypassPlayback.single().sampleRate)
     }
 
     @Test
@@ -376,6 +423,55 @@ class NavigationTtsEngineTest {
         assertTrue(stateLosses.isEmpty())
     }
 
+
+    @Test
+    fun requestPcmDuringRecoverySuppressesTheRetryButKeepsTheRecoveredEngineUsable() = runBlocking {
+        val recoveryProbeQueued = kotlinx.coroutines.CompletableDeferred<SynthesisCall>()
+        val initial = ttsDouble()
+        val replacement = ttsDouble()
+        initial.onSynthesize = { call ->
+            when (call.text) {
+                "Subspace" -> {
+                    writePcm16Wav(call.file)
+                    initial.emitDone(call.utteranceId)
+                }
+                "Alpha" -> initial.emitError(call.utteranceId)
+            }
+            TextToSpeech.SUCCESS
+        }
+        replacement.onSynthesize = { call ->
+            when (call.text) {
+                "Subspace" -> recoveryProbeQueued.complete(call)
+                "Bravo" -> {
+                    writePcm16Wav(call.file)
+                    replacement.emitDone(call.utteranceId)
+                }
+            }
+            TextToSpeech.SUCCESS
+        }
+        val engine = engine(factoryOf(initial, replacement))
+        assertTrue(engine.prepare() is PrepareResult.Success)
+        val alpha = async { engine.request("Alpha") {} }
+        val recoveryProbe = recoveryProbeQueued.await()
+        val bypass = RecordedPcm(shortArrayOf(-2_048, 2_048), 16_000)
+        val bypassPlayback = mutableListOf<RecordedPcm>()
+
+        val bypassResult = engine.requestPcm(bypass, bypassPlayback::add)
+        writePcm16Wav(recoveryProbe.file)
+        replacement.emitDone(recoveryProbe.utteranceId)
+
+        assertTrue(bypassResult is NavigationSynthesisResult.Success)
+        assertSame(bypass, (bypassResult as NavigationSynthesisResult.Success).pcm)
+        assertEquals(1, bypassPlayback.size)
+        assertEquals(bypass.samples.toList(), bypassPlayback.single().samples.toList())
+        assertEquals(NavigationSynthesisResult.Superseded, alpha.await())
+        assertEquals(listOf("Subspace"), replacement.synthesisCalls.map { it.text })
+
+        val bravo = engine.request("Bravo") {}
+
+        assertTrue(bravo is NavigationSynthesisResult.Success)
+        assertEquals(listOf("Subspace", "Bravo"), replacement.synthesisCalls.map { it.text })
+    }
 
     @Test
     fun shutdownIsAtMostOnceWhenConcurrentTeardownRaces() = runBlocking {
@@ -594,6 +690,32 @@ class NavigationTtsEngineTest {
     }
 
     @Test
+    fun runtimeSynthesizeToFileIoFailureMapsToExactInfrastructureFailure() = runBlocking {
+        val tts = ttsDouble()
+        tts.onSynthesize = { call ->
+            if (call.text == "Subspace") {
+                writePcm16Wav(call.file)
+                tts.emitDone(call.utteranceId)
+                TextToSpeech.SUCCESS
+            } else {
+                throw IOException("cache unavailable")
+            }
+        }
+        val engine = engine(factoryOf(tts))
+        assertTrue(engine.prepare() is PrepareResult.Success)
+
+        val result = engine.request("Alpha") {}
+
+        assertEquals(
+            NavigationSynthesisResult.InfrastructureFailure(
+                NavigationTtsFailure.RendererInfrastructureFailure.FileIoFailure("cache unavailable"),
+            ),
+            result,
+        )
+        assertFalse(tts.synthesisCalls.last().file.exists())
+    }
+
+    @Test
     fun malformedRuntimeOutputIsInfrastructureFailureWithoutEngineReinitialization() = runBlocking {
         val tts = ttsDouble()
         tts.onSynthesize = { call ->
@@ -728,6 +850,38 @@ class NavigationTtsEngineTest {
     }
 
     @Test
+    fun lateTerminalCallbacksAfterShutdownCannotDeliverPcmOrReviveTheEngine() = runBlocking {
+        val runtimeQueued = kotlinx.coroutines.CompletableDeferred<SynthesisCall>()
+        val tts = ttsDouble().apply {
+            onSynthesize = { call ->
+                if (call.text == "Subspace") {
+                    writePcm16Wav(call.file)
+                    emitDone(call.utteranceId)
+                } else {
+                    runtimeQueued.complete(call)
+                }
+                TextToSpeech.SUCCESS
+            }
+        }
+        val engine = engine(factoryOf(tts))
+        assertTrue(engine.prepare() is PrepareResult.Success)
+        val delivered = mutableListOf<RecordedPcm>()
+        val request = async { engine.request("Alpha", delivered::add) }
+        val alpha = runtimeQueued.await()
+
+        engine.shutdown()
+        request.join()
+        tts.emitDone(alpha.utteranceId)
+        tts.emitError(alpha.utteranceId)
+        tts.emitStop(alpha.utteranceId)
+
+        assertTrue(request.isCancelled)
+        assertTrue(delivered.isEmpty())
+        assertFalse(alpha.file.exists())
+        assertEquals(1, tts.shutdownCount)
+    }
+
+    @Test
     fun shutdownDuringRecoveryProbeShutsDownTheCandidateAndDeletesItsProbeFile() = runBlocking {
         val recoveryProbeQueued = kotlinx.coroutines.CompletableDeferred<SynthesisCall>()
         val initial = ttsDouble()
@@ -804,7 +958,7 @@ class NavigationTtsEngineTest {
     }
 
     @Test
-    fun advancingNavigationGenerationDoesNotInvalidateAnInFlightProbeCallback() = runBlocking {
+    fun requestPcmDuringPrepareProbeDeliversItsPcmWithoutInvalidatingTheProbe() = runBlocking {
         val probeQueued = kotlinx.coroutines.CompletableDeferred<SynthesisCall>()
         val tts = ttsDouble().apply {
             onSynthesize = { call ->
@@ -815,14 +969,115 @@ class NavigationTtsEngineTest {
         val engine = engine(factoryOf(tts))
         val prepare = async { engine.prepare() }
         val probe = probeQueued.await()
+        val bypass = RecordedPcm(shortArrayOf(-321, 654), 16_000)
+        val playback = mutableListOf<RecordedPcm>()
 
-        assertTrue(
-            engine.requestPcm(RecordedPcm(shortArrayOf(1), 16_000)) {} is NavigationSynthesisResult.Success,
-        )
+        val bypassResult = engine.requestPcm(bypass, playback::add)
         writePcm16Wav(probe.file)
         tts.emitDone(probe.utteranceId)
 
+        assertTrue(bypassResult is NavigationSynthesisResult.Success)
+        assertSame(bypass, (bypassResult as NavigationSynthesisResult.Success).pcm)
+        assertEquals(1, playback.size)
+        assertEquals(bypass.samples.toList(), playback.single().samples.toList())
+        assertEquals(bypass.sampleRate, playback.single().sampleRate)
         assertTrue(prepare.await() is PrepareResult.Success)
+    }
+
+
+    @Test
+    fun newerRequestPcmCancelsEarlierInFlightPlaybackAndDeliversOnlyTheNewestPcm() = runBlocking {
+        val engine = engine(factoryOf(ttsDouble()))
+        val firstPlaybackStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val firstPlaybackCancelled = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val first = RecordedPcm(shortArrayOf(1), 16_000)
+        val second = RecordedPcm(shortArrayOf(2), 16_000)
+        val delivered = mutableListOf<RecordedPcm>()
+        val firstRequest = async {
+            engine.requestPcm(first) {
+                firstPlaybackStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    firstPlaybackCancelled.complete(Unit)
+                }
+            }
+        }
+        firstPlaybackStarted.await()
+
+        val secondResult = engine.requestPcm(second, delivered::add)
+        firstPlaybackCancelled.await()
+
+        assertTrue(firstRequest.isCancelled)
+        assertTrue(secondResult is NavigationSynthesisResult.Success)
+        assertSame(second, (secondResult as NavigationSynthesisResult.Success).pcm)
+        assertEquals(1, delivered.size)
+        assertEquals(second.samples.toList(), delivered.single().samples.toList())
+    }
+
+    @Test
+    fun cancellingRequestPcmCallerDoesNotCancelEngineOwnedPlaybackBeforeSupersession() = runBlocking {
+        val engine = engine(factoryOf(ttsDouble()))
+        val playbackStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val playbackCancelled = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val cancelledCaller = async {
+            engine.requestPcm(RecordedPcm(shortArrayOf(10), 16_000)) {
+                playbackStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    playbackCancelled.complete(Unit)
+                }
+            }
+        }
+        playbackStarted.await()
+
+        cancelledCaller.cancel()
+        cancelledCaller.join()
+
+        assertTrue(cancelledCaller.isCancelled)
+        assertFalse(playbackCancelled.isCompleted)
+
+        val replacement = RecordedPcm(shortArrayOf(20), 16_000)
+        val replacementPlayback = mutableListOf<RecordedPcm>()
+        val replacementResult = engine.requestPcm(replacement, replacementPlayback::add)
+        playbackCancelled.await()
+
+        assertTrue(replacementResult is NavigationSynthesisResult.Success)
+        assertEquals(1, replacementPlayback.size)
+        assertEquals(replacement.samples.toList(), replacementPlayback.single().samples.toList())
+    }
+
+    @Test
+    fun shutdownCancelsInFlightRequestPcmPlaybackWithoutDeliveringAResult() = runBlocking {
+        val tts = ttsDouble()
+        tts.onSynthesize = { call ->
+            writePcm16Wav(call.file)
+            tts.emitDone(call.utteranceId)
+            TextToSpeech.SUCCESS
+        }
+        val engine = engine(factoryOf(tts))
+        assertTrue(engine.prepare() is PrepareResult.Success)
+        val playbackStarted = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val playbackCancelled = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val request = async {
+            engine.requestPcm(RecordedPcm(shortArrayOf(123), 16_000)) {
+                playbackStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    playbackCancelled.complete(Unit)
+                }
+            }
+        }
+        playbackStarted.await()
+
+        engine.shutdown()
+        request.join()
+        playbackCancelled.await()
+
+        assertTrue(request.isCancelled)
+        assertEquals(1, tts.shutdownCount)
     }
 
     private fun engine(

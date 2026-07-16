@@ -136,6 +136,156 @@ class WavPcmReaderTest {
     }
 
     @Test
+    fun normalizesMonoAndStereoSupportedWavEncodingsToExactNavigationPcmSamples() {
+        data class Fixture(
+            val name: String,
+            val formatTag: Int,
+            val channels: Int,
+            val sampleRate: Int,
+            val bitsPerSample: Int,
+            val payload: ByteArray,
+            val expectedSamples: ShortArray,
+        )
+
+        val fixtures = listOf(
+            Fixture(
+                name = "native-rate mono PCM8",
+                formatTag = WAVE_FORMAT_PCM,
+                channels = 1,
+                sampleRate = 16_000,
+                bitsPerSample = 8,
+                payload = byteArrayOf(0, 128.toByte(), 255.toByte()),
+                expectedSamples = shortArrayOf(-32_768, 0, 32_512),
+            ),
+            Fixture(
+                name = "resampled stereo PCM8",
+                formatTag = WAVE_FORMAT_PCM,
+                channels = 2,
+                sampleRate = 8_000,
+                bitsPerSample = 8,
+                payload = byteArrayOf(0, 128.toByte(), 128.toByte(), 255.toByte()),
+                expectedSamples = shortArrayOf(-16_384, -64, 16_256, 16_256),
+            ),
+            Fixture(
+                name = "resampled mono PCM16",
+                formatTag = WAVE_FORMAT_PCM,
+                channels = 1,
+                sampleRate = 8_000,
+                bitsPerSample = 16,
+                payload = pcm16Bytes(shortArrayOf(-32_768, 16_384)),
+                expectedSamples = shortArrayOf(-32_768, -8_192, 16_384, 16_384),
+            ),
+            Fixture(
+                name = "native-rate stereo PCM16",
+                formatTag = WAVE_FORMAT_PCM,
+                channels = 2,
+                sampleRate = 16_000,
+                bitsPerSample = 16,
+                payload = pcm16Bytes(shortArrayOf(-16_384, 0, 0, 16_384, 32_767, 32_767)),
+                expectedSamples = shortArrayOf(-8_192, 8_192, 32_767),
+            ),
+            Fixture(
+                name = "native-rate mono IEEE float",
+                formatTag = WAVE_FORMAT_IEEE_FLOAT,
+                channels = 1,
+                sampleRate = 16_000,
+                bitsPerSample = 32,
+                payload = float32Bytes(floatArrayOf(-1.0f, -0.5f, 0.5f, 1.0f)),
+                expectedSamples = shortArrayOf(-32_768, -16_384, 16_384, 32_767),
+            ),
+            Fixture(
+                name = "resampled stereo IEEE float",
+                formatTag = WAVE_FORMAT_IEEE_FLOAT,
+                channels = 2,
+                sampleRate = 8_000,
+                bitsPerSample = 32,
+                payload = float32Bytes(floatArrayOf(-1.0f, 0.0f, 0.0f, 1.0f)),
+                expectedSamples = shortArrayOf(-16_384, 0, 16_384, 16_384),
+            ),
+        )
+
+        fixtures.forEach { fixture ->
+            val result = normalizeWavToScoPcm(
+                writeWav(
+                    formatTag = fixture.formatTag,
+                    channels = fixture.channels,
+                    sampleRate = fixture.sampleRate,
+                    bitsPerSample = fixture.bitsPerSample,
+                    payload = fixture.payload,
+                ),
+            )
+
+            assertTrue("${fixture.name}: expected normalized PCM, got $result", result is NormalizeResult.Success)
+            val pcm = (result as NormalizeResult.Success).pcm
+            assertEquals("${fixture.name}: target sample rate", 16_000, pcm.sampleRate)
+            assertEquals("${fixture.name}: exact PCM16 samples", fixture.expectedSamples.toList(), pcm.samples.toList())
+        }
+    }
+
+    @Test
+    fun mapsWavDecodeBoundariesToDistinctInfrastructureFailures() {
+        data class FailureCase(
+            val name: String,
+            val writeFixture: () -> File,
+            val expected: NavigationTtsFailure.RendererInfrastructureFailure,
+        )
+
+        val cases = listOf(
+            FailureCase(
+                name = "unsupported encoding",
+                writeFixture = {
+                    writeWav(
+                        formatTag = 7,
+                        channels = 1,
+                        sampleRate = 16_000,
+                        bitsPerSample = 8,
+                        payload = byteArrayOf(0),
+                    )
+                },
+                expected = NavigationTtsFailure.RendererInfrastructureFailure.UnsupportedEncoding,
+            ),
+            FailureCase(
+                name = "unsupported channel count",
+                writeFixture = {
+                    writeWav(
+                        formatTag = WAVE_FORMAT_PCM,
+                        channels = 3,
+                        sampleRate = 16_000,
+                        bitsPerSample = 16,
+                        payload = ByteArray(6),
+                    )
+                },
+                expected = NavigationTtsFailure.RendererInfrastructureFailure.UnsupportedChannelCount,
+            ),
+            FailureCase(
+                name = "empty PCM",
+                writeFixture = {
+                    writeWav(
+                        formatTag = WAVE_FORMAT_PCM,
+                        channels = 1,
+                        sampleRate = 16_000,
+                        bitsPerSample = 16,
+                        payload = ByteArray(0),
+                    )
+                },
+                expected = NavigationTtsFailure.RendererInfrastructureFailure.EmptyPcm,
+            ),
+            FailureCase(
+                name = "malformed WAV",
+                writeFixture = { nextFixture().apply { writeText("not a WAV file") } },
+                expected = NavigationTtsFailure.RendererInfrastructureFailure.WavDecodeFailure,
+            ),
+        )
+
+        cases.forEach { case ->
+            assertEquals(
+                case.name,
+                NormalizeResult.Failure(case.expected),
+                normalizeWavToScoPcm(case.writeFixture()),
+            )
+        }
+    }
+    @Test
     fun reportsEmptyPcmWithoutReturningARecording() {
         val file = writeWav(
             formatTag = WAVE_FORMAT_PCM,
