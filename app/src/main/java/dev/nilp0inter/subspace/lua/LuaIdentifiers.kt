@@ -3,7 +3,7 @@ package dev.nilp0inter.subspace.lua
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Opaque identifier for a proof Lua state.
+ * Opaque identifier for a Lua kernel state.
  *
  * Carries no native pointer or Lua registry index. The underlying [value] is a
  * process-local monotonic `Long` assigned by the bridge; it is never derived
@@ -24,9 +24,9 @@ internal value class LuaStateId(val value: Long) {
 }
 
 /**
- * Opaque generation of a proof Lua state. Every mutation that invalidates
+ * Opaque generation of a Lua kernel state. Every mutation that invalidates
  * descendant coroutine and operation handles increments the generation.
- * Stale-generation completions return a typed [LuaProofOutcome.Stale] without
+ * Stale-generation completions return a typed [LuaKernelOutcome.Stale] without
  * entering Lua.
  */
 @JvmInline
@@ -41,7 +41,7 @@ internal value class LuaStateGeneration(val value: Long) {
 }
 
 /**
- * Opaque identifier for a proof Lua coroutine. Carries its owning [stateId]
+ * Opaque identifier for a Lua kernel coroutine. Carries its owning [stateId]
  * so the bridge can reject foreign-state handles without dereferencing native
  * memory.
  */
@@ -59,7 +59,7 @@ internal value class LuaCoroutineId(val value: Long) {
 }
 
 /**
- * Opaque identifier for a suspended proof operation token. Each token accepts
+ * Opaque identifier for a suspended kernel operation token. Each token accepts
  * at most one terminal resume, cancellation, or close outcome.
  */
 @JvmInline

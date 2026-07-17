@@ -4,35 +4,35 @@ import org.json.JSONException
 import org.json.JSONObject
 
 /**
- * Strict decoder for the JSON outcome objects returned by the native proof
+ * Strict decoder for the JSON outcome objects returned by the native kernel
  * bridge. Malformed or unknown JSON normalizes to a
- * [LuaProofOutcome.RuntimeFailure] rather than throwing.
+ * [LuaKernelOutcome.RuntimeFailure] rather than throwing.
  *
- * Required `kind` values are mapped to [LuaProofOutcome] variants. Unknown
+ * Required `kind` values are mapped to [LuaKernelOutcome] variants. Unknown
  * `kind` values, missing required fields, or malformed JSON all normalize to
- * [LuaProofOutcome.RuntimeFailure] with a diagnostic string.
+ * [LuaKernelOutcome.RuntimeFailure] with a diagnostic string.
  *
  * Optional fields: `stateId`, `generation`, `coroutineId`, `operationId`,
  * `value`, `diagnostic`, `currentBytes`, `peakBytes`, `deniedAllocations`,
  * `bridgeBytes`, `elapsedNanos`, `luaVersion`, `bindingVersion`, `topology`.
  */
-internal object LuaProofOutcomeCodec {
+internal object LuaKernelOutcomeCodec {
 
     /**
      * Decode a JSON outcome string. Never throws for expected input;
-     * malformed or unknown JSON returns [LuaProofOutcome.RuntimeFailure].
+     * malformed or unknown JSON returns [LuaKernelOutcome.RuntimeFailure].
      */
-    fun decode(json: String): LuaProofOutcome {
+    fun decode(json: String): LuaKernelOutcome {
         val root: JSONObject = try {
             JSONObject(json)
         } catch (e: JSONException) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = null,
                 generation = null,
                 diagnostic = "malformed outcome json: ${e.message}",
             )
         } catch (e: Exception) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = null,
                 generation = null,
                 diagnostic = "unexpected decode error: ${e.javaClass.simpleName}",
@@ -42,7 +42,7 @@ internal object LuaProofOutcomeCodec {
         val kind: String = try {
             root.getString("kind")
         } catch (e: JSONException) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = optLong(root, "stateId"),
                 generation = optLong(root, "generation"),
                 diagnostic = "missing required 'kind' field",
@@ -62,7 +62,7 @@ internal object LuaProofOutcomeCodec {
             "invalid_ownership" -> decodeInvalidOwnership(root)
             "stale" -> decodeStale(root)
             "closed" -> decodeClosed(root)
-            else -> LuaProofOutcome.RuntimeFailure(
+            else -> LuaKernelOutcome.RuntimeFailure(
                 stateId = optLong(root, "stateId"),
                 generation = optLong(root, "generation"),
                 diagnostic = "unknown outcome kind: $kind",
@@ -70,13 +70,13 @@ internal object LuaProofOutcomeCodec {
         }
     }
 
-    private fun decodeCreated(root: JSONObject): LuaProofOutcome {
+    private fun decodeCreated(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "created: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "created: missing generation")
         val luaVersion = reqString(root, "luaVersion") ?: return failure(root, "created: missing luaVersion")
         val bindingVersion = reqString(root, "bindingVersion") ?: return failure(root, "created: missing bindingVersion")
         val topology = reqString(root, "topology") ?: return failure(root, "created: missing topology")
-        return LuaProofOutcome.Created(
+        return LuaKernelOutcome.Created(
             stateId = stateId,
             generation = generation,
             luaVersion = luaVersion,
@@ -85,15 +85,15 @@ internal object LuaProofOutcomeCodec {
         )
     }
 
-    private fun decodeCompleted(root: JSONObject): LuaProofOutcome {
+    private fun decodeCompleted(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "completed: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "completed: missing generation")
         // The native snapshot operation emits kind="completed" with an explicit
         // "operation":"snapshot" marker plus all four memory telemetry fields
         // (currentBytes, peakBytes, deniedAllocations, bridgeBytes). Normal
         // load/start/resume completions may also carry telemetry fields but
-        // lack the marker. We decode marker-present as LuaProofOutcome.Snapshot
-        // and marker-absent as LuaProofOutcome.Completed (retaining any
+        // lack the marker. We decode marker-present as LuaKernelOutcome.Snapshot
+        // and marker-absent as LuaKernelOutcome.Completed (retaining any
         // telemetry fields on Completed so they are not lost).
         val operation = optString(root, "operation")
         if (operation == "snapshot") {
@@ -101,7 +101,7 @@ internal object LuaProofOutcomeCodec {
             val peakBytes = reqLong(root, "peakBytes") ?: return failure(root, "snapshot: missing peakBytes")
             val deniedAllocations = reqLong(root, "deniedAllocations") ?: return failure(root, "snapshot: missing deniedAllocations")
             val bridgeBytes = reqLong(root, "bridgeBytes") ?: return failure(root, "snapshot: missing bridgeBytes")
-            return LuaProofOutcome.Snapshot(
+            return LuaKernelOutcome.Snapshot(
                 stateId = stateId,
                 generation = generation,
                 currentBytes = currentBytes,
@@ -114,7 +114,7 @@ internal object LuaProofOutcomeCodec {
                 topology = optString(root, "topology"),
             )
         }
-        return LuaProofOutcome.Completed(
+        return LuaKernelOutcome.Completed(
             stateId = stateId,
             generation = generation,
             coroutineId = optLong(root, "coroutineId"),
@@ -130,12 +130,12 @@ internal object LuaProofOutcomeCodec {
         )
     }
 
-    private fun decodeYielded(root: JSONObject): LuaProofOutcome {
+    private fun decodeYielded(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "yielded: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "yielded: missing generation")
         val coroutineId = reqLong(root, "coroutineId") ?: return failure(root, "yielded: missing coroutineId")
         val operationId = reqLong(root, "operationId") ?: return failure(root, "yielded: missing operationId")
-        return LuaProofOutcome.Yielded(
+        return LuaKernelOutcome.Yielded(
             stateId = stateId,
             generation = generation,
             coroutineId = coroutineId,
@@ -144,41 +144,41 @@ internal object LuaProofOutcomeCodec {
         )
     }
 
-    private fun decodeSyntaxFailure(root: JSONObject): LuaProofOutcome {
+    private fun decodeSyntaxFailure(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "syntax_failure: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "syntax_failure: missing generation")
         val diagnostic = reqString(root, "diagnostic") ?: return failure(root, "syntax_failure: missing diagnostic")
-        return LuaProofOutcome.SyntaxFailure(
+        return LuaKernelOutcome.SyntaxFailure(
             stateId = stateId,
             generation = generation,
             diagnostic = diagnostic,
         )
     }
 
-    private fun decodeValidationFailure(root: JSONObject): LuaProofOutcome {
+    private fun decodeValidationFailure(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "validation_failure: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "validation_failure: missing generation")
         val diagnostic = reqString(root, "diagnostic") ?: return failure(root, "validation_failure: missing diagnostic")
-        return LuaProofOutcome.ValidationFailure(
+        return LuaKernelOutcome.ValidationFailure(
             stateId = stateId,
             generation = generation,
             diagnostic = diagnostic,
         )
     }
 
-    private fun decodeRuntimeFailure(root: JSONObject): LuaProofOutcome {
-        return LuaProofOutcome.RuntimeFailure(
+    private fun decodeRuntimeFailure(root: JSONObject): LuaKernelOutcome {
+        return LuaKernelOutcome.RuntimeFailure(
             stateId = optLong(root, "stateId"),
             generation = optLong(root, "generation"),
             diagnostic = reqString(root, "diagnostic") ?: "runtime failure (no diagnostic)",
         )
     }
 
-    private fun decodeMemoryFailure(root: JSONObject): LuaProofOutcome {
+    private fun decodeMemoryFailure(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "memory_failure: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "memory_failure: missing generation")
         val diagnostic = reqString(root, "diagnostic") ?: return failure(root, "memory_failure: missing diagnostic")
-        return LuaProofOutcome.MemoryFailure(
+        return LuaKernelOutcome.MemoryFailure(
             stateId = stateId,
             generation = generation,
             diagnostic = diagnostic,
@@ -190,10 +190,10 @@ internal object LuaProofOutcomeCodec {
     }
 
 
-    private fun decodeInterrupted(root: JSONObject): LuaProofOutcome {
+    private fun decodeInterrupted(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "interrupted: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "interrupted: missing generation")
-        return LuaProofOutcome.Interrupted(
+        return LuaKernelOutcome.Interrupted(
             stateId = stateId,
             generation = generation,
             diagnostic = optString(root, "diagnostic"),
@@ -201,44 +201,44 @@ internal object LuaProofOutcomeCodec {
         )
     }
 
-    private fun decodeCancelled(root: JSONObject): LuaProofOutcome {
+    private fun decodeCancelled(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "cancelled: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "cancelled: missing generation")
         val operationId = reqLong(root, "operationId") ?: return failure(root, "cancelled: missing operationId")
-        return LuaProofOutcome.Cancelled(
+        return LuaKernelOutcome.Cancelled(
             stateId = stateId,
             generation = generation,
             operationId = operationId,
         )
     }
 
-    private fun decodeInvalidOwnership(root: JSONObject): LuaProofOutcome {
-        return LuaProofOutcome.InvalidOwnership(
+    private fun decodeInvalidOwnership(root: JSONObject): LuaKernelOutcome {
+        return LuaKernelOutcome.InvalidOwnership(
             stateId = optLong(root, "stateId"),
             generation = optLong(root, "generation"),
             diagnostic = reqString(root, "diagnostic") ?: "invalid ownership (no diagnostic)",
         )
     }
 
-    private fun decodeStale(root: JSONObject): LuaProofOutcome {
-        return LuaProofOutcome.Stale(
+    private fun decodeStale(root: JSONObject): LuaKernelOutcome {
+        return LuaKernelOutcome.Stale(
             stateId = optLong(root, "stateId"),
             generation = optLong(root, "generation"),
             diagnostic = reqString(root, "diagnostic") ?: "stale (no diagnostic)",
         )
     }
 
-    private fun decodeClosed(root: JSONObject): LuaProofOutcome {
+    private fun decodeClosed(root: JSONObject): LuaKernelOutcome {
         val stateId = reqLong(root, "stateId") ?: return failure(root, "closed: missing stateId")
         val generation = reqLong(root, "generation") ?: return failure(root, "closed: missing generation")
-        return LuaProofOutcome.Closed(
+        return LuaKernelOutcome.Closed(
             stateId = stateId,
             generation = generation,
         )
     }
 
-    private fun failure(root: JSONObject, reason: String): LuaProofOutcome =
-        LuaProofOutcome.RuntimeFailure(
+    private fun failure(root: JSONObject, reason: String): LuaKernelOutcome =
+        LuaKernelOutcome.RuntimeFailure(
             stateId = optLong(root, "stateId"),
             generation = optLong(root, "generation"),
             diagnostic = reason,

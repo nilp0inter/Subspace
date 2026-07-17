@@ -5,6 +5,7 @@ import dev.nilp0inter.subspace.channel.capability.AsynchronousConversationCapabi
 import dev.nilp0inter.subspace.channel.capability.CapabilityFailureReason
 import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.channel.capability.DelayedPlaybackCapability
 import dev.nilp0inter.subspace.channel.capability.OpenAiCompletionCapability
 import dev.nilp0inter.subspace.model.AcceptedAgentRun
@@ -147,7 +148,15 @@ class AgentRunCoordinator(
             diagnostic(scope.channelInstanceId, null, AgentRunDiagnosticCode.LIMIT_EXCEEDED)
             return CapabilityOperationResult.Failed(CapabilityFailureReason.INVALID_REQUEST)
         }
-        val lifecycle = lifecycleFor(scope, configuration.durable.configurationFingerprint)
+        val lifecycle = when (val admission = lifecycleFor(scope, configuration.durable.configurationFingerprint)) {
+            is LifecycleAdmission.Admitted -> admission.lifecycle
+            LifecycleAdmission.Closed,
+            LifecycleAdmission.Stale,
+            -> {
+                diagnostic(scope.channelInstanceId, null, AgentRunDiagnosticCode.ADMISSION_REJECTED)
+                return CapabilityOperationResult.Closed
+            }
+        }
         val runId = AgentRunId(newId())
         val messageId = AgentMessageId(newId())
         val operationId = AgentOperationId(newId())
@@ -182,7 +191,7 @@ class AgentRunCoordinator(
                 snapshot.runs.filter { it.id in recovered.value.resumableRunIds }.groupBy { it.channelInstanceId }.forEach { (channel, runs) ->
                     // A restart always opens fresh volatile context. Stored request snapshots remain durable.
                     val epoch = (snapshot.channelEpochs[channel] ?: -1L) + 1L
-                    lifecycles[channel] = ChannelLifecycle(null, epoch, snapshot.configurationEpochs[channel] ?: 0L, "", newId())
+                    lifecycles[channel] = ChannelLifecycle(CapabilityScopeIdentity(channel, RuntimeGeneration.next()), epoch, snapshot.configurationEpochs[channel] ?: 0L, "", newId())
                     conversations.remove(channel)
                     publishStatusLocked(channel, null)
                     ensureWorkerLocked(channel, lifecycles.getValue(channel).token)
@@ -210,21 +219,30 @@ class AgentRunCoordinator(
         val configurationEpoch = store.advanceConfigurationEpoch(channel).valueOr(previous?.configurationEpoch?.plus(1) ?: 0L)
         val configuration = if (removed) null else configurationResolver.resolve(scope)
         lifecycles[channel] = ChannelLifecycle(
-            scope = configuration?.let { scope },
+            scope = scope,
             conversationEpoch = conversationEpoch,
             configurationEpoch = configurationEpoch,
             configurationFingerprint = configuration?.durable?.configurationFingerprint.orEmpty(),
             token = newId(),
+            retiredGeneration = scope.runtimeGeneration,
         )
         conversations.remove(channel)
         publishStatusLocked(channel, null)
     }
 
     /** SOS is a conversation-only reset; terminal inbound messages stay durable and playable. */
-    override suspend fun resetConversation(scope: CapabilityScopeIdentity) = resetConversation(scope.channelInstanceId)
+    override suspend fun resetConversation(scope: CapabilityScopeIdentity) = mutex.withLock {
+        val lifecycle = lifecycles[scope.channelInstanceId] ?: return
+        if (!scopeCanMutate(scope, lifecycle)) return
+        resetConversationLocked(scope.channelInstanceId)
+    }
 
     /** SOS is a conversation-only reset; terminal inbound messages stay durable and playable. */
     suspend fun resetConversation(channelInstanceId: String) = mutex.withLock {
+        resetConversationLocked(channelInstanceId)
+    }
+
+    private fun resetConversationLocked(channelInstanceId: String) {
         val previous = lifecycles[channelInstanceId] ?: return
         // Revoke publication and stop the worker first; the store atomically classifies every
         // old run as cancelled or indeterminate according to its exact-once effect envelope.
@@ -287,9 +305,9 @@ class AgentRunCoordinator(
     private suspend fun process(run: DurableAgentRun, token: String): Boolean {
         if (!isCurrent(run.channelInstanceId, token)) return false
         val lifecycle = mutex.withLock { lifecycles[run.channelInstanceId] } ?: return false
-        val resolved = lifecycle.scope?.let(configurationResolver::resolve)
+        val resolved = if (lifecycle.configurationFingerprint.isNotEmpty()) configurationResolver.resolve(lifecycle.scope) else null
         val configuration = resolved ?: AgentRunCoordinatorConfiguration(run.configuration, emptyList())
-        if (lifecycle.scope != null && configuration.durable.configurationFingerprint != lifecycle.configurationFingerprint) return false
+        if (resolved != null && configuration.durable.configurationFingerprint != lifecycle.configurationFingerprint) return false
         if (store.beginRun(run.id) is DurableAgentStoreResult.Failure) return false
         publish(run.channelInstanceId, null)
 
@@ -308,7 +326,7 @@ class AgentRunCoordinator(
             ) return fail(run, token, AgentRunDiagnosticCode.STORE_FAILURE)
             val outcome = try {
                 withTimeout(minOf(limits.operationTimeoutMillis, (deadlineMillis - nowMillis()).coerceAtLeast(1L))) {
-                    completion.complete(AgentOperationContext(lifecycle.scope ?: CapabilityScopeIdentity(run.channelInstanceId, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)), run.id, operationId),
+                    completion.complete(AgentOperationContext(lifecycle.scope, run.id, operationId),
                         OpenAiChatRequest(dev.nilp0inter.subspace.model.OpenAiConnectionProfileId(run.configuration.connectionProfileId), dev.nilp0inter.subspace.model.OpenAiModelId(run.configuration.modelId), conversation.toList(), configuration.tools, parallelToolCalls = false))
                 }
             } catch (_: CancellationException) { throw CancellationException() }
@@ -327,7 +345,7 @@ class AgentRunCoordinator(
                         if (++toolCalls > limits.maximumToolCalls) return fail(run, token, AgentRunDiagnosticCode.TOOL_LOOP_LIMIT)
                         val result = try {
                             withTimeout(minOf(limits.operationTimeoutMillis, (deadlineMillis - nowMillis()).coerceAtLeast(1L))) {
-                                tools.execute(AgentOperationContext(lifecycle.scope ?: CapabilityScopeIdentity(run.channelInstanceId, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)), run.id, AgentOperationId(newId())), call)
+                                tools.execute(AgentOperationContext(lifecycle.scope, run.id, AgentOperationId(newId())), call)
                             }
                         } catch (_: CancellationException) { throw CancellationException() }
                           catch (_: Exception) { return fail(run, token, AgentRunDiagnosticCode.STORE_FAILURE) }
@@ -349,7 +367,7 @@ class AgentRunCoordinator(
         if (!isCurrent(run.channelInstanceId, token)) return false
         val result = try {
             withTimeout(limits.operationTimeoutMillis) {
-                playback.schedule(AgentOperationContext(lifecycle.scope ?: CapabilityScopeIdentity(run.channelInstanceId, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)), run.id, AgentOperationId(newId())), DelayedPlaybackRequest(responseId, text))
+                playback.schedule(AgentOperationContext(lifecycle.scope, run.id, AgentOperationId(newId())), DelayedPlaybackRequest(responseId, text))
             }
         } catch (_: CancellationException) { throw CancellationException() }
           catch (_: Exception) { DelayedPlaybackOutcome.Failed(dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason.HOST_FAILURE) }
@@ -389,11 +407,45 @@ class AgentRunCoordinator(
         return true
     }
 
-    private fun lifecycleFor(scope: CapabilityScopeIdentity, fingerprint: String): ChannelLifecycle =
-        lifecycles.getOrPut(scope.channelInstanceId) {
+    private fun lifecycleFor(scope: CapabilityScopeIdentity, fingerprint: String): LifecycleAdmission {
+        val existing = lifecycles[scope.channelInstanceId]
+        if (existing == null) {
             val snapshot = store.snapshot()
-            ChannelLifecycle(scope, snapshot.channelEpochs[scope.channelInstanceId] ?: 0L, snapshot.configurationEpochs[scope.channelInstanceId] ?: 0L, fingerprint, newId())
+            val lifecycle = ChannelLifecycle(
+                scope = scope,
+                conversationEpoch = snapshot.channelEpochs[scope.channelInstanceId] ?: 0L,
+                configurationEpoch = snapshot.configurationEpochs[scope.channelInstanceId] ?: 0L,
+                configurationFingerprint = fingerprint,
+                token = newId(),
+            )
+            lifecycles[scope.channelInstanceId] = lifecycle
+            return LifecycleAdmission.Admitted(lifecycle)
         }
+
+        val retiredGeneration = existing.retiredGeneration
+        if (retiredGeneration != null) {
+            if (scope.runtimeGeneration.value <= retiredGeneration.value) {
+                return LifecycleAdmission.Closed
+            }
+            val successor = existing.copy(
+                scope = scope,
+                configurationFingerprint = fingerprint,
+                retiredGeneration = null,
+            )
+            lifecycles[scope.channelInstanceId] = successor
+            return LifecycleAdmission.Admitted(successor)
+        }
+
+        if (scope.runtimeGeneration.value < existing.scope.runtimeGeneration.value) {
+            return LifecycleAdmission.Stale
+        }
+        val lifecycle = existing.copy(scope = scope, configurationFingerprint = fingerprint)
+        lifecycles[scope.channelInstanceId] = lifecycle
+        return LifecycleAdmission.Admitted(lifecycle)
+    }
+
+    private fun scopeCanMutate(scope: CapabilityScopeIdentity, lifecycle: ChannelLifecycle): Boolean =
+        lifecycle.retiredGeneration == null && scope.runtimeGeneration == lifecycle.scope.runtimeGeneration
 
 
     private fun isCurrent(channel: String, token: String): Boolean = !closed && lifecycles[channel]?.token == token
@@ -440,7 +492,20 @@ class AgentRunCoordinator(
         is AgentRunTerminalOutcome.Indeterminate -> AgentRunState.INDETERMINATE
     }
 
-    private data class ChannelLifecycle(val scope: CapabilityScopeIdentity?, val conversationEpoch: Long, val configurationEpoch: Long, val configurationFingerprint: String, val token: String)
+    private sealed interface LifecycleAdmission {
+        data class Admitted(val lifecycle: ChannelLifecycle) : LifecycleAdmission
+        data object Closed : LifecycleAdmission
+        data object Stale : LifecycleAdmission
+    }
+
+    private data class ChannelLifecycle(
+        val scope: CapabilityScopeIdentity,
+        val conversationEpoch: Long,
+        val configurationEpoch: Long,
+        val configurationFingerprint: String,
+        val token: String,
+        val retiredGeneration: RuntimeGeneration? = null,
+    )
 }
 
 private fun DurableAgentStoreResult<Long>.valueOr(fallback: Long): Long = (this as? DurableAgentStoreResult.Success)?.value ?: fallback

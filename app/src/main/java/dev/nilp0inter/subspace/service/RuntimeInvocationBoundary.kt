@@ -26,6 +26,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.asCoroutineDispatcher
 
 /**
@@ -50,6 +52,7 @@ enum class RuntimeInvocationOrigin {
 
 enum class RuntimeInvocationPhase {
     CONSTRUCT,
+    STARTUP,
     PREPARE_INPUT,
     INPUT_STARTED,
     INPUT_RELEASED,
@@ -267,6 +270,7 @@ class RuntimeGenerationInvocationGate internal constructor(
     val childWork = RuntimeChildWork(lifecycleScope)
 
     private val stateLock = Any()
+    private val executionMutex = Mutex()
     private val queue = Channel<Request<*>>(policy.perGenerationQueueCapacity)
     private var admitting = true
     private var live = true
@@ -467,8 +471,12 @@ class RuntimeGenerationInvocationGate internal constructor(
         processor.cancel()
         childWork.cancelAndJoinWithin(policy.closeTimeoutMillis)
 
+        val closeStarted = AtomicBoolean(false)
         val closeJob = terminalScope.async {
-            workers.run { terminalClose() }
+            workers.run {
+                closeStarted.set(true)
+                terminalClose()
+            }
         }
         return try {
             withTimeout(policy.closeTimeoutMillis) {
@@ -476,10 +484,17 @@ class RuntimeGenerationInvocationGate internal constructor(
                 RuntimeInvocationOutcome.Success(Unit)
             }
         } catch (_: TimeoutCancellationException) {
-            closeJob.cancel(CancellationException("Runtime close timed out"))
+            // If the callback won the race with the timeout, it owns the one runtime close and
+            // must finish before callers can consider a fallback. If it has not started, cancel
+            // and join it so a fallback cannot race a late worker dispatch.
+            if (!closeStarted.get()) {
+                closeJob.cancel(CancellationException("Runtime close timed out before starting"))
+            }
+            withContext(NonCancellable) { closeJob.join() }
             RuntimeInvocationOutcome.TimedOut
         } catch (_: CancellationException) {
             closeJob.cancel()
+            withContext(NonCancellable) { closeJob.join() }
             RuntimeInvocationOutcome.Cancelled
         } catch (failure: Throwable) {
             failure.toOutcome(RuntimeInvocationPhase.CLOSE, RuntimeInvocationOrigin.RUNTIME)
@@ -501,11 +516,41 @@ class RuntimeGenerationInvocationGate internal constructor(
         }
 
         try {
-            request.execute()
+            executionMutex.withLock {
+                request.execute()
+            }
         } finally {
             synchronized(stateLock) {
                 if (active === request) active = null
             }
+        }
+    }
+
+    /**
+     * Runs a continuation under generation liveness and worker serialization without entering
+     * the FIFO admission queue. Used by actor runtime to resume a yielded Lua slice under the
+     * same per-generation execution serialization as host-admitted callbacks, but never as a
+     * new host-admitted callback. Returns [RuntimeInvocationOutcome.Closed] if the generation
+     * is no longer live; otherwise runs [action] on the worker dispatcher under [executionMutex].
+     */
+    internal suspend fun <T> invokeContinuation(action: suspend () -> T): RuntimeInvocationOutcome<T> {
+        if (!isLive) return RuntimeInvocationOutcome.Closed
+        return try {
+            executionMutex.withLock {
+                if (!isLive) {
+                    RuntimeInvocationOutcome.Closed
+                } else {
+                    try {
+                        RuntimeInvocationOutcome.Success(workers.run { action() })
+                    } catch (_: CancellationException) {
+                        RuntimeInvocationOutcome.Cancelled
+                    } catch (failure: Throwable) {
+                        failure.toOutcome(RuntimeInvocationPhase.CLOSE, RuntimeInvocationOrigin.RUNTIME)
+                    }
+                }
+            }
+        } catch (_: CancellationException) {
+            RuntimeInvocationOutcome.Cancelled
         }
     }
 

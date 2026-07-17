@@ -1,10 +1,10 @@
-//! Internal proof of an embedded stock Lua 5.4 substrate for the Subspace
-//! plugin runtime.
+//! Internal embedded stock Lua 5.4 actor kernel for the Subspace plugin
+//! runtime.
 //!
-//! Native library `subspace_lua_proof` (Android: `libsubspace_lua_proof.so`).
-//! Kotlin JNI object `LuaProofNative` in package `dev.nilp0inter.subspace.lua`.
+//! Native library `subspace_lua_actor` (Android: `libsubspace_lua_actor.so`).
+//! Kotlin JNI object `LuaNativeKernel` in package `dev.nilp0inter.subspace.lua`.
 //!
-//! # What this proves
+//! # What this provides
 //!
 //! - A restricted stock Lua 5.4 VM with a narrow standard-library subset and
 //!   no IO/OS/debug/FFI/dynamic loading.
@@ -19,8 +19,8 @@
 //!   `interrupted`.
 //! - Per-state allocator accounting and denial (current, sampled peak, denied
 //!   count, terminal Lua bytes, bridge-owned bytes recorded separately).
-//! - The selected execution candidate `jvm_owned` driving the state engine and
-//!   the same ownership/terminal state machine.
+//! - The `jvm_owned` execution model driving the state engine and the same
+//!   ownership/terminal state machine.
 //! - JSON outcomes over JNI; JNI functions convert all expected errors to JSON
 //!   and never unwind across the JNI boundary.
 //!
@@ -30,7 +30,7 @@
 //! pulls `lua-src 550.1.1`, which vendors upstream Lua 5.4 source (the Lua
 //! 5.4.8 release line). `send` makes `Lua`/`Thread`/values `Send` so the
 //! engine can hold a `Lua` instance behind an `Arc<Mutex<>>` and still satisfy
-//! `Send + Sync`.
+//! `Send + sync`.
 //!
 //! # Safety posture
 //!
@@ -48,7 +48,6 @@ mod jni_bridge;
 mod outcome;
 mod ownership;
 mod state;
-mod topology;
 
 /// Lua version reported to the host, matching the vendored substrate.
 pub const LUA_VERSION: &str = "5.4.8";
@@ -60,4 +59,6 @@ pub use accounting::MemoryReport;
 pub use outcome::{Outcome, OutcomeKind};
 pub use ownership::{Generation, Lifecycle, OperationId, StateHandle, StateId};
 pub use state::{StateEngine, StateSnapshot};
-pub use topology::Topology;
+
+#[cfg(any(test, feature = "registry-test"))]
+pub use jni_bridge::registry_test;

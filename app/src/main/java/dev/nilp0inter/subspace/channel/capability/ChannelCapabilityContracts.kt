@@ -29,11 +29,26 @@ sealed interface ChannelCapability {
     data object DeferredAudioPlayback : ChannelCapability { override val stableId = "deferred-audio-playback" }
 }
 
-/** A monotonically assigned runtime generation. It is scoped to one channel instance. */
+/**
+ * A monotonically assigned runtime generation. It is scoped to one channel instance
+ * but allocated from a host process-wide counter so that reconstructed registries
+ * cannot reuse prior generation IDs.
+ */
 @JvmInline
 value class RuntimeGeneration(val value: Long) {
     init {
         require(value >= 0) { "Runtime generation must be non-negative" }
+    }
+
+    companion object {
+        private val counter = java.util.concurrent.atomic.AtomicLong(0)
+
+        /**
+         * Allocates the next process-wide monotonic generation. The returned
+         * value is always greater than every previously allocated generation
+         * in this process, even across registry reconstruction.
+         */
+        fun next(): RuntimeGeneration = RuntimeGeneration(counter.getAndIncrement())
     }
 }
 

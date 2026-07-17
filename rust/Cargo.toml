@@ -1,9 +1,9 @@
 [workspace]
 members = ["subspace-ogg", "subspace-parakeet", "subspace-supertonic"]
-# The Lua proof crate is a nested standalone workspace with its own Cargo.lock
+# The Lua actor kernel is a nested standalone workspace with its own Cargo.lock
 # and release panic = "unwind". It must NOT be a member of this workspace,
 # which pins panic = "abort" for its JNI crates.
-exclude = ["subspace-lua-proof"]
+exclude = ["subspace-lua-actor"]
 resolver = "2"
 [profile.release]
 opt-level = 3

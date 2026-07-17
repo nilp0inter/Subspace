@@ -1,0 +1,100 @@
+package dev.nilp0inter.subspace.lua.actor
+
+/**
+ * Internal configurable resource policy supplied at actor construction.
+ *
+ * This is host-owned internal configuration, not plugin configuration. All
+ * values are internal policy and MUST NOT become a public plugin compatibility
+ * promise. Policy values are evidence-derived and may be remeasured against
+ * real internal workloads.
+ *
+ * @param luaKernelConfig per-state Lua kernel configuration (memory limit, hook
+ *   interval, instruction budget).
+ * @param mailboxCapacity bounded event mailbox capacity; reject with Busy when
+ *   full, matching the gate's bounded queue.
+ * @param activeSliceBudgetMillis active execution budget for pure-Lua
+ *   computation while the VM is entered. Not charged for yielded wait time.
+ * @param operationWaitDeadlineMillis deadline for a yielded operation before it
+ *   is completed with a typed timed-out result.
+ * @param callbackTimeoutMillis callback deadline for one host-callback Lua
+ *   slice.
+ * @param closeTimeoutMillis bound for terminal actor close including joining
+ *   background tasks and invoking terminal Lua close.
+ * @param maxConcurrentTasks maximum concurrent background tasks in the
+ *   generation-owned task scope.
+ * @param perTaskDeadlineMillis per-task deadline for one background task.
+ */
+internal data class ActorPolicy(
+    val luaKernelConfig: ActorKernelConfig,
+    val mailboxCapacity: Int,
+    val activeSliceBudgetMillis: Long,
+    val operationWaitDeadlineMillis: Long,
+    val callbackTimeoutMillis: Long,
+    val closeTimeoutMillis: Long,
+    val maxConcurrentTasks: Int,
+    val perTaskDeadlineMillis: Long,
+) {
+    init {
+        require(mailboxCapacity > 0) { "Mailbox capacity must be positive" }
+        require(activeSliceBudgetMillis > 0) { "Active slice budget must be positive" }
+        require(operationWaitDeadlineMillis > 0) { "Operation wait deadline must be positive" }
+        require(callbackTimeoutMillis > 0) { "Callback timeout must be positive" }
+        require(closeTimeoutMillis > 0) { "Close timeout must be positive" }
+        require(maxConcurrentTasks > 0) { "Max concurrent tasks must be positive" }
+        require(perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
+    }
+
+    companion object {
+        /**
+         * Representative starting policy derived from the proof's evidence.
+         * These are NOT public compatibility promises; they are starting
+         * evidence that may be remeasured against real workloads.
+         */
+        fun startingEvidence(
+            memoryLimitBytes: Long = DEFAULT_MEMORY_LIMIT_BYTES,
+            hookInterval: Int = DEFAULT_HOOK_INTERVAL,
+            instructionBudget: Long = DEFAULT_INSTRUCTION_BUDGET,
+            mailboxCapacity: Int = DEFAULT_MAILBOX_CAPACITY,
+        ): ActorPolicy = ActorPolicy(
+            luaKernelConfig = ActorKernelConfig(
+                memoryLimitBytes = memoryLimitBytes,
+                hookInterval = hookInterval,
+                instructionBudget = instructionBudget,
+            ),
+            mailboxCapacity = mailboxCapacity,
+            activeSliceBudgetMillis = DEFAULT_ACTIVE_SLICE_BUDGET_MILLIS,
+            operationWaitDeadlineMillis = DEFAULT_OPERATION_WAIT_DEADLINE_MILLIS,
+            callbackTimeoutMillis = DEFAULT_CALLBACK_TIMEOUT_MILLIS,
+            closeTimeoutMillis = DEFAULT_CLOSE_TIMEOUT_MILLIS,
+            maxConcurrentTasks = DEFAULT_MAX_CONCURRENT_TASKS,
+            perTaskDeadlineMillis = DEFAULT_PER_TASK_DEADLINE_MILLIS,
+        )
+
+        // Starting evidence — NOT normative limits.
+        private const val DEFAULT_MEMORY_LIMIT_BYTES = 8L * 1024 * 1024
+        private const val DEFAULT_HOOK_INTERVAL = 500
+        private const val DEFAULT_INSTRUCTION_BUDGET = 1_000_000L
+        private const val DEFAULT_MAILBOX_CAPACITY = 16
+        private const val DEFAULT_ACTIVE_SLICE_BUDGET_MILLIS = 5_000L
+        private const val DEFAULT_OPERATION_WAIT_DEADLINE_MILLIS = 30_000L
+        private const val DEFAULT_CALLBACK_TIMEOUT_MILLIS = 15_000L
+        private const val DEFAULT_CLOSE_TIMEOUT_MILLIS = 5_000L
+        private const val DEFAULT_MAX_CONCURRENT_TASKS = 4
+        private const val DEFAULT_PER_TASK_DEADLINE_MILLIS = 60_000L
+    }
+}
+
+/**
+ * Per-state Lua kernel configuration.
+ */
+internal data class ActorKernelConfig(
+    val memoryLimitBytes: Long,
+    val hookInterval: Int,
+    val instructionBudget: Long,
+) {
+    init {
+        require(memoryLimitBytes >= 0L) { "Memory limit must be non-negative" }
+        require(hookInterval > 0) { "Hook interval must be positive" }
+        require(instructionBudget >= 0L) { "Instruction budget must be non-negative" }
+    }
+}

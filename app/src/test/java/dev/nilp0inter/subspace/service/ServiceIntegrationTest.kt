@@ -8,6 +8,7 @@ import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.PcmOutput
 import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.audio.resolveLocalAudioRoute
+import dev.nilp0inter.subspace.channel.KeyboardBuiltInProvider
 import dev.nilp0inter.subspace.channel.capability.CapabilityAcquisition
 import dev.nilp0inter.subspace.channel.capability.CapabilityAcquisitionPolicy
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
@@ -24,6 +25,9 @@ import dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome
 import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
 import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
 import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioRecording
+import dev.nilp0inter.subspace.channel.capability.Transcription
+import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
 import dev.nilp0inter.subspace.model.ChannelCatalogueCodec
 import dev.nilp0inter.subspace.model.ChannelCatalogueDecodeResult
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
@@ -44,6 +48,10 @@ import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import dev.nilp0inter.subspace.model.ProviderConfigurationResult
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
+import dev.nilp0inter.subspace.model.KeyboardProviderConfiguration
+import dev.nilp0inter.subspace.model.KeyboardProviderConfigurationCodec
+import dev.nilp0inter.subspace.lua.LuaNativeKernel
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +61,7 @@ import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.runCurrent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -143,10 +152,95 @@ class ServiceIntegrationTest {
         assertFalse(manager.isActive)
         assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, registry.shutdownAndAwait())
     }
+
+    @Test
+    fun kotlinCataloguePttReconciliationAndRestartRemainLuaDormant() = runTest {
+        LuaNativeKernel.resetForTest()
+        ActorRuntimeFactory.resetForTest()
+        try {
+            val first = ChannelDefinition(
+                id = "first",
+                name = "First keyboard",
+                implementationId = BuiltInChannelImplementationIds.KEYBOARD,
+                enabled = true,
+                configSchemaVersion = 1,
+                configPayload = KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration("linux:us")),
+            )
+            val second = ChannelDefinition(
+                id = "second",
+                name = "Second keyboard",
+                implementationId = BuiltInChannelImplementationIds.KEYBOARD,
+                enabled = true,
+                configSchemaVersion = 1,
+                configPayload = KeyboardProviderConfigurationCodec.encode(KeyboardProviderConfiguration("windows:us")),
+            )
+            val catalogue = ChannelCatalogueSnapshot(listOf(first, second), first.id)
+            val firstHost = RecordingCapabilityHost(transcript = "first transcript")
+            val firstRegistry = compositionRegistry(KeyboardBuiltInProvider(), firstHost)
+
+            firstRegistry.reconcile(catalogue)
+            advanceUntilIdle()
+            firstRegistry.refreshReadiness()
+            advanceUntilIdle()
+            assertEquals(listOf(first.id, second.id), firstRegistry.runtimeSnapshots.value.entries.map { it.id })
+
+            val firstSource = CaptureServiceFakes.singleShotSource(shortArrayOf(4, -2))
+            val firstOutput = RecordingOutput()
+            val firstManager = PttAudioSessionManager(
+                scope = this,
+                captureService = CaptureServiceFakes.newService(this),
+                channelRouter = firstRegistry,
+                resolvePttAudioRoute = { resolveLocalAudioRoute(firstOutput, firstSource) },
+            )
+            assertTrue(firstManager.start(dev.nilp0inter.subspace.model.PttSource.Phone, first.id, dev.nilp0inter.subspace.model.InputMode.OnAPinch))
+            runCurrent()
+            assertTrue(firstManager.release(dev.nilp0inter.subspace.model.PttSource.Phone))
+            advanceUntilIdle()
+
+            assertEquals(listOf("first:first transcript "), firstHost.deliveredTexts)
+            assertEquals(1, firstSource.openCount)
+            assertEquals(0, firstOutput.errorBeeps)
+
+            firstRegistry.reconcile(catalogue.copy(activeChannelId = second.id))
+            firstRegistry.refreshReadiness()
+            advanceUntilIdle()
+            assertEquals(second.id, firstRegistry.runtimeSnapshots.value.activeChannelId)
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, firstRegistry.shutdownAndAwait())
+
+            val restartedHost = RecordingCapabilityHost(transcript = "second transcript")
+            val restartedRegistry = compositionRegistry(KeyboardBuiltInProvider(), restartedHost)
+            restartedRegistry.reconcile(catalogue.copy(activeChannelId = second.id))
+            restartedRegistry.refreshReadiness()
+            advanceUntilIdle()
+
+            val restartedSource = CaptureServiceFakes.singleShotSource(shortArrayOf(7, -3))
+            val restartedOutput = RecordingOutput()
+            val restartedManager = PttAudioSessionManager(
+                scope = this,
+                captureService = CaptureServiceFakes.newService(this),
+                channelRouter = restartedRegistry,
+                resolvePttAudioRoute = { resolveLocalAudioRoute(restartedOutput, restartedSource) },
+            )
+            assertTrue(restartedManager.start(dev.nilp0inter.subspace.model.PttSource.Phone, second.id, dev.nilp0inter.subspace.model.InputMode.OnAPinch))
+            runCurrent()
+            assertTrue(restartedManager.release(dev.nilp0inter.subspace.model.PttSource.Phone))
+            advanceUntilIdle()
+
+            assertEquals(listOf("second:second transcript "), restartedHost.deliveredTexts)
+            assertEquals(1, restartedSource.openCount)
+            assertEquals(0, restartedOutput.errorBeeps)
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, restartedRegistry.shutdownAndAwait())
+            assertFalse(ActorRuntimeFactory.isCreateAttempted)
+            assertFalse(LuaNativeKernel.isLoadAttempted)
+        } finally {
+            ActorRuntimeFactory.resetForTest()
+            LuaNativeKernel.resetForTest()
+        }
+    }
 }
 
 internal fun TestScope.compositionRegistry(
-    provider: CompositionProvider,
+    provider: ChannelImplementationProvider,
     capabilityHost: RecordingCapabilityHost,
     onPttSessionCancelRequested: suspend () -> Unit = {},
 ): ChannelRuntimeRegistry {
@@ -298,6 +392,7 @@ internal class CompositionRuntime(
 
 internal class RecordingCapabilityHost(
     private val unavailableInstances: Set<String> = emptySet(),
+    private val transcript: String? = null,
 ) : ChannelCapabilityHost {
     val acquisitions = mutableListOf<CapabilityScopeIdentity>()
     val cleanup = mutableListOf<String>()
@@ -321,21 +416,30 @@ internal class RecordingCapabilityHost(
         if (identity.channelInstanceId in unavailableInstances) {
             return HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
         }
-        if (key != CapabilityKey.TextOutput) {
-            return HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
-        }
-        return HostedCapabilityAcquisition.Available(
-            object : TextOutputCapability {
-                override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
-                    deliveredTexts += "${identity.channelInstanceId}:${request.text}"
-                    return TextDeliveryOutcome.Delivered("delivery-${identity.channelInstanceId}")
-                }
+        return when (key) {
+            CapabilityKey.TextOutput -> HostedCapabilityAcquisition.Available(
+                object : TextOutputCapability {
+                    override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
+                        deliveredTexts += "${identity.channelInstanceId}:${request.text}"
+                        return TextDeliveryOutcome.Delivered("delivery-${identity.channelInstanceId}")
+                    }
 
-                override suspend fun sendKey(request: dev.nilp0inter.subspace.channel.capability.TextKeyRequest): TextDeliveryOutcome =
-                    TextDeliveryOutcome.Delivered("key-${identity.channelInstanceId}")
-            },
-            cleanup = { termination -> cleanup += "${identity.channelInstanceId}:${identity.runtimeGeneration.value}:$termination" },
-        ) as HostedCapabilityAcquisition<T>
+                    override suspend fun sendKey(request: dev.nilp0inter.subspace.channel.capability.TextKeyRequest): TextDeliveryOutcome =
+                        TextDeliveryOutcome.Delivered("key-${identity.channelInstanceId}")
+                },
+                cleanup = { termination -> cleanup += "${identity.channelInstanceId}:${identity.runtimeGeneration.value}:$termination" },
+            )
+            CapabilityKey.Transcription -> transcript?.let { text ->
+                HostedCapabilityAcquisition.Available(
+                    object : TranscriptionCapability {
+                        override suspend fun transcribe(recording: OpaqueAudioRecording): CapabilityOperationResult<Transcription> =
+                            CapabilityOperationResult.Success(Transcription(text))
+                    },
+                    cleanup = { termination -> cleanup += "${identity.channelInstanceId}:${identity.runtimeGeneration.value}:$termination" },
+                )
+            } ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
+            else -> HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        } as HostedCapabilityAcquisition<T>
     }
 
     override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(

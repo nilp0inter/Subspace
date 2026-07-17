@@ -1,0 +1,54 @@
+{
+  "schema": "subspace.lua.actor.device-run-manifest.v1",
+  "evidenceRunId": "62c4cdf8-8a71-4782-9d4e-589a12417af6",
+  "device": {
+    "serial": "a5c3b76a",
+    "model": "OnePlus CPH2653",
+    "androidVersion": "16",
+    "apiLevel": 36,
+    "abi": "arm64-v8a",
+    "buildFingerprint": "OnePlus/CPH2653EEA/OP5D55L1:16/BP2A.250605.015/V.R4T3.26073a0-1df561-1f78cb:user/release-keys"
+  },
+  "artifacts": {
+    "applicationApk": {
+      "path": "app/build/outputs/apk/debug/app-debug.apk",
+      "sha256": "d0f2df269fb818cf670a4aa01bdf51dd85410a239f5a00caef49ceb132b7f322"
+    },
+    "instrumentationApk": {
+      "path": "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk",
+      "sha256": "6f255e0ef49134efd5b12ee17acc97be35dc708a0d7dbd31acf3645ed0b59f53"
+    },
+    "packagedNativeLibraries": [
+      "lib/arm64-v8a/libandroidx.graphics.path.so",
+      "lib/arm64-v8a/libonnxruntime.so",
+      "lib/arm64-v8a/libonnxruntime4j_jni.so",
+      "lib/arm64-v8a/libsubspace_lua_actor.so",
+      "lib/arm64-v8a/libsubspace_ogg.so",
+      "lib/arm64-v8a/libsubspace_parakeet.so",
+      "lib/arm64-v8a/libsubspace_supertonic.so"
+    ],
+    "packagedLuaLibraries": [
+      "lib/arm64-v8a/libsubspace_lua_actor.so"
+    ]
+  },
+  "instrumentation": {
+    "command": [
+      "adb",
+      "shell",
+      "am",
+      "instrument",
+      "-w",
+      "-r",
+      "-e",
+      "class",
+      "dev.nilp0inter.subspace.lua.LuaActorInstrumentationTest",
+      "dev.nilp0inter.subspace.test/androidx.test.runner.AndroidJUnitRunner"
+    ],
+    "class": "dev.nilp0inter.subspace.lua.LuaActorInstrumentationTest",
+    "runner": "dev.nilp0inter.subspace.test/androidx.test.runner.AndroidJUnitRunner",
+    "returnCode": 0,
+    "result": "OK (1 test)",
+    "probeCount": 8,
+    "failedProbes": []
+  }
+}

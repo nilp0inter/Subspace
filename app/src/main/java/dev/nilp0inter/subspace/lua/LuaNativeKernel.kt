@@ -1,14 +1,14 @@
 package dev.nilp0inter.subspace.lua
 
 /**
- * JNI object exporting the proof Lua bridge native methods. The native library
- * `subspace_lua_proof` is loaded lazily — only when [ensureLoaded] is called
- * by [LuaProofNativeBridge] on explicit proof bridge use. No ordinary
+ * JNI object exporting the Lua kernel native methods. The native library
+ * `subspace_lua_actor` is loaded lazily — only when [ensureLoaded] is called
+ * by [LuaNativeKernelBridge] on explicit kernel bridge use. No ordinary
  * application startup path references this object.
  *
  * JNI method signatures match the shared contract exactly:
  *
- * - `nativeCreate(topology: String, memoryLimitBytes: Long, hookInterval: Int, instructionBudget: Long): String`
+ * - `nativeCreate(memoryLimitBytes: Long, hookInterval: Int, instructionBudget: Long): String`
  * - `nativeLoad(stateId: Long, generation: Long, source: String, entrypoint: String): String`
  * - `nativeStart(stateId: Long, generation: Long): String`
  * - `nativeResume(stateId: Long, generation: Long, operationId: Long, success: Boolean, value: String): String`
@@ -20,8 +20,8 @@ package dev.nilp0inter.subspace.lua
  * Every JNI function returns a JSON object and must not throw for expected
  * input. No native pointer or Lua registry index is exposed.
  */
-internal object LuaProofNative {
-    private const val NATIVE_LIB_NAME = "subspace_lua_proof"
+internal object LuaNativeKernel {
+    private const val NATIVE_LIB_NAME = "subspace_lua_actor"
 
     @Volatile
     private var loaded: Boolean = false
@@ -31,7 +31,7 @@ internal object LuaProofNative {
 
     /**
      * Attempt to load the native library. Returns true on success. Called only
-     * by [LuaProofNativeBridge] on explicit proof bridge use — never during
+     * by [LuaNativeKernelBridge] on explicit kernel bridge use — never during
      * ordinary application startup.
      */
     @Synchronized
@@ -66,7 +66,6 @@ internal object LuaProofNative {
     }
 
     external fun nativeCreate(
-        topology: String,
         memoryLimitBytes: Long,
         hookInterval: Int,
         instructionBudget: Long,

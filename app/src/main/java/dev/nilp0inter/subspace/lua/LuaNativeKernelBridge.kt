@@ -1,16 +1,16 @@
 package dev.nilp0inter.subspace.lua
 
 /**
- * Lazy native implementation of [LuaProofBridge] backed by [LuaProofNative].
+ * Lazy native implementation of [LuaKernelBridge] backed by [LuaNativeKernel].
  *
  * The native library is loaded only when the first bridge method is invoked —
  * no ordinary application startup path creates an instance or calls
- * [ensureLoaded]. This keeps the proof substrate invisible to production
+ * [ensureLoaded]. This keeps the kernel substrate invisible to production
  * channel registration, UI, and service lifecycle.
  *
  * Every method delegates to the JNI object and decodes the JSON outcome via
- * [LuaProofOutcomeCodec]. Malformed or unknown JSON normalizes to
- * [LuaProofOutcome.RuntimeFailure] rather than throwing. No native pointer or
+ * [LuaKernelOutcomeCodec]. Malformed or unknown JSON normalizes to
+ * [LuaKernelOutcome.RuntimeFailure] rather than throwing. No native pointer or
  * Lua registry index is exposed across the bridge.
  *
  * State handles are assigned on the JVM side as opaque [LuaStateId] /
@@ -18,100 +18,99 @@ package dev.nilp0inter.subspace.lua
  * values. The native side validates every operation against its owning state
  * generation.
  */
-internal class LuaProofNativeBridge : LuaProofBridge {
+internal class LuaNativeKernelBridge : LuaKernelBridge {
 
     /**
-     * Create a proof Lua state. Assigns a fresh opaque [LuaStateId] and
+     * Create a Lua kernel state. Assigns a fresh opaque [LuaStateId] and
      * initial [LuaStateGeneration], passes the config to native code, and
      * decodes the result.
      */
-    override fun create(config: LuaProofConfig): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun create(config: LuaKernelConfig): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = null,
                 generation = null,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeCreate(
-                config.topology.wireValue,
+            LuaNativeKernel.nativeCreate(
                 config.memoryLimitBytes,
                 config.hookInterval,
                 config.instructionBudget,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = null,
                 generation = null,
                 diagnostic = "nativeCreate link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeLoad(
+            LuaNativeKernel.nativeLoad(
                 handle.stateId.value,
                 handle.generation.value,
                 source,
                 entrypoint,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeLoad link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun start(handle: LuaStateHandle): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun start(handle: LuaStateHandle): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeStart(
+            LuaNativeKernel.nativeStart(
                 handle.stateId.value,
                 handle.generation.value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeStart link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
     override fun resume(
         operation: LuaOperationHandle,
         success: Boolean,
         value: String,
-    ): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    ): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = operation.stateHandle.stateId.value,
                 generation = operation.stateHandle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeResume(
+            LuaNativeKernel.nativeResume(
                 operation.stateHandle.stateId.value,
                 operation.stateHandle.generation.value,
                 operation.operationId.value,
@@ -119,105 +118,105 @@ internal class LuaProofNativeBridge : LuaProofBridge {
                 value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = operation.stateHandle.stateId.value,
                 generation = operation.stateHandle.generation.value,
                 diagnostic = "nativeResume link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun cancel(operation: LuaOperationHandle): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun cancel(operation: LuaOperationHandle): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = operation.stateHandle.stateId.value,
                 generation = operation.stateHandle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeCancel(
+            LuaNativeKernel.nativeCancel(
                 operation.stateHandle.stateId.value,
                 operation.stateHandle.generation.value,
                 operation.operationId.value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = operation.stateHandle.stateId.value,
                 generation = operation.stateHandle.generation.value,
                 diagnostic = "nativeCancel link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun interrupt(handle: LuaStateHandle): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun interrupt(handle: LuaStateHandle): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeInterrupt(
+            LuaNativeKernel.nativeInterrupt(
                 handle.stateId.value,
                 handle.generation.value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeInterrupt link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun snapshot(handle: LuaStateHandle): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun snapshot(handle: LuaStateHandle): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeSnapshot(
+            LuaNativeKernel.nativeSnapshot(
                 handle.stateId.value,
                 handle.generation.value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeSnapshot link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
-    override fun close(handle: LuaStateHandle): LuaProofOutcome {
-        if (!LuaProofNative.ensureLoaded()) {
-            return LuaProofOutcome.RuntimeFailure(
+    override fun close(handle: LuaStateHandle): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
-                diagnostic = "subspace_lua_proof native library not available",
+                diagnostic = "subspace_lua_actor native library not available",
             )
         }
         val json = try {
-            LuaProofNative.nativeClose(
+            LuaNativeKernel.nativeClose(
                 handle.stateId.value,
                 handle.generation.value,
             )
         } catch (e: UnsatisfiedLinkError) {
-            return LuaProofOutcome.RuntimeFailure(
+            return LuaKernelOutcome.RuntimeFailure(
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeClose link error: ${e.message}",
             )
         }
-        return LuaProofOutcomeCodec.decode(json)
+        return LuaKernelOutcomeCodec.decode(json)
     }
 }

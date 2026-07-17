@@ -1,7 +1,6 @@
 package dev.nilp0inter.subspace.channel.capability
 
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 
@@ -9,26 +8,51 @@ import kotlinx.coroutines.CancellationException
  * Host-owned capability scope for one channel instance and one runtime generation.
  * The host creates a fresh scope for every generation; no global capability lookup is
  * available to providers or runtimes.
+ *
+ * For staged successor semantics, [initiallyAuthorized] may be false, preventing
+ * capability acquisition until [authorize] is called. This allows a successor scope
+ * to be constructed and validated effect-free while a predecessor drains, then
+ * authorized only after the predecessor has fully closed.
  */
 class RevocableChannelCapabilityScope(
     override val identity: CapabilityScopeIdentity,
     declaredCapabilities: Set<ChannelCapability>,
     private val host: ChannelCapabilityHost,
     private val diagnostics: CapabilityDiagnosticSink = CapabilityDiagnosticSink { },
+    initiallyAuthorized: Boolean = true,
 ) : ChannelCapabilityScope {
     override val declaredCapabilities: Set<ChannelCapability> = declaredCapabilities.toSet()
-    private val closed = AtomicBoolean(false)
+    private val state = AtomicReference(
+        if (initiallyAuthorized) ScopeState.OPEN else ScopeState.PENDING
+    )
     private val leases = ConcurrentHashMap.newKeySet<ManagedLease<*>>()
 
     override val isClosed: Boolean
-        get() = closed.get()
+        get() = state.get() === ScopeState.REVOKED
+
+    /** Returns true if this scope is authorized for capability acquisition. */
+    val isAuthorized: Boolean
+        get() = state.get() === ScopeState.OPEN
+
+    /**
+     * One-way authorization with monotonic linearization. Transitions this scope
+     * from [ScopeState.PENDING] to [ScopeState.OPEN]; atomically refuses after
+     * [revoke] has linearized the scope to [ScopeState.REVOKED].
+     *
+     * Linearization point: the successful CAS of [state] from PENDING to OPEN.
+     * Returns true iff this call performed that transition.
+     * Returns false if already authorized (OPEN) or already revoked (REVOKED);
+     * in particular, revoke linearizes before authorize can observe REVOKED,
+     * so authorize never returns true once revoke is concurrent or completed.
+     */
+    fun authorize(): Boolean = state.compareAndSet(ScopeState.PENDING, ScopeState.OPEN)
 
     override suspend fun availability(key: CapabilityKey<*>): CapabilityAvailabilityResult {
         if (!isDeclared(key)) {
             record(key.capability, CapabilityDiagnosticPhase.AVAILABILITY, CapabilityDiagnosticOutcome.DENIED)
             return CapabilityAvailabilityResult.Denied(CapabilityDeniedReason.UNDECLARED)
         }
-        if (closed.get()) {
+        if (state.get() !== ScopeState.OPEN) {
             record(key.capability, CapabilityDiagnosticPhase.AVAILABILITY, CapabilityDiagnosticOutcome.CLOSED)
             return CapabilityAvailabilityResult.Closed
         }
@@ -53,7 +77,7 @@ class RevocableChannelCapabilityScope(
             record(key.capability, CapabilityDiagnosticPhase.ACQUISITION, CapabilityDiagnosticOutcome.DENIED)
             return CapabilityAcquisition.Denied(CapabilityDeniedReason.UNDECLARED)
         }
-        if (closed.get()) {
+        if (state.get() !== ScopeState.OPEN) {
             record(key.capability, CapabilityDiagnosticPhase.ACQUISITION, CapabilityDiagnosticOutcome.CLOSED)
             return CapabilityAcquisition.Closed
         }
@@ -66,7 +90,7 @@ class RevocableChannelCapabilityScope(
         record(key.capability, CapabilityDiagnosticPhase.ACQUISITION, CapabilityDiagnosticOutcome.RECOVERABLE)
         val preparation = policy as? CapabilityAcquisitionPolicy.PrepareRecoverable
             ?: return CapabilityAcquisition.Recoverable(initial.reason)
-        if (closed.get()) {
+        if (state.get() !== ScopeState.OPEN) {
             record(key.capability, CapabilityDiagnosticPhase.PREPARATION, CapabilityDiagnosticOutcome.CLOSED)
             return CapabilityAcquisition.Closed
         }
@@ -84,7 +108,12 @@ class RevocableChannelCapabilityScope(
      * already-terminal state.
      */
     suspend fun revoke(): CapabilityScopeTerminationResult {
-        if (!closed.compareAndSet(false, true)) return CapabilityScopeTerminationResult.AlreadyClosed
+        // One atomic monotonic transition: either PENDING→REVOKED or OPEN→REVOKED.
+        // Linearizing to REVOKED first prevents any concurrent authorize (PENDING→OPEN)
+        // or acquire from observing OPEN state, before lease cleanup runs.
+        if (!state.compareAndSet(ScopeState.OPEN, ScopeState.REVOKED) &&
+            !state.compareAndSet(ScopeState.PENDING, ScopeState.REVOKED)
+        ) return CapabilityScopeTerminationResult.AlreadyClosed
 
         var cleanupFailed = false
         for (lease in leases.toList()) {
@@ -122,13 +151,13 @@ class RevocableChannelCapabilityScope(
         return when (hosted) {
             is HostedCapabilityAcquisition.Available -> {
                 val lease = ManagedLease(key.capability, hosted.port, hosted.cleanup)
-                if (closed.get()) {
+                if (state.get() === ScopeState.REVOKED) {
                     lease.revoke()
                     record(key.capability, phase, CapabilityDiagnosticOutcome.CLOSED)
                     CapabilityAcquisition.Closed
                 } else {
                     leases += lease
-                    if (closed.get()) {
+                    if (state.get() === ScopeState.REVOKED) {
                         lease.revoke()
                         record(key.capability, phase, CapabilityDiagnosticOutcome.CLOSED)
                         CapabilityAcquisition.Closed
@@ -190,13 +219,13 @@ class RevocableChannelCapabilityScope(
         override suspend fun <R> use(
             operation: suspend (T) -> CapabilityOperationResult<R>,
         ): CapabilityOperationResult<R> {
-            if (leaseState.get() != CapabilityLeaseState.ACTIVE || closed.get()) {
+            if (leaseState.get() != CapabilityLeaseState.ACTIVE || this@RevocableChannelCapabilityScope.state.get() === ScopeState.REVOKED) {
                 record(capability, CapabilityDiagnosticPhase.OPERATION, CapabilityDiagnosticOutcome.CLOSED)
                 return CapabilityOperationResult.Closed
             }
             return try {
                 val result = operation(port)
-                if (leaseState.get() != CapabilityLeaseState.ACTIVE || closed.get()) {
+                if (leaseState.get() != CapabilityLeaseState.ACTIVE || this@RevocableChannelCapabilityScope.state.get() === ScopeState.REVOKED) {
                     record(capability, CapabilityDiagnosticPhase.OPERATION, CapabilityDiagnosticOutcome.CLOSED)
                     CapabilityOperationResult.Closed
                 } else {
@@ -263,3 +292,13 @@ sealed interface CapabilityScopeTerminationResult {
     data object AlreadyClosed : CapabilityScopeTerminationResult
     data class CleanupFailed(val reason: CapabilityFailureReason) : CapabilityScopeTerminationResult
 }
+
+/**
+ * Monotonic authorization state for [RevocableChannelCapabilityScope].
+ * Transitions are one-way: PENDING → OPEN, PENDING → REVOKED, OPEN → REVOKED.
+ * REVOKED is terminal; no transition leaves it. All transitions are performed by a
+ * single atomic CAS on [RevocableChannelCapabilityScope.state], so authorization
+ * and revocation share exactly one linearization point rather than two independent
+ * booleans that can interleave.
+ */
+private enum class ScopeState { PENDING, OPEN, REVOKED }

@@ -34,6 +34,8 @@ import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
 import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
 import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
 import dev.nilp0inter.subspace.channel.capability.SynthesizedAudioArtifact
+import dev.nilp0inter.subspace.lua.LuaNativeKernel
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
 import dev.nilp0inter.subspace.model.ChannelDefinition
 import dev.nilp0inter.subspace.model.KeyboardConnectionState
@@ -57,6 +59,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import dev.nilp0inter.subspace.channel.KeyboardRuntime
 import dev.nilp0inter.subspace.channel.SleepwalkerTextOutputService
 import dev.nilp0inter.subspace.channel.TextOutputAvailability
@@ -88,6 +91,31 @@ class BuiltInRuntimesTest {
             TextOutputRequest("captured text ", TextOutputProfile("linux:us")),
             host.textRequests.single(),
         )
+    }
+
+    @Test
+    fun keyboardCapabilityFlowCompletesWithoutCreatingAnActorOrLoadingLua() = runTest {
+        LuaNativeKernel.resetForTest()
+        ActorRuntimeFactory.resetForTest()
+        try {
+            val host = RuntimeCapabilityHost(transcript = "catalogue text")
+            val runtime = keyboardRuntime("kotlin-only", "linux:us", host)
+            val target = (runtime.runtime.prepareInput() as ChannelInputAcceptance.Accepted).target
+
+            target.onInputStarted(EmptySession)
+            target.onInputReleased(RecordedPcm(shortArrayOf(1, -1), 16_000))
+
+            assertEquals(ChannelExecutionStatus.SUCCESS, runtime.runtime.snapshot.value.executionStatus)
+            assertEquals(
+                listOf(TextOutputRequest("catalogue text ", TextOutputProfile("linux:us"))),
+                host.textRequests,
+            )
+            assertFalse(ActorRuntimeFactory.isCreateAttempted)
+            assertFalse(LuaNativeKernel.isLoadAttempted)
+        } finally {
+            ActorRuntimeFactory.resetForTest()
+            LuaNativeKernel.resetForTest()
+        }
     }
 
     @Test

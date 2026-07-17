@@ -13,6 +13,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
+import dev.nilp0inter.subspace.lua.LuaNativeKernel
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -121,6 +123,44 @@ class MainActivityServiceLifecycleTest {
         assertTrue("PttForegroundService must remain started after the activity unbinds", s.startRequested)
         assertTrue("PttForegroundService must remain in the foreground after the activity unbinds", s.foreground)
         assertFalse("PttForegroundService must be unbound after the activity stops", s.hasBound)
+    }
+    @Test
+    fun ordinaryForegroundLifecycleDoesNotCreateOrLoadLuaActorRuntime() {
+        ActorRuntimeFactory.resetForTest()
+        LuaNativeKernel.resetForTest()
+        try {
+            scenario = ActivityScenario.launch(MainActivity::class.java)
+
+            waitFor("service should be started and foreground during the Lua-dormancy witness") {
+                val snapshot = serviceSnapshot()
+                snapshot.exists && snapshot.startRequested && snapshot.foreground
+            }
+            assertFalse(
+                "ordinary activity/service startup with Kotlin providers must not construct a Lua actor",
+                ActorRuntimeFactory.isCreateAttempted,
+            )
+            assertFalse(
+                "ordinary activity/service startup with Kotlin providers must not load Lua native code",
+                LuaNativeKernel.isLoadAttempted,
+            )
+
+            scenario!!.moveToState(Lifecycle.State.CREATED)
+            waitFor("foreground service must survive backgrounding during the Lua-dormancy witness") {
+                val snapshot = serviceSnapshot()
+                snapshot.exists && snapshot.startRequested && snapshot.foreground && !snapshot.hasBound
+            }
+            assertFalse(
+                "background lifecycle must not retroactively construct a Lua actor",
+                ActorRuntimeFactory.isCreateAttempted,
+            )
+            assertFalse(
+                "background lifecycle must not retroactively load Lua native code",
+                LuaNativeKernel.isLoadAttempted,
+            )
+        } finally {
+            ActorRuntimeFactory.resetForTest()
+            LuaNativeKernel.resetForTest()
+        }
     }
 
     @Test
@@ -434,7 +474,7 @@ class MainActivityServiceLifecycleTest {
         val deadline = System.currentTimeMillis() + SERVICE_STATE_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (condition()) return
-            Thread.sleep(POLL_INTERVAL_MS)
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
         }
         throw AssertionError(message)
     }
@@ -445,7 +485,6 @@ class MainActivityServiceLifecycleTest {
         // propagate to the system service registry. The bound is generous to
         // stay deterministic on slow devices without sleeping.
         const val SERVICE_STATE_TIMEOUT_MS = 10_000L
-        const val POLL_INTERVAL_MS = 100L
         const val BIND_TIMEOUT_MS = 5_000L
 
         // Captures the `ServiceRecord{<hex> ...}` identity token (including the

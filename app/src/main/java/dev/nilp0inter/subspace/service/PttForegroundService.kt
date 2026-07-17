@@ -47,6 +47,7 @@ import dev.nilp0inter.subspace.channel.KeyboardBuiltInProvider
 import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
 import dev.nilp0inter.subspace.channel.capability.AudioOperationCapabilityAdapter
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.channel.capability.PlaybackResultFactory
 import dev.nilp0inter.subspace.channel.capability.RecordingPlaybackResultFactory
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
@@ -231,6 +232,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     val channelDescriptors: StateFlow<List<ChannelImplementationDescriptor>> = _channelDescriptors.asStateFlow()
     private lateinit var runtimeInvocationBoundary: RuntimeInvocationBoundary
     private lateinit var runtimeRegistry: ChannelRuntimeRegistry
+    /** Process-wide synthetic scope for agent-initiated speech synthesis; allocated once, never generation zero. */
+    private val agentPlaybackScope = CapabilityScopeIdentity("agent-playback", RuntimeGeneration.next())
     private lateinit var textOutputService: SleepwalkerTextOutputService
     private lateinit var capabilityHost: ServiceChannelCapabilityHost
     private val journalStorageBackends = ConcurrentHashMap<String, ServiceJournalStorageBackend>()
@@ -431,7 +434,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             modelDiscovery = openAiModels,
             completion = OpenAiSdkCompletionService(openAiClients),
             synthesize = { text ->
-                synthesisCapability(CapabilityScopeIdentity("agent-playback", dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)))
+                synthesisCapability(agentPlaybackScope)
                     ?.synthesize(SpeechSynthesisRequest(text, "en", SpeechVoice("default")))
                     ?: CapabilityOperationResult.Unavailable(CapabilityUnavailableReason.MODEL_NOT_READY)
             },
@@ -615,7 +618,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                         val replacement = current[old.id]
                         if (replacement == null || replacement != old) {
                             agentRuntimeGraph.coordinator.replace(
-                                CapabilityScopeIdentity(old.id, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration(0)),
+                                runtimeRegistry.capabilityScopeIdentity(old.id) ?: CapabilityScopeIdentity(old.id, RuntimeGeneration.next()),
                                 removed = replacement == null,
                             )
                         }

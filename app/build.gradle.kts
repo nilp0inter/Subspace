@@ -243,22 +243,22 @@ val buildSupertonicNative = registerNativeBuildTask(
     "libsubspace_supertonic.so",
 )
 
-// The proof crate is a nested standalone Cargo workspace:
-//   rust/subspace-lua-proof/Cargo.toml          (workspace root, own Cargo.lock)
-//   rust/subspace-lua-proof/subspace-lua-proof/  (member crate with cdylib+rlib)
+// The actor kernel crate is a nested standalone Cargo workspace:
+//   rust/subspace-lua-actor/Cargo.toml          (workspace root, own Cargo.lock)
+//   rust/subspace-lua-actor/subspace-lua-actor/  (member crate with cdylib+rlib)
 // It is excluded from the parent `rust/` workspace and uses release
 // `panic = "unwind"` so JNI entry points can catch_unwind without propagating
 // a Rust panic across the JNI boundary. This dedicated registration preserves
 // the shared `registerNativeBuildTask` and existing native tasks' profile
 // behavior (parent workspace `panic = "abort"`) unchanged.
-val buildLuaProofNative = tasks.register<org.gradle.api.DefaultTask>("buildLuaProofNative") {
+val buildLuaActorNative = tasks.register<org.gradle.api.DefaultTask>("buildLuaActorNative") {
     group = "native"
-    description = "Cross-compiles the subspace-lua-proof Rust crate for Android ABIs using cargo-ndk."
+    description = "Cross-compiles the subspace-lua-actor Rust crate for Android ABIs using cargo-ndk."
     val outputsDir = jniLibsDir
     outputs.dir(outputsDir)
     val rootDir = rootProject.projectDir
-    val workspaceDir = "$rootDir/rust/subspace-lua-proof"
-    val memberDir = "$workspaceDir/subspace-lua-proof"
+    val workspaceDir = "$rootDir/rust/subspace-lua-actor"
+    val memberDir = "$workspaceDir/subspace-lua-actor"
     // Track the nested workspace inputs: member manifest+source and the
     // standalone workspace lockfile. Do not reference the parent workspace
     // Cargo.toml because this crate is excluded from it.
@@ -270,6 +270,18 @@ val buildLuaProofNative = tasks.register<org.gradle.api.DefaultTask>("buildLuaPr
         inputs.file(lockFile)
     }
     doLast {
+        // Clean up retired proof/candidate .so outputs from prior incremental builds
+        // so the APK packages exactly one Lua library.
+        nativeTargets.keys.forEach { abi ->
+            val abiDir = outputsDir.get().dir(abi).asFile
+            if (abiDir.exists()) {
+                abiDir.listFiles()?.forEach { file ->
+                    if (file.name == "libsubspace_lua_proof.so") {
+                        file.delete()
+                    }
+                }
+            }
+        }
         val cargo = resolveOnPath("cargo") ?: "cargo"
         val ndk = System.getenv("ANDROID_NDK_HOME") ?: System.getenv("NDK_DIR")
         require(!ndk.isNullOrBlank()) {
@@ -293,13 +305,13 @@ val buildLuaProofNative = tasks.register<org.gradle.api.DefaultTask>("buildLuaPr
             val output = process.inputStream.bufferedReader().readText()
             val exit = process.waitFor()
             if (exit != 0) {
-                throw GradleException("cargo ndk build failed for $abi (subspace-lua-proof):\n$output")
+                throw GradleException("cargo ndk build failed for $abi (subspace-lua-actor):\n$output")
             }
-            val so = file("$workspaceDir/target/$target/release/libsubspace_lua_proof.so")
+            val so = file("$workspaceDir/target/$target/release/libsubspace_lua_actor.so")
             if (!so.exists()) {
                 throw GradleException("missing $so after cargo ndk build")
             }
-            so.copyTo(outDir.file("libsubspace_lua_proof.so").asFile, overwrite = true)
+            so.copyTo(outDir.file("libsubspace_lua_actor.so").asFile, overwrite = true)
         }
     }
 }
@@ -308,7 +320,7 @@ tasks.matching { it.name == "preBuild" }.configureEach {
     dependsOn(buildOggNative)
     dependsOn(buildParakeetNative)
     dependsOn(buildSupertonicNative)
-    dependsOn(buildLuaProofNative)
+    dependsOn(buildLuaActorNative)
 }
 
 // ---------------------------------------------------------------------------

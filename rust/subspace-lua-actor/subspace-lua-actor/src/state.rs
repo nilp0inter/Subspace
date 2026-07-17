@@ -3,13 +3,8 @@
 //! [`StateEngine`] owns the restricted stock Lua 5.4 VM, the ownership/terminal
 //! state machine, per-state allocator accounting, the instruction hook + budget,
 //! the interrupt flag, and the operation id space. The engine drives the same
-//! [`EngineInner::process`] logic regardless of topology; the caller thread
-//! acquires the per-state mutex directly.
-//!
-//! > **Proof note:** Originally two topologies drove this engine — `jvm_owned`
-//! > (direct) and `native_owned` (per-state worker thread). After physical-
-//! > device proof benchmarking the worker topology was removed. Only the
-//! > direct (JVM-owned) path remains compiled.
+//! [`EngineInner::process`] logic; the caller thread acquires the per-state
+//! mutex directly.
 //!
 //! # Restricted standard library
 //!
@@ -39,7 +34,7 @@
 //! On resume, the host passes `(success, value)` which becomes the return of
 //! `coroutine.yield` inside Lua.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -56,16 +51,14 @@ use crate::ownership::{
     assign_operation_id, assign_state_id, Generation, Lifecycle, OperationId, OperationVerdict,
     OwnershipVerdict, StateHandle, StateId,
 };
-use crate::topology::Topology;
 
 /// Safe standard library subset. Excludes IO, OS, PACKAGE, DEBUG, FFI.
 /// No `package.loadlib`, no `require`, no dynamic C searchers.
-/// Computed at runtime because StdLib's BitOr is not const.
 fn safe_stdlib() -> StdLib {
     StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH
 }
 
-/// Bootstrap Lua snippet that injects the `subspace` proof namespace:
+/// Bootstrap Lua snippet that injects the `subspace` kernel namespace:
 /// - `subspace.yield_operation(label)` suspends the coroutine yielding an
 ///   opaque operation (unchanged contract seam).
 /// - `subspace._modules` is a per-state pure-Lua module-cache table keyed by
@@ -80,6 +73,10 @@ fn safe_stdlib() -> StdLib {
 ///   function bound from Rust; it immediately returns a normalized rejection
 ///   `(false, "rejected:"..label)` without performing work, preserving the
 ///   yield-before-external-work invariant.
+/// - Plugin-created coroutines are disabled after bootstrap: instruction hooks
+///   are per-thread, so `create`/`resume`/`wrap`/`close` are removed to prevent
+///   child threads from bypassing the finite budget or interrupt flag. The
+///   host-created coroutine retains `coroutine.yield` for yield operations.
 ///
 /// Loaded before user source so entrypoints can call any of these.
 const SUBSPACE_BOOTSTRAP: &str = r#"
@@ -97,16 +94,57 @@ end
 subspace.module_clear = function(name)
   subspace._modules[tostring(name)] = nil
 end
+
+-- The host owns coroutine lifecycle. `StateEngine` installs its instruction
+-- hook on the host-created mlua thread; plugin-created child threads would not
+-- inherit that per-thread hook and could evade instruction budgets/interrupts.
+-- Keep only coroutine.yield for subspace.yield_operation and remove all APIs
+-- that can create or drive another thread.
+coroutine.create = nil
+coroutine.resume = nil
+coroutine.wrap = nil
+coroutine.close = nil
+
+-- Source-only mode: disable base dynamic loaders so constructed bytecode or
+-- filesystem access cannot execute through Lua's own load/dofile/loadfile.
+-- load is replaced with a text-only wrapper; loadfile and dofile are removed
+-- entirely.
+do
+  local legacy_load = load
+  load = function(chunk, chunkname, mode, env)
+    if type(chunk) == "string" and chunk:sub(1, 1) == "\27" then
+      return nil, "attempt to load a binary chunk (source-only mode)"
+    end
+    return legacy_load(chunk, chunkname, "t", env)
+  end
+  loadfile = nil
+  dofile = nil
+end
 "#;
 
 // ---------------------------------------------------------------------------
 // EngineInner — the mutable state behind the per-state mutex
 // ---------------------------------------------------------------------------
 
+/// Maximum number of exact terminal outcomes retained for duplicate
+/// resume/cancel requests. The FIFO is deliberately bounded: a state may
+/// yield indefinitely, while host retry semantics only require a recent
+/// duplicate to echo its exact terminal result.
+///
+/// This is public solely so integration tests can exercise the eviction
+/// boundary without duplicating a production implementation detail.
+#[doc(hidden)]
+pub const TERMINAL_OPERATION_CACHE_CAPACITY: usize = 64;
+
+/// Maximum number of recently evicted operation ids retained as typed stale
+/// tombstones. Keeping this separate FIFO bounded preserves finite memory
+/// while distinguishing an immediately evicted own operation from a foreign
+/// operation id.
+const EVICTED_TERMINAL_OPERATION_TOMBSTONE_CAPACITY: usize = 64;
+
 struct EngineInner {
     state_id: StateId,
     generation: Generation,
-    topology: Topology,
     lua: Option<Lua>,
     lifecycle: Lifecycle,
     entrypoint: Option<Function>,
@@ -116,7 +154,21 @@ struct EngineInner {
     next_coroutine_id: i64,
     current_operation: Option<OperationId>,
     current_label: Option<String>,
+    /// Recent terminal outcomes keyed by operation id. Bounded by
+    /// `TERMINAL_OPERATION_CACHE_CAPACITY` so a long-lived state cannot grow
+    /// unboundedly with each completed resume/cancel.
     terminal_operations: HashMap<OperationId, Outcome>,
+    /// FIFO order for `terminal_operations` eviction.
+    terminal_operation_order: VecDeque<OperationId>,
+    /// Recently evicted terminal operation ids. This bounded tombstone FIFO
+    /// lets a duplicate that falls just outside the outcome cache receive the
+    /// typed `Stale` result rather than being mistaken for a foreign id.
+    evicted_terminal_operation_order: VecDeque<OperationId>,
+    /// Test-only synchronization hook invoked after an interrupt has observed
+    /// its target and released the state mutex, but before it sets the flag
+    /// and dispatches tagged invalidation. `None` in production, with no
+    /// allocation unless an integration test installs a hook.
+    interrupt_post_peek_hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     accountant: Accountant,
     interrupt_flag: Arc<AtomicBool>,
     instruction_count: Arc<AtomicI64>,
@@ -137,7 +189,13 @@ enum Command {
         value: String,
     },
     Cancel { operation_id: OperationId },
-    InvalidateSuspended,
+    InvalidateSuspended {
+        /// The operation id the interrupt observed at its decision point.
+        /// The handler only invalidates the suspension when the live
+        /// `current_operation` still equals this id, so a concurrent resume
+        /// that produced a fresh yield cannot be invalidated by a stale peek.
+        expected_operation_id: OperationId,
+    },
     LowerMemoryLimit { new_limit_bytes: u64 },
     Snapshot,
     Close,
@@ -146,7 +204,6 @@ enum Command {
 impl EngineInner {
     fn new(
         state_id: StateId,
-        topology: Topology,
         memory_limit_bytes: u64,
         hook_interval: u32,
         instruction_budget: u64,
@@ -201,7 +258,7 @@ impl EngineInner {
             .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_call: {e}")))?;
 
         // Bind both host functions on the `subspace` table created by the
-        // bootstrap snippet. They are internal proof seams — no JNI entry
+        // bootstrap snippet. They are internal kernel seams — no JNI entry
         // points are added; entrypoints reach them only via Lua.
         {
             let globals = lua.globals();
@@ -222,7 +279,6 @@ impl EngineInner {
         Ok(EngineInner {
             state_id,
             generation: 1,
-            topology,
             lua: Some(lua),
             lifecycle: Lifecycle::Init,
             entrypoint: None,
@@ -233,6 +289,9 @@ impl EngineInner {
             current_operation: None,
             current_label: None,
             terminal_operations: HashMap::new(),
+            terminal_operation_order: VecDeque::new(),
+            evicted_terminal_operation_order: VecDeque::new(),
+            interrupt_post_peek_hook: None,
             accountant: Accountant::new(memory_limit_bytes),
             interrupt_flag,
             instruction_count,
@@ -271,6 +330,53 @@ impl EngineInner {
         } else {
             OperationVerdict::Foreign
         }
+    }
+
+    /// Whether an operation recently aged out of the exact terminal-outcome
+    /// cache. These bounded tombstones prevent the immediate post-eviction
+    /// duplicate from being confused with an operation owned by another state.
+    fn is_recently_evicted_terminal_operation(&self, operation_id: OperationId) -> bool {
+        self.evicted_terminal_operation_order
+            .contains(&operation_id)
+    }
+
+    /// Record an accepted terminal operation with bounded FIFO retention.
+    /// Recent duplicates echo their exact cached outcome. On overflow, retain
+    /// only the evicted id in a second bounded FIFO so it gets typed `Stale`.
+    fn record_terminal_operation(&mut self, operation_id: OperationId, outcome: Outcome) {
+        if self.terminal_operations.contains_key(&operation_id) {
+            self.terminal_operations.insert(operation_id, outcome);
+            return;
+        }
+
+        if self.terminal_operation_order.len() == TERMINAL_OPERATION_CACHE_CAPACITY {
+            let evicted_operation_id = self
+                .terminal_operation_order
+                .pop_front()
+                .expect("terminal operation FIFO length matched cache capacity");
+            self.terminal_operations.remove(&evicted_operation_id);
+            self.record_evicted_terminal_operation(evicted_operation_id);
+        }
+
+        self.terminal_operation_order.push_back(operation_id);
+        self.terminal_operations.insert(operation_id, outcome);
+    }
+
+    /// Retain a recently evicted id in a bounded FIFO. This cannot grow with
+    /// the number of operations a long-lived state executes.
+    fn record_evicted_terminal_operation(&mut self, operation_id: OperationId) {
+        if self.evicted_terminal_operation_order.len()
+            == EVICTED_TERMINAL_OPERATION_TOMBSTONE_CAPACITY
+        {
+            self.evicted_terminal_operation_order.pop_front();
+        }
+        self.evicted_terminal_operation_order.push_back(operation_id);
+    }
+
+    fn stale_evicted_terminal_operation(&self, operation_id: OperationId) -> Outcome {
+        Outcome::new(OutcomeKind::Stale)
+            .with("operationId", json!(operation_id))
+            .with("diagnostic", json!("terminal operation outcome evicted"))
     }
 
     fn memory_report(&self) -> MemoryReport {
@@ -323,7 +429,7 @@ impl EngineInner {
                 value,
             } => self.handle_resume(operation_id, success, value),
             Command::Cancel { operation_id } => self.handle_cancel(operation_id),
-            Command::InvalidateSuspended => self.handle_invalidate_suspended(),
+            Command::InvalidateSuspended { expected_operation_id } => self.handle_invalidate_suspended(expected_operation_id),
             Command::LowerMemoryLimit { new_limit_bytes } => self.handle_lower_memory_limit(new_limit_bytes),
             Command::Snapshot => self.handle_snapshot(),
             Command::Close => self.handle_close(),
@@ -369,6 +475,8 @@ impl EngineInner {
                 self.coroutine_id = 0;
                 self.current_operation = None;
                 self.terminal_operations.clear();
+                self.terminal_operation_order.clear();
+                self.evicted_terminal_operation_order.clear();
 
                 let outcome = Outcome::new(OutcomeKind::Completed)
                     .with("diagnostic", json!("loaded"));
@@ -444,6 +552,11 @@ impl EngineInner {
     ) -> Outcome {
         // Check operation verdict BEFORE lifecycle so duplicates echo the
         // accepted terminal state without re-entering Lua (exactly-once).
+        if self.is_recently_evicted_terminal_operation(operation_id) {
+            return self.outcome_with_handle(
+                self.outcome_with_telemetry(self.stale_evicted_terminal_operation(operation_id)),
+            );
+        }
         match self.check_operation(operation_id) {
             OperationVerdict::Foreign => {
                 let outcome =
@@ -486,7 +599,7 @@ impl EngineInner {
         let result = thread.resume::<Value>((success, value));
         let co_id = self.coroutine_id;
         let outcome = self.classify_resume_result(result, &thread, co_id);
-        self.terminal_operations.insert(operation_id, outcome.clone());
+        self.record_terminal_operation(operation_id, outcome.clone());
 
         self.outcome_with_handle(self.outcome_with_telemetry(outcome))
     }
@@ -494,6 +607,11 @@ impl EngineInner {
     fn handle_cancel(&mut self, operation_id: OperationId) -> Outcome {
         // Check operation verdict BEFORE lifecycle so duplicates echo the
         // accepted terminal state without re-entering Lua (exactly-once).
+        if self.is_recently_evicted_terminal_operation(operation_id) {
+            return self.outcome_with_handle(
+                self.outcome_with_telemetry(self.stale_evicted_terminal_operation(operation_id)),
+            );
+        }
         match self.check_operation(operation_id) {
             OperationVerdict::Foreign => {
                 let outcome =
@@ -523,7 +641,7 @@ impl EngineInner {
         let outcome = Outcome::new(OutcomeKind::Cancelled)
             .with("coroutineId", json!(self.coroutine_id))
             .with("operationId", json!(operation_id));
-        self.terminal_operations.insert(operation_id, outcome.clone());
+        self.record_terminal_operation(operation_id, outcome.clone());
         self.outcome_with_handle(self.outcome_with_telemetry(outcome))
     }
 
@@ -551,7 +669,7 @@ impl EngineInner {
             .with("luaVersion", json!(crate::LUA_VERSION))
             .with("bindingVersion", json!(crate::BINDING_VERSION))
             .with("operation", json!("snapshot"))
-            .with("topology", json!(self.topology.as_str()));
+            .with("topology", json!("jvm_owned"));
         self.outcome_with_handle(outcome)
     }
 
@@ -585,26 +703,57 @@ impl EngineInner {
             .with("elapsedNanos", json!(elapsed))
     }
 
-    /// Terminally invalidate a suspended coroutine/operation when interrupt is
-    /// called while the state is `Yielded`. After this, the operation is marked
-    /// consumed and the coroutine thread is dropped, so a later resume/cancel
-    /// cannot produce a Lua effect — they hit the duplicate/foreign path and
-    /// echo the terminal state instead.
-    fn handle_invalidate_suspended(&mut self) -> Outcome {
-        if self.lifecycle == Lifecycle::Yielded {
-            if let Some(op) = self.current_operation.take() {
-                let outcome = Outcome::runtime_failure(
-                    "suspended operation was terminally invalidated",
-                );
-                self.terminal_operations.insert(op, outcome);
-            }
+    /// Terminally invalidate the exact suspended operation an interrupt
+    /// observed while the state was `Yielded`.
+    ///
+    /// The caller read `expected_operation_id` atomically with ownership and
+    /// lifecycle under the per-state mutex, then released that lock to set the
+    /// interrupt flag. This handler is the second lock acquisition. Its
+    /// identity comparison prevents that gap from invalidating a newer yield.
+    ///
+    /// - If `current_operation == Some(expected)`, this is the original live
+    ///   suspension. Record its terminal rejection, drop its coroutine, and
+    ///   return `Interrupted`; later resume/cancel echoes the cached terminal
+    ///   result.
+    /// - Otherwise a concurrent resume/cancel/close won first. Leave the
+    ///   resulting state unchanged, clear the flag set for the old suspended
+    ///   operation, and return typed `Stale` carrying the observed operation
+    ///   id. This prevents an old suspended interrupt from affecting a newer
+    ///   yielded operation.
+    fn handle_invalidate_suspended(&mut self, expected_operation_id: OperationId) -> Outcome {
+        let live = if self.lifecycle == Lifecycle::Yielded {
+            self.current_operation
+        } else {
+            None
+        };
+
+        if live == Some(expected_operation_id) {
+            // The suspension interrupt observed is still the live one.
+            // Invalidate it terminally.
+            let outcome = Outcome::runtime_failure(
+                "suspended operation was terminally invalidated",
+            );
+            self.record_terminal_operation(expected_operation_id, outcome);
             self.coroutine = None;
+            self.current_operation = None;
             self.current_label = None;
             self.lifecycle = Lifecycle::Failed;
+            return self.outcome_with_handle(
+                Outcome::new(OutcomeKind::Interrupted)
+                    .with("operationId", json!(expected_operation_id))
+                    .with("diagnostic", json!("suspended state terminally invalidated")),
+            );
         }
+
+        // A concurrent resume/cancel/close won the old operation before
+        // interrupt re-acquired the lock. Do not touch the resulting state.
+        // This flag belonged to the old suspended operation; clear it so it
+        // cannot interrupt a newly yielded operation on a later resume.
+        self.interrupt_flag.store(false, Ordering::Relaxed);
         self.outcome_with_handle(
-            Outcome::new(OutcomeKind::Interrupted)
-                .with("diagnostic", json!("suspended state terminally invalidated"))
+            Outcome::new(OutcomeKind::Stale)
+                .with("operationId", json!(expected_operation_id))
+                .with("diagnostic", json!("interrupt overtaken by concurrent resume; suspension unchanged")),
         )
     }
 
@@ -748,7 +897,7 @@ impl EngineInner {
 }
 
 // ---------------------------------------------------------------------------
-// StateEngine — public API wrapping the per-state mutex + optional worker
+// StateEngine — public API wrapping the per-state mutex
 // ---------------------------------------------------------------------------
 
 /// A snapshot of the engine's observable state.
@@ -756,7 +905,6 @@ impl EngineInner {
 pub struct StateSnapshot {
     pub memory: MemoryReport,
     pub elapsed_nanos: u64,
-    pub topology: Topology,
     pub lifecycle: Lifecycle,
 }
 
@@ -765,9 +913,9 @@ pub struct StateSnapshot {
 /// Operations lock the inner mutex directly on the caller thread — there is no
 /// per-state worker thread. The engine drives [`EngineInner::process`] and
 /// serializes access through the per-state mutex.
+#[derive(Clone)]
 pub struct StateEngine {
     inner: Arc<Mutex<EngineInner>>,
-    topology: Topology,
     state_id: StateId,
     interrupt_flag: Arc<AtomicBool>,
 }
@@ -776,7 +924,6 @@ impl StateEngine {
     /// Create a new state engine. Returns the engine on success, or an
     /// `Outcome` (validation/memory failure) on failure.
     pub fn new(
-        topology: Topology,
         memory_limit_bytes: u64,
         hook_interval: u32,
         instruction_budget: u64,
@@ -784,7 +931,6 @@ impl StateEngine {
         let state_id = assign_state_id();
         let inner_val = EngineInner::new(
             state_id,
-            topology,
             memory_limit_bytes,
             hook_interval,
             instruction_budget,
@@ -795,10 +941,32 @@ impl StateEngine {
 
         Ok(StateEngine {
             inner,
-            topology,
             state_id,
             interrupt_flag,
         })
+    }
+
+    /// Integration-test seam for exercising bounded terminal-outcome eviction
+    /// without duplicating the implementation capacity.
+    #[doc(hidden)]
+    pub const fn terminal_operation_cache_capacity() -> usize {
+        TERMINAL_OPERATION_CACHE_CAPACITY
+    }
+
+    /// Install or clear an integration-test synchronization hook invoked by
+    /// [`Self::interrupt`] after it has observed a suspended operation and
+    /// released the per-state mutex, but before tagged invalidation. Tests use
+    /// this to force `peek(op1) -> resume(op1)->yield(op2) -> invalidate(op1)`.
+    ///
+    /// The hook is never installed by production callers. It executes without
+    /// the state mutex held and must not panic.
+    #[doc(hidden)]
+    pub fn set_interrupt_post_peek_hook(
+        &self,
+        hook: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.interrupt_post_peek_hook = hook;
     }
 
     pub fn handle(&self) -> StateHandle {
@@ -810,9 +978,6 @@ impl StateEngine {
         self.state_id
     }
 
-    pub fn topology(&self) -> Topology {
-        self.topology
-    }
 
     pub fn load(&self, generation: Generation, source: &str, entrypoint: &str) -> Outcome {
         self.dispatch(
@@ -866,9 +1031,23 @@ impl StateEngine {
     /// cannot produce a Lua effect. The atomic flag handles the running case
     /// fire-and-forget; the suspended invalidation goes through the normal
     /// dispatch path for topology-safe serialization.
+    ///
+    /// Linearization: the peek reads `current_operation` atomically with the
+    /// ownership/lifecycle check under the same lock acquisition, then tags the
+    /// `InvalidateSuspended` command with that exact id. When the dispatch
+    /// path re-acquires the lock, the handler only invalidates when the live
+    /// `current_operation` still equals the tagged id. A concurrent resume that
+    /// won the old operation (consuming it or producing a fresh yield with a
+    /// different id) makes the ids mismatch, so the interrupt observes the
+    /// resulting state consistently and returns a typed `Stale` outcome instead
+    /// of destroying a suspension it never observed. In that stale-suspended
+    /// case the handler clears the flag, so the old decision cannot affect a
+    /// newly yielded operation; active interrupts retain the flag for the hook.
     pub fn interrupt(&self, generation: Generation) -> Outcome {
-        // Quick ownership and lifecycle peek under the lock.
-        let suspended = {
+        // Ownership, lifecycle, and the exact live operation id are read
+        // atomically under a single lock acquisition. The operation id is the
+        // identity token for the suspended target at this decision point.
+        let (observed_op, post_peek_hook) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match inner.check_ownership(generation) {
                 OwnershipVerdict::Closed => {
@@ -879,19 +1058,45 @@ impl StateEngine {
                 }
                 OwnershipVerdict::Admit => {}
             }
-            inner.lifecycle == Lifecycle::Yielded
+            (
+                if inner.lifecycle == Lifecycle::Yielded {
+                    inner.current_operation
+                } else {
+                    None
+                },
+                inner.interrupt_post_peek_hook.clone(),
+            )
         };
+        // Test hooks deliberately run after releasing the state mutex. They
+        // make the old peek -> resume -> tagged-invalidate interleaving
+        // deterministic without changing production synchronization.
+        if observed_op.is_some() {
+            if let Some(hook) = post_peek_hook {
+                hook();
+            }
+        }
         // Set the atomic flag fire-and-forget (read by the instruction hook).
         self.interrupt_flag.store(true, Ordering::Relaxed);
-        if suspended {
-            // Terminally invalidate the suspended coroutine through the
-            // normal dispatch path for topology-safe serialization.
-            self.dispatch(generation, Command::InvalidateSuspended)
-        } else {
-            Outcome::new(OutcomeKind::Interrupted)
-                .with("stateId", json!(self.state_id))
-                .with("generation", json!(generation))
-                .with("diagnostic", json!("interrupt flag set"))
+        match observed_op {
+            Some(op) => {
+                // Terminally invalidate the exact suspended operation the
+                // interrupt observed, through the normal dispatch path for
+                // topology-safe serialization.
+                self.dispatch(
+                    generation,
+                    Command::InvalidateSuspended {
+                        expected_operation_id: op,
+                    },
+                )
+            }
+            None => {
+                // Active (Running) or non-suspended: the atomic flag drives
+                // the stop at the next hook tick.
+                Outcome::new(OutcomeKind::Interrupted)
+                    .with("stateId", json!(self.state_id))
+                    .with("generation", json!(generation))
+                    .with("diagnostic", json!("interrupt flag set"))
+            }
         }
     }
 

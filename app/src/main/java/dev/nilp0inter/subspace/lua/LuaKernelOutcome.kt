@@ -1,7 +1,7 @@
 package dev.nilp0inter.subspace.lua
 
 /**
- * Normalized sealed outcome for every proof bridge operation. Every JNI
+ * Normalized sealed outcome for every kernel bridge operation. Every JNI
  * function returns a JSON object whose `kind` field maps to one of these
  * variants. Malformed or unknown JSON normalizes to
  * [RuntimeFailure] rather than throwing.
@@ -20,7 +20,7 @@ package dev.nilp0inter.subspace.lua
  * - `stale` — generation mismatch or duplicate terminal completion
  * - `closed` — state was closed; late completion rejected
  */
-internal sealed class LuaProofOutcome {
+internal sealed class LuaKernelOutcome {
     abstract val stateId: Long?
     abstract val generation: Long?
 
@@ -31,7 +31,7 @@ internal sealed class LuaProofOutcome {
         val luaVersion: String,
         val bindingVersion: String,
         val topology: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Entrypoint or resume completed. */
     data class Completed(
@@ -47,7 +47,7 @@ internal sealed class LuaProofOutcome {
         val luaVersion: String?,
         val bindingVersion: String?,
         val topology: String?,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Coroutine yielded an opaque operation token. */
     data class Yielded(
@@ -56,28 +56,28 @@ internal sealed class LuaProofOutcome {
         val coroutineId: Long,
         val operationId: Long,
         val value: String?,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Source loading found a syntax error. State remains closable. */
     data class SyntaxFailure(
         override val stateId: Long,
         override val generation: Long,
         val diagnostic: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Entrypoint or config validation failed. State remains closable. */
     data class ValidationFailure(
         override val stateId: Long,
         override val generation: Long,
         val diagnostic: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Protected Lua callback raised an error. Process remains alive. */
     data class RuntimeFailure(
         override val stateId: Long?,
         override val generation: Long?,
         val diagnostic: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Allocator denied a request under protected execution. State remains closable. */
     data class MemoryFailure(
@@ -88,7 +88,7 @@ internal sealed class LuaProofOutcome {
         val peakBytes: Long?,
         val deniedAllocations: Long?,
         val bridgeBytes: Long?,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Instruction hook interrupted uncooperative pure-Lua execution. */
     data class Interrupted(
@@ -96,28 +96,28 @@ internal sealed class LuaProofOutcome {
         override val generation: Long,
         val diagnostic: String?,
         val elapsedNanos: Long?,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Operation token was cancelled. */
     data class Cancelled(
         override val stateId: Long,
         override val generation: Long,
         val operationId: Long,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Handle belongs to another state, is unknown, or ownership is invalid. */
     data class InvalidOwnership(
         override val stateId: Long?,
         override val generation: Long?,
         val diagnostic: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** Generation mismatch or duplicate terminal completion. No Lua effect. */
     data class Stale(
         override val stateId: Long?,
         override val generation: Long?,
         val diagnostic: String,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /**
      * Per-state allocator snapshot. Records current, sampled peak, denied
@@ -136,11 +136,11 @@ internal sealed class LuaProofOutcome {
         val luaVersion: String?,
         val bindingVersion: String?,
         val topology: String?,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 
     /** State was closed; late completion rejected idempotently. */
     data class Closed(
         override val stateId: Long,
         override val generation: Long,
-    ) : LuaProofOutcome()
+    ) : LuaKernelOutcome()
 }

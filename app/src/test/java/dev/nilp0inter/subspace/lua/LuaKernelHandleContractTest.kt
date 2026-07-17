@@ -1,11 +1,9 @@
 package dev.nilp0inter.subspace.lua
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class LuaProofHandleContractTest {
+class LuaKernelHandleContractTest {
     @Test
     fun `operation identity retains its state generation and coroutine owner`() {
         val owningState = LuaStateHandle(LuaStateId(41), LuaStateGeneration(3))
@@ -45,13 +43,13 @@ class LuaProofHandleContractTest {
             "zero coroutine id" to { LuaCoroutineId(0) },
             "zero operation id" to { LuaOperationId(0) },
             "negative memory limit" to {
-                LuaProofConfig(LuaBridgeTopology.JvmOwned, -1, 1, 1)
+                LuaKernelConfig(-1, 1, 1)
             },
             "zero hook interval" to {
-                LuaProofConfig(LuaBridgeTopology.JvmOwned, 1, 0, 1)
+                LuaKernelConfig(1, 0, 1)
             },
             "negative instruction budget" to {
-                LuaProofConfig(LuaBridgeTopology.JvmOwned, 1, 1, -1)
+                LuaKernelConfig(1, 1, -1)
             },
         )
 
@@ -65,10 +63,4 @@ class LuaProofHandleContractTest {
         }
     }
 
-    @Test
-    fun `topology wire values recognize only the supported ownership models`() {
-        assertEquals(LuaBridgeTopology.JvmOwned, LuaBridgeTopology.fromWire("jvm_owned"))
-        assertNull(LuaBridgeTopology.fromWire("worker_pool"))
-        assertNull(LuaBridgeTopology.fromWire("JVM_OWNED"))
-    }
 }

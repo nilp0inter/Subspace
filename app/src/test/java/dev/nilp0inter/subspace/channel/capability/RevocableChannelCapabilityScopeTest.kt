@@ -1,9 +1,13 @@
 package dev.nilp0inter.subspace.channel.capability
 
+import dev.nilp0inter.subspace.lua.actor.ActorCapabilityMediator
+
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import java.util.concurrent.CyclicBarrier
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -33,6 +37,52 @@ class RevocableChannelCapabilityScopeTest {
         assertEquals(1, port.sendCount)
         assertEquals(listOf(identity), host.acquireIdentities)
         assertEquals(CapabilityLeaseState.ACTIVE, lease.state)
+    }
+
+    @Test
+    fun actorMediatedOperationsCarryOnlyScopedHostRequestsAndContainLocalHostFailure() = runTest {
+        val failingIdentity = identity("failing-actor", 3)
+        val peerIdentity = identity("peer-actor", 3)
+        val failingPort = RecordingTextOutput(sendFailure = IllegalStateException("host unavailable"))
+        val peerPort = RecordingTextOutput()
+        val host = RecordingCapabilityHost(
+            availabilityHandler = { _, _ -> CapabilityAvailability.Available },
+            acquireHandler = { requestedIdentity, _ ->
+                when (requestedIdentity) {
+                    failingIdentity -> available(failingPort)
+                    peerIdentity -> available(peerPort)
+                    else -> error("unexpected actor identity: $requestedIdentity")
+                }
+            },
+            prepareHandler = { _, _, _ -> error("preparation was not requested") },
+        )
+        val failingScope = scope(failingIdentity, setOf(ChannelCapability.TextOutput), host)
+        val failingActor = ActorCapabilityMediator(failingScope)
+        val peerActor = ActorCapabilityMediator(
+            scope(peerIdentity, setOf(ChannelCapability.TextOutput), host),
+        )
+        val request = TextOutputRequest("opaque host operation", TextOutputProfile("host:profile"))
+
+        val localFailure = failingActor.useCapability(CapabilityKey.TextOutput) { port ->
+            CapabilityOperationResult.Success(port.sendText(request))
+        }
+        val peerSuccess = peerActor.useCapability(CapabilityKey.TextOutput) { port ->
+            CapabilityOperationResult.Success(port.sendText(request))
+        }
+
+        assertEquals(CapabilityOperationResult.Failed(CapabilityFailureReason.HOST_FAILURE), localFailure)
+        assertEquals(CapabilityOperationResult.Success(TextDeliveryOutcome.Delivered("operation-1")), peerSuccess)
+        assertEquals(listOf(request), failingPort.textRequests)
+        assertEquals(listOf(request), peerPort.textRequests)
+        assertEquals(listOf(failingIdentity, peerIdentity), host.acquireIdentities)
+
+        assertEquals(CapabilityScopeTerminationResult.Revoked, failingScope.revoke())
+        val late = failingActor.useCapability(CapabilityKey.TextOutput) { port ->
+            CapabilityOperationResult.Success(port.sendText(request))
+        }
+
+        assertEquals(CapabilityOperationResult.Closed, late)
+        assertEquals(listOf(request), failingPort.textRequests)
     }
 
     @Test
@@ -359,6 +409,137 @@ class RevocableChannelCapabilityScopeTest {
         assertFalse(emittedDiagnostics.contains("token-42"))
     }
 
+    @Test
+    fun revokeLinearizesBeforeSubsequentAuthorizeLeavingScopeClosedAndUnauthorizedWithZeroHostEffect() = runTest {
+        val host = hostFor(RecordingTextOutput())
+        val scope = scope(
+            identity("staged-successor", 0),
+            setOf(ChannelCapability.TextOutput),
+            host,
+            initiallyAuthorized = false,
+        )
+
+        // revoke linearizes the single atomic to REVOKED before authorize is ever attempted.
+        assertEquals(CapabilityScopeTerminationResult.Revoked, scope.revoke())
+
+        // authorize cannot succeed once revoke has linearized: the PENDING->OPEN CAS fails
+        // because the atomic is already REVOKED.
+        assertFalse(scope.authorize())
+        assertTrue(scope.isClosed)
+        assertFalse(scope.isAuthorized)
+
+        // Subsequent availability/acquisition are reported closed and never reach the host.
+        assertEquals(CapabilityAvailabilityResult.Closed, scope.availability(CapabilityKey.TextOutput))
+        assertEquals(CapabilityAcquisition.Closed, scope.acquire(CapabilityKey.TextOutput))
+
+        assertTrue(host.availabilityIdentities.isEmpty())
+        assertTrue(host.acquireIdentities.isEmpty())
+        assertTrue(host.prepareRequests.isEmpty())
+    }
+
+    @Test
+    fun concurrentRevokeAndAuthorizeRaceNeverLeavesTheScopeAuthorizedOnceRevokeLinearizes() {
+        // Deterministic barrier-synchronized race (no wall-clock sleeps): a CyclicBarrier
+        // releases the revoke and authorize threads at the same instant on every iteration so
+        // the two operations contend on the shared atomic. The single-atomic implementation
+        // guarantees that, regardless of which CAS wins, the final state is REVOKED and
+        // authorize can never leave the scope OPEN once revoke has linearized. Hence
+        // isAuthorized is ALWAYS false after the race.
+        //
+        // The reviewed two-AtomicBoolean implementation (separate `authorized` and `closed`
+        // fields, authorize = check `closed` then CAS `authorized`) would, whenever
+        // authorize's closed-check observes false before revoke's closed CAS but authorize's
+        // CAS runs after revoke has set authorized=false, return true and leave the scope
+        // both closed and authorized - violating the closed+unauthorized invariant this
+        // assertion checks on every iteration, so it would fail within the first few races.
+        val iterations = 2048
+        val barrier = CyclicBarrier(2)
+        repeat(iterations) { iteration ->
+            val host = hostFor(RecordingTextOutput())
+            val scope = scope(
+                identity("race-successor", iteration.toLong()),
+                setOf(ChannelCapability.TextOutput),
+                host,
+                initiallyAuthorized = false,
+            )
+
+            var revokeResult: CapabilityScopeTerminationResult? = null
+            var authorizeResult: Boolean? = null
+            val revoker = Thread {
+                barrier.await()
+                revokeResult = runBlocking { scope.revoke() }
+            }
+            val authorizer = Thread {
+                barrier.await()
+                authorizeResult = scope.authorize()
+            }
+            revoker.start()
+            authorizer.start()
+            revoker.join()
+            authorizer.join()
+
+            // There is exactly one revoker with no leases, so revoke always owns the
+            // linearization to REVOKED and never reports AlreadyClosed or CleanupFailed.
+            assertEquals(
+                "iter $iteration: revoke must finalize Revoked once it linearized",
+                CapabilityScopeTerminationResult.Revoked,
+                revokeResult,
+            )
+            assertTrue("iter $iteration: scope must be closed after revoke linearized", scope.isClosed)
+            assertFalse(
+                "iter $iteration: authorize must not succeed after revoke linearized " +
+                    "(authorizeResult=$authorizeResult, isAuthorized=${scope.isAuthorized})",
+                scope.isAuthorized,
+            )
+
+            // Zero host effect: neither authorize nor revoke touches the host; no lease exists.
+            assertTrue("iter $iteration: host availability must not be consulted", host.availabilityIdentities.isEmpty())
+            assertTrue("iter $iteration: host acquire must not be consulted", host.acquireIdentities.isEmpty())
+            assertTrue("iter $iteration: host prepare must not be consulted", host.prepareRequests.isEmpty())
+        }
+    }
+
+    @Test
+    fun authorizeIsOneWayIdempotentAndGatesAcquisitionWithZeroHostEffectUntilAuthorized() = runTest {
+        val port = RecordingTextOutput()
+        val host = hostFor(port)
+        val scope = scope(
+            identity("authorize-gate", 0),
+            setOf(ChannelCapability.TextOutput),
+            host,
+            initiallyAuthorized = false,
+        )
+
+        // Unauthorized (PENDING) scope: acquisition and availability stay closed with zero host effect.
+        assertEquals(CapabilityAvailabilityResult.Closed, scope.availability(CapabilityKey.TextOutput))
+        assertEquals(CapabilityAcquisition.Closed, scope.acquire(CapabilityKey.TextOutput))
+        assertFalse(scope.isAuthorized)
+        assertFalse(scope.isClosed)
+        assertTrue(host.availabilityIdentities.isEmpty())
+        assertTrue(host.acquireIdentities.isEmpty())
+
+        // First authorize performs the one-way PENDING->OPEN transition exactly once.
+        assertTrue(scope.authorize())
+        assertTrue(scope.isAuthorized)
+        assertFalse(scope.isClosed)
+
+        // Idempotent: a second authorize is a no-op on an already-OPEN scope.
+        assertFalse(scope.authorize())
+        assertTrue(scope.isAuthorized)
+
+        // Now acquisition proceeds to the host and creates an independent, usable lease.
+        val lease = scope.acquireTextLease()
+        assertEquals(CapabilityOperationResult.Success(Unit), lease.sendText("post-authorize"))
+        assertEquals(1, port.sendCount)
+        assertEquals(listOf(identity("authorize-gate", 0)), host.acquireIdentities)
+
+        // Revocation is terminal and makes the one-way authorization refuse thereafter.
+        assertEquals(CapabilityScopeTerminationResult.Revoked, scope.revoke())
+        assertFalse(scope.authorize())
+        assertTrue(scope.isClosed)
+        assertFalse(scope.isAuthorized)
+        assertEquals(CapabilityOperationResult.Closed, lease.sendText("after revoke"))
+    }
     private fun identity(instanceId: String, generation: Long) =
         CapabilityScopeIdentity(instanceId, RuntimeGeneration(generation))
 
@@ -367,11 +548,13 @@ class RevocableChannelCapabilityScopeTest {
         declared: Set<ChannelCapability>,
         host: ChannelCapabilityHost,
         diagnostics: MutableList<CapabilityDiagnostic> = mutableListOf(),
+        initiallyAuthorized: Boolean = true,
     ) = RevocableChannelCapabilityScope(
         identity = identity,
         declaredCapabilities = declared,
         host = host,
         diagnostics = CapabilityDiagnosticSink { diagnostics += it },
+        initiallyAuthorized = initiallyAuthorized,
     )
 
     private fun hostFor(
@@ -405,10 +588,12 @@ class RevocableChannelCapabilityScopeTest {
     private class RecordingTextOutput(
         private val sendFailure: Exception? = null,
     ) : TextOutputCapability {
+        val textRequests = mutableListOf<TextOutputRequest>()
         var sendCount = 0
             private set
 
         override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
+            textRequests += request
             sendCount += 1
             sendFailure?.let { throw it }
             return TextDeliveryOutcome.Delivered("operation-$sendCount")

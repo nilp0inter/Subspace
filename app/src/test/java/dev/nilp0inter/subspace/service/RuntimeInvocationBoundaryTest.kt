@@ -27,6 +27,170 @@ import org.junit.Test
 
 class RuntimeInvocationBoundaryTest {
     @Test
+    fun yieldedActorSliceReleasesHostAdmissionAndContinuationStaysOutsideHostFifo() = runTest {
+        val harness = harness(queueCapacity = 1)
+        val actor = RecordingActorRuntime(harness.gate)
+        val allowSecondSlice = CompletableDeferred<Unit>()
+        val secondSliceEntered = CompletableDeferred<Unit>()
+
+        val first = async {
+            harness.gate.invoke(RuntimeInvocationPhase.PREPARE_INPUT) {
+                actor.admit("A") {
+                    actor.events += "lua:A:yielded"
+                    "yielded"
+                }
+            }
+        }
+        runCurrent()
+
+        assertEquals("yielded", assertSuccess(first.await()))
+        val second = async {
+            harness.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+                actor.admit("B") {
+                    secondSliceEntered.complete(Unit)
+                    allowSecondSlice.await()
+                    "B completed"
+                }
+            }
+        }
+        runCurrent()
+        assertTrue(secondSliceEntered.isCompleted)
+
+        val continuation = async {
+            actor.resume("A") { "A resumed" }
+        }
+        val queuedHostCallback = async {
+            harness.gate.invoke(RuntimeInvocationPhase.READINESS_REFRESH) {
+                actor.admit("C") { "C completed" }
+            }
+        }
+        runCurrent()
+
+        assertFalse(continuation.isCompleted)
+        allowSecondSlice.complete(Unit)
+        runCurrent()
+
+        assertEquals("B completed", assertSuccess(second.await()))
+        assertEquals("A resumed", assertSuccess(continuation.await()))
+        assertEquals("C completed", assertSuccess(queuedHostCallback.await()))
+        assertEquals(listOf("A", "B", "C"), actor.adapterAdmissions)
+        assertEquals(listOf("A"), actor.continuations)
+        assertEquals(1, actor.maximumConcurrentLuaEntries)
+        assertEquals(
+            listOf(
+                "adapter:A",
+                "lua:A:entered",
+                "lua:A:yielded",
+                "lua:A:exited",
+                "adapter:B",
+                "lua:B:entered",
+                "lua:B:exited",
+                "lua:continuation:A:entered",
+                "lua:continuation:A:exited",
+                "adapter:C",
+                "lua:C:entered",
+                "lua:C:exited",
+            ),
+            actor.events,
+        )
+        harness.close()
+    }
+
+    @Test
+    fun actorMailboxOverflowMapsToBusyAndNeverExecutesAfterCapacityReturns() = runTest {
+        val harness = harness(queueCapacity = 1)
+        val actor = RecordingActorRuntime(harness.gate)
+        val releaseFirstSlice = CompletableDeferred<Unit>()
+
+        val first = async {
+            harness.gate.invoke(RuntimeInvocationPhase.PREPARE_INPUT) {
+                actor.admit("first") {
+                    releaseFirstSlice.await()
+                    "first completed"
+                }
+            }
+        }
+        runCurrent()
+        val queued = async {
+            harness.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+                actor.admit("queued") { "queued completed" }
+            }
+        }
+        runCurrent()
+
+        val overflow = harness.gate.invoke(RuntimeInvocationPhase.READINESS_REFRESH) {
+            actor.admit("overflow") { "must not execute" }
+        }
+
+        assertEquals(RuntimeInvocationOutcome.Busy, overflow)
+        assertEquals(listOf("first"), actor.adapterAdmissions)
+        releaseFirstSlice.complete(Unit)
+        runCurrent()
+
+        assertEquals("first completed", assertSuccess(first.await()))
+        assertEquals("queued completed", assertSuccess(queued.await()))
+        assertEquals(listOf("first", "queued"), actor.adapterAdmissions)
+        assertEquals(1, actor.maximumConcurrentLuaEntries)
+        harness.close()
+    }
+
+    @Test
+    fun timeoutCancellationAndRuntimeFailureRemainDistinctAndOnlyTimedGenerationRejectsLateEffects() = runTest {
+        val timed = harness(instanceId = "timed", generation = 1, callbackTimeoutMillis = 10)
+        val cancelled = harness(instanceId = "cancelled", generation = 2)
+        val failed = harness(instanceId = "failed", generation = 3)
+        val unaffected = harness(instanceId = "unaffected", generation = 4)
+        val timedActor = RecordingActorRuntime(timed.gate)
+        val allowTimedSliceToReturn = CompletableDeferred<Unit>()
+
+        val timingOut = async {
+            timed.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+                timedActor.admit("timed") {
+                    withContext(NonCancellable) {
+                        allowTimedSliceToReturn.await()
+                        timedActor.commitEffect("late")
+                    }
+                    "late completion"
+                }
+            }
+        }
+        runCurrent()
+        advanceTimeBy(10)
+        runCurrent()
+
+        assertEquals(RuntimeInvocationOutcome.TimedOut, timingOut.await())
+        assertEquals(
+            RuntimeInvocationOutcome.Cancelled,
+            cancelled.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+                throw kotlinx.coroutines.CancellationException("caller cancelled")
+            },
+        )
+        assertFailure(
+            failed.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) {
+                throw IllegalStateException("ordinary runtime failure")
+            },
+            RuntimeInvocationOutcome.RuntimeFailure::class.java,
+            RuntimeInvocationPhase.HANDLE_SOS,
+            "Runtime callback failed",
+            "failed",
+            RuntimeGeneration(3),
+        )
+        assertEquals(
+            "peer remains live",
+            assertSuccess(unaffected.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) { "peer remains live" }),
+        )
+
+        allowTimedSliceToReturn.complete(Unit)
+        runCurrent()
+        assertEquals(emptyList<String>(), timedActor.effects)
+        assertEquals(RuntimeInvocationOutcome.Closed, timedActor.commitEffect("after timeout"))
+
+        timed.close()
+        cancelled.close()
+        failed.close()
+        unaffected.close()
+    }
+    @Test
     fun callbacksForOneGenerationRunFifoWithoutOverlap() = runTest {
         val harness = harness()
         val events = mutableListOf<String>()
@@ -541,6 +705,51 @@ class RuntimeInvocationBoundaryTest {
         inputReleasedTimeoutMillis = inputReleasedTimeoutMillis,
         closeTimeoutMillis = closeTimeoutMillis,
     )
+
+    /** Records externally observable adapter admission, native-entry, continuation, and effect order. */
+    private class RecordingActorRuntime(
+        private val gate: RuntimeGenerationInvocationGate,
+    ) {
+        val events = mutableListOf<String>()
+        val adapterAdmissions = mutableListOf<String>()
+        val continuations = mutableListOf<String>()
+        val effects = mutableListOf<String>()
+        private val activeLuaEntries = AtomicInteger(0)
+        var maximumConcurrentLuaEntries: Int = 0
+            private set
+
+        suspend fun admit(label: String, slice: suspend () -> String): String {
+            adapterAdmissions += label
+            events += "adapter:$label"
+            return enterLua(label, slice)
+        }
+
+        suspend fun resume(label: String, slice: suspend () -> String): RuntimeInvocationOutcome<String> {
+            continuations += label
+            return gate.invokeContinuation {
+                enterLua("continuation:$label", slice)
+            }
+        }
+
+        fun commitEffect(label: String): RuntimeInvocationOutcome<Unit> = gate.commitIfLive {
+            effects += label
+        }
+
+        private suspend fun enterLua(label: String, slice: suspend () -> String): String {
+            val active = activeLuaEntries.incrementAndGet()
+            maximumConcurrentLuaEntries = maxOf(maximumConcurrentLuaEntries, active)
+            if (active != 1) {
+                throw AssertionError("Native Lua entry overlapped for $label")
+            }
+            events += "lua:$label:entered"
+            return try {
+                slice()
+            } finally {
+                events += "lua:$label:exited"
+                activeLuaEntries.decrementAndGet()
+            }
+        }
+    }
 
     private class InvocationHarness(
         private val boundary: RuntimeInvocationBoundary,

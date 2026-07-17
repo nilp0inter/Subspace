@@ -200,6 +200,254 @@ class AgentRunCoordinatorTest {
             coordinator.shutdown()
         }
     }
+    @Test
+    fun restartRecoveryCompletionToolAndPlaybackShareOneFreshScope() = runTest {
+        withTemporaryDirectory { directory ->
+            val preRestartScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            val recoveredCompletionScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            val recoveredToolScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            val recoveredPlaybackScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            var callCount = 0
+            val completion = object : OpenAiCompletionCapability {
+                override suspend fun complete(context: AgentOperationContext, request: OpenAiChatRequest): OpenAiChatOutcome {
+                    val user = request.messages.filterIsInstance<dev.nilp0inter.subspace.model.OpenAiMessage.User>().last().text
+                    if (user == "first") {
+                        preRestartScopeCapture.complete(context.scope)
+                        awaitCancellation()
+                    }
+                    recoveredCompletionScopeCapture.complete(context.scope)
+                    // Recovered run: return tool calls then final message on second turn
+                    return if (callCount++ == 0) {
+                        OpenAiChatOutcome.ToolCalls(
+                            listOf(
+                                dev.nilp0inter.subspace.model.OpenAiToolCall(
+                                    dev.nilp0inter.subspace.model.AgentToolCallId("call-1"),
+                                    dev.nilp0inter.subspace.model.OpenAiToolName("test_tool"),
+                                    emptyMap(),
+                                ),
+                            ),
+                        )
+                    } else {
+                        OpenAiChatOutcome.FinalAssistantMessage("done")
+                    }
+                }
+            }
+            val store = DurableAgentRunStore(File(directory, "runs.json"))
+            val channel = scope("restart")
+            val beforeRestart = AgentRunCoordinator(
+                scope = this,
+                store = store,
+                configurationResolver = AgentRunConfigurationResolver { AgentRunCoordinatorConfiguration(DurableAgentConfiguration("profile", "gateway/custom-model", "system", "fingerprint"), emptyList()) },
+                completion = completion,
+                tools = AgentToolExecutionPort { context, call ->
+                    recoveredToolScopeCapture.complete(context.scope)
+                    dev.nilp0inter.subspace.model.OpenAiToolResult(call.id, dev.nilp0inter.subspace.model.OpenAiToolOutcome.Delivered)
+                },
+                playback = object : DelayedPlaybackCapability {
+                    override suspend fun schedule(context: AgentOperationContext, request: DelayedPlaybackRequest): DelayedPlaybackOutcome {
+                        recoveredPlaybackScopeCapture.complete(context.scope)
+                        return DelayedPlaybackOutcome.Heard(DelayedPlaybackOperationId("heard"))
+                    }
+                },
+                limits = AgentRunLimits(maximumUserTextBytes = 100, maximumRequestBytes = 1_000, maximumAssistantTextBytes = 100, maximumModelTurns = 2, maximumToolCalls = 2, operationTimeoutMillis = 100, maximumRunElapsedMillis = 100),
+                nowMillis = { 0L },
+                newId = { java.util.UUID.randomUUID().toString() },
+            )
+            assertTrue(beforeRestart.enqueue(channel, request("first")) is CapabilityOperationResult.Success)
+            runCurrent()
+            assertTrue(preRestartScopeCapture.isCompleted)
+            assertTrue(beforeRestart.enqueue(channel, request("second")) is CapabilityOperationResult.Success)
+            beforeRestart.shutdown()
+
+            val afterRestart = AgentRunCoordinator(
+                scope = this,
+                store = store,
+                configurationResolver = AgentRunConfigurationResolver { AgentRunCoordinatorConfiguration(DurableAgentConfiguration("profile", "gateway/custom-model", "system", "fingerprint"), emptyList()) },
+                completion = completion,
+                tools = AgentToolExecutionPort { context, call ->
+                    recoveredToolScopeCapture.complete(context.scope)
+                    dev.nilp0inter.subspace.model.OpenAiToolResult(call.id, dev.nilp0inter.subspace.model.OpenAiToolOutcome.Delivered)
+                },
+                playback = object : DelayedPlaybackCapability {
+                    override suspend fun schedule(context: AgentOperationContext, request: DelayedPlaybackRequest): DelayedPlaybackOutcome {
+                        recoveredPlaybackScopeCapture.complete(context.scope)
+                        return DelayedPlaybackOutcome.Heard(DelayedPlaybackOperationId("heard"))
+                    }
+                },
+                limits = AgentRunLimits(maximumUserTextBytes = 100, maximumRequestBytes = 1_000, maximumAssistantTextBytes = 100, maximumModelTurns = 2, maximumToolCalls = 2, operationTimeoutMillis = 100, maximumRunElapsedMillis = 100),
+                nowMillis = { 0L },
+                newId = { java.util.UUID.randomUUID().toString() },
+            )
+            afterRestart.start()
+            runCurrent()
+
+            val preRestartScope = preRestartScopeCapture.await()
+            val recoveredCompletionScope = recoveredCompletionScopeCapture.await()
+            val recoveredToolScope = recoveredToolScopeCapture.await()
+            val recoveredPlaybackScope = recoveredPlaybackScopeCapture.await()
+            // Consistency: all three recovered contexts share the same scope
+            assertEquals("completion and tool scopes must match", recoveredCompletionScope, recoveredToolScope)
+            assertEquals("completion and playback scopes must match", recoveredCompletionScope, recoveredPlaybackScope)
+            // Fresh: recovered scope differs from the pre-restart scope (not reused)
+            assertFalse("recovered scope must be fresh, not the pre-restart scope", preRestartScope == recoveredCompletionScope)
+            // Channel identity preserved
+            assertEquals("channel identity preserved", "restart", recoveredCompletionScope.channelInstanceId)
+            afterRestart.shutdown()
+        }
+    }
+
+    @Test
+    fun sequentialRestartRecoveriesAllocateDistinctScopes() = runTest {
+        withTemporaryDirectory { directory ->
+            val firstRecoveryScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            val secondRecoveryScopeCapture = CompletableDeferred<CapabilityScopeIdentity>()
+            val completion = object : OpenAiCompletionCapability {
+                override suspend fun complete(context: AgentOperationContext, request: OpenAiChatRequest): OpenAiChatOutcome {
+                    val user = request.messages.filterIsInstance<dev.nilp0inter.subspace.model.OpenAiMessage.User>().last().text
+                    if (user == "block-a") {
+                        awaitCancellation()
+                    }
+                    if (user == "q-a") {
+                        firstRecoveryScopeCapture.complete(context.scope)
+                        return OpenAiChatOutcome.FinalAssistantMessage("a")
+                    }
+                    if (user == "q-b") {
+                        secondRecoveryScopeCapture.complete(context.scope)
+                        return OpenAiChatOutcome.FinalAssistantMessage("b")
+                    }
+                    return OpenAiChatOutcome.FinalAssistantMessage("unreachable")
+                }
+            }
+            val store = DurableAgentRunStore(File(directory, "runs.json"))
+            val channel = scope("restart-multi")
+
+            // First restart cycle: block the head, queue resumable work behind it, shut down.
+            val first = coordinator(this, store, completion)
+            assertTrue(first.enqueue(channel, request("block-a")) is CapabilityOperationResult.Success)
+            runCurrent()
+            assertTrue(first.enqueue(channel, request("q-a")) is CapabilityOperationResult.Success)
+            first.shutdown()
+
+            // Recovery A: start() recovers the queued "q-a" with a fresh scope.
+            val recoveredA = coordinator(this, store, completion)
+            recoveredA.start()
+            runCurrent()
+            val firstScope = firstRecoveryScopeCapture.await()
+            recoveredA.shutdown()
+
+            // Second restart cycle: again block the head, queue resumable work, shut down.
+            val second = coordinator(this, store, completion)
+            assertTrue(second.enqueue(channel, request("block-b")) is CapabilityOperationResult.Success)
+            runCurrent()
+            assertTrue(second.enqueue(channel, request("q-b")) is CapabilityOperationResult.Success)
+            second.shutdown()
+
+            // Recovery B: start() recovers the queued "q-b" with a second fresh scope.
+            val recoveredB = coordinator(this, store, completion)
+            recoveredB.start()
+            runCurrent()
+            val secondScope = secondRecoveryScopeCapture.await()
+            recoveredB.shutdown()
+
+            // Non-colliding: two recovery generations allocate distinct scopes.
+            assertFalse("sequential recoveries must allocate distinct scopes", firstScope == secondScope)
+        }
+    }
+
+    @Test
+    fun oldGenerationLeaseRacingAfterReplaceIsRejectedWhileFreshSuccessorBinds() = runTest {
+        withTemporaryDirectory { directory ->
+            val started = CompletableDeferred<Unit>()
+            val completionCalls = mutableListOf<Pair<CapabilityScopeIdentity, String>>()
+            val toolScopes = mutableListOf<CapabilityScopeIdentity>()
+            val playbackScopes = mutableListOf<CapabilityScopeIdentity>()
+            var successorTurn = 0
+            val completion = object : OpenAiCompletionCapability {
+                override suspend fun complete(context: AgentOperationContext, request: OpenAiChatRequest): OpenAiChatOutcome {
+                    val user = request.messages.filterIsInstance<dev.nilp0inter.subspace.model.OpenAiMessage.User>().last().text
+                    completionCalls += context.scope to user
+                    if (user == "old request") {
+                        started.complete(Unit)
+                        awaitCancellation()
+                    }
+                    // Fresh successor H: tool calls on first turn, final message on second.
+                    return if (user == "fresh successor" && successorTurn++ == 0) {
+                        OpenAiChatOutcome.ToolCalls(
+                            listOf(
+                                dev.nilp0inter.subspace.model.OpenAiToolCall(
+                                    dev.nilp0inter.subspace.model.AgentToolCallId("call-1"),
+                                    dev.nilp0inter.subspace.model.OpenAiToolName("test_tool"),
+                                    emptyMap(),
+                                ),
+                            ),
+                        )
+                    } else {
+                        OpenAiChatOutcome.FinalAssistantMessage("done")
+                    }
+                }
+            }
+            val store = DurableAgentRunStore(File(directory, "runs.json"))
+            val coordinator = AgentRunCoordinator(
+                scope = this,
+                store = store,
+                configurationResolver = AgentRunConfigurationResolver { AgentRunCoordinatorConfiguration(DurableAgentConfiguration("profile", "gateway/custom-model", "system", "fingerprint"), emptyList()) },
+                completion = completion,
+                tools = AgentToolExecutionPort { context, call ->
+                    toolScopes += context.scope
+                    dev.nilp0inter.subspace.model.OpenAiToolResult(call.id, dev.nilp0inter.subspace.model.OpenAiToolOutcome.Delivered)
+                },
+                playback = object : DelayedPlaybackCapability {
+                    override suspend fun schedule(context: AgentOperationContext, request: DelayedPlaybackRequest): DelayedPlaybackOutcome {
+                        playbackScopes += context.scope
+                        return DelayedPlaybackOutcome.Heard(DelayedPlaybackOperationId("heard"))
+                    }
+                },
+                limits = AgentRunLimits(maximumUserTextBytes = 100, maximumRequestBytes = 1_000, maximumAssistantTextBytes = 100, maximumModelTurns = 2, maximumToolCalls = 2, operationTimeoutMillis = 100, maximumRunElapsedMillis = 100),
+                nowMillis = { 0L },
+                newId = { java.util.UUID.randomUUID().toString() },
+            )
+            // Explicit generation relationship: H is strictly newer than retired G, not the helper's default generation.
+            val generationG = RuntimeGeneration(7)
+            val generationH = RuntimeGeneration(generationG.value + 1)
+            assertTrue("H must be strictly newer than G", generationH.value > generationG.value)
+            val scopeG = CapabilityScopeIdentity("race", generationG)
+            val scopeH = CapabilityScopeIdentity("race", generationH)
+
+            // Establish G and let its remote completion start, then retire G via replace.
+            assertTrue(coordinator.enqueue(scopeG, request("old request")) is CapabilityOperationResult.Success)
+            runCurrent()
+            assertTrue(started.isCompleted)
+            coordinator.replace(scopeG)
+            runCurrent()
+            val runsAfterReplace = store.snapshot().runs
+            assertTrue("retired G run must be terminal", runsAfterReplace.single().state.isTerminal)
+
+            // Old-G lease racing after replace: typed rejection, zero new durable/remote/tool/playback work.
+            assertEquals("old generation must be closed after replace", CapabilityOperationResult.Closed, coordinator.enqueue(scopeG, request("late old lease")))
+            runCurrent()
+            assertEquals("no new durable run admitted for rejected old lease", runsAfterReplace.size, store.snapshot().runs.size)
+            assertFalse("rejected old lease must not reach remote completion", completionCalls.any { it.second == "late old lease" })
+            assertTrue("rejected old lease must not start tool execution", toolScopes.isEmpty())
+            assertTrue("rejected old lease must not start playback", playbackScopes.isEmpty())
+
+            // Fresh successor H binds the lifecycle and succeeds; all operation contexts use H.
+            assertTrue(coordinator.enqueue(scopeH, request("fresh successor")) is CapabilityOperationResult.Success)
+            runCurrent()
+            val successorCompletionScopes = completionCalls.filter { it.second == "fresh successor" }.map { it.first }
+            assertTrue("successor must perform completion", successorCompletionScopes.isNotEmpty())
+            assertTrue("all completion contexts must use successor scope H", successorCompletionScopes.all { it == scopeH })
+            assertEquals("tool context must use successor scope H", scopeH, toolScopes.single())
+            assertEquals("playback context must use successor scope H", scopeH, playbackScopes.single())
+
+            // Later G still rejected and cannot overwrite H.
+            assertEquals("stale G must remain closed after H binds", CapabilityOperationResult.Closed, coordinator.enqueue(scopeG, request("stale again")))
+            runCurrent()
+            assertFalse("stale G must not reach remote completion", completionCalls.any { it.second == "stale again" })
+            // Equal-current H is accepted (the bound successor generation), proving G did not overwrite H.
+            assertTrue("equal-current successor H must be accepted", coordinator.enqueue(scopeH, request("equal current")) is CapabilityOperationResult.Success)
+            coordinator.shutdown()
+        }
+    }
 
     private fun coordinator(
         scope: CoroutineScope,

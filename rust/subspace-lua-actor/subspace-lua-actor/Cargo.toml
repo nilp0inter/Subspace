@@ -1,7 +1,7 @@
-# Internal proof crate for the Subspace embedded Lua 5.4 bridge.
+# Internal actor kernel crate for the Subspace embedded Lua 5.4 bridge.
 #
-# Native library: `subspace_lua_proof` (Android loads `libsubspace_lua_proof.so`).
-# Package: `dev.nilp0inter.subspace.lua` (Kotlin JNI object `LuaProofNative`).
+# Native library: `subspace_lua_actor` (Android loads `libsubspace_lua_actor.so`).
+# Package: `dev.nilp0inter.subspace.lua` (Kotlin JNI object `LuaNativeKernel`).
 #
 # Pinned substrate: `mlua = =0.12.0`, features `lua54`, `vendored`, `send`.
 # `vendored` pulls `lua-src 550.1.1`, which vendors upstream Lua 5.4 source
@@ -13,10 +13,10 @@
 # `panic = "unwind"` without affecting the parent `rust/` workspace.
 
 [package]
-name = "subspace-lua-proof"
+name = "subspace-lua-actor"
 version = "0.1.0"
 edition = "2021"
-description = "Internal proof of an embedded stock Lua 5.4 substrate for the Subspace plugin runtime (JNI, restricted stdlib, no IO/OS/debug/FFI)"
+description = "Internal embedded stock Lua 5.4 actor kernel for the Subspace plugin runtime (JNI, restricted stdlib, no IO/OS/debug/FFI)"
 license = "MIT"
 publish = false
 
@@ -24,7 +24,7 @@ publish = false
 # which vendors the upstream Lua 5.4 source tree (5.4.8 release line).
 
 [lib]
-name = "subspace_lua_proof"
+name = "subspace_lua_actor"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
@@ -43,3 +43,4 @@ serde_json = { version = "=1.0.150", default-features = false, features = ["std"
 
 [features]
 default = []
+registry-test = []

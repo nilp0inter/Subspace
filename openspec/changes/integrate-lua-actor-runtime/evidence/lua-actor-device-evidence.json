@@ -1,0 +1,1066 @@
+{
+  "schema": "subspace.lua.actor.v1",
+  "context": {
+    "runId": "62c4cdf8-8a71-4782-9d4e-589a12417af6",
+    "deviceModel": "OnePlus CPH2653",
+    "androidVersion": "16",
+    "apiLevel": 36,
+    "buildFingerprint": "OnePlus/CPH2653EEA/OP5D55L1:16/BP2A.250605.015/V.R4T3.26073a0-1df561-1f78cb:user/release-keys",
+    "buildType": "debuggable",
+    "abi": "arm64-v8a",
+    "nativeLibrary": "subspace_lua_actor",
+    "nativeBuild": "cargo-ndk release; minApi=31; packagedAbi=arm64-v8a",
+    "threadCountAtStart": 6,
+    "threadCountAtEnd": 7
+  },
+  "nativeProvenance": {
+    "luaVersion": "5.4.8",
+    "bindingVersion": "0.1.0",
+    "kernelTopology": "jvm_owned"
+  },
+  "injectedPolicies": [
+    {
+      "probe": "startup_readiness_and_bounded_mailbox",
+      "memoryLimitBytes": 2097152,
+      "hookInterval": 41,
+      "instructionBudget": 250000,
+      "mailboxCapacity": 2,
+      "activeSliceBudgetMillis": 2000,
+      "operationWaitDeadlineMillis": 3000,
+      "callbackTimeoutMillis": 2500,
+      "closeTimeoutMillis": 1000
+    },
+    {
+      "probe": "local_vs_fatal_containment",
+      "memoryLimitBytes": 2097152,
+      "hookInterval": 41,
+      "instructionBudget": 250000,
+      "mailboxCapacity": 1,
+      "activeSliceBudgetMillis": 2000,
+      "operationWaitDeadlineMillis": 3000,
+      "callbackTimeoutMillis": 2500,
+      "closeTimeoutMillis": 1000
+    },
+    {
+      "probe": "local_vs_fatal_containment",
+      "memoryLimitBytes": 2097152,
+      "hookInterval": 41,
+      "instructionBudget": 250000,
+      "mailboxCapacity": 1,
+      "activeSliceBudgetMillis": 2000,
+      "operationWaitDeadlineMillis": 3000,
+      "callbackTimeoutMillis": 2500,
+      "closeTimeoutMillis": 1000
+    },
+    {
+      "probe": "bounded_shutdown",
+      "memoryLimitBytes": 2097152,
+      "hookInterval": 41,
+      "instructionBudget": 250000,
+      "mailboxCapacity": 1,
+      "activeSliceBudgetMillis": 2000,
+      "operationWaitDeadlineMillis": 3000,
+      "callbackTimeoutMillis": 2500,
+      "closeTimeoutMillis": 1000
+    }
+  ],
+  "probes": [
+    {
+      "id": "startup_readiness_and_bounded_mailbox",
+      "passed": true,
+      "elapsedNanos": 23724792
+    },
+    {
+      "id": "yield_slot_release_and_multiple_suspensions",
+      "passed": true,
+      "elapsedNanos": 1506979
+    },
+    {
+      "id": "instruction_and_allocator_containment",
+      "passed": true,
+      "elapsedNanos": 1809843
+    },
+    {
+      "id": "local_vs_fatal_containment",
+      "passed": true,
+      "elapsedNanos": 1373750
+    },
+    {
+      "id": "terminal_identity_and_exactly_once_races",
+      "passed": true,
+      "elapsedNanos": 2514428
+    },
+    {
+      "id": "state_isolation_and_replacement_late_suppression",
+      "passed": true,
+      "elapsedNanos": 481407
+    },
+    {
+      "id": "binary_and_native_module_rejection",
+      "passed": true,
+      "elapsedNanos": 402344
+    },
+    {
+      "id": "bounded_shutdown",
+      "passed": true,
+      "elapsedNanos": 651979
+    }
+  ],
+  "operations": [
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 2,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 167500,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 3,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 127187,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 2,
+        "generation": 1,
+        "nativeElapsedNanos": 328906,
+        "currentBytes": 23743,
+        "peakBytes": 23743,
+        "deniedAllocations": 0,
+        "bridgeBytes": 90
+      },
+      "elapsedNanos": 104375,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 3,
+        "generation": 1,
+        "nativeElapsedNanos": 273021,
+        "currentBytes": 23744,
+        "peakBytes": 23744,
+        "deniedAllocations": 0,
+        "bridgeBytes": 91
+      },
+      "elapsedNanos": 93906,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "start_first",
+      "outcome": {
+        "kind": "yielded",
+        "stateId": 2,
+        "generation": 1,
+        "coroutineId": 1,
+        "operationId": 1,
+        "value": "first"
+      },
+      "elapsedNanos": 119635,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "start_second_after_first_yield",
+      "outcome": {
+        "kind": "yielded",
+        "stateId": 3,
+        "generation": 1,
+        "coroutineId": 1,
+        "operationId": 2,
+        "value": "second"
+      },
+      "elapsedNanos": 95573,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "resume_second",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 3,
+        "generation": 1,
+        "coroutineId": 0,
+        "value": "second-complete",
+        "nativeElapsedNanos": 768594,
+        "currentBytes": 25143,
+        "peakBytes": 25143,
+        "deniedAllocations": 0,
+        "bridgeBytes": 91
+      },
+      "elapsedNanos": 106250,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "resume_first",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 2,
+        "generation": 1,
+        "coroutineId": 0,
+        "value": "first-complete",
+        "nativeElapsedNanos": 1072187,
+        "currentBytes": 25141,
+        "peakBytes": 25141,
+        "deniedAllocations": 0,
+        "bridgeBytes": 90
+      },
+      "elapsedNanos": 92813,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 2,
+        "generation": 1
+      },
+      "elapsedNanos": 87344,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "yield_slot_release_and_multiple_suspensions",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 3,
+        "generation": 1
+      },
+      "elapsedNanos": 82500,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 4,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 109375,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "13",
+        "instructionBudget": "10000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 4,
+        "generation": 1,
+        "nativeElapsedNanos": 74792,
+        "currentBytes": 23371,
+        "peakBytes": 23371,
+        "deniedAllocations": 0,
+        "bridgeBytes": 43
+      },
+      "elapsedNanos": 86927,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "start_infinite_loop",
+      "outcome": {
+        "kind": "interrupted",
+        "stateId": 4,
+        "generation": 1,
+        "diagnostic": "instruction budget exhausted",
+        "nativeElapsedNanos": 298906
+      },
+      "elapsedNanos": 217968,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 4,
+        "generation": 1
+      },
+      "elapsedNanos": 77968,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 5,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 101562,
+      "parameters": {
+        "memoryLimitBytes": "131072",
+        "hookInterval": "31",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 5,
+        "generation": 1,
+        "nativeElapsedNanos": 74896,
+        "currentBytes": 23812,
+        "peakBytes": 23812,
+        "deniedAllocations": 0,
+        "bridgeBytes": 93
+      },
+      "elapsedNanos": 94063,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "start_allocation_growth",
+      "outcome": {
+        "kind": "memory_failure",
+        "stateId": 5,
+        "generation": 1,
+        "diagnostic": "memory error: not enough memory",
+        "currentBytes": 128592,
+        "peakBytes": 128592,
+        "deniedAllocations": 1,
+        "bridgeBytes": 93
+      },
+      "elapsedNanos": 315677,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "snapshot",
+      "outcome": {
+        "kind": "snapshot",
+        "stateId": 5,
+        "generation": 1,
+        "currentBytes": 128592,
+        "peakBytes": 128592,
+        "deniedAllocations": 1,
+        "bridgeBytes": 93,
+        "nativeElapsedNanos": 515990,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 134063,
+      "parameters": {
+        "phase": "after_denial"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 5,
+        "generation": 1
+      },
+      "elapsedNanos": 134271,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 6,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 95000,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 6,
+        "generation": 1,
+        "nativeElapsedNanos": 65312,
+        "currentBytes": 23440,
+        "peakBytes": 23440,
+        "deniedAllocations": 0,
+        "bridgeBytes": 58
+      },
+      "elapsedNanos": 77968,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "start_policy_survivor",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 6,
+        "generation": 1,
+        "coroutineId": 1,
+        "value": "survives-policy-failure",
+        "nativeElapsedNanos": 155781,
+        "currentBytes": 24671,
+        "peakBytes": 24671,
+        "deniedAllocations": 0,
+        "bridgeBytes": 58
+      },
+      "elapsedNanos": 75937,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "instruction_and_allocator_containment",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 6,
+        "generation": 1
+      },
+      "elapsedNanos": 51094,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 9,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 75729,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 10,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 71250,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 9,
+        "generation": 1,
+        "nativeElapsedNanos": 138750,
+        "currentBytes": 23844,
+        "peakBytes": 23844,
+        "deniedAllocations": 0,
+        "bridgeBytes": 116
+      },
+      "elapsedNanos": 36667,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 10,
+        "generation": 1,
+        "nativeElapsedNanos": 90573,
+        "currentBytes": 23433,
+        "peakBytes": 23433,
+        "deniedAllocations": 0,
+        "bridgeBytes": 51
+      },
+      "elapsedNanos": 30521,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "start_owner",
+      "outcome": {
+        "kind": "yielded",
+        "stateId": 9,
+        "generation": 1,
+        "coroutineId": 1,
+        "operationId": 3,
+        "value": "race"
+      },
+      "elapsedNanos": 25990,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "resume_foreign",
+      "outcome": {
+        "kind": "invalid_ownership",
+        "stateId": 10,
+        "generation": 1,
+        "diagnostic": "operation id not issued by this state"
+      },
+      "elapsedNanos": 39062,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "resume_stale",
+      "outcome": {
+        "kind": "stale",
+        "stateId": 9,
+        "generation": 2,
+        "diagnostic": "stale (no diagnostic)"
+      },
+      "elapsedNanos": 22813,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "completion_vs_cancellation[0]",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 9,
+        "generation": 1,
+        "coroutineId": 0,
+        "value": "winner",
+        "nativeElapsedNanos": 1259896,
+        "currentBytes": 25234,
+        "peakBytes": 25234,
+        "deniedAllocations": 0,
+        "bridgeBytes": 116
+      },
+      "parameters": {
+        "threadCount": "7"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "completion_vs_cancellation[1]",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 9,
+        "generation": 1,
+        "coroutineId": 0,
+        "value": "winner",
+        "nativeElapsedNanos": 1285208,
+        "currentBytes": 25234,
+        "peakBytes": 25234,
+        "deniedAllocations": 0,
+        "bridgeBytes": 116
+      },
+      "parameters": {
+        "threadCount": "7"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 9,
+        "generation": 1,
+        "nativeElapsedNanos": 2202291,
+        "currentBytes": 26023,
+        "peakBytes": 26023,
+        "deniedAllocations": 0,
+        "bridgeBytes": 167
+      },
+      "elapsedNanos": 42969,
+      "parameters": {
+        "entrypoint": "observe"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "observe_terminal_effect",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 9,
+        "generation": 1,
+        "coroutineId": 2,
+        "value": "1",
+        "nativeElapsedNanos": 2250729,
+        "currentBytes": 27225,
+        "peakBytes": 27225,
+        "deniedAllocations": 0,
+        "bridgeBytes": 167
+      },
+      "elapsedNanos": 33334,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 9,
+        "generation": 1
+      },
+      "elapsedNanos": 41041,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "resume_after_close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 9,
+        "generation": 1
+      },
+      "elapsedNanos": 10157,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "start_foreign_survivor",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 10,
+        "generation": 1,
+        "coroutineId": 1,
+        "value": "foreign-survivor",
+        "nativeElapsedNanos": 2274375,
+        "currentBytes": 24664,
+        "peakBytes": 24664,
+        "deniedAllocations": 0,
+        "bridgeBytes": 51
+      },
+      "elapsedNanos": 27344,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "terminal_identity_and_exactly_once_races",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 10,
+        "generation": 1
+      },
+      "elapsedNanos": 31562,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 11,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 75625,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 12,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 70156,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 11,
+        "generation": 1,
+        "nativeElapsedNanos": 122188,
+        "currentBytes": 23922,
+        "peakBytes": 23922,
+        "deniedAllocations": 0,
+        "bridgeBytes": 128
+      },
+      "elapsedNanos": 35417,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 12,
+        "generation": 1,
+        "nativeElapsedNanos": 76823,
+        "currentBytes": 23521,
+        "peakBytes": 23521,
+        "deniedAllocations": 0,
+        "bridgeBytes": 64
+      },
+      "elapsedNanos": 30469,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "start_generation_g",
+      "outcome": {
+        "kind": "yielded",
+        "stateId": 11,
+        "generation": 1,
+        "coroutineId": 1,
+        "operationId": 4,
+        "value": "g"
+      },
+      "elapsedNanos": 23490,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 11,
+        "generation": 1
+      },
+      "elapsedNanos": 29948,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "late_completion_generation_g",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 11,
+        "generation": 1
+      },
+      "elapsedNanos": 10156,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "start_generation_h",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 12,
+        "generation": 1,
+        "coroutineId": 1,
+        "value": "generation-h",
+        "nativeElapsedNanos": 247917,
+        "currentBytes": 24752,
+        "peakBytes": 24752,
+        "deniedAllocations": 0,
+        "bridgeBytes": 64
+      },
+      "elapsedNanos": 25260,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "state_isolation_and_replacement_late_suppression",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 12,
+        "generation": 1
+      },
+      "elapsedNanos": 30157,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "create",
+      "outcome": {
+        "kind": "created",
+        "stateId": 13,
+        "generation": 1,
+        "luaVersion": "5.4.8",
+        "bindingVersion": "0.1.0",
+        "topology": "jvm_owned"
+      },
+      "elapsedNanos": 66875,
+      "parameters": {
+        "memoryLimitBytes": "2097152",
+        "hookInterval": "37",
+        "instructionBudget": "250000"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "load_binary",
+      "outcome": {
+        "kind": "syntax_failure",
+        "stateId": 13,
+        "generation": 1,
+        "diagnostic": "binary Lua chunks are not accepted"
+      },
+      "elapsedNanos": 35781,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 13,
+        "generation": 1,
+        "nativeElapsedNanos": 89896,
+        "currentBytes": 23942,
+        "peakBytes": 23942,
+        "deniedAllocations": 0,
+        "bridgeBytes": 143
+      },
+      "elapsedNanos": 36562,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "execute_package_loadlib",
+      "outcome": {
+        "kind": "runtime_failure",
+        "stateId": 13,
+        "generation": 1,
+        "diagnostic": "runtime error: subspace-lua-actor/src/state.rs:454:1: attempt to index a nil value (global 'package')\nstack traceback:\n\tsubspace-lua-actor/src/state.rs:454:1: in function 'entry'"
+      },
+      "elapsedNanos": 51979,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "load",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 13,
+        "generation": 1,
+        "nativeElapsedNanos": 207240,
+        "currentBytes": 26518,
+        "peakBytes": 26518,
+        "deniedAllocations": 0,
+        "bridgeBytes": 207
+      },
+      "elapsedNanos": 28541,
+      "parameters": {
+        "entrypoint": "entry"
+      },
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "start_benign_after_rejection",
+      "outcome": {
+        "kind": "completed",
+        "stateId": 13,
+        "generation": 1,
+        "coroutineId": 2,
+        "value": "benign-after-module-rejection",
+        "nativeElapsedNanos": 240469,
+        "currentBytes": 27630,
+        "peakBytes": 27630,
+        "deniedAllocations": 0,
+        "bridgeBytes": 207
+      },
+      "elapsedNanos": 28438,
+      "parameters": {},
+      "threadCount": 7
+    },
+    {
+      "probe": "binary_and_native_module_rejection",
+      "operation": "close",
+      "outcome": {
+        "kind": "closed",
+        "stateId": 13,
+        "generation": 1
+      },
+      "elapsedNanos": 29688,
+      "parameters": {},
+      "threadCount": 7
+    }
+  ],
+  "raceOutcomes": [
+    {
+      "name": "completion_vs_cancellation",
+      "outcomes": [
+        {
+          "kind": "completed",
+          "stateId": 9,
+          "generation": 1,
+          "coroutineId": 0,
+          "value": "winner",
+          "nativeElapsedNanos": 1259896,
+          "currentBytes": 25234,
+          "peakBytes": 25234,
+          "deniedAllocations": 0,
+          "bridgeBytes": 116
+        },
+        {
+          "kind": "completed",
+          "stateId": 9,
+          "generation": 1,
+          "coroutineId": 0,
+          "value": "winner",
+          "nativeElapsedNanos": 1285208,
+          "currentBytes": 25234,
+          "peakBytes": 25234,
+          "deniedAllocations": 0,
+          "bridgeBytes": 116
+        }
+      ]
+    }
+  ],
+  "actorOutcomes": [
+    "mailbox_first=Admitted",
+    "mailbox_second=Admitted",
+    "mailbox_overflow=Busy",
+    "ordinary_error=LocalContained",
+    "instruction_fatal=FatalLatched",
+    {
+      "operation": "close",
+      "elapsedNanos": 322031
+    }
+  ],
+  "outcomeCounts": {
+    "created": 10,
+    "completed": 21,
+    "yielded": 4,
+    "closed": 12,
+    "interrupted": 1,
+    "memory_failure": 1,
+    "snapshot": 1,
+    "invalid_ownership": 1,
+    "stale": 1,
+    "syntax_failure": 1,
+    "runtime_failure": 1
+  }
+}

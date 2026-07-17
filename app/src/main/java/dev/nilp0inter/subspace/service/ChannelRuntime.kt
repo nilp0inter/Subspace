@@ -54,6 +54,12 @@ data class ChannelRuntimeSnapshot(
     val playbackPaused: Boolean = false,
 )
 
+/** Provider-neutral result of bounded, protected runtime startup. */
+sealed interface ChannelActivationResult {
+    data object Ready : ChannelActivationResult
+    data class Failed(val message: String) : ChannelActivationResult
+}
+
 interface ChannelRuntime {
     val id: String
     val snapshot: StateFlow<ChannelRuntimeSnapshot>
@@ -61,6 +67,14 @@ interface ChannelRuntime {
     suspend fun prepareInput(): ChannelInputAcceptance
     suspend fun handleSos() {}
     suspend fun refreshReadiness() {}
+
+    /**
+     * Bounded, host-protected runtime startup invoked after construction and, for staged
+     * successors, after the predecessor has fully closed and capabilities are authorized.
+     * The default returns [ChannelActivationResult.Ready] so existing Kotlin providers that
+     * do not override this hook remain ready immediately.
+     */
+    suspend fun activate(): ChannelActivationResult = ChannelActivationResult.Ready
 
     /** Implementations must make terminal closure idempotent and await their child work. */
     suspend fun close()
