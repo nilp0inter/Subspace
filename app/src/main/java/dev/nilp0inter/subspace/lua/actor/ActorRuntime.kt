@@ -18,6 +18,7 @@ import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
+import dev.nilp0inter.subspace.lua.LuaSpawnAdmission
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
@@ -65,6 +66,7 @@ internal class ActorRuntime(
     private val suspendedTokens = ConcurrentHashMap<ActorOperationId, ActorOperationToken>()
     private var stateHandle: LuaStateHandle? = null
     private val closeOwner = AtomicBoolean(false)
+    private val closeFinished = CompletableDeferred<Unit>()
     private var startupOperationIdentity: ActorOperationIdentity? = null
     // Registration and release of direct gate continuations are synchronized
     // with close ownership. The completed signal represents zero admitted
@@ -85,19 +87,85 @@ internal class ActorRuntime(
     val isClosed: Boolean
         get() = closeOwner.get() || latch.isClosed
 
+    /** Marks a successfully constructed program-image actor as staged. */
+    fun stageProgramImage(): Boolean = latch.stage()
+
+    /** Claims the single startup transition for a program-image adapter. */
+    fun claimProgramImageStartup(): Boolean = latch.start()
+
+    /** Publishes a program-image actor only after all activation callbacks succeed. */
+    fun publishProgramImageLive(): Boolean {
+        if (!latch.publishReady()) return false
+        mailbox.open()
+        return true
+    }
+
+    /** Latches adapter-side activation or callback contract failure. */
+    fun latchProgramImageFailure() {
+        mailbox.retire()
+        mailbox.invalidateQueued()
+        latch.latchFailed()
+    }
+
+    /** Invokes startup while the program image is starting, fenced against actor close. */
+    suspend fun invokeProgramImageStartup(
+        callback: dev.nilp0inter.subspace.lua.LuaCallbackHandle,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        val handle = stateHandle ?: return ActorGateResult.Closed
+        if (latch.phase != ActorLifecyclePhase.STARTING || isClosed) return ActorGateResult.Closed
+        return trackGateContinuation { bridge.invokeStartupCallback(handle, callback, spawnAdmission) }
+    }
+
+    /** Invokes a named program-image callback while the actor is starting or live. */
+    suspend fun invokeProgramImageCallback(
+        callback: dev.nilp0inter.subspace.lua.LuaCallbackHandle,
+        arguments: dev.nilp0inter.subspace.lua.LuaValue,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        val handle = stateHandle ?: return ActorGateResult.Closed
+        if ((latch.phase != ActorLifecyclePhase.STARTING && !latch.isLive) || isClosed) {
+            return ActorGateResult.Closed
+        }
+        return trackGateContinuation { bridge.invokeCallback(handle, callback, arguments, spawnAdmission) }
+    }
+
+    /** Starts one host-admitted background coroutine through the generation gate. */
+    suspend fun startProgramImageCoroutine(
+        coroutineId: LuaCoroutineId,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        val handle = stateHandle ?: return ActorGateResult.Closed
+        if (!latch.isLive || isClosed) return ActorGateResult.Closed
+        return runGateContinuation { bridge.startCoroutine(handle, coroutineId, spawnAdmission) }
+    }
+
+    /** Resumes one exact background operation through the generation gate. */
+    suspend fun resumeProgramImageCoroutine(
+        operation: LuaOperationHandle,
+        success: Boolean,
+        value: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        if (!latch.isLive || isClosed) return ActorGateResult.Closed
+        return runGateContinuation { bridge.resume(operation, success, value, spawnAdmission) }
+    }
+
+    /** Computes the operation-specific Lua sleep deadline from host policy. */
+    fun calculateSleepDeadline(requestedMillis: Long): Long? =
+        ActorPolicy.calculateSleepDeadline(requestedMillis, policy.timerSlackMillis)
+
     private sealed class ActorQuiescenceResult {
         data object Quiescent : ActorQuiescenceResult()
         data object TimedOut : ActorQuiescenceResult()
     }
 
     /**
-     * Register one gate-owned continuation until its action returns. Close
-     * fences registration under [gateContinuationLock], so quiescence observes
-     * every continuation admitted before close and none can enter afterward.
+     * Tracks a direct bridge entry already admitted by the registry execution
+     * gate. It deliberately does not invoke [ActorGenerationGate] again:
+     * synchronous runtime callbacks hold that non-reentrant gate already.
      */
-    private suspend fun <T> runGateContinuation(
-        action: suspend () -> T,
-    ): ActorGateResult<T> {
+    private suspend fun <T> trackGateContinuation(action: suspend () -> T): ActorGateResult<T> {
         val admitted = synchronized(gateContinuationLock) {
             if (closeOwner.get()) {
                 false
@@ -110,9 +178,8 @@ internal class ActorRuntime(
             }
         }
         if (!admitted) return ActorGateResult.Closed
-
         return try {
-            gate.runContinuation(action)
+            ActorGateResult.Success(action())
         } finally {
             val idle = synchronized(gateContinuationLock) {
                 activeGateContinuations -= 1
@@ -120,6 +187,17 @@ internal class ActorRuntime(
             }
             idle?.complete(Unit)
         }
+    }
+
+    /** Admits a background continuation through the generation gate once. */
+    private suspend fun <T> runGateContinuation(action: suspend () -> T): ActorGateResult<T> = when (
+        val tracked = trackGateContinuation { gate.runContinuation(action) }
+    ) {
+        is ActorGateResult.Success -> tracked.value
+        ActorGateResult.Closed -> ActorGateResult.Closed
+        ActorGateResult.Cancelled -> ActorGateResult.Cancelled
+        is ActorGateResult.TimedOut -> tracked
+        ActorGateResult.AlreadyCompleted -> ActorGateResult.AlreadyCompleted
     }
 
     /**
@@ -466,7 +544,9 @@ internal class ActorRuntime(
     suspend fun yieldOperation(
         task: ActorTaskIdentity,
         kernelHandle: LuaOperationHandle,
+        deadlineMillis: Long = policy.operationWaitDeadlineMillis,
     ): ActorOperationIdentity {
+        require(deadlineMillis >= 0) { "Operation deadline must be non-negative" }
         val operationId = ActorOperationId.next()
         val identity = ActorOperationIdentity(
             scope = scope,
@@ -475,11 +555,11 @@ internal class ActorRuntime(
         )
         val token = ActorOperationToken(identity, kernelHandle)
         suspendedTokens[operationId] = token
-        // (2) Schedule exactly-once typed timeout at operationWaitDeadlineMillis
+        // (2) Schedule exactly-once typed timeout at deadlineMillis
         // without charging active budget. Uses the generation's timer scope
         // independent of max background-task capacity.
         taskScope.launchTimer {
-            kotlinx.coroutines.delay(policy.operationWaitDeadlineMillis)
+            kotlinx.coroutines.delay(deadlineMillis)
             if (!token.isCompleted && gate.isLive() && !isClosed) {
                 resumeOperation(identity, ActorTerminal.TimedOut(identity))
             }
@@ -556,7 +636,7 @@ internal class ActorRuntime(
                         val value = when (terminal) {
                             is ActorTerminal.Completed -> terminal.value
                             is ActorTerminal.Failed -> terminal.diagnostic
-                            is ActorTerminal.TimedOut -> "operation timed out"
+                            is ActorTerminal.TimedOut -> "E_TIMEOUT"
                             else -> ""
                         }
                         runGateContinuation<LuaKernelOutcome> {
@@ -773,48 +853,38 @@ internal class ActorRuntime(
      * No cleanup coroutine or process-global work is created.
      */
     suspend fun close(): ActorCloseResult {
-        if (!closeOwner.compareAndSet(false, true)) return ActorCloseResult.AlreadyClosed
+        if (!closeOwner.compareAndSet(false, true)) {
+            closeFinished.await()
+            return ActorCloseResult.AlreadyClosed
+        }
 
-        // Fence continuation registration after close ownership. A contender
-        // that registered before this fence is included in the idle signal;
-        // every later contender observes closeOwner and returns Closed.
         synchronized(gateContinuationLock) {}
-
-        return withContext(NonCancellable) {
-            latch.retire()
-            mailbox.stopAdmission()
-            mailbox.invalidateQueued()
-            scheduler.close()
-
-            taskScope.cancelAll()
-            taskScope.joinAllWithin(policy.closeTimeoutMillis)
-
-            suspendedTokens.values.forEach { token ->
-                token.complete(ActorTerminal.Closed)
-            }
-            suspendedTokens.clear()
-            capabilityMediator?.revoke()
-
-            val quiescence = awaitLuaQuiescence(policy.closeTimeoutMillis)
-            val handle = stateHandle
-            if (handle != null) {
-                if (quiescence is ActorQuiescenceResult.TimedOut) {
-                    // Timeout is explicit: interrupt first. The bridge's
-                    // per-state serialization orders the interrupted native
-                    // action before this terminal close; no native bodies
-                    // overlap and late resume/cancel sees the close tombstone.
-                    bridge.interrupt(handle)
+        return try {
+            withContext(NonCancellable) {
+                latch.retire()
+                mailbox.stopAdmission()
+                mailbox.invalidateQueued()
+                scheduler.close()
+                taskScope.cancelAll()
+                taskScope.joinAllWithin(policy.closeTimeoutMillis)
+                suspendedTokens.values.forEach { token -> token.complete(ActorTerminal.Closed) }
+                suspendedTokens.clear()
+                capabilityMediator?.revoke()
+                val quiescence = awaitLuaQuiescence(policy.closeTimeoutMillis)
+                stateHandle?.let { handle ->
+                    if (quiescence is ActorQuiescenceResult.TimedOut) bridge.interrupt(handle)
+                    bridge.close(handle)
+                    stateHandle = null
                 }
-                bridge.close(handle)
-                stateHandle = null
+                latch.close()
+                mailbox.close()
+                when (quiescence) {
+                    ActorQuiescenceResult.Quiescent -> ActorCloseResult.Closed
+                    ActorQuiescenceResult.TimedOut -> ActorCloseResult.ClosedWithTimeout
+                }
             }
-
-            latch.close()
-            mailbox.close()
-            when (quiescence) {
-                ActorQuiescenceResult.Quiescent -> ActorCloseResult.Closed
-                ActorQuiescenceResult.TimedOut -> ActorCloseResult.ClosedWithTimeout
-            }
+        } finally {
+            closeFinished.complete(Unit)
         }
     }
 

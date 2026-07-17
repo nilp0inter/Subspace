@@ -90,6 +90,71 @@ class LuaKernelOutcomeCodecTest {
     }
 
     @Test
+    fun `completed callback values preserve readiness and input objects as parseable JSON`() {
+        val readiness = LuaKernelOutcomeCodec.decode(
+            """{"kind":"completed","stateId":41,"generation":3,"value":{"ready":true}}""",
+        ) as? LuaKernelOutcome.Completed
+            ?: throw AssertionError("Readiness completion must retain its completed outcome")
+        val readinessValue = readiness.value
+            ?: throw AssertionError("Readiness object must not be discarded by JNI decoding")
+        val readinessJson = org.json.JSONObject(readinessValue)
+        assertTrue("Readiness callback JSON must retain ready=true.", readinessJson.getBoolean("ready"))
+
+        val input = LuaKernelOutcomeCodec.decode(
+            """{"kind":"completed","stateId":41,"generation":3,"value":{"error":{"code":"E_CAPTURE_FAILURE","detail":"processing failed"}}}""",
+        ) as? LuaKernelOutcome.Completed
+            ?: throw AssertionError("Input completion must retain its completed outcome")
+        val inputValue = input.value
+            ?: throw AssertionError("Input result object must not be discarded by JNI decoding")
+        val error = org.json.JSONObject(inputValue).getJSONObject("error")
+        assertEquals("E_CAPTURE_FAILURE", error.getString("code"))
+        assertEquals("processing failed", error.getString("detail"))
+    }
+
+    @Test
+    fun `malformed completed and yielded spawn or log arrays normalize to runtime failure`() {
+        val cases = listOf(
+            "completed spawnedCoroutines object" to
+                """{"kind":"completed","stateId":41,"generation":3,"spawnedCoroutines":{}}""",
+            "completed logs object" to
+                """{"kind":"completed","stateId":41,"generation":3,"logs":{}}""",
+            "completed spawned coroutine string" to
+                """{"kind":"completed","stateId":41,"generation":3,"spawnedCoroutines":["17"]}""",
+            "completed spawned coroutine fractional" to
+                """{"kind":"completed","stateId":41,"generation":3,"spawnedCoroutines":[17.5]}""",
+            "completed spawned coroutine overflow" to
+                """{"kind":"completed","stateId":41,"generation":3,"spawnedCoroutines":[9223372036854775808]}""",
+            "completed spawned coroutine null" to
+                """{"kind":"completed","stateId":41,"generation":3,"spawnedCoroutines":[null]}""",
+            "completed log number" to
+                """{"kind":"completed","stateId":41,"generation":3,"logs":[7]}""",
+            "completed log null" to
+                """{"kind":"completed","stateId":41,"generation":3,"logs":[null]}""",
+            "yielded spawnedCoroutines object" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"spawnedCoroutines":{}}""",
+            "yielded logs object" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"logs":{}}""",
+            "yielded spawned coroutine string" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"spawnedCoroutines":["17"]}""",
+            "yielded spawned coroutine fractional" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"spawnedCoroutines":[17.5]}""",
+            "yielded spawned coroutine overflow" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"spawnedCoroutines":[9223372036854775808]}""",
+            "yielded spawned coroutine null" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"spawnedCoroutines":[null]}""",
+            "yielded log number" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"logs":[7]}""",
+            "yielded log null" to
+                """{"kind":"yielded","stateId":41,"generation":3,"coroutineId":17,"operationId":29,"logs":[null]}""",
+        )
+
+        cases.forEach { (name, json) ->
+            val outcome = LuaKernelOutcomeCodec.decode(json)
+            assertTrue("$name must normalize to RuntimeFailure instead of throwing or accepting malformed native data: $outcome", outcome is LuaKernelOutcome.RuntimeFailure)
+        }
+    }
+
+    @Test
     fun `malformed unknown missing and type-invalid native outcomes normalize to runtime failure`() {
         val cases = listOf(
             "malformed json" to "not json",

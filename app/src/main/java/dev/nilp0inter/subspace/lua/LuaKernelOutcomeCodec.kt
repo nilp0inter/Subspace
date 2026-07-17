@@ -49,23 +49,31 @@ internal object LuaKernelOutcomeCodec {
             )
         }
 
-        return when (kind) {
-            "created" -> decodeCreated(root)
-            "completed" -> decodeCompleted(root)
-            "yielded" -> decodeYielded(root)
-            "syntax_failure" -> decodeSyntaxFailure(root)
-            "validation_failure" -> decodeValidationFailure(root)
-            "runtime_failure" -> decodeRuntimeFailure(root)
-            "memory_failure" -> decodeMemoryFailure(root)
-            "interrupted" -> decodeInterrupted(root)
-            "cancelled" -> decodeCancelled(root)
-            "invalid_ownership" -> decodeInvalidOwnership(root)
-            "stale" -> decodeStale(root)
-            "closed" -> decodeClosed(root)
-            else -> LuaKernelOutcome.RuntimeFailure(
+        return try {
+            when (kind) {
+                "created" -> decodeCreated(root)
+                "completed" -> decodeCompleted(root)
+                "yielded" -> decodeYielded(root)
+                "syntax_failure" -> decodeSyntaxFailure(root)
+                "validation_failure" -> decodeValidationFailure(root)
+                "runtime_failure" -> decodeRuntimeFailure(root)
+                "memory_failure" -> decodeMemoryFailure(root)
+                "interrupted" -> decodeInterrupted(root)
+                "cancelled" -> decodeCancelled(root)
+                "invalid_ownership" -> decodeInvalidOwnership(root)
+                "stale" -> decodeStale(root)
+                "closed" -> decodeClosed(root)
+                else -> LuaKernelOutcome.RuntimeFailure(
+                    stateId = optLong(root, "stateId"),
+                    generation = optLong(root, "generation"),
+                    diagnostic = "unknown outcome kind: $kind",
+                )
+            }
+        } catch (e: Exception) {
+            LuaKernelOutcome.RuntimeFailure(
                 stateId = optLong(root, "stateId"),
                 generation = optLong(root, "generation"),
-                diagnostic = "unknown outcome kind: $kind",
+                diagnostic = "malformed outcome json: ${e.message ?: e.javaClass.simpleName}",
             )
         }
     }
@@ -114,11 +122,13 @@ internal object LuaKernelOutcomeCodec {
                 topology = optString(root, "topology"),
             )
         }
+        val spawnedList = optionalLongArray(root, "spawnedCoroutines")
+        val logsList = optionalStringArray(root, "logs")
         return LuaKernelOutcome.Completed(
             stateId = stateId,
             generation = generation,
             coroutineId = optLong(root, "coroutineId"),
-            value = optString(root, "value"),
+            value = optValueJsonText(root, "value"),
             elapsedNanos = optLong(root, "elapsedNanos"),
             currentBytes = optLong(root, "currentBytes"),
             peakBytes = optLong(root, "peakBytes"),
@@ -127,6 +137,8 @@ internal object LuaKernelOutcomeCodec {
             luaVersion = optString(root, "luaVersion"),
             bindingVersion = optString(root, "bindingVersion"),
             topology = optString(root, "topology"),
+            spawnedCoroutines = spawnedList,
+            logs = logsList
         )
     }
 
@@ -135,12 +147,16 @@ internal object LuaKernelOutcomeCodec {
         val generation = reqLong(root, "generation") ?: return failure(root, "yielded: missing generation")
         val coroutineId = reqLong(root, "coroutineId") ?: return failure(root, "yielded: missing coroutineId")
         val operationId = reqLong(root, "operationId") ?: return failure(root, "yielded: missing operationId")
+        val spawnedList = optionalLongArray(root, "spawnedCoroutines")
+        val logsList = optionalStringArray(root, "logs")
         return LuaKernelOutcome.Yielded(
             stateId = stateId,
             generation = generation,
             coroutineId = coroutineId,
             operationId = operationId,
             value = optString(root, "value"),
+            spawnedCoroutines = spawnedList,
+            logs = logsList,
         )
     }
 
@@ -246,30 +262,43 @@ internal object LuaKernelOutcomeCodec {
 
     private fun optLong(root: JSONObject, field: String): Long? {
         if (!root.has(field) || root.isNull(field)) return null
-        // Strict: accept only integral JSON Number, not quoted strings or
-        // fractional values. org.json getLong() coerces "42" to 42L and
-        // truncates 41.5 to 41; reject both to preserve type safety.
-        val raw = root.opt(field)
-        if (raw !is Number) return null
-        if (raw is Long || raw is Int || raw is Short || raw is Byte) {
-            return raw.toLong()
-        }
-        // Double/Float: reject non-integral values.
-        val d = raw.toDouble()
-        if (d != Math.floor(d) || d.isInfinite() || d.isNaN()) return null
-        return d.toLong()
+        return strictLong(root.opt(field))
     }
 
     private fun reqLong(root: JSONObject, field: String): Long? {
         if (!root.has(field) || root.isNull(field)) return null
-        val raw = root.opt(field)
-        if (raw !is Number) return null
-        if (raw is Long || raw is Int || raw is Short || raw is Byte) {
-            return raw.toLong()
+        return strictLong(root.opt(field))
+    }
+
+    private fun strictLong(raw: Any?): Long? = when (raw) {
+        is Long, is Int, is Short, is Byte -> (raw as Number).toLong()
+        is Double, is Float -> {
+            val value = (raw as Number).toDouble()
+            if (!value.isFinite() || value != Math.floor(value) ||
+                value < Long.MIN_VALUE.toDouble() || value >= Long.MAX_VALUE.toDouble()
+            ) null else value.toLong()
         }
-        val d = raw.toDouble()
-        if (d != Math.floor(d) || d.isInfinite() || d.isNaN()) return null
-        return d.toLong()
+        else -> null
+    }
+
+    private fun optionalLongArray(root: JSONObject, field: String): List<Long>? {
+        if (!root.has(field) || root.isNull(field)) return null
+        val array = root.optJSONArray(field)
+            ?: throw IllegalArgumentException("$field must be an array")
+        return List(array.length()) { index ->
+            strictLong(array.opt(index))
+                ?: throw IllegalArgumentException("$field[$index] must be an in-range integer")
+        }
+    }
+
+    private fun optionalStringArray(root: JSONObject, field: String): List<String>? {
+        if (!root.has(field) || root.isNull(field)) return null
+        val array = root.optJSONArray(field)
+            ?: throw IllegalArgumentException("$field must be an array")
+        return List(array.length()) { index ->
+            array.opt(index) as? String
+                ?: throw IllegalArgumentException("$field[$index] must be a string")
+        }
     }
 
     private fun optString(root: JSONObject, field: String): String? {
@@ -278,6 +307,15 @@ internal object LuaKernelOutcomeCodec {
         val raw = root.opt(field)
         if (raw !is String) return null
         return raw
+    }
+
+    /** Preserves a native structured value as JSON text for LuaValue decoding. */
+    private fun optValueJsonText(root: JSONObject, field: String): String? {
+        if (!root.has(field) || root.isNull(field)) return null
+        return when (val raw = root.opt(field)) {
+            is String -> raw
+            else -> raw?.toString()
+        }
     }
 
     private fun reqString(root: JSONObject, field: String): String? {

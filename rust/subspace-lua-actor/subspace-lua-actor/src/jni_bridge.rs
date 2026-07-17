@@ -52,14 +52,43 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::{LazyLock, Mutex};
 
-use jni::objects::{JClass, JString};
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
 use serde_json::json;
 
 use crate::outcome::{Outcome, OutcomeKind};
 use crate::ownership::{Generation, OperationId, StateId};
-use crate::state::StateEngine;
+use crate::state::{SpawnAdmission, SpawnAdmitter, StateEngine};
+
+fn spawn_admitter(
+    env: &mut JNIEnv,
+    host_admitter: JObject,
+) -> Result<Arc<dyn SpawnAdmitter>, Outcome> {
+    let vm = env
+        .get_java_vm()
+        .map_err(|_| Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"))?;
+    let host: GlobalRef = env
+        .new_global_ref(host_admitter)
+        .map_err(|_| Outcome::runtime_failure("unable to retain host spawn admission"))?;
+    Ok(Arc::new(move |coroutine_id| {
+        let mut callback_env = match vm.attach_current_thread() {
+            Ok(env) => env,
+            Err(_) => return SpawnAdmission::Closed,
+        };
+        match callback_env
+            .call_method(&host, "admitTask", "(J)I", &[JValue::Long(coroutine_id)])
+            .and_then(|value| value.i())
+        {
+            Ok(0) => SpawnAdmission::Accepted,
+            Ok(2) => SpawnAdmission::Capacity,
+            _ => {
+                let _ = callback_env.exception_clear();
+                SpawnAdmission::Closed
+            }
+        }
+    }))
+}
 
 // ---------------------------------------------------------------------------
 // Registry (process-global, split-lock, bounded tombstone history)
@@ -99,10 +128,8 @@ impl Registry {
         self.tombstone_fifo.retain(|id| *id != state_id);
 
         let tomb_count = self.tombstone_count();
-        self.entries.insert(
-            state_id,
-            RegistryEntry::Tombstone { closed_generation },
-        );
+        self.entries
+            .insert(state_id, RegistryEntry::Tombstone { closed_generation });
         self.tombstone_fifo.push_back(state_id);
 
         if tomb_count >= MAX_TOMBSTONES {
@@ -254,10 +281,7 @@ fn close_internal(state_id: StateId, generation: Generation) -> Outcome {
     // generation, which differs from the requested `generation` — that
     // path is excluded.
     if outcome.kind() == OutcomeKind::Closed {
-        let outcome_gen = outcome
-            .to_json()
-            .get("generation")
-            .and_then(|v| v.as_i64());
+        let outcome_gen = outcome.to_json().get("generation").and_then(|v| v.as_i64());
         if outcome_gen == Some(generation) {
             let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             // Defensive: only tombstone if the entry is still Live (a
@@ -277,7 +301,7 @@ fn close_internal(state_id: StateId, generation: Generation) -> Outcome {
 // Names match: Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_native<Name>
 // ---------------------------------------------------------------------------
 
-/// `nativeCreate(memoryLimitBytes: Long, hookInterval: Int, instructionBudget: Long): String`
+/// `nativeCreate(memoryLimitBytes: Long, hookInterval: Int, instructionBudget: Long, maxConcurrentTasks: Int, maxTimerSlots: Int): String`
 #[no_mangle]
 pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeCreate(
     mut env: JNIEnv,
@@ -285,13 +309,37 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeCr
     memory_limit_bytes: jlong,
     hook_interval: jint,
     instruction_budget: jlong,
+    max_concurrent_tasks: jint,
+    max_timer_slots: jint,
 ) -> jstring {
     jni_body(&mut env, |_env| {
-        let memory_limit = if memory_limit_bytes < 0 { 0 } else { memory_limit_bytes as u64 };
-        let hook_int = if hook_interval < 0 { 0 } else { hook_interval as u32 };
-        let budget = if instruction_budget < 0 { 0 } else { instruction_budget as u64 };
+        let memory_limit = if memory_limit_bytes < 0 {
+            0
+        } else {
+            memory_limit_bytes as u64
+        };
+        let hook_int = if hook_interval < 0 {
+            0
+        } else {
+            hook_interval as u32
+        };
+        let budget = if instruction_budget < 0 {
+            0
+        } else {
+            instruction_budget as u64
+        };
+        let max_tasks = if max_concurrent_tasks <= 0 {
+            16
+        } else {
+            max_concurrent_tasks as usize
+        };
+        let max_slots = if max_timer_slots <= 0 {
+            16
+        } else {
+            max_timer_slots as usize
+        };
 
-        match StateEngine::new(memory_limit, hook_int, budget) {
+        match StateEngine::new(memory_limit, hook_int, budget, max_tasks, max_slots) {
             Ok(engine) => {
                 let handle = engine.handle();
                 let state_id = handle.state_id;
@@ -345,52 +393,66 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSt
     generation: jlong,
 ) -> jstring {
     jni_body(&mut env, |_env| {
-        let sid = state_id as StateId;
-        let gen = generation as Generation;
-        with_state(sid, gen, |engine| engine.start(gen))
+        let reject_spawns: Arc<dyn SpawnAdmitter> = Arc::new(|_| SpawnAdmission::Closed);
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.start_with_spawn_admitter(generation as Generation, reject_spawns)
+        })
     })
 }
 
-/// `nativeResume(stateId: Long, generation: Long, operationId: Long, success: Boolean, value: String): String`
+/// `nativeResume(stateId, generation, coroutineId, operationId, success, value, hostAdmitter): String`
 #[no_mangle]
 pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeResume(
     mut env: JNIEnv,
     _class: JClass,
     state_id: jlong,
     generation: jlong,
+    coroutine_id: jlong,
     operation_id: jlong,
     success: jni::sys::jboolean,
     value: JString,
+    host_admitter: JObject,
 ) -> jstring {
     jni_body(&mut env, |env| {
-        let sid = state_id as StateId;
-        let gen = generation as Generation;
-        let op_id = operation_id as OperationId;
-        let ok = success != 0;
-
         let val = match jstring_to_rust(env, &value) {
-            Some(s) => s,
+            Some(value) => value,
             None => return Outcome::validation_failure("value string is invalid"),
         };
-
-        with_state(sid, gen, |engine| engine.resume(gen, op_id, ok, &val))
+        let admitter = match spawn_admitter(env, host_admitter) {
+            Ok(admitter) => admitter,
+            Err(outcome) => return outcome,
+        };
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.resume_coroutine_with_spawn_admitter(
+                generation as Generation,
+                coroutine_id as i64,
+                operation_id as OperationId,
+                success != 0,
+                &val,
+                admitter,
+            )
+        })
     })
 }
 
-/// `nativeCancel(stateId: Long, generation: Long, operationId: Long): String`
+/// `nativeCancel(stateId: Long, generation: Long, coroutineId: Long, operationId: Long): String`
 #[no_mangle]
 pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeCancel(
     mut env: JNIEnv,
     _class: JClass,
     state_id: jlong,
     generation: jlong,
+    coroutine_id: jlong,
     operation_id: jlong,
 ) -> jstring {
     jni_body(&mut env, |_env| {
         let sid = state_id as StateId;
         let gen = generation as Generation;
+        let co_id = coroutine_id as i64;
         let op_id = operation_id as OperationId;
-        with_state(sid, gen, |engine| engine.cancel(gen, op_id))
+        with_state(sid, gen, |engine| {
+            engine.cancel_coroutine(gen, co_id, op_id)
+        })
     })
 }
 
@@ -446,6 +508,114 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeCl
     })
 }
 
+/// `nativeLoadProgramImage(stateId: Long, generation: Long, sourceMapJson: String, entrypoint: String): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeLoadProgramImage(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    source_map_json: JString,
+    entrypoint: JString,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let sid = state_id as StateId;
+        let gen = generation as Generation;
+
+        let map_json = match jstring_to_rust(env, &source_map_json) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("sourceMapJson string is invalid"),
+        };
+        let entry = match jstring_to_rust(env, &entrypoint) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("entrypoint string is invalid"),
+        };
+
+        with_state(sid, gen, |engine| {
+            engine.load_program_image(gen, &map_json, &entry)
+        })
+    })
+}
+
+/// `nativeInvokeCallback(stateId: Long, generation: Long, callbackName: String, argumentsJson: String, hostAdmitter: Object): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    callback_name: JString,
+    arguments_json: JString,
+    host_admitter: JObject,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let sid = state_id as StateId;
+        let gen = generation as Generation;
+        let name = match jstring_to_rust(env, &callback_name) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("callbackName string is invalid"),
+        };
+        let args = match jstring_to_rust(env, &arguments_json) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("argumentsJson string is invalid"),
+        };
+        let vm = match env.get_java_vm() {
+            Ok(vm) => vm,
+            Err(_) => {
+                return Outcome::runtime_failure("unable to acquire JavaVM for spawn admission")
+            }
+        };
+        let host: GlobalRef = match env.new_global_ref(host_admitter) {
+            Ok(host) => host,
+            Err(_) => return Outcome::runtime_failure("unable to retain host spawn admission"),
+        };
+        let admitter: Arc<dyn SpawnAdmitter> = Arc::new(move |coroutine_id| {
+            let mut callback_env = match vm.attach_current_thread() {
+                Ok(env) => env,
+                Err(_) => return SpawnAdmission::Closed,
+            };
+            let decision = callback_env
+                .call_method(&host, "admitTask", "(J)I", &[JValue::Long(coroutine_id)])
+                .and_then(|value| value.i());
+            match decision {
+                Ok(0) => SpawnAdmission::Accepted,
+                Ok(2) => SpawnAdmission::Capacity,
+                _ => {
+                    let _ = callback_env.exception_clear();
+                    SpawnAdmission::Closed
+                }
+            }
+        });
+        with_state(sid, gen, |engine| {
+            engine.invoke_callback_with_spawn_admitter(gen, &name, &args, admitter)
+        })
+    })
+}
+
+/// `nativeStartCoroutine(stateId, generation, coroutineId, hostAdmitter): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    coroutine_id: jlong,
+    host_admitter: JObject,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let admitter = match spawn_admitter(env, host_admitter) {
+            Ok(admitter) => admitter,
+            Err(outcome) => return outcome,
+        };
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.start_coroutine_with_spawn_admitter(
+                generation as Generation,
+                coroutine_id as i64,
+                admitter,
+            )
+        })
+    })
+}
 // Prevent LLVM from stripping the JNI symbols in release builds.
 #[used]
 static JNI_SYMBOLS: &[&str] = &[
@@ -457,6 +627,9 @@ static JNI_SYMBOLS: &[&str] = &[
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInterrupt",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSnapshot",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeClose",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeLoadProgramImage",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeCallback",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine",
 ];
 
 // ---------------------------------------------------------------------------

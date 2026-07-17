@@ -286,6 +286,9 @@ class RuntimeGenerationInvocationGate internal constructor(
     val isLive: Boolean
         get() = synchronized(stateLock) { live }
 
+    internal val isAdmissionStopped: Boolean
+        get() = synchronized(stateLock) { !admitting }
+
     /** Stops new callbacks and rejects queued work while preserving a committed target until final close. */
     fun stopAdmission() {
         val cancelled: List<Request<*>>
@@ -471,11 +474,12 @@ class RuntimeGenerationInvocationGate internal constructor(
         processor.cancel()
         childWork.cancelAndJoinWithin(policy.closeTimeoutMillis)
 
-        val closeStarted = AtomicBoolean(false)
+        val terminalCloseClaimed = AtomicBoolean(false)
         val closeJob = terminalScope.async {
             workers.run {
-                closeStarted.set(true)
-                terminalClose()
+                if (terminalCloseClaimed.compareAndSet(false, true)) {
+                    terminalClose()
+                }
             }
         }
         return try {
@@ -484,17 +488,20 @@ class RuntimeGenerationInvocationGate internal constructor(
                 RuntimeInvocationOutcome.Success(Unit)
             }
         } catch (_: TimeoutCancellationException) {
-            // If the callback won the race with the timeout, it owns the one runtime close and
-            // must finish before callers can consider a fallback. If it has not started, cancel
-            // and join it so a fallback cannot race a late worker dispatch.
-            if (!closeStarted.get()) {
+            // The timeout's successful claim prevents a queued worker from invoking the callback.
+            // A worker claim owns the close, so it must finish before any fallback may proceed.
+            if (terminalCloseClaimed.compareAndSet(false, true)) {
                 closeJob.cancel(CancellationException("Runtime close timed out before starting"))
+            } else {
+                withContext(NonCancellable) { closeJob.join() }
             }
-            withContext(NonCancellable) { closeJob.join() }
             RuntimeInvocationOutcome.TimedOut
         } catch (_: CancellationException) {
-            closeJob.cancel()
-            withContext(NonCancellable) { closeJob.join() }
+            if (terminalCloseClaimed.compareAndSet(false, true)) {
+                closeJob.cancel()
+            } else {
+                withContext(NonCancellable) { closeJob.join() }
+            }
             RuntimeInvocationOutcome.Cancelled
         } catch (failure: Throwable) {
             failure.toOutcome(RuntimeInvocationPhase.CLOSE, RuntimeInvocationOrigin.RUNTIME)

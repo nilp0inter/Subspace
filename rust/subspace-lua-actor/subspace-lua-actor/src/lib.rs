@@ -58,7 +58,8 @@ pub const BINDING_VERSION: &str = "0.1.0";
 pub use accounting::MemoryReport;
 pub use outcome::{Outcome, OutcomeKind};
 pub use ownership::{Generation, Lifecycle, OperationId, StateHandle, StateId};
-pub use state::{StateEngine, StateSnapshot};
+#[doc(hidden)]
+pub use state::{SpawnAdmission, SpawnAdmitter, StateEngine, StateSnapshot};
 
 #[cfg(any(test, feature = "registry-test"))]
 pub use jni_bridge::registry_test;

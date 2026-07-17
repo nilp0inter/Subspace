@@ -8,6 +8,14 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
+import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
+import dev.nilp0inter.subspace.audio.ChannelInputResult
+import dev.nilp0inter.subspace.audio.RecordedPcm
+import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
+import dev.nilp0inter.subspace.channel.capability.CapabilityKey
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
+import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
 import dev.nilp0inter.subspace.lua.actor.ActorConstructResult
 import dev.nilp0inter.subspace.lua.actor.ActorEventEnvelope
 import dev.nilp0inter.subspace.lua.actor.ActorEventId
@@ -18,16 +26,33 @@ import dev.nilp0inter.subspace.lua.actor.ActorGateCommit
 import dev.nilp0inter.subspace.lua.actor.ActorGateResult
 import dev.nilp0inter.subspace.lua.actor.ActorGenerationGate
 import dev.nilp0inter.subspace.lua.actor.ActorKernelConfig
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.lua.actor.ActorLoadResult
 import dev.nilp0inter.subspace.lua.actor.ActorMailboxResult
 import dev.nilp0inter.subspace.lua.actor.ActorPolicy
 import dev.nilp0inter.subspace.lua.actor.ActorRuntime
 import dev.nilp0inter.subspace.lua.actor.ActorStartupResult
+import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
+import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.model.ChannelImplementationId
+import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelProviderError
+import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
+import dev.nilp0inter.subspace.service.ChannelPreparationReason
+import dev.nilp0inter.subspace.service.ChannelRuntimeRegistry
+import dev.nilp0inter.subspace.service.ChannelRuntimeRegistryShutdownResult
+import dev.nilp0inter.subspace.service.CommittedTargetLeaseOwner
+import dev.nilp0inter.subspace.service.RuntimeInvocationBoundary
+import dev.nilp0inter.subspace.service.RuntimeInvocationPolicy
+import dev.nilp0inter.subspace.service.RuntimeWorkerDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
 import java.util.UUID
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
@@ -37,6 +62,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -120,6 +146,7 @@ class LuaActorInstrumentationTest {
             actorStateIsolationAndReplacementSuppressLateCompletion()
             binaryAndNativeModuleRequestsDoNotPoisonBenignEvents()
             shutdownStopsAdmissionAndRejectsLateCompletion()
+            ProviderPathWorkload(evidence, failures).run()
         }
 
         /** Startup publishes readiness before ordinary admission; a full mailbox rejects without a retained waiter. */
@@ -515,6 +542,467 @@ class LuaActorInstrumentationTest {
         }
     }
 
+    /**
+     * Device-only provider integration cases. Every image below enters the production JNI bridge
+     * only through LuaChannelImplementationProvider -> ChannelRuntimeRegistry -> ActorRuntimeFactory.
+     * The registry fixture never starts an audio source or any product service.
+     */
+    private class ProviderPathWorkload(
+        private val evidence: EvidenceCollector,
+        private val failures: MutableList<String>,
+    ) {
+        fun run() {
+            restrictedSourceAndPackageLoading()
+            callbackTableFailuresAreRejected()
+            lifecycleReadinessInputAndSos()
+            startupAndNestedSpawn()
+            sleepCompletionAndCloseSuppressStaleWork()
+            compatibilityAndMalformedSourceFailBeforeActivation()
+            instructionAndAllocatorFailuresAreContained()
+            replacementAndShutdownCloseWithoutStaleEntry()
+        }
+
+        private fun restrictedSourceAndPackageLoading() = case("provider_restricted_source_package_and_cache") {
+            fixture(image(
+                entry = "plugin.restricted",
+                sources = mapOf(
+                    "plugin.restricted" to """
+                        local first = require("plugin.nested")
+                        local second = require("plugin.nested")
+                        return {
+                          startup = function()
+                            if package ~= nil or os ~= nil or io ~= nil or debug ~= nil or load ~= nil then
+                              return { error = { code = "E_RESTRICTED", detail = "restricted global exposed" } }
+                            end
+                            if pcall(string.dump, function() end) then
+                              return { error = { code = "E_BYTECODE", detail = "string.dump was not disabled" } }
+                            end
+                            if first ~= second or first.loads() ~= 1 then
+                              return { error = { code = "E_CACHE", detail = "nested require was not cached" } }
+                            end
+                          end,
+                          handle_readiness = function() return { ready = first.ready() } end,
+                          handle_input = function(event)
+                            if event.event ~= "capture" then return { error = { code = "E_INPUT", detail = "wrong event" } } end
+                            return { ok = true }
+                          end,
+                        }
+                    """.trimIndent(),
+                    "plugin.nested" to """
+                        local counter = 0
+                        counter = counter + 1
+                        return { loads = function() return counter end, ready = function() return true end }
+                    """.trimIndent(),
+                ),
+            )).use { fixture ->
+                val definition = definition("restricted-package")
+                fixture.install(definition)
+                await("restricted package readiness") {
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                assertInputAccepted(fixture.registry, definition.id, "restricted package input")
+            }
+        }
+
+        private fun callbackTableFailuresAreRejected() = case("provider_callback_table_validation") {
+            val cases = listOf(
+                "missing_startup" to "return { handle_readiness = function() return { ready = true } end }",
+                "wrong_optional_type" to "return { startup = function() end, handle_sos = 1 }",
+                "metatable" to "return setmetatable({ startup = function() end }, {})",
+            )
+            cases.forEach { (label, source) ->
+                fixture(image("plugin.$label", mapOf("plugin.$label" to source))).use { fixture ->
+                    val definition = definition("callback-$label")
+                    fixture.install(definition)
+                    val preparation = awaitPreparation(fixture.registry, definition.id, "callback table $label")
+                    require(preparation is ChannelPreparationAvailability.Unavailable) {
+                        "callback table case=$label must be unavailable, got $preparation"
+                    }
+                }
+            }
+        }
+
+        private fun lifecycleReadinessInputAndSos() = case("provider_lifecycle_readiness_input_sos") {
+            fixture(image(
+                entry = "plugin.lifecycle",
+                sources = mapOf("plugin.lifecycle" to """
+                    local channel = require("subspace.channel")
+                    local lifecycle = false
+                    local sos = false
+                    return {
+                      startup = function() lifecycle = false end,
+                      handle_lifecycle = function(event)
+                        if event.event ~= channel.LIFECYCLE_READY then
+                          return { error = { code = "E_LIFECYCLE", detail = "unexpected lifecycle event" } }
+                        end
+                        lifecycle = true
+                      end,
+                      handle_readiness = function() return { ready = lifecycle } end,
+                      handle_input = function(event)
+                        if event.event ~= channel.CAPTURE_COMPLETE then
+                          return { error = { code = "E_INPUT", detail = "unexpected capture event" } }
+                        end
+                        return { ok = true }
+                      end,
+                      handle_sos = function(event)
+                        if event.event ~= channel.SOS_TRIGGERED then
+                          return { error = { code = "E_SOS", detail = "unexpected SOS event" } }
+                        end
+                        sos = true
+                      end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val definition = definition("lifecycle")
+                fixture.install(definition)
+                await("lifecycle readiness") {
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                assertInputAccepted(fixture.registry, definition.id, "lifecycle input")
+                val sos = runBlocking { fixture.registry.dispatchSos(definition.id) }
+                assertEquals("case=lifecycle_sos", ChannelPreparationAvailability.Available, sos)
+            }
+        }
+
+        private fun startupAndNestedSpawn() = case("provider_synchronous_startup_nested_spawn") {
+            fixture(image(
+                entry = "plugin.spawn",
+                sources = mapOf("plugin.spawn" to """
+                    local runtime = require("subspace.runtime")
+                    local child = false
+                    local admitted = false
+                    return {
+                      startup = function()
+                        local ok, err = runtime.spawn(function()
+                          local nested, nestedErr = runtime.spawn(function() child = true end)
+                          admitted = nested == true and nestedErr == nil
+                        end)
+                        if ok ~= true or err ~= nil then
+                          return { error = { code = "E_SPAWN", detail = "startup spawn was not synchronously admitted" } }
+                        end
+                      end,
+                      handle_readiness = function() return { ready = admitted and child } end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val definition = definition("nested-spawn")
+                fixture.install(definition)
+                await("startup and nested spawn completion") {
+                    fixture.registry.refreshReadiness()
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+            }
+        }
+
+        private fun sleepCompletionAndCloseSuppressStaleWork() = case("provider_sleep_timer_deadline_cancel_close_stale") {
+            fixture(image(
+                entry = "plugin.sleep",
+                sources = mapOf("plugin.sleep" to """
+                    local runtime = require("subspace.runtime")
+                    local timerFirst = false
+                    local timeoutOrCancel = false
+                    return {
+                      startup = function()
+                        local admitted, admissionError = runtime.spawn(function()
+                          local completed, error = runtime.sleep(0.02)
+                          timerFirst = completed == true and error == nil
+                          timeoutOrCancel = completed == nil and error ~= nil and
+                            (error.error == "E_TIMEOUT" or error.error == "E_CANCELLED")
+                        end)
+                        if admitted ~= true or admissionError ~= nil then
+                          return { error = { code = "E_SPAWN", detail = "sleep task was not admitted" } }
+                        end
+                      end,
+                      handle_readiness = function() return { ready = timerFirst or timeoutOrCancel } end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val definition = definition("sleep")
+                fixture.install(definition)
+                await("sleep terminal result") {
+                    fixture.registry.refreshReadiness()
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+            }
+
+            // Closing a live sleeping generation must suppress its continuation; the H image is
+            // independent and proves a late G timer cannot mutate the replacement's Lua globals.
+            fixture(image(
+                entry = "plugin.g",
+                sources = mapOf("plugin.g" to """
+                    local runtime = require("subspace.runtime")
+                    local stale = false
+                    return {
+                      startup = function() runtime.spawn(function() runtime.sleep(5.0); stale = true end) end,
+                      handle_readiness = function() return { ready = stale } end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val generationG = definition("sleep-replacement", name = "G")
+                fixture.install(generationG)
+                runBlocking { fixture.registry.reconcile(ChannelCatalogueSnapshot(emptyList(), "")) }
+                assertEquals("case=sleep_close", null, fixture.registry.getRuntimeSnapshot(generationG.id))
+            }
+        }
+
+        private fun compatibilityAndMalformedSourceFailBeforeActivation() = case("provider_compatibility_and_malformed_source") {
+            ActorRuntimeFactory.resetForTest()
+            LuaNativeKernel.resetForTest()
+            val incompatible = ImmutableProgramImage.create(
+                entryPoint = "plugin.incompatible",
+                sourceMap = mapOf("plugin.incompatible" to "return { startup = function() end }"),
+                requirements = LuaProgramRequirements(LUA_VERSION, "subspace-lua-device-incompatible"),
+            )
+            fixture(LuaChannelImplementationProvider.fromCreationResult(incompatible, LuaNativeKernelBridge())).use { fixture ->
+                val definition = definition("incompatible")
+                fixture.install(definition)
+                val unavailable = awaitProviderFailure(fixture.registry, definition.id, "compatibility")
+                require(unavailable is ChannelProviderError.RuntimeCompatibilityFailure) {
+                    "case=compatibility must reject before activation with typed compatibility error, got $unavailable"
+                }
+                assertTrue("case=compatibility must not construct an actor", !ActorRuntimeFactory.isCreateAttempted)
+                assertTrue("case=compatibility must not load the native kernel", !LuaNativeKernel.isLoadAttempted)
+            }
+            ActorRuntimeFactory.resetForTest()
+            LuaNativeKernel.resetForTest()
+
+            fixture(image("plugin.malformed", mapOf("plugin.malformed" to "return { startup = function( end }"))).use { fixture ->
+                val definition = definition("malformed-source")
+                fixture.install(definition)
+                awaitProviderFailure(fixture.registry, definition.id, "malformed source")
+            }
+        }
+
+        private fun instructionAndAllocatorFailuresAreContained() = case("provider_instruction_and_allocator_denial") {
+            fixture(
+                image("plugin.interrupted", mapOf("plugin.interrupted" to "return { startup = function() while true do end end }")),
+                policy = policy(instructionBudget = 10_000L),
+            ).use { fixture ->
+                val definition = definition("interrupted")
+                fixture.install(definition)
+                awaitRuntimeFailure(fixture.registry, definition.id, "instruction interruption")
+            }
+            fixture(
+                image("plugin.allocator", mapOf("plugin.allocator" to """
+                    local values = {}
+                    for i = 1, 100000 do values[i] = { i, i * 2 } end
+                    return { startup = function() end }
+                """.trimIndent())),
+                policy = policy(memoryLimitBytes = 128L * 1024L),
+            ).use { fixture ->
+                val definition = definition("allocator")
+                fixture.install(definition)
+                awaitProviderFailure(fixture.registry, definition.id, "allocator denial")
+            }
+        }
+
+        private fun replacementAndShutdownCloseWithoutStaleEntry() = case("provider_replacement_g_to_h_and_shutdown") {
+            fixture(image(
+                entry = "plugin.replacement",
+                sources = mapOf("plugin.replacement" to """
+                    return {
+                      startup = function() end,
+                      handle_readiness = function() return { ready = true } end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val generationG = definition("replacement", name = "G")
+                fixture.install(generationG)
+                await("generation G readiness") {
+                    fixture.registry.getRuntimeSnapshot(generationG.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                val generationH = generationG.copy(name = "H")
+                runBlocking { fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(generationH), generationH.id)) }
+                await("generation H readiness") {
+                    fixture.registry.getRuntimeSnapshot(generationH.id)?.name == "H" &&
+                        fixture.registry.getRuntimeSnapshot(generationH.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                fixture.shutdown()
+                assertEquals("case=shutdown_no_stale_entry", null, fixture.registry.getRuntimeSnapshot(generationH.id))
+            }
+        }
+
+        private fun case(label: String, body: () -> Unit) {
+            val started = System.nanoTime()
+            try {
+                body()
+                evidence.recordDeviceCase(label, "passed")
+                evidence.recordProbe(label, passed = true, elapsedNanos = System.nanoTime() - started, failure = null)
+            } catch (failure: Throwable) {
+                val message = "case=$label: ${failure.message ?: failure::class.java.name}"
+                failures += message
+                evidence.recordDeviceCase(label, message)
+                evidence.recordProbe(label, passed = false, elapsedNanos = System.nanoTime() - started, failure = message)
+            }
+        }
+
+        private fun fixture(
+            image: ImmutableProgramImage,
+            policy: ActorPolicy = policy(),
+        ): RegistryFixture = fixture(LuaChannelImplementationProvider(image, LuaNativeKernelBridge(), policy))
+
+        private fun fixture(provider: LuaChannelImplementationProvider): RegistryFixture {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val workers = RuntimeWorkerDispatcher.create(workerCount = 1, queueCapacity = 16, threadNamePrefix = "lua-device")
+            val boundary = RuntimeInvocationBoundary(
+                workers,
+                RuntimeInvocationPolicy(
+                    perGenerationQueueCapacity = 16,
+                    callbackTimeoutMillis = 5_000L,
+                    inputReleasedTimeoutMillis = 5_000L,
+                    closeTimeoutMillis = 5_000L,
+                ),
+            )
+            val providers = ChannelImplementationProviderRegistry().also { it.register(provider) }
+            return RegistryFixture(
+                registry = ChannelRuntimeRegistry(
+                    providers = providers,
+                    capabilityHost = NoCapabilities,
+                    invocationBoundary = boundary,
+                    runtimeScope = scope,
+                    closeScope = scope,
+                    shutdownAwaitMillis = 10_000L,
+                ),
+                boundary = boundary,
+                scope = scope,
+            )
+        }
+
+        private fun image(entry: String, sources: Map<String, String>): ImmutableProgramImage = when (
+            val result = ImmutableProgramImage.create(
+                entryPoint = entry,
+                sourceMap = sources,
+                requirements = LuaProgramRequirements(LUA_VERSION, API_VERSION),
+            )
+        ) {
+            is ProgramImageCreationResult.Success -> result.image
+            is ProgramImageCreationResult.Failure -> throw AssertionError("fixture=$entry is invalid: ${result.error.message}")
+        }
+
+        private fun policy(
+            memoryLimitBytes: Long = 2L * 1024L * 1024L,
+            instructionBudget: Long = 250_000L,
+        ) = ActorPolicy(
+            luaKernelConfig = ActorKernelConfig(memoryLimitBytes, hookInterval = 31, instructionBudget),
+            mailboxCapacity = 8,
+            activeSliceBudgetMillis = 5_000L,
+            operationWaitDeadlineMillis = 5_000L,
+            callbackTimeoutMillis = 5_000L,
+            closeTimeoutMillis = 5_000L,
+            maxConcurrentTasks = 4,
+            perTaskDeadlineMillis = null,
+            timerSlackMillis = 100L,
+        )
+
+        private fun definition(id: String, name: String = id): ChannelDefinition = ChannelDefinition(
+            id = id,
+            name = name,
+            implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+            enabled = true,
+            configSchemaVersion = 1,
+            configPayload = OpaqueJsonObject.fromJsonObject(JSONObject()),
+        )
+
+        private fun await(label: String, condition: () -> Boolean) = runBlocking {
+            withTimeout(10_000L) {
+                while (!condition()) delay(10L)
+            }
+        }
+
+        private fun awaitPreparation(
+            registry: ChannelRuntimeRegistry,
+            id: String,
+            label: String,
+        ): ChannelPreparationAvailability {
+            await(label) { registry.getRuntimeSnapshot(id)?.preparation != null }
+            return requireNotNull(registry.getRuntimeSnapshot(id)?.preparation) { "case=$label has no registry snapshot" }
+        }
+
+        private fun awaitProviderFailure(
+            registry: ChannelRuntimeRegistry,
+            id: String,
+            label: String,
+        ): ChannelProviderError {
+            val preparation = awaitPreparation(registry, id, label)
+            val unavailable = preparation as? ChannelPreparationAvailability.Unavailable
+                ?: throw AssertionError("case=$label expected provider unavailability, got $preparation")
+            return (unavailable.reason as? ChannelPreparationReason.Provider)?.error
+                ?: throw AssertionError("case=$label expected provider reason, got ${unavailable.reason}")
+        }
+
+        private fun awaitRuntimeFailure(
+            registry: ChannelRuntimeRegistry,
+            id: String,
+            label: String,
+        ) {
+            val preparation = awaitPreparation(registry, id, label)
+            val unavailable = preparation as? ChannelPreparationAvailability.Unavailable
+                ?: throw AssertionError("case=$label expected runtime unavailability, got $preparation")
+            if (unavailable.reason !is ChannelPreparationReason.RuntimeFailed) {
+                throw AssertionError("case=$label expected runtime failure, got ${unavailable.reason}")
+            }
+        }
+
+        private fun assertInputAccepted(registry: ChannelRuntimeRegistry, id: String, label: String) = runBlocking {
+            val acceptance = registry.prepareInput(id) as? ChannelInputAcceptance.Accepted
+                ?: throw AssertionError("case=$label expected cached readiness input acceptance")
+            try {
+                assertEquals(
+                    "case=$label must return no v1 playback result",
+                    ChannelInputResult.None,
+                    acceptance.target.onInputReleased(RecordedPcm(shortArrayOf(), 8_000)),
+                )
+            } finally {
+                acceptance.target.onInputCancelled("case=$label complete")
+                (acceptance.target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
+            }
+        }
+
+        private class RegistryFixture(
+            val registry: ChannelRuntimeRegistry,
+            private val boundary: RuntimeInvocationBoundary,
+            private val scope: CoroutineScope,
+        ) : AutoCloseable {
+            fun install(definition: ChannelDefinition) = runBlocking {
+                registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+            }
+
+            fun shutdown() {
+                val result = runBlocking { registry.shutdownAndAwait() }
+                assertEquals("registry shutdown must close every provider generation", ChannelRuntimeRegistryShutdownResult.Closed, result)
+            }
+
+            override fun close() {
+                try {
+                    shutdown()
+                } finally {
+                    boundary.close()
+                    scope.cancel()
+                }
+            }
+        }
+
+        private object NoCapabilities : ChannelCapabilityHost {
+            override suspend fun availability(
+                identity: CapabilityScopeIdentity,
+                key: CapabilityKey<*>,
+            ): CapabilityAvailability = CapabilityAvailability.Available
+
+            override suspend fun <T : ChannelCapabilityPort> acquire(
+                identity: CapabilityScopeIdentity,
+                key: CapabilityKey<T>,
+            ): HostedCapabilityAcquisition<T> = HostedCapabilityAcquisition.Unavailable(
+                dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.UNSUPPORTED,
+            )
+
+            override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+                identity: CapabilityScopeIdentity,
+                key: CapabilityKey<T>,
+                timeoutMillis: Long,
+            ): HostedCapabilityAcquisition<T> = acquire(identity, key)
+        }
+    }
+
     private class EvidenceCollector(
         private val context: JSONObject,
     ) {
@@ -523,6 +1011,7 @@ class LuaActorInstrumentationTest {
         private val races = JSONArray()
         private val actorPolicies = JSONArray()
         private val actorOutcomes = JSONArray()
+        private val deviceCases = JSONArray()
         private val outcomeCounts = linkedMapOf<String, Int>()
         private val nativeProvenance = linkedMapOf<String, String>()
 
@@ -584,6 +1073,14 @@ class LuaActorInstrumentationTest {
         fun recordActorOutcome(value: String) {
             actorOutcomes.put(value)
         }
+        fun recordDeviceCase(label: String, outcome: String) {
+            deviceCases.put(
+                JSONObject()
+                    .put("label", label)
+                    .put("outcome", outcome),
+            )
+        }
+
 
         fun recordActorClose(elapsedNanos: Long) {
             actorOutcomes.put(JSONObject().put("operation", "close").put("elapsedNanos", elapsedNanos))
@@ -598,6 +1095,7 @@ class LuaActorInstrumentationTest {
             .put("operations", operations)
             .put("raceOutcomes", races)
             .put("actorOutcomes", actorOutcomes)
+            .put("deviceCases", deviceCases)
             .put("outcomeCounts", JSONObject(outcomeCounts))
             .toString()
     }

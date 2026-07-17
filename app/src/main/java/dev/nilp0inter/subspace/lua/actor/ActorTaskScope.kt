@@ -7,8 +7,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -27,11 +25,11 @@ internal class ActorTaskScope(
     parentScope: CoroutineScope,
     private val scopeIdentity: CapabilityScopeIdentity,
     private val maxConcurrentTasks: Int,
-    private val perTaskDeadlineMillis: Long,
+    private val perTaskDeadlineMillis: Long?,
 ) {
     init {
         require(maxConcurrentTasks > 0) { "Max concurrent tasks must be positive" }
-        require(perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
+        require(perTaskDeadlineMillis == null || perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
     }
 
     private val supervisorJob = SupervisorJob(
@@ -41,51 +39,56 @@ internal class ActorTaskScope(
     )
     private val scope = CoroutineScope(parentScope.coroutineContext + supervisorJob)
 
-    private val tasks = ConcurrentHashMap<ActorTaskId, ActorTaskHandle>()
-    private val activeCount = AtomicInteger(0)
+    private val stateLock = Any()
+    private val tasks = mutableMapOf<ActorTaskId, ActorTaskHandle>()
+    private var activeCount = 0
+    private var admissionClosed = false
     private val taskCounter = AtomicLong(0L)
 
+    init {
+        supervisorJob.invokeOnCompletion {
+            synchronized(stateLock) { admissionClosed = true }
+        }
+    }
+
     val isActive: Boolean
-        get() = supervisorJob.isActive
+        get() = synchronized(stateLock) { !admissionClosed && supervisorJob.isActive }
 
     val activeTaskCount: Int
-        get() = activeCount.get()
+        get() = synchronized(stateLock) { activeCount }
 
     val totalTaskCount: Int
-        get() = tasks.size
+        get() = synchronized(stateLock) { tasks.size }
 
     /**
-     * Launch one background task bounded by the generation. Returns the task
-     * identity, or null if the scope is closed or at capacity.
-     *
-     * Capacity admission is atomic: concurrent launches never exceed
-     * [maxConcurrentTasks] under a CAS loop.
+     * Linearizes capacity admission, task registration, and close against one
+     * lock. Completion removes the registration even when cancellation wins
+     * before the lazy child has entered its body.
      */
-    fun launch(task: suspend (ActorTaskIdentity) -> Unit): ActorTaskIdentity? {
-        if (!supervisorJob.isActive) return null
-        while (true) {
-            val current = activeCount.get()
-            if (current >= maxConcurrentTasks) return null
-            if (activeCount.compareAndSet(current, current + 1)) break
-        }
-
+    fun launch(task: suspend (ActorTaskIdentity) -> Unit): ActorTaskIdentity? = synchronized(stateLock) {
+        if (admissionClosed || !supervisorJob.isActive || activeCount >= maxConcurrentTasks) return@synchronized null
         val taskId = ActorTaskId(taskCounter.incrementAndGet())
         val identity = ActorTaskIdentity(scope = scopeIdentity, taskId = taskId)
-        tasks[taskId] = ActorTaskHandle(taskId)
-
-        scope.launch {
+        val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
-                withTimeoutOrNull(perTaskDeadlineMillis) {
+                if (perTaskDeadlineMillis != null) {
+                    withTimeoutOrNull(perTaskDeadlineMillis) { task(identity) }
+                } else {
                     task(identity)
                 }
             } catch (_: CancellationException) {
                 // generation cancelled — expected during retirement
-            } finally {
-                activeCount.decrementAndGet()
-                tasks.remove(taskId)
             }
         }
-        return identity
+        tasks[taskId] = ActorTaskHandle(taskId)
+        activeCount += 1
+        job.invokeOnCompletion {
+            synchronized(stateLock) {
+                if (tasks.remove(taskId) != null) activeCount -= 1
+            }
+        }
+        job.start()
+        identity
     }
 
     /**
@@ -97,11 +100,11 @@ internal class ActorTaskScope(
         scope.launch { block() }
     }
 
-    /**
-     * Cancel all descendants. Called during retirement or close.
-     */
     fun cancelAll() {
-        supervisorJob.cancel()
+        synchronized(stateLock) {
+            admissionClosed = true
+            supervisorJob.cancel()
+        }
     }
 
     /**
@@ -109,7 +112,7 @@ internal class ActorTaskScope(
      * tasks completed or were cancelled within the bound.
      */
     suspend fun joinAllWithin(timeoutMillis: Long): Boolean {
-        supervisorJob.cancel()
+        cancelAll()
         return withTimeoutOrNull(timeoutMillis) {
             supervisorJob.join()
             true

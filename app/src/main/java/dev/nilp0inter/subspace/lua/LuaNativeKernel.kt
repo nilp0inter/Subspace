@@ -69,6 +69,8 @@ internal object LuaNativeKernel {
         memoryLimitBytes: Long,
         hookInterval: Int,
         instructionBudget: Long,
+        maxConcurrentTasks: Int,
+        maxTimerSlots: Int,
     ): String
 
     external fun nativeLoad(
@@ -86,14 +88,17 @@ internal object LuaNativeKernel {
     external fun nativeResume(
         stateId: Long,
         generation: Long,
+        coroutineId: Long,
         operationId: Long,
         success: Boolean,
         value: String,
+        spawnAdmission: LuaSpawnAdmission,
     ): String
 
     external fun nativeCancel(
         stateId: Long,
         generation: Long,
+        coroutineId: Long,
         operationId: Long,
     ): String
 
@@ -110,5 +115,27 @@ internal object LuaNativeKernel {
     external fun nativeClose(
         stateId: Long,
         generation: Long,
+    ): String
+
+    external fun nativeLoadProgramImage(
+        stateId: Long,
+        generation: Long,
+        sourceMapJson: String,
+        entryPoint: String,
+    ): String
+
+    external fun nativeInvokeCallback(
+        stateId: Long,
+        generation: Long,
+        callbackName: String,
+        argumentsJson: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): String
+
+    external fun nativeStartCoroutine(
+        stateId: Long,
+        generation: Long,
+        coroutineId: Long,
+        spawnAdmission: LuaSpawnAdmission,
     ): String
 }

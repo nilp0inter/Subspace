@@ -1,8 +1,11 @@
 package dev.nilp0inter.subspace.model
 
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
+import dev.nilp0inter.subspace.lua.actor.ActorGenerationGate
 import dev.nilp0inter.subspace.service.ChannelRuntime
+import kotlinx.coroutines.CoroutineScope
 import org.json.JSONObject
 
 /** Typed failures returned by provider registration, configuration, and construction. */
@@ -53,6 +56,16 @@ sealed interface ChannelProviderError {
         val detail: String,
     ) : ChannelProviderError {
         override val message = "Could not construct runtime for $implementationId: $detail"
+    }
+
+    data class RuntimeCompatibilityFailure(
+        override val implementationId: ChannelImplementationId,
+        val requirement: String,
+        val requiredVersion: String,
+        val supportedVersion: String,
+    ) : ChannelProviderError {
+        override val message =
+            "Runtime compatibility failure for $implementationId: $requirement requires $requiredVersion (supported $supportedVersion)"
     }
 }
 
@@ -278,11 +291,76 @@ data class ChannelImplementationDescriptor(
         }
     }
 }
+/**
+ * Provider-neutral generation execution context.
+ *
+ * Supplies typed generation-bound admission for internal timers and
+ * background tasks plus a liveness query. Does NOT expose CoroutineScope,
+ * RuntimeGenerationInvocationGate, CapabilityScopeIdentity,
+ * RuntimeGeneration, or any other internal type.
+ *
+ * The context is bound to a single generation and rejects operations
+ * initiated after that generation is closed or replaced.
+ *
+ * Sealed so only host-owned implementation types exist.
+ */
+sealed interface GenerationExecutionContext {
+    /** Stable channel instance identifier. Consistent across generations. */
+    val instanceId: String
+
+    /**
+     * Check whether the generation is still active (not closed or replaced).
+     * Functions return false/throw after the generation closes.
+     */
+    fun isActive(): Boolean
+
+    /**
+     * Schedule a one-shot timer bound to this generation. The callback fires
+     * at most once while live and is suppressed after close. The accepted
+     * handle cancels the timer idempotently.
+     */
+    fun scheduleTimer(
+        delaySeconds: Double,
+        callback: suspend () -> Unit,
+    ): GenerationAdmission<Disposable>
+
+    /**
+     * Admit a generation-bound background task. During construction and
+     * activation, admission reserves bounded capacity and stages the task;
+     * it cannot execute yet. After the registry publishes generation
+     * readiness, later admissions become runnable after the current
+     * invocation slice.
+     */
+    fun admitTask(task: suspend () -> Unit): GenerationAdmission<Unit>
+}
+
+/** Internal actor adapter port; never exposed through the provider-facing context contract. */
+internal interface ActorRuntimeHostContext : GenerationExecutionContext {
+    val actorIdentity: CapabilityScopeIdentity
+    val actorParentScope: CoroutineScope
+    val actorGate: ActorGenerationGate
+    fun discardActorStagedTasks()
+}
+
+sealed interface GenerationAdmission<out T> {
+    data class Accepted<T>(val value: T) : GenerationAdmission<T>
+    data class Rejected(val reason: GenerationAdmissionRejection) : GenerationAdmission<Nothing>
+}
+
+enum class GenerationAdmissionRejection {
+    CLOSED,
+    CAPACITY_EXHAUSTED,
+}
+
+interface Disposable {
+    fun dispose()  // cancel the timer; idempotent
+}
 
 data class ChannelRuntimeConstructionRequest(
     val definition: ChannelDefinition,
     val configuration: ValidatedChannelConfiguration,
     val capabilities: ChannelCapabilityScope,
+    val generationContext: GenerationExecutionContext,
 ) {
     init {
         require(definition.implementationId == configuration.implementationId) {

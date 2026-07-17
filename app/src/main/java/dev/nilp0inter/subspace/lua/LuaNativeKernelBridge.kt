@@ -38,6 +38,8 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
                 config.memoryLimitBytes,
                 config.hookInterval,
                 config.instructionBudget,
+                config.maxConcurrentTasks,
+                config.maxTimerSlots,
             )
         } catch (e: UnsatisfiedLinkError) {
             return LuaKernelOutcome.RuntimeFailure(
@@ -101,6 +103,7 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
         operation: LuaOperationHandle,
         success: Boolean,
         value: String,
+        spawnAdmission: LuaSpawnAdmission,
     ): LuaKernelOutcome {
         if (!LuaNativeKernel.ensureLoaded()) {
             return LuaKernelOutcome.RuntimeFailure(
@@ -113,9 +116,11 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
             LuaNativeKernel.nativeResume(
                 operation.stateHandle.stateId.value,
                 operation.stateHandle.generation.value,
+                operation.coroutineId.value,
                 operation.operationId.value,
                 success,
                 value,
+                spawnAdmission,
             )
         } catch (e: UnsatisfiedLinkError) {
             return LuaKernelOutcome.RuntimeFailure(
@@ -139,6 +144,7 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
             LuaNativeKernel.nativeCancel(
                 operation.stateHandle.stateId.value,
                 operation.stateHandle.generation.value,
+                operation.coroutineId.value,
                 operation.operationId.value,
             )
         } catch (e: UnsatisfiedLinkError) {
@@ -215,6 +221,138 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
                 stateId = handle.stateId.value,
                 generation = handle.generation.value,
                 diagnostic = "nativeClose link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
+    }
+
+    override fun loadProgramImage(
+        handle: LuaStateHandle,
+        entryPoint: String,
+        sourceMap: Map<String, String>
+    ): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val sourceMapJson = org.json.JSONObject(sourceMap).toString()
+        val json = try {
+            LuaNativeKernel.nativeLoadProgramImage(
+                handle.stateId.value,
+                handle.generation.value,
+                sourceMapJson,
+                entryPoint
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeLoadProgramImage link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
+    }
+
+    override fun invokeStartupCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (callbackHandle.stateHandle != handle) {
+            return invalidCallbackOwnership(handle, callbackHandle)
+        }
+        return invokeCallbackJson(handle, callbackHandle, "", spawnAdmission)
+    }
+
+    override fun invokeCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (callbackHandle.stateHandle != handle) {
+            return invalidCallbackOwnership(handle, callbackHandle)
+        }
+        val argumentsJson = when (val encoding = arguments.toJsonString()) {
+            is JsonEncodingResult.Success -> encoding.json
+            is JsonEncodingResult.Failure -> {
+                return LuaKernelOutcome.ValidationFailure(
+                    stateId = handle.stateId.value,
+                    generation = handle.generation.value,
+                    diagnostic = encoding.diagnostic,
+                )
+            }
+        }
+        return invokeCallbackJson(handle, callbackHandle, argumentsJson, spawnAdmission)
+    }
+
+    private fun invalidCallbackOwnership(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+    ): LuaKernelOutcome.InvalidOwnership = LuaKernelOutcome.InvalidOwnership(
+        stateId = handle.stateId.value,
+        generation = handle.generation.value,
+        diagnostic = "callback '${callbackHandle.name}' belongs to a different state handle",
+    )
+
+    private fun invokeCallbackJson(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        argumentsJson: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val json = try {
+            LuaNativeKernel.nativeInvokeCallback(
+                handle.stateId.value,
+                handle.generation.value,
+                callbackHandle.name,
+                argumentsJson,
+                spawnAdmission,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeInvokeCallback link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
+    }
+
+    override fun startCoroutine(
+        handle: LuaStateHandle,
+        coroutineId: LuaCoroutineId,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val json = try {
+            LuaNativeKernel.nativeStartCoroutine(
+                handle.stateId.value,
+                handle.generation.value,
+                coroutineId.value,
+                spawnAdmission,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeStartCoroutine link error: ${e.message}",
             )
         }
         return LuaKernelOutcomeCodec.decode(json)

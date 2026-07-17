@@ -12,7 +12,7 @@ const INSTRUCTION_BUDGET: u64 = 50_000;
 const STRESS_CYCLES: usize = 24;
 
 fn engine() -> StateEngine {
-    StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, INSTRUCTION_BUDGET)
+    StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, INSTRUCTION_BUDGET, 16, 16)
         .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()))
 }
 
@@ -608,7 +608,7 @@ fn pure_lua_interruptions_are_state_local_and_compute_still_completes() {
         function main() while true do local value = proxy.missing end end
         "#,
     ] {
-        let interrupted = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 1_000)
+        let interrupted = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 1_000, 16, 16)
             .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()));
         let handle = interrupted.handle();
         assert_kind(&interrupted.load(handle.generation, workload, "main"), OutcomeKind::Completed);
@@ -628,7 +628,7 @@ fn pure_lua_interruptions_are_state_local_and_compute_still_completes() {
         assert_kind(&unaffected.close(unaffected.handle().generation), OutcomeKind::Closed);
     }
 
-    let compute = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 100_000)
+    let compute = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 100_000, 16, 16)
         .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()));
     let computed = load_and_start(
         &compute,
@@ -797,13 +797,13 @@ fn close_reports_terminal_lua_bytes_without_folding_in_bridge_bytes() {
 // point and are intentionally not represented as recoverable Lua-allocation phases here.
 #[test]
 fn allocator_denial_is_normalized_at_every_deterministic_mlua_phase() {
-    let creation = match StateEngine::new(1_024, HOOK_INTERVAL, INSTRUCTION_BUDGET) {
+    let creation = match StateEngine::new(1_024, HOOK_INTERVAL, INSTRUCTION_BUDGET, 16, 16) {
         Ok(_) => panic!("a 1 KiB Lua allocator limit must deny VM construction"),
         Err(outcome) => outcome,
     };
     assert_kind(&creation, OutcomeKind::MemoryFailure);
 
-    let constrained = StateEngine::new(256 * 1024, HOOK_INTERVAL, INSTRUCTION_BUDGET)
+    let constrained = StateEngine::new(256 * 1024, HOOK_INTERVAL, INSTRUCTION_BUDGET, 16, 16)
         .unwrap_or_else(|outcome| panic!("constrained creation failed: {:?}", outcome.to_json()));
     let constrained_handle = constrained.handle();
     let peer = engine();
@@ -1076,7 +1076,7 @@ fn unknown_close_does_not_create_or_mutate_registry_entry() {
      // code) while main thread probes registry_lock_available_for_test(). With
      // the split-lock fix, the lock is free inside the closure, returning true.
      // Old global-lock code holds it across the closure, returning false.
-     let long_state = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 5_000)
+     let long_state = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 5_000, 16, 16)
          .unwrap_or_else(|outcome| panic!("long state creation failed: {:?}", outcome.to_json()));
      let quick_state = engine();
  

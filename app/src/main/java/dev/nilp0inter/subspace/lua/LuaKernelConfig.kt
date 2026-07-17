@@ -16,6 +16,8 @@ internal data class LuaKernelConfig(
     val memoryLimitBytes: Long,
     val hookInterval: Int,
     val instructionBudget: Long,
+    val maxConcurrentTasks: Int = 16,
+    val maxTimerSlots: Int = 16,
 ) {
     init {
         require(memoryLimitBytes >= 0L) { "Memory limit must be non-negative" }

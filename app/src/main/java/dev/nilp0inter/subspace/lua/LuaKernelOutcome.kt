@@ -47,15 +47,19 @@ internal sealed class LuaKernelOutcome {
         val luaVersion: String?,
         val bindingVersion: String?,
         val topology: String?,
+        val spawnedCoroutines: List<Long>? = null,
+        val logs: List<String>? = null,
     ) : LuaKernelOutcome()
 
-    /** Coroutine yielded an opaque operation token. */
+    /** Coroutine yielded an opaque operation token and may have admitted ordered child coroutines. */
     data class Yielded(
         override val stateId: Long,
         override val generation: Long,
         val coroutineId: Long,
         val operationId: Long,
         val value: String?,
+        val spawnedCoroutines: List<Long>? = null,
+        val logs: List<String>? = null,
     ) : LuaKernelOutcome()
 
     /** Source loading found a syntax error. State remains closable. */

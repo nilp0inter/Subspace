@@ -69,6 +69,12 @@ interface ChannelRuntime {
     suspend fun refreshReadiness() {}
 
     /**
+     * Provider-neutral opt-in cadence for registry-owned readiness refresh.
+     * Null preserves the existing on-demand-only behavior.
+     */
+    val readinessRefreshIntervalMillis: Long? get() = null
+
+    /**
      * Bounded, host-protected runtime startup invoked after construction and, for staged
      * successors, after the predecessor has fully closed and capabilities are authorized.
      * The default returns [ChannelActivationResult.Ready] so existing Kotlin providers that

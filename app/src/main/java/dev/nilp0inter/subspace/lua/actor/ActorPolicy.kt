@@ -22,7 +22,10 @@ package dev.nilp0inter.subspace.lua.actor
  *   background tasks and invoking terminal Lua close.
  * @param maxConcurrentTasks maximum concurrent background tasks in the
  *   generation-owned task scope.
- * @param perTaskDeadlineMillis per-task deadline for one background task.
+ * @param perTaskDeadlineMillis per-task deadline for one background task, or null
+ *   for no deadline.
+ * @param timerSlackMillis host-configured non-negative timer margin (slack)
+ *   in milliseconds used for operation-specific sleep deadlines.
  */
 internal data class ActorPolicy(
     val luaKernelConfig: ActorKernelConfig,
@@ -32,7 +35,8 @@ internal data class ActorPolicy(
     val callbackTimeoutMillis: Long,
     val closeTimeoutMillis: Long,
     val maxConcurrentTasks: Int,
-    val perTaskDeadlineMillis: Long,
+    val perTaskDeadlineMillis: Long?,
+    val timerSlackMillis: Long = 0L,
 ) {
     init {
         require(mailboxCapacity > 0) { "Mailbox capacity must be positive" }
@@ -41,7 +45,8 @@ internal data class ActorPolicy(
         require(callbackTimeoutMillis > 0) { "Callback timeout must be positive" }
         require(closeTimeoutMillis > 0) { "Close timeout must be positive" }
         require(maxConcurrentTasks > 0) { "Max concurrent tasks must be positive" }
-        require(perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
+        require(perTaskDeadlineMillis == null || perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
+        require(timerSlackMillis >= 0) { "Timer slack must be non-negative" }
     }
 
     companion object {
@@ -68,6 +73,7 @@ internal data class ActorPolicy(
             closeTimeoutMillis = DEFAULT_CLOSE_TIMEOUT_MILLIS,
             maxConcurrentTasks = DEFAULT_MAX_CONCURRENT_TASKS,
             perTaskDeadlineMillis = DEFAULT_PER_TASK_DEADLINE_MILLIS,
+            timerSlackMillis = 0L,
         )
 
         // Starting evidence — NOT normative limits.
@@ -81,6 +87,21 @@ internal data class ActorPolicy(
         private const val DEFAULT_CLOSE_TIMEOUT_MILLIS = 5_000L
         private const val DEFAULT_MAX_CONCURRENT_TASKS = 4
         private const val DEFAULT_PER_TASK_DEADLINE_MILLIS = 60_000L
+
+        /**
+         * Calculate an overflow-safe sleep-operation deadline from requested
+         * delay and bounded slack. A null result rejects an unrepresentable
+         * duration rather than encoding it as a sentinel.
+         */
+        fun calculateSleepDeadline(delayMillis: Long, slackMillis: Long): Long? {
+            require(delayMillis >= 0) { "Delay must be non-negative" }
+            require(slackMillis >= 0) { "Slack must be non-negative" }
+            return try {
+                Math.addExact(delayMillis, slackMillis)
+            } catch (_: ArithmeticException) {
+                null
+            }
+        }
     }
 }
 

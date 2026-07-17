@@ -1,5 +1,8 @@
 package dev.nilp0inter.subspace.lua.actor
 
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
+import dev.nilp0inter.subspace.model.ActorRuntimeHostContext
+import dev.nilp0inter.subspace.model.GenerationExecutionContext
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.channel.capability.RevocableChannelCapabilityScope
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
@@ -78,4 +81,40 @@ internal object ActorRuntimeFactory {
             parentScope = parentScope,
         )
     }
+
+    /**
+     * Creates an actor only through the host-owned generation seam. Providers
+     * receive the provider-neutral [GenerationExecutionContext]; this method
+     * performs the internal downcast so no raw gate, scope, or capability
+     * identity leaks across the provider contract.
+     */
+    fun createForGeneration(
+        generationContext: GenerationExecutionContext,
+        capabilities: ChannelCapabilityScope,
+        bridge: LuaKernelBridge,
+        policy: ActorPolicy,
+    ): ActorRuntimeCreationResult {
+        val hostContext = generationContext as? ActorRuntimeHostContext
+            ?: return ActorRuntimeCreationResult.Failure("generation context lacks actor host authority")
+        val capabilityScope = capabilities as? RevocableChannelCapabilityScope
+            ?: return ActorRuntimeCreationResult.Failure("capability scope is not host-revocable")
+        if (capabilityScope.identity != hostContext.actorIdentity) {
+            return ActorRuntimeCreationResult.Failure("generation context and capability scope identities differ")
+        }
+        return ActorRuntimeCreationResult.Success(
+            create(
+                scope = hostContext.actorIdentity,
+                bridge = bridge,
+                gate = hostContext.actorGate,
+                policy = policy,
+                capabilityScope = capabilityScope,
+                parentScope = hostContext.actorParentScope,
+            ),
+        )
+    }
+}
+
+internal sealed interface ActorRuntimeCreationResult {
+    data class Success(val actor: ActorRuntime) : ActorRuntimeCreationResult
+    data class Failure(val detail: String) : ActorRuntimeCreationResult
 }

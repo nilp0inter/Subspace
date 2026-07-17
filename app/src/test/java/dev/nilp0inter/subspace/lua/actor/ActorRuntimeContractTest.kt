@@ -15,6 +15,9 @@ import dev.nilp0inter.subspace.lua.LuaOperationId
 import dev.nilp0inter.subspace.lua.LuaStateGeneration
 import dev.nilp0inter.subspace.lua.LuaStateId
 import dev.nilp0inter.subspace.lua.LuaStateHandle
+import dev.nilp0inter.subspace.lua.LuaCallbackHandle
+import dev.nilp0inter.subspace.lua.LuaValue
+import dev.nilp0inter.subspace.lua.LuaSpawnAdmission
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.locks.ReentrantLock
@@ -206,6 +209,182 @@ class ActorRuntimeContractTest {
         assertEquals(ActorCoroutineResult.Completed("first"), held.await())
         firstScheduler.release()
         assertEquals(listOf("first-entered", "second-completed", "first-finished"), effects)
+    }
+
+    @Test
+    fun `task without a whole task deadline survives repeated waits beyond a former generic deadline`() = runTest {
+        val actorScope = scope("lifecycle-long-task", 45)
+        val formerGenericDeadlineMillis = 5L
+        val taskScope = ActorTaskScope(
+            parentScope = this,
+            scopeIdentity = actorScope,
+            maxConcurrentTasks = 1,
+            perTaskDeadlineMillis = null,
+        )
+        val checkpoints = mutableListOf<Int>()
+
+        try {
+            checkNotNull(taskScope.launch {
+                repeat(3) { checkpoint ->
+                    kotlinx.coroutines.delay(formerGenericDeadlineMillis + 1)
+                    checkpoints += checkpoint
+                }
+            })
+            runCurrent()
+
+            advanceTimeBy((formerGenericDeadlineMillis + 1) * 3)
+            runCurrent()
+
+            assertEquals(
+                "A managed task without a whole-task deadline must keep running until its function returns, even after cumulative waits exceed the former generic deadline.",
+                listOf(0, 1, 2),
+                checkpoints,
+            )
+        } finally {
+            taskScope.cancelAll()
+            taskScope.joinAllWithin(100)
+        }
+    }
+
+    @Test
+    fun `operation-specific long sleep completes before its own deadline despite exceeding generic wait deadline`() = runTest {
+        val actorScope = scope("long-sleep", 46)
+        val bridge = RecordingKernelBridge()
+        val formerGenericDeadlineMillis = 5L
+        val sleepDeadlineMillis = 30L
+        val actor = actor(
+            actorScope,
+            bridge,
+            RecordingGate(),
+            this,
+            policy = policy(operationWaitDeadlineMillis = formerGenericDeadlineMillis),
+        )
+        stageReady(actor)
+        val pending = actor.yieldOperation(
+            task = ActorTaskIdentity(actorScope, ActorTaskId.next()),
+            kernelHandle = kernelHandle(101L),
+            deadlineMillis = sleepDeadlineMillis,
+        )
+
+        try {
+            advanceTimeBy(sleepDeadlineMillis - 1)
+            runCurrent()
+            assertEquals(
+                "The former generic wait deadline must not terminate a longer operation-specific sleep.",
+                0,
+                bridge.resumeCalls.get(),
+            )
+
+            assertTrue(
+                "Completion before the operation-specific deadline must resume the coroutine successfully.",
+                actor.resumeOperation(pending, ActorTerminal.Completed(pending, "timer fired")) is ActorOperationOutcome.Resumed,
+            )
+            assertEquals(1, bridge.resumeCalls.get())
+            assertEquals(RecordingKernelBridge.ResumeCall(kernelHandle(101L), true, "timer fired"), bridge.lastResumeCall())
+
+            advanceTimeBy(1)
+            runCurrent()
+            assertEquals(
+                "The retired deadline timer must not manufacture a second resume after completion wins.",
+                1,
+                bridge.resumeCalls.get(),
+            )
+        } finally {
+            actor.close()
+        }
+    }
+
+    @Test
+    fun `operation deadline wins with normalized timeout and rejects later completion`() = runTest {
+        val actorScope = scope("deadline-first", 47)
+        val bridge = RecordingKernelBridge()
+        val actor = actor(actorScope, bridge, RecordingGate(), this, policy = policy(operationWaitDeadlineMillis = 5))
+        stageReady(actor)
+        val pending = actor.yieldOperation(
+            task = ActorTaskIdentity(actorScope, ActorTaskId.next()),
+            kernelHandle = kernelHandle(102L),
+            deadlineMillis = 30,
+        )
+
+        try {
+            advanceTimeBy(30)
+            runCurrent()
+
+            assertEquals(
+                "Deadline-first terminal admission must resume Lua with the stable timeout error.",
+                RecordingKernelBridge.ResumeCall(kernelHandle(102L), false, "E_TIMEOUT"),
+                bridge.lastResumeCall(),
+            )
+            assertEquals(
+                "A completion that arrives after timeout must be stale and must not re-enter Lua.",
+                ActorOperationOutcome.Stale,
+                actor.resumeOperation(pending, ActorTerminal.Completed(pending, "late timer")),
+            )
+            assertEquals(1, bridge.resumeCalls.get())
+        } finally {
+            actor.close()
+        }
+    }
+
+    @Test
+    fun `live explicit cancellation enters the cancellation path once while actor remains usable`() = runTest {
+        val actorScope = scope("live-cancellation", 48)
+        val bridge = RecordingKernelBridge()
+        val actor = actor(actorScope, bridge, RecordingGate(), this)
+        stageReady(actor)
+        val pending = actor.yieldOperation(
+            task = ActorTaskIdentity(actorScope, ActorTaskId.next()),
+            kernelHandle = kernelHandle(103L),
+            deadlineMillis = 30,
+        )
+
+        try {
+            assertTrue(
+                "Explicit cancellation in a live generation must terminalize through the cancellation path.",
+                actor.cancelOperation(pending) is ActorOperationOutcome.Resumed,
+            )
+            assertEquals(1, bridge.cancelCalls.get())
+            assertEquals(0, bridge.resumeCalls.get())
+            assertTrue("Cancelling one operation must not fail or close a live actor.", actor.isReady)
+            assertEquals(
+                "A duplicate completion after live cancellation must not re-enter Lua.",
+                ActorOperationOutcome.Stale,
+                actor.resumeOperation(pending, ActorTerminal.Completed(pending, "late")),
+            )
+            assertEquals(1, bridge.cancelCalls.get())
+            assertEquals(0, bridge.resumeCalls.get())
+        } finally {
+            actor.close()
+        }
+    }
+
+    @Test
+    fun `closing a suspended operation suppresses timeout and completion resumes`() = runTest {
+        val actorScope = scope("close-sleep", 49)
+        val bridge = RecordingKernelBridge()
+        val actor = actor(actorScope, bridge, RecordingGate(), this)
+        stageReady(actor)
+        val pending = actor.yieldOperation(
+            task = ActorTaskIdentity(actorScope, ActorTaskId.next()),
+            kernelHandle = kernelHandle(104L),
+            deadlineMillis = 30,
+        )
+
+        assertEquals(ActorCloseResult.Closed, actor.close())
+        advanceTimeBy(30)
+        runCurrent()
+
+        assertEquals(
+            "Generation close must discard a sleeping coroutine rather than resuming it with timeout or cancellation.",
+            0,
+            bridge.resumeCalls.get() + bridge.cancelCalls.get(),
+        )
+        assertEquals(
+            "A post-close completion must remain terminally closed.",
+            ActorOperationOutcome.Closed,
+            actor.resumeOperation(pending, ActorTerminal.Completed(pending, "late")),
+        )
+        assertEquals(0, bridge.resumeCalls.get() + bridge.cancelCalls.get())
     }
 
     @Test
@@ -1341,7 +1520,7 @@ class ActorRuntimeContractTest {
         callbackTimeoutMillis: Long = 13,
         closeTimeoutMillis: Long = 17,
         maxConcurrentTasks: Int = 2,
-        perTaskDeadlineMillis: Long = 19,
+        perTaskDeadlineMillis: Long? = 19,
     ): ActorPolicy = ActorPolicy(
         luaKernelConfig = ActorKernelConfig(
             memoryLimitBytes = memoryLimitBytes,
@@ -1441,6 +1620,15 @@ class ActorRuntimeContractTest {
             activeNativeBodies.decrementAndGet()
         }
 
+        data class ResumeCall(
+            val operation: LuaOperationHandle,
+            val success: Boolean,
+            val value: String,
+        )
+
+        private val resumePayloads = mutableListOf<ResumeCall>()
+
+        fun lastResumeCall(): ResumeCall? = synchronized(resumePayloads) { resumePayloads.lastOrNull() }
         val resumedHandles = mutableListOf<LuaOperationHandle>()
         val cancelledHandles = mutableListOf<LuaOperationHandle>()
         var createOutcome: LuaKernelOutcome? = null
@@ -1467,10 +1655,12 @@ class ActorRuntimeContractTest {
             operation: LuaOperationHandle,
             success: Boolean,
             value: String,
+            spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome = nativeLock.withLock {
             enterNative("resume")
             try {
                 resumeCalls.incrementAndGet()
+                synchronized(resumePayloads) { resumePayloads += ResumeCall(operation, success, value) }
                 synchronized(resumedHandles) { resumedHandles += operation }
                 if (holdResumeNative) {
                     nativeResumeEntered.countDown()
@@ -1533,6 +1723,31 @@ class ActorRuntimeContractTest {
                 leaveNative()
             }
         }
+
+        override fun loadProgramImage(
+            handle: LuaStateHandle,
+            entryPoint: String,
+            sourceMap: Map<String, String>
+        ): LuaKernelOutcome = completed()
+
+        override fun invokeStartupCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome = completed()
+
+        override fun invokeCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome = completed()
+
+        override fun startCoroutine(
+            handle: LuaStateHandle,
+            coroutineId: LuaCoroutineId,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome = completed()
 
         private fun completed(): LuaKernelOutcome = LuaKernelOutcome.Completed(
             stateId = 1,

@@ -17,12 +17,15 @@ import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.ChannelProviderResolution
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
+import dev.nilp0inter.subspace.model.GenerationExecutionContext
+import dev.nilp0inter.subspace.model.GenerationExecutionContextImpl
 import dev.nilp0inter.subspace.model.ProviderConfigurationResult
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -91,6 +94,7 @@ class ChannelRuntimeRegistry(
         snapshotState: ChannelRuntimeSnapshot,
         val capabilities: RevocableChannelCapabilityScope,
         val gate: RuntimeGenerationInvocationGate,
+        val generationContext: GenerationExecutionContextImpl,
     ) : RuntimeEntry(definition, generation, snapshotState) {
         /** A detached runtime can arrive after a pending generation's gate has already closed. */
         val detachedRuntimeCloseOwner = AtomicBoolean(false)
@@ -103,6 +107,7 @@ class ChannelRuntimeRegistry(
         snapshotState: ChannelRuntimeSnapshot,
         capabilities: RevocableChannelCapabilityScope,
         gate: RuntimeGenerationInvocationGate,
+        generationContext: GenerationExecutionContextImpl,
         /**
          * Predecessor terminal closure that must complete before this successor is promoted to
          * live. `null` when there is no staged predecessor (fresh install). The successor may be
@@ -110,7 +115,7 @@ class ChannelRuntimeRegistry(
          * current/ready/authorized/startable until this completes.
          */
         val predecessorClosed: CompletableDeferred<Unit>? = null,
-    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate)
+    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate, generationContext)
 
     private class LiveEntry(
         definition: ChannelDefinition,
@@ -118,8 +123,11 @@ class ChannelRuntimeRegistry(
         snapshotState: ChannelRuntimeSnapshot,
         capabilities: RevocableChannelCapabilityScope,
         gate: RuntimeGenerationInvocationGate,
+        generationContext: GenerationExecutionContextImpl,
         val runtime: ChannelRuntime,
-    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate)
+    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate, generationContext) {
+        var readinessRefreshJob: Job? = null
+    }
 
     private class UnavailableEntry(
         definition: ChannelDefinition,
@@ -397,6 +405,7 @@ class ChannelRuntimeRegistry(
                     runtimeScope,
                     closeScope,
                 )
+                val context = GenerationExecutionContextImpl(definition.id, gate, gate.childWork.scope)
                 val pending = PendingEntry(
                     definition,
                     generation,
@@ -407,6 +416,7 @@ class ChannelRuntimeRegistry(
                     ),
                     scope,
                     gate,
+                    context,
                     predecessorClosed,
                 )
                 entries[definition.id] = pending
@@ -453,7 +463,12 @@ class ChannelRuntimeRegistry(
         )
         return when (
             val result = provider.constructRuntime(
-                ChannelRuntimeConstructionRequest(effectiveDefinition, configuration, entry.capabilities),
+                ChannelRuntimeConstructionRequest(
+                    effectiveDefinition,
+                    configuration,
+                    entry.capabilities,
+                    entry.generationContext,
+                ),
             )
         ) {
             is ChannelRuntimeConstructionResult.Success -> ConstructionAttempt.Runtime(result.runtime)
@@ -515,11 +530,20 @@ class ChannelRuntimeRegistry(
                 LiveEntry(
                     plan.entry.definition,
                     plan.entry.generation,
-                    plan.entry.snapshotState,
+                    runtime.snapshot.value.copy(
+                        id = plan.entry.definition.id,
+                        name = plan.entry.definition.name,
+                        implementationId = plan.entry.definition.implementationId,
+                        enabled = plan.entry.definition.enabled,
+                    ),
                     plan.entry.capabilities,
                     plan.entry.gate,
+                    plan.entry.generationContext,
                     runtime,
-                ).also { entries[plan.entry.definition.id] = it }
+                ).also { 
+                    entries[plan.entry.definition.id] = it
+                    publishAggregateLocked()
+                }
             } else {
                 null
             }
@@ -529,6 +553,40 @@ class ChannelRuntimeRegistry(
             return
         }
         collectSnapshots(live)
+        val firstReadiness = live.gate.invoke(RuntimeInvocationPhase.READINESS_REFRESH) {
+            live.runtime.refreshReadiness()
+        }
+        val stagedJobs = synchronized(lock) {
+            val stillCurrent = !isShutdown && !live.retired && entries[live.definition.id] === live && live.gate.isLive
+            if (firstReadiness is RuntimeInvocationOutcome.Success && stillCurrent) {
+                live.generationContext.authorizeStagedTasksAfterReady()
+            } else {
+                live.generationContext.discardStagedTasks()
+                emptyList()
+            }
+        }
+        stagedJobs.forEach(Job::start)
+        val stillCurrent = synchronized(lock) {
+            !isShutdown && !live.retired && entries[live.definition.id] === live && live.gate.isLive
+        }
+        if (firstReadiness is RuntimeInvocationOutcome.Success && stillCurrent) {
+            live.runtime.readinessRefreshIntervalMillis
+                ?.takeIf { it > 0L }
+                ?.let { intervalMillis ->
+                    live.readinessRefreshJob = runtimeScope.launch {
+                        while (true) {
+                            delay(intervalMillis)
+                            val current = synchronized(lock) {
+                                !isShutdown && entries[live.definition.id] === live && !live.retired && live.gate.isLive
+                            }
+                            if (!current) return@launch
+                            live.gate.invoke(RuntimeInvocationPhase.READINESS_REFRESH) {
+                                live.runtime.refreshReadiness()
+                            }
+                        }
+                    }
+                }
+        }
     }
 
     private suspend fun installConstructionFailure(plan: ConstructionPlan, error: ChannelProviderError) {
@@ -609,6 +667,8 @@ class ChannelRuntimeRegistry(
         if (entry.retired) return
         entry.retired = true
         retiredEntries += entry
+        (entry as? LifecycleEntry)?.generationContext?.stopAdmission()
+        (entry as? LifecycleEntry)?.gate?.stopAdmission()
         if (entry.activationClaimed) {
             // Activation path exclusively owns closure; do not stop admission or close here.
             // It completes the claimed entry after startup failure or a failed promotion check,
@@ -631,11 +691,26 @@ class ChannelRuntimeRegistry(
 
     private suspend fun closeLifecycleEntry(entry: LifecycleEntry) = withContext(NonCancellable) {
         entry.snapshotCollection?.cancel()
+        (entry as? LiveEntry)?.readinessRefreshJob?.cancel()
         entry.gate.stopAdmission()
         try {
+            entry.generationContext.closeAndDrain()
             entry.capabilities.revoke()
-            entry.gate.close {
-                (entry as? LiveEntry)?.runtime?.close()
+            val runtime = (entry as? LiveEntry)?.runtime
+            if (runtime == null) {
+                entry.gate.close {}
+            } else {
+                val runtimeCloseStarted = AtomicBoolean(false)
+                entry.gate.close {
+                    runtimeCloseStarted.set(true)
+                    runtime.close()
+                }
+                if (!runtimeCloseStarted.get()) {
+                    // The terminal worker can time out before it starts the callback. Its close
+                    // job is joined before gate.close returns, so this elected fallback cannot
+                    // overlap a late worker dispatch.
+                    runtime.close()
+                }
             }
         } finally {
             synchronized(lock) {
@@ -648,8 +723,10 @@ class ChannelRuntimeRegistry(
     private suspend fun closeDetachedGeneration(entry: LifecycleEntry, runtime: ChannelRuntime?) =
         withContext(NonCancellable) {
             entry.snapshotCollection?.cancel()
+            (entry as? LiveEntry)?.readinessRefreshJob?.cancel()
             entry.gate.stopAdmission()
             try {
+                entry.generationContext.closeAndDrain()
                 entry.capabilities.revoke()
                 if (runtime == null) {
                     entry.gate.close {}
@@ -804,7 +881,17 @@ class ChannelRuntimeRegistry(
         reason: String,
     ) {
         withContext(NonCancellable) {
-            entry.gate.invoke(RuntimeInvocationPhase.INPUT_CANCELLED) {
+            val callbackStarted = AtomicBoolean(false)
+            val result = entry.gate.invoke(RuntimeInvocationPhase.INPUT_CANCELLED) {
+                callbackStarted.set(true)
+                target.onInputCancelled(reason)
+            }
+            if (!callbackStarted.get() && (
+                result == RuntimeInvocationOutcome.Closed ||
+                    result == RuntimeInvocationOutcome.Cancelled ||
+                    result == RuntimeInvocationOutcome.TimedOut
+                )
+            ) {
                 target.onInputCancelled(reason)
             }
         }

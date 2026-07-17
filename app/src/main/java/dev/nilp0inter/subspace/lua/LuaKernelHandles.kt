@@ -29,3 +29,13 @@ internal data class LuaOperationHandle(
     val coroutineId: LuaCoroutineId,
     val operationId: LuaOperationId,
 )
+
+/**
+ * Owner-bearing handle for a validated callback function reference stored
+ * inside the owning Lua state. Carries its owning [stateHandle] and the [name]
+ * of the callback. Handles are invalidated on state close or replacement.
+ */
+internal data class LuaCallbackHandle(
+    val stateHandle: LuaStateHandle,
+    val name: String,
+)

@@ -52,6 +52,7 @@ internal interface LuaKernelBridge {
         operation: LuaOperationHandle,
         success: Boolean,
         value: String,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
     ): LuaKernelOutcome
 
     /**
@@ -80,4 +81,57 @@ internal interface LuaKernelBridge {
      * [LuaKernelOutcome.Stale].
      */
     fun close(handle: LuaStateHandle): LuaKernelOutcome
+
+    /**
+     * Load a Lua program image containing multiple modules, evaluate modules under
+     * an effect guard, validate the returned callback table, and return a Completed
+     * outcome containing the list of available callback names on success.
+     */
+    fun loadProgramImage(
+        handle: LuaStateHandle,
+        entryPoint: String,
+        sourceMap: Map<String, String>
+    ): LuaKernelOutcome
+
+    /**
+     * Invoke the startup callback with Lua's zero-argument call semantics.
+     * This is intentionally distinct from event callback invocation, whose
+     * single [LuaValue] argument is encoded as one Lua argument.
+     */
+    fun invokeStartupCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
+    ): LuaKernelOutcome
+
+    /**
+     * Invoke a callback function synchronously with the given event arguments.
+     * Spawn admission is scoped to this native execution slice.
+     */
+    fun invokeCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
+    ): LuaKernelOutcome
+
+    /**
+     * Start a spawned background coroutine.
+     */
+    fun startCoroutine(
+        handle: LuaStateHandle,
+        coroutineId: LuaCoroutineId,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
+    ): LuaKernelOutcome
+}
+
+/** Native callback port: 0 accepted, 1 closed, 2 capacity exhausted. */
+internal interface LuaSpawnAdmission {
+    fun admitTask(coroutineId: Long): Int
+
+    companion object {
+        fun rejecting(): LuaSpawnAdmission = object : LuaSpawnAdmission {
+            override fun admitTask(coroutineId: Long): Int = 1
+        }
+    }
 }

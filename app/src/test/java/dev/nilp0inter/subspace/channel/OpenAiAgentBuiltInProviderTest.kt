@@ -18,6 +18,12 @@ import dev.nilp0inter.subspace.model.OpenAiAgentProviderConfiguration
 import dev.nilp0inter.subspace.model.OpenAiAgentProviderConfigurationCodec
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
+import dev.nilp0inter.subspace.model.GenerationExecutionContextImpl
+import dev.nilp0inter.subspace.service.RuntimeInvocationBoundary
+import dev.nilp0inter.subspace.service.RuntimeWorkerDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -64,8 +70,16 @@ class OpenAiAgentBuiltInProviderTest {
             payload = payload,
         ),
         capabilities = UnusedCapabilities,
+        generationContext = unusedGenerationContext(),
     )
 
+
+    private fun unusedGenerationContext(): GenerationExecutionContextImpl {
+        val scope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val boundary = RuntimeInvocationBoundary(RuntimeWorkerDispatcher.fromDispatcher(Dispatchers.Unconfined))
+        val gate = boundary.openGeneration("agent-instance", RuntimeGeneration(0), scope)
+        return GenerationExecutionContextImpl("agent-instance", gate, scope)
+    }
     private fun opaque(value: String): OpaqueJsonObject = OpaqueJsonObject.parse(value).getOrThrow()
 
     private object UnusedCapabilities : ChannelCapabilityScope {
