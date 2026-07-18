@@ -16,6 +16,9 @@ import dev.nilp0inter.subspace.dependency.PackageOutcome
 import dev.nilp0inter.subspace.dependency.PackageSourceRecord
 import dev.nilp0inter.subspace.lua.API_VERSION
 import dev.nilp0inter.subspace.lua.LUA_VERSION
+import dev.nilp0inter.subspace.lua.NoOpPluginLogSink
+import dev.nilp0inter.subspace.lua.LogRecord
+import dev.nilp0inter.subspace.lua.PluginLogSink
 import dev.nilp0inter.subspace.lua.LuaCallbackHandle
 import dev.nilp0inter.subspace.lua.LuaCoroutineId
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
@@ -94,6 +97,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = bridge,
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = {
                     // Publication must be committed before reconciliation observes the registry.
                     assertTrue(providers.resolve(implementationId) is ChannelProviderResolution.Available)
@@ -172,6 +176,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = bridge,
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = { reconciliations += 1 },
                 serviceScope = this,
                 ioDispatcher = StandardTestDispatcher(testScheduler),
@@ -195,6 +200,73 @@ class InstalledPackagesServiceCompositionTest {
     }
 
     @Test
+    fun `non no-op sink receives native Lua logs from an installed runtime after install and recovery`() = runTest {
+        withTemporaryDirectory { root ->
+            val sink = RecordingPluginLogSink()
+            try {
+                val source = sourceRecord()
+                val implementationId = InstalledProviderId.derive(source.repositoryId)
+                val initialBridge = RecordingLuaKernelBridge().apply {
+                    startupLogs = listOf("""{"level":"info","payload":{"message":"installed-after-install"}}""")
+                }
+                val initialProviders = ChannelImplementationProviderRegistry()
+                val initialCoordinator = InstalledPackagesCoordinator(
+                    storeRoot = root,
+                    providerRegistry = initialProviders,
+                    bridge = initialBridge,
+                    logSink = sink,
+                    onCatalogueReconcile = {},
+                    serviceScope = this,
+                    ioDispatcher = StandardTestDispatcher(testScheduler),
+                )
+                val initialRuntime = runtimeRegistry(initialProviders, backgroundScope)
+                try {
+                    val installed = InstalledPackagesFacade(initialCoordinator).installOrUpdate(
+                        ByteArrayInputStream(packageArchive()),
+                        source,
+                    )
+                    assertEquals(MutationResult.Installed(implementationId), success(installed))
+                    val definition = definition(implementationId)
+                    initialRuntime.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+                    runCurrent()
+                    assertInstalledRuntimeLog(sink, "installed-after-install", "info")
+                } finally {
+                    assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(initialRuntime))
+                    initialCoordinator.shutdown()
+                }
+
+                val recoveredBridge = RecordingLuaKernelBridge().apply {
+                    startupLogs = listOf("""{"level":"warn","payload":{"message":"installed-after-recovery"}}""")
+                }
+                val recoveredProviders = ChannelImplementationProviderRegistry()
+                val recoveredCoordinator = InstalledPackagesCoordinator(
+                    storeRoot = root,
+                    providerRegistry = recoveredProviders,
+                    bridge = recoveredBridge,
+                    logSink = sink,
+                    onCatalogueReconcile = {},
+                    serviceScope = this,
+                    ioDispatcher = StandardTestDispatcher(testScheduler),
+                )
+                val recoveredRuntime = runtimeRegistry(recoveredProviders, backgroundScope)
+                try {
+                    recoveredCoordinator.start()
+                    advanceUntilIdle()
+                    val definition = definition(implementationId)
+                    recoveredRuntime.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+                    runCurrent()
+                    assertInstalledRuntimeLog(sink, "installed-after-recovery", "warn")
+                } finally {
+                    assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(recoveredRuntime))
+                    recoveredCoordinator.shutdown()
+                }
+            } finally {
+                sink.close()
+            }
+        }
+    }
+
+    @Test
     fun `mutation failure before start does not publish global fallback`() = runTest {
         withTemporaryDirectory { root ->
             val installedId = InstalledProviderId.derive(sourceRecord().repositoryId)
@@ -205,6 +277,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = RecordingLuaKernelBridge(),
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = { throw AssertionError("A rejected install must not reconcile providers") },
                 serviceScope = this,
                 ioDispatcher = UnconfinedTestDispatcher(testScheduler),
@@ -265,6 +338,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = RecordingLuaKernelBridge(),
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = {
                     reconciliations += 1
                     runtimeRegistry.reconcile(catalogue)
@@ -337,6 +411,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = bridge,
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = {
                     reconciliations += 1
                     runtimeRegistry.reconcile(catalogue)
@@ -422,6 +497,7 @@ class InstalledPackagesServiceCompositionTest {
                 storeRoot = root,
                 providerRegistry = providers,
                 bridge = bridge,
+                logSink = NoOpPluginLogSink,
                 onCatalogueReconcile = {
                     reconciliations += 1
                     runtimeRegistry.reconcile(catalogue)
@@ -457,6 +533,7 @@ class InstalledPackagesServiceCompositionTest {
             storeRoot = root,
             providerRegistry = providers,
             bridge = RecordingLuaKernelBridge(),
+            logSink = NoOpPluginLogSink,
             onCatalogueReconcile = {},
             serviceScope = this,
             ioDispatcher = UnconfinedTestDispatcher(testScheduler),
@@ -511,6 +588,16 @@ class InstalledPackagesServiceCompositionTest {
         is PackageOutcome.Failure -> throw AssertionError("Expected package operation success, got ${outcome.error}")
     }
 
+    private fun assertInstalledRuntimeLog(sink: RecordingPluginLogSink, marker: String, level: String) {
+        val record = if (sink.records.isEmpty()) {
+            throw AssertionError("Installed runtime did not publish its native Lua log")
+        } else {
+            sink.records.removeFirst()
+        }
+        assertEquals(level, record.level)
+        assertTrue("sink received the wrong installed runtime payload: ${record.payloadJson}", record.payloadJson.contains("\"message\":\"$marker\""))
+    }
+
     private suspend fun <T> withTemporaryDirectory(block: suspend (File) -> T): T {
         val directory = createTempDirectory("installed-packages-service-composition-").toFile()
         return try {
@@ -525,6 +612,16 @@ class InstalledPackagesServiceCompositionTest {
         coordinates = GitHubRepositoryCoordinates("service-test-owner", "service-test-repository"),
         release = GitHubReleaseIdentity("456", "v1", false),
         asset = GitHubAssetIdentity("789", "service-test-package.zip"),
+        ownerId = "9000001",
+    )
+
+    private fun definition(implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId): ChannelDefinition = ChannelDefinition(
+        id = "installed-log-propagation",
+        name = "Installed log propagation",
+        implementationId = implementationId,
+        enabled = true,
+        configSchemaVersion = 1,
+        configPayload = OpaqueJsonObject.parse("{}").getOrThrow(),
     )
 
     private fun packageArchive(): ByteArray {
@@ -649,11 +746,43 @@ class InstalledPackagesServiceCompositionTest {
         ): HostedCapabilityAcquisition<T> = acquire(identity, key)
     }
 
+    private class RecordingPluginLogSink : PluginLogSink {
+        val records = ArrayDeque<PublishedPluginLog>()
+
+        override fun tryPublish(
+            instanceId: String,
+            generation: Long,
+            timestampMillis: Long,
+            level: String,
+            payloadJson: String,
+        ): Boolean {
+            records.addLast(PublishedPluginLog(instanceId, generation, timestampMillis, level, payloadJson))
+            return true
+        }
+
+        override fun close() = Unit
+
+        override fun recordProjectionLoss() = Unit
+
+        override fun getLossCount(): Long = 0L
+
+        override suspend fun receive(): LogRecord? = null
+    }
+
+    private data class PublishedPluginLog(
+        val instanceId: String,
+        val generation: Long,
+        val timestampMillis: Long,
+        val level: String,
+        val payloadJson: String,
+    )
+
     private class RecordingLuaKernelBridge : LuaKernelBridge {
         private val states = mutableMapOf<Long, Boolean>()
         private var nextStateId = 1L
         val createdStateIds = mutableListOf<Long>()
         val closedStateIds = mutableListOf<Long>()
+        var startupLogs: List<String> = emptyList()
 
         override fun create(config: LuaKernelConfig): LuaKernelOutcome {
             val id = nextStateId++
@@ -692,7 +821,7 @@ class InstalledPackagesServiceCompositionTest {
         override fun loadProgramImage(handle: LuaStateHandle, entryPoint: String, sourceMap: Map<String, String>): LuaKernelOutcome =
             completed(handle, "[\"startup\",\"handle_readiness\"]")
 
-        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(handle)
+        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(handle, logs = startupLogs)
 
         override fun invokeCallback(
             handle: LuaStateHandle,
@@ -703,7 +832,7 @@ class InstalledPackagesServiceCompositionTest {
 
         override fun startCoroutine(handle: LuaStateHandle, coroutineId: LuaCoroutineId, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(handle)
 
-        private fun completed(handle: LuaStateHandle, value: String? = null): LuaKernelOutcome.Completed = LuaKernelOutcome.Completed(
+        private fun completed(handle: LuaStateHandle, value: String? = null, logs: List<String>? = null): LuaKernelOutcome.Completed = LuaKernelOutcome.Completed(
             stateId = handle.stateId.value,
             generation = handle.generation.value,
             coroutineId = null,
@@ -717,6 +846,7 @@ class InstalledPackagesServiceCompositionTest {
             bindingVersion = API_VERSION,
             topology = "service-composition",
             spawnedCoroutines = null,
+            logs = logs,
         )
     }
 }

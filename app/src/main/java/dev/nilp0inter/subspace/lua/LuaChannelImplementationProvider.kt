@@ -40,6 +40,7 @@ internal class LuaChannelImplementationProvider private constructor(
     private val bridge: LuaKernelBridge,
     private val actorPolicy: ActorPolicy,
     private val validationBounds: ValidationBounds,
+    private val logSink: PluginLogSink = NoOpPluginLogSink
 ) : ChannelImplementationProvider {
 
     companion object {
@@ -56,6 +57,7 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge: LuaKernelBridge,
             actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
             validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
+            logSink: PluginLogSink = NoOpPluginLogSink
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -65,6 +67,7 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge = bridge,
             actorPolicy = actorPolicy,
             validationBounds = validationBounds,
+            logSink = logSink,
         )
 
         /**
@@ -80,6 +83,7 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge: LuaKernelBridge,
             actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
             validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
+            logSink: PluginLogSink = NoOpPluginLogSink
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -89,7 +93,9 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge = bridge,
             actorPolicy = actorPolicy,
             validationBounds = validationBounds,
+            logSink = logSink,
         )
+
     }
 
     override val descriptor = ChannelImplementationDescriptor(
@@ -215,6 +221,7 @@ internal class LuaChannelImplementationProvider private constructor(
                 stateHandle = stateHandle,
                 bridge = bridge,
                 callbacks = callbacks,
+                logSink = logSink,
             ),
         )
     }

@@ -58,7 +58,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -95,9 +95,10 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertTrue("production actor factory must construct the installed provider generation", ActorRuntimeFactory.isCreateAttempted)
                 assertTrue("installed provider construction must load the packaged JNI library", LuaNativeKernel.isLoaded)
                 assertEquals("one JNI state must be created for the enabled installed definition", 1, fixture.bridge.createdStateIds.size)
+                val v1State = fixture.bridge.createdStateIds.single()
                 assertTrue(
                     "the bounded Lua timer must make the v1 package input-ready",
-                    awaitInputAcceptance(fixture.runtimeRegistry, definition.id),
+                    awaitLuaInputAcceptance(fixture.runtimeRegistry, definition.id, fixture.bridge, v1State, awaitTimerResume = true),
                 )
             }
         }
@@ -114,8 +115,11 @@ class InstalledLuaPackagesInstrumentationTest {
                     MutationResult.Installed(INSTALLED_ID),
                     success(first.repository.installOrUpdate(ByteArrayInputStream(v1Archive()), sourceRecord(SOURCE_REPOSITORY, "101", "201"))),
                 )
-                assertTrue("v1 must become input-ready before its replacement", awaitInputAcceptance(first.runtimeRegistry, definition.id))
                 val v1State = first.bridge.createdStateIds.single()
+                assertTrue(
+                    "v1 must become input-ready before its replacement",
+                    awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, v1State, awaitTimerResume = true),
+                )
                 val v1Generation = requireNotNull(first.runtimeRegistry.capabilityScopeIdentity(definition.id)).runtimeGeneration
 
                 assertEquals(
@@ -128,7 +132,7 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertNotEquals("a changed exact digest must allocate a successor Lua generation", v1Generation, v2Generation)
                 assertNotEquals("a changed exact digest must allocate a successor JNI state", v1State, v2State)
                 assertTrue("the old JNI state must close before successor startup", first.bridge.closedBeforeStartup(v1State, v2State))
-                assertTrue("v2 must become ready through the successor JNI state", awaitInputAcceptance(first.runtimeRegistry, definition.id))
+                assertTrue("v2 must become ready through the successor JNI state", awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, v2State, awaitTimerResume = false))
                 assertFalse(
                     "a late v1 timer must not mutate v2 readiness after v1 closes",
                     inputRefusedAfterTimerWindow(first.runtimeRegistry, definition.id),
@@ -146,7 +150,7 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertEquals(Unit, success(restarted.repository.loadAndPublish()))
                 assertTrue("restart must materialize the committed v2 provider", restarted.providers.resolve(INSTALLED_ID) is ChannelProviderResolution.Available)
                 assertTrue("restart must allocate a fresh v2 JNI state", restarted.bridge.createdStateIds.size == 1)
-                assertTrue("fresh v2 state must reach readiness without retained v1 globals", awaitInputAcceptance(restarted.runtimeRegistry, definition.id))
+                assertTrue("fresh v2 state must reach readiness without retained v1 globals", awaitLuaInputAcceptance(restarted.runtimeRegistry, definition.id, restarted.bridge, restarted.bridge.createdStateIds.single(), awaitTimerResume = false))
 
                 assertEquals(MutationResult.Removed(INSTALLED_ID), success(restarted.repository.remove(SOURCE_REPOSITORY)))
                 assertTrue("removed installed provider must no longer resolve", restarted.providers.resolve(INSTALLED_ID) is ChannelProviderResolution.Missing)
@@ -167,17 +171,23 @@ class InstalledLuaPackagesInstrumentationTest {
                     MutationResult.Installed(INSTALLED_ID),
                     success(first.repository.installOrUpdate(ByteArrayInputStream(v1Archive()), sourceRecord(SOURCE_REPOSITORY, "101", "201"))),
                 )
-                assertTrue("v1 must become ready before update", awaitInputAcceptance(first.runtimeRegistry, definition.id))
                 val v1State = first.bridge.createdStateIds.single()
+                assertTrue(
+                    "v1 must become ready before update",
+                    awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, v1State, awaitTimerResume = true, stage = "initial v1 before update"),
+                )
                 val v1Generation = requireNotNull(first.runtimeRegistry.capabilityScopeIdentity(definition.id)).runtimeGeneration
 
                 assertEquals(
                     MutationResult.Updated(INSTALLED_ID),
                     success(first.repository.installOrUpdate(ByteArrayInputStream(v2Archive()), sourceRecord(SOURCE_REPOSITORY, "102", "202"))),
                 )
-                assertTrue("v2 must become ready before explicit rollback", awaitInputAcceptance(first.runtimeRegistry, definition.id))
                 val v2State = first.bridge.createdStateIds.last()
                 val v2Generation = requireNotNull(first.runtimeRegistry.capabilityScopeIdentity(definition.id)).runtimeGeneration
+                assertTrue(
+                    "v2 must become ready before explicit rollback",
+                    awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, v2State, awaitTimerResume = false, stage = "v2 before explicit rollback"),
+                )
                 assertNotEquals("update must replace the v1 Lua state", v1State, v2State)
                 assertNotEquals("update must replace the v1 runtime generation", v1Generation, v2Generation)
 
@@ -190,7 +200,10 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertNotEquals("rollback must allocate a fresh JNI state", v2State, rollbackState)
                 assertNotEquals("rollback must allocate a fresh runtime generation", v2Generation, rollbackGeneration)
                 assertTrue("v2 must close before the rolled-back v1 successor starts", first.bridge.closedBeforeStartup(v2State, rollbackState))
-                assertTrue("rolled-back v1 must reach readiness from its fresh volatile state", awaitInputAcceptance(first.runtimeRegistry, definition.id))
+                assertTrue(
+                    "rolled-back v1 must reach readiness from its fresh volatile state",
+                    awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, rollbackState, awaitTimerResume = true, stage = "rolled-back v1 before removal"),
+                )
 
                 assertEquals(MutationResult.Removed(INSTALLED_ID), success(first.repository.remove(SOURCE_REPOSITORY)))
                 assertTrue("removed provider must resolve as missing", first.providers.resolve(INSTALLED_ID) is ChannelProviderResolution.Missing)
@@ -208,7 +221,10 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertNotEquals("reinstall must never revive the removed JNI state", rollbackState, reinstalledState)
                 assertNotEquals("reinstall must never revive the removed runtime generation", rollbackGeneration, reinstalledGeneration)
                 assertTrue("removed generation must close before reinstalled v1 starts", first.bridge.closedBeforeStartup(rollbackState, reinstalledState))
-                assertTrue("reinstalled v1 must become ready with no retained Lua globals", awaitInputAcceptance(first.runtimeRegistry, definition.id))
+                assertTrue(
+                    "reinstalled v1 must become ready with no retained Lua globals",
+                    awaitLuaInputAcceptance(first.runtimeRegistry, definition.id, first.bridge, reinstalledState, awaitTimerResume = true, stage = "reinstalled v1 before restart"),
+                )
                 val reinstalled = success(InstalledPackageStore(root).loadIndex()).index.providers.getValue(SOURCE_REPOSITORY)
                 assertEquals("reinstall must persist the exact v1 digest", digestOf(v1Archive()), reinstalled.active.digest.value)
                 assertEquals("first install after removal must not infer a rollback revision", null, reinstalled.rollback)
@@ -221,7 +237,11 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertEquals(Unit, success(restarted.repository.loadAndPublish()))
                 assertTrue("restart must rematerialize the committed installed provider", restarted.providers.resolve(INSTALLED_ID) is ChannelProviderResolution.Available)
                 assertEquals("restart must create exactly one new JNI state for the enabled definition", 1, restarted.bridge.createdStateIds.size)
-                assertTrue("restart must reach v1 readiness without retaining prior-process Lua globals", awaitInputAcceptance(restarted.runtimeRegistry, definition.id))
+                val restartedState = restarted.bridge.createdStateIds.single()
+                assertTrue(
+                    "restart must reach v1 readiness without retaining prior-process Lua globals",
+                    awaitLuaInputAcceptance(restarted.runtimeRegistry, definition.id, restarted.bridge, restartedState, awaitTimerResume = true, stage = "restarted v1"),
+                )
                 val recovered = success(InstalledPackageStore(root).loadIndex()).index.providers.getValue(SOURCE_REPOSITORY)
                 assertEquals("restart must retain the committed v1 digest", digestOf(v1Archive()), recovered.active.digest.value)
                 assertEquals("restart must not manufacture a rollback revision", null, recovered.rollback)
@@ -267,27 +287,55 @@ class InstalledLuaPackagesInstrumentationTest {
                 assertTrue("only the valid sibling may allocate a Lua JNI state", restarted.bridge.createdStateIds.size == 1)
                 assertTrue("the corrupt definition must project unavailable without a Lua state", restarted.runtimeRegistry.preparation(corruptDefinition.id) is ChannelPreparationAvailability.Unavailable)
                 assertTrue("the corrupt definition must reject input", restarted.runtimeRegistry.prepareInput(corruptDefinition.id) is ChannelInputAcceptance.Unavailable)
-                assertTrue("the valid installed sibling must reach readiness", awaitInputAcceptance(restarted.runtimeRegistry, validDefinition.id))
-                assertTrue("the built-in debug runtime must remain operational", awaitInputAcceptance(restarted.runtimeRegistry, builtInDefinition.id))
+                val validState = restarted.bridge.createdStateIds.single()
+                assertTrue("the valid installed sibling must reach readiness", awaitLuaInputAcceptance(restarted.runtimeRegistry, validDefinition.id, restarted.bridge, validState, awaitTimerResume = true))
+                assertTrue("the built-in debug runtime must remain operational", acceptInput(restarted.runtimeRegistry, builtInDefinition.id))
             }
         }
     }
 
-    private suspend fun awaitInputAcceptance(registry: ChannelRuntimeRegistry, definitionId: String): Boolean =
-        withTimeout(WAIT_MILLIS) {
-            while (true) {
-                registry.refreshReadiness()
-                when (val acceptance = registry.prepareInput(definitionId)) {
-                    is ChannelInputAcceptance.Accepted -> {
-                        acceptance.target.onInputCancelled("instrumentation readiness probe complete")
-                        (acceptance.target as? dev.nilp0inter.subspace.service.CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
-                        return@withTimeout true
-                    }
-                    else -> delay(POLL_MILLIS)
-                }
-            }
-            false
+    private suspend fun awaitLuaInputAcceptance(
+        registry: ChannelRuntimeRegistry,
+        definitionId: String,
+        bridge: TracingNativeBridge,
+        stateId: Long,
+        awaitTimerResume: Boolean,
+        stage: String = definitionId,
+    ): Boolean {
+        val readinessBaseline = bridge.readinessCallbackCount(stateId)
+        if (awaitTimerResume && !bridge.awaitSuccessfulTimerResume(stateId)) {
+            throw readinessFailure(registry, definitionId, stage, "the v1 timer resume for state $stateId")
         }
+        registry.refreshReadiness()
+        if (!bridge.awaitReadinessCallbackAfter(stateId, readinessBaseline)) {
+            throw readinessFailure(registry, definitionId, stage, "a handle_readiness callback for state $stateId")
+        }
+        return acceptInput(registry, definitionId, stage)
+    }
+
+    private suspend fun acceptInput(
+        registry: ChannelRuntimeRegistry,
+        definitionId: String,
+        stage: String = definitionId,
+    ): Boolean = when (val acceptance = registry.prepareInput(definitionId)) {
+        is ChannelInputAcceptance.Accepted -> {
+            acceptance.target.onInputCancelled("instrumentation readiness probe complete")
+            (acceptance.target as? dev.nilp0inter.subspace.service.CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
+            true
+        }
+        else -> throw readinessFailure(registry, definitionId, stage, "input acceptance; lastAcceptance=$acceptance")
+    }
+
+    private fun readinessFailure(
+        registry: ChannelRuntimeRegistry,
+        definitionId: String,
+        stage: String,
+        waitingFor: String,
+    ): AssertionError = AssertionError(
+        "input acceptance failed at lifecycle stage '$stage' while waiting for $waitingFor; " +
+            "preparation=${registry.preparation(definitionId)}; snapshot=${registry.getRuntimeSnapshot(definitionId)}; " +
+            "generation=${registry.capabilityScopeIdentity(definitionId)}",
+    )
 
     /** Returns true only if the successor becomes unavailable after the retired v1 timer deadline. */
     private suspend fun inputRefusedAfterTimerWindow(registry: ChannelRuntimeRegistry, definitionId: String): Boolean {
@@ -333,6 +381,7 @@ class InstalledLuaPackagesInstrumentationTest {
         coordinates = GitHubRepositoryCoordinates("fixture-owner", "fixture-repository"),
         release = GitHubReleaseIdentity(releaseId, "fixture-release", false),
         asset = GitHubAssetIdentity(assetId, "fixture-package.zip"),
+        ownerId = "9000001",
     )
 
     private fun <T> success(outcome: PackageOutcome<T>): T = when (outcome) {
@@ -423,6 +472,8 @@ class InstalledLuaPackagesInstrumentationTest {
             val stateId: Long
             data class Created(override val stateId: Long) : Event
             data class Startup(override val stateId: Long) : Event
+            data class Resume(override val stateId: Long) : Event
+            data class Readiness(override val stateId: Long) : Event
             data class Closed(override val stateId: Long) : Event
         }
 
@@ -438,6 +489,18 @@ class InstalledLuaPackagesInstrumentationTest {
             return closed >= 0 && started >= 0 && closed < started
         }
 
+        fun readinessCallbackCount(stateId: Long): Int = events.count { it is Event.Readiness && it.stateId == stateId }
+
+        suspend fun awaitSuccessfulTimerResume(stateId: Long): Boolean = withTimeoutOrNull(WAIT_MILLIS) {
+            while (events.none { it is Event.Resume && it.stateId == stateId }) delay(POLL_MILLIS)
+            true
+        } == true
+
+        suspend fun awaitReadinessCallbackAfter(stateId: Long, baseline: Int): Boolean = withTimeoutOrNull(WAIT_MILLIS) {
+            while (readinessCallbackCount(stateId) <= baseline) delay(POLL_MILLIS)
+            true
+        } == true
+
         override fun create(config: LuaKernelConfig): LuaKernelOutcome = delegate.create(config).also { outcome ->
             (outcome as? LuaKernelOutcome.Created)?.let { events += Event.Created(it.stateId) }
         }
@@ -448,7 +511,9 @@ class InstalledLuaPackagesInstrumentationTest {
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = delegate.start(handle)
 
         override fun resume(operation: LuaOperationHandle, success: Boolean, value: String, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome =
-            delegate.resume(operation, success, value, spawnAdmission)
+            delegate.resume(operation, success, value, spawnAdmission).also {
+                if (success) events += Event.Resume(operation.stateHandle.stateId.value)
+            }
 
         override fun cancel(operation: LuaOperationHandle): LuaKernelOutcome = delegate.cancel(operation)
 
@@ -476,7 +541,11 @@ class InstalledLuaPackagesInstrumentationTest {
             callbackHandle: LuaCallbackHandle,
             arguments: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
-        ): LuaKernelOutcome = delegate.invokeCallback(handle, callbackHandle, arguments, spawnAdmission)
+        ): LuaKernelOutcome = delegate.invokeCallback(handle, callbackHandle, arguments, spawnAdmission).also { outcome ->
+            if (callbackHandle.name == "handle_readiness" && outcome is LuaKernelOutcome.Completed && outcome.stateId == handle.stateId.value) {
+                events += Event.Readiness(outcome.stateId)
+            }
+        }
 
         override fun startCoroutine(
             handle: LuaStateHandle,

@@ -44,9 +44,13 @@ internal class LuaAdapterRuntime(
     private val stateHandle: LuaStateHandle,
     private val bridge: LuaKernelBridge,
     private val callbacks: Map<String, LuaCallbackHandle>,
+    private val logSink: PluginLogSink = NoOpPluginLogSink
 ) : ChannelRuntime {
 
     private val closed = AtomicBoolean(false)
+    private val hostGeneration = requireNotNull(generationContext as? ActorRuntimeHostContext) {
+        "Lua adapter requires a host-owned actor runtime context"
+    }.actorIdentity.runtimeGeneration.value
     private val activated = AtomicBoolean(false)
     private val activationClaimed = AtomicBoolean(false)
     private val lifecycleLock = Any()
@@ -514,17 +518,34 @@ internal class LuaAdapterRuntime(
                 recordDiagnostic("invalid native log record")
                 return@forEach
             }
+            val timestamp = System.currentTimeMillis()
             synchronized(logLock) {
                 if (logs.size == MAX_LOG_RECORDS) logs.removeFirst()
                 logs.addLast(
                     LuaAdapterLogRecord(
                         instanceId = generationContext.instanceId,
-                        generation = stateHandle.generation.value,
-                        timestampMillis = System.currentTimeMillis(),
+                        generation = hostGeneration,
+                        timestampMillis = timestamp,
                         level = requireNotNull(level),
                         payload = requireNotNull(payload),
                     ),
                 )
+            }
+            if (!closed.get() && generationContext.isActive()) {
+                val serializedPayload = try {
+                    canonicalSerialize(payload, 262_144)
+                } catch (e: Exception) {
+                    null
+                }
+                if (serializedPayload != null) {
+                    logSink.tryPublish(
+                        instanceId = generationContext.instanceId,
+                        generation = hostGeneration,
+                        timestampMillis = timestamp,
+                        level = requireNotNull(level),
+                        payloadJson = serializedPayload
+                    )
+                }
             }
         }
     }

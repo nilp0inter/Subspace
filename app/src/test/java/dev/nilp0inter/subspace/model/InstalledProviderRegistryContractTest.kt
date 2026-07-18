@@ -329,6 +329,7 @@ class InstalledProviderRegistryContractTest {
         coordinates = GitHubRepositoryCoordinates("registry-owner", "registry-repository"),
         release = GitHubReleaseIdentity("456", "v1", false),
         asset = GitHubAssetIdentity("789", "registry-package.zip"),
+        ownerId = "9000001",
     )
 
     private fun emptyPayload(): OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(JSONObject())

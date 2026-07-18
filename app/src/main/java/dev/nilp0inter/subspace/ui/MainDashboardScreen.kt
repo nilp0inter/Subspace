@@ -395,6 +395,12 @@ private fun CatalogueManagementPanel(
         ) {
             Text("Manage OpenAI connection profiles")
         }
+        OutlinedButton(
+            onClick = actions::navigateToPackageManagement,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Manage installed packages")
+        }
         appState.channels.forEachIndexed { index, channel ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),

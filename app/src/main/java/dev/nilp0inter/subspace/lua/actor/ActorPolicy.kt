@@ -73,7 +73,7 @@ internal data class ActorPolicy(
             closeTimeoutMillis = DEFAULT_CLOSE_TIMEOUT_MILLIS,
             maxConcurrentTasks = DEFAULT_MAX_CONCURRENT_TASKS,
             perTaskDeadlineMillis = DEFAULT_PER_TASK_DEADLINE_MILLIS,
-            timerSlackMillis = 0L,
+            timerSlackMillis = DEFAULT_TIMER_SLACK_MILLIS,
         )
 
         // Starting evidence — NOT normative limits.
@@ -87,6 +87,7 @@ internal data class ActorPolicy(
         private const val DEFAULT_CLOSE_TIMEOUT_MILLIS = 5_000L
         private const val DEFAULT_MAX_CONCURRENT_TASKS = 4
         private const val DEFAULT_PER_TASK_DEADLINE_MILLIS = 60_000L
+        private const val DEFAULT_TIMER_SLACK_MILLIS = 100L
 
         /**
          * Calculate an overflow-safe sleep-operation deadline from requested

@@ -343,6 +343,7 @@ class InstalledPackageTransactionsTest {
         coordinates = GitHubRepositoryCoordinates("owner-$repositoryId", "repository-$repositoryId"),
         release = GitHubReleaseIdentity(releaseId, "v$releaseId", false),
         asset = GitHubAssetIdentity(assetId, "package-$assetId.zip"),
+        ownerId = "9000001",
     )
 
     private fun packageArchive(repositoryId: String, version: String, marker: String): ByteArray {

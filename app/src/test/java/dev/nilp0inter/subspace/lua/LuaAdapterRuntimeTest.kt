@@ -58,6 +58,7 @@ private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
 private fun testLuaProvider(
     image: ImmutableProgramImage,
     bridge: LuaKernelBridge,
+    logSink: PluginLogSink = NoOpPluginLogSink,
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -71,6 +72,7 @@ private fun testLuaProvider(
         ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
     },
     bridge = bridge,
+    logSink = logSink,
 )
 
 /**
@@ -543,7 +545,7 @@ class LuaAdapterRuntimeTest {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
             harness.authorizeStagedTasks()
             timers.awaitPending()
-            timers.assertPending(listOf(1_000L, 1_000L))
+            timers.assertPending(listOf(1_000L, 1_100L))
 
             timers.release(1)
             assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls)
@@ -585,7 +587,7 @@ class LuaAdapterRuntimeTest {
             assertEquals(ChannelActivationResult.Ready, closeHarness.runtime.activate())
             closeHarness.authorizeStagedTasks()
             closeTimers.awaitPending()
-            closeTimers.assertPending(listOf(1_000L, 1_000L))
+            closeTimers.assertPending(listOf(1_000L, 1_100L))
             closeHarness.runtime.close()
             closeTimers.releaseAll()
             assertTrue(closeBridge.resumeCalls.isEmpty())
@@ -726,6 +728,113 @@ class LuaAdapterRuntimeTest {
     }
 
     @Test
+    fun `native logs publish every valid level once with host-owned metadata and canonical payload bytes`() = runTest {
+        val sink = RecordingLogSink()
+        val startedAt = System.currentTimeMillis()
+        val bridge = RecordingBridge().apply {
+            enqueue(
+                "startup",
+                completed(
+                    logs = listOf(
+                        """{"level":"debug","payload":{"z":{"k":true,"a":[2,"x"]},"a":null,"instance_id":"forged","generation":999}}""",
+                        """{"level":"info","payload":{"sequence":2}}""",
+                        """{"level":"warn","payload":{"sequence":3}}""",
+                        """{"level":"error","payload":{"sequence":4}}""",
+                    ),
+                ),
+            )
+        }
+        val harness = harness(bridge, setOf("startup"), logSink = sink)
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            val finishedAt = System.currentTimeMillis()
+
+            assertEquals(listOf("debug", "info", "warn", "error"), sink.records.map { it.level })
+            assertEquals(1, sink.records.count { it.level == "debug" })
+            sink.records.forEach { record ->
+                assertEquals("lua-adapter", record.instanceId)
+                assertEquals(7L, record.generation)
+                assertTrue(record.timestampMillis in startedAt..finishedAt)
+            }
+            assertEquals(
+                "{\"a\":null,\"generation\":999.0,\"instance_id\":\"forged\",\"z\":{\"a\":[2.0,\"x\"],\"k\":true}}",
+                sink.records.first().payloadJson,
+            )
+            assertEquals(
+                listOf("{\"sequence\":2.0}", "{\"sequence\":3.0}", "{\"sequence\":4.0}"),
+                sink.records.drop(1).map { it.payloadJson },
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `structured native logs carry the host runtime generation rather than the Lua state generation`() = runTest {
+        val hostGeneration = RuntimeGeneration(113)
+        val sink = RecordingLogSink()
+        val bridge = RecordingBridge().apply {
+            enqueue(
+                "startup",
+                completed(logs = listOf("""{"level":"info","payload":{"message":"host-generation"}}""")),
+            )
+        }
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup"),
+            logSink = sink,
+            hostRuntimeGeneration = hostGeneration,
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+
+            assertEquals(listOf(113L), harness.runtime.logSnapshot.map { it.generation })
+            assertEquals(listOf(113L), sink.records.map { it.generation })
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `malformed foreign and stale native logs are not published`() = runTest {
+        val invalidSink = RecordingLogSink()
+        val invalidBridge = RecordingBridge().apply {
+            enqueue(
+                "startup",
+                completed(
+                    logs = listOf(
+                        "not-json",
+                        """{"level":"trace","payload":{}}""",
+                        """{"level":"info","payload":[]}""",
+                        """{"level":"info","payload":{},"instance_id":"forged"}""",
+                    ),
+                ),
+            )
+        }
+        val invalidHarness = harness(invalidBridge, setOf("startup"), logSink = invalidSink)
+        try {
+            assertEquals(ChannelActivationResult.Ready, invalidHarness.runtime.activate())
+            assertTrue(invalidSink.records.isEmpty())
+        } finally {
+            invalidHarness.close()
+        }
+
+        val staleSink = RecordingLogSink()
+        lateinit var staleHarness: AdapterHarness
+        val staleBridge = RecordingBridge().apply {
+            enqueue("startup", completed(logs = listOf("""{"level":"info","payload":{"late":true}}""")))
+            beforeCallback = { callback -> if (callback == "startup") staleHarness.stopAdmission() }
+        }
+        staleHarness = harness(staleBridge, setOf("startup"), logSink = staleSink)
+        try {
+            assertTrue(staleHarness.runtime.activate() is ChannelActivationResult.Failed)
+            assertTrue(staleSink.records.isEmpty())
+        } finally {
+            staleHarness.close()
+        }
+    }
+
+    @Test
     fun `authorized background sleep resumes exactly once and invalid yields are rejected locally`() = runTest {
         val bridge = RecordingBridge().apply {
             enqueue("startup", completed(spawnedCoroutines = listOf(92, 93)))
@@ -781,9 +890,11 @@ class LuaAdapterRuntimeTest {
         bridge: RecordingBridge,
         callbacks: Set<String>,
         timerDelay: suspend (Long) -> Unit = { delay(it) },
+        logSink: PluginLogSink = NoOpPluginLogSink,
+        hostRuntimeGeneration: RuntimeGeneration = RuntimeGeneration(7),
     ): AdapterHarness {
         val instanceId = "lua-adapter"
-        val generation = RuntimeGeneration(7)
+        val generation = hostRuntimeGeneration
         val parentJob = SupervisorJob()
         val parentScope = CoroutineScope(Dispatchers.Unconfined + parentJob)
         val workers = RuntimeWorkerDispatcher.fromDispatcher(Dispatchers.Unconfined)
@@ -810,7 +921,7 @@ class LuaAdapterRuntimeTest {
             host = NoCapabilitiesHost,
         )
         bridge.retainedCallbacks = callbacks
-        val result = testLuaProvider(image, bridge).constructRuntime(
+        val result = testLuaProvider(image, bridge, logSink).constructRuntime(
             ChannelRuntimeConstructionRequest(
                 definition = definition,
                 configuration = ValidatedChannelConfiguration(
@@ -871,6 +982,10 @@ class LuaAdapterRuntimeTest {
 
         suspend fun retireGeneration() {
             context.closeAndDrain()
+        }
+
+        fun stopAdmission() {
+            context.stopAdmission()
         }
 
         fun saturateTaskCapacity() {
@@ -935,6 +1050,37 @@ class LuaAdapterRuntimeTest {
         val callbackResult: String,
         val expectedStatus: ChannelExecutionStatus,
     )
+
+    private data class PublishedLog(
+        val instanceId: String,
+        val generation: Long,
+        val timestampMillis: Long,
+        val level: String,
+        val payloadJson: String,
+    )
+
+    private class RecordingLogSink : PluginLogSink {
+        val records = mutableListOf<PublishedLog>()
+
+        override fun tryPublish(
+            instanceId: String,
+            generation: Long,
+            timestampMillis: Long,
+            level: String,
+            payloadJson: String,
+        ): Boolean {
+            records += PublishedLog(instanceId, generation, timestampMillis, level, payloadJson)
+            return true
+        }
+
+        override fun close() = Unit
+
+        override fun recordProjectionLoss() = Unit
+
+        override fun getLossCount(): Long = 0L
+
+        override suspend fun receive(): LogRecord? = null
+    }
 
     private data class CallbackCall(
         val name: String,

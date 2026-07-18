@@ -169,8 +169,15 @@ public data class PackageSourceRecord(
     val repositoryId: GitHubRepositoryIdentity,
     val coordinates: GitHubRepositoryCoordinates,
     val release: GitHubReleaseIdentity,
-    val asset: GitHubAssetIdentity
-)
+    val asset: GitHubAssetIdentity,
+    val ownerId: String
+) {
+    init {
+        require(isPositiveDecimal(ownerId)) {
+            "Publisher ID must be a canonical positive decimal string: $ownerId"
+        }
+    }
+}
 
 /**
  * 1.5: Immutable package manifest.

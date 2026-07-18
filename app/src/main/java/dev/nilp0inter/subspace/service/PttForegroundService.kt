@@ -20,6 +20,9 @@ import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import dev.nilp0inter.subspace.MainActivity
+import dev.nilp0inter.subspace.lua.PluginLogSink
+import dev.nilp0inter.subspace.lua.PluginLogSinkImpl
+import dev.nilp0inter.subspace.lua.LogRecord
 import dev.nilp0inter.subspace.R
 import dev.nilp0inter.subspace.audio.AndroidMicCaptureSource
 import dev.nilp0inter.subspace.audio.AndroidPcmOutput
@@ -104,9 +107,47 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+
+internal data class PluginLogProjection(
+    val level: LogLevel,
+    val tag: String,
+    val message: String,
+    val throwable: Throwable?,
+    val timestampMillis: Long,
+)
+
+internal fun LogRecord.toPluginLogProjection(): PluginLogProjection? {
+    val mappedLevel = when (level.lowercase()) {
+        "debug" -> LogLevel.Debug
+        "info" -> LogLevel.Info
+        "warn" -> LogLevel.Warn
+        "error" -> LogLevel.Error
+        else -> return null
+    }
+    return PluginLogProjection(
+        level = mappedLevel,
+        tag = "LuaChannel",
+        message = message,
+        throwable = null,
+        timestampMillis = timestampMillis,
+    )
+}
+
+internal suspend fun forwardNextPluginLog(
+    sink: PluginLogSink,
+    admit: (PluginLogProjection) -> Boolean,
+): Boolean {
+    val record = sink.receive() ?: return false
+    val projection = record.toPluginLogProjection()
+    if (projection == null || !admit(projection)) {
+        sink.recordProjectionLoss()
+    }
+    return true
+}
 
 internal fun deriveCarMediaPttState(
     phase: PttAudioSessionManager.SessionPhase?,
@@ -230,9 +271,15 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var providerRegistry: ChannelImplementationProviderRegistry
     /** Service-owned installed-package coordinator; started after built-in registration. */
     private lateinit var installedPackagesCoordinator: InstalledPackagesCoordinator
-    /** Internal facade exposing installed-package state and mutations for host actions. */
+    /** Internal facade exposing installed-package state and mutations. */
     private lateinit var installedPackagesFacade: InstalledPackagesFacade
     internal val installedPackages: InstalledPackagesFacade get() = installedPackagesFacade
+    /** Service-owned package-management coordinator (source resolution, inspection, trust). */
+    private lateinit var packageManagementCoordinator: PackageManagementCoordinator
+    val packageManagementState: StateFlow<dev.nilp0inter.subspace.service.PackageManagementSummary>
+        get() = packageManagementCoordinator.managementState
+    private lateinit var pluginLogSink: PluginLogSink
+    private var logSinkWorkerJob: Job? = null
     private val _channelDescriptors = MutableStateFlow<List<ChannelImplementationDescriptor>>(emptyList())
     val channelDescriptors: StateFlow<List<ChannelImplementationDescriptor>> = _channelDescriptors.asStateFlow()
     private lateinit var runtimeInvocationBoundary: RuntimeInvocationBoundary
@@ -337,6 +384,19 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     override fun onCreate() {
         super.onCreate()
         SubspaceLogger.initialize(cacheDir)
+        pluginLogSink = PluginLogSinkImpl()
+        logSinkWorkerJob = serviceScope.launch(Dispatchers.IO) {
+            while (isActive && forwardNextPluginLog(pluginLogSink) { projection ->
+                SubspaceLogger.tryLogPlugin(
+                    level = projection.level,
+                    tag = projection.tag,
+                    message = projection.message,
+                    timestamp = projection.timestampMillis,
+                )
+            }) {
+                // Drain until service shutdown closes the bounded sink.
+            }
+        }
         serviceScope.launch(Dispatchers.IO) {
             val legacyCache = java.io.File(noBackupFilesDir, "announcement-cache")
             if (legacyCache.exists()) legacyCache.deleteRecursively()
@@ -526,6 +586,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             storeRoot = java.io.File(noBackupFilesDir, "installed-lua-packages"),
             providerRegistry = providerRegistry,
             bridge = dev.nilp0inter.subspace.lua.LuaNativeKernelBridge(),
+            logSink = pluginLogSink,
             onCatalogueReconcile = {
                 _channelDescriptors.value = providerRegistry.descriptors()
                 runtimeRegistry.reconcile(channelRepository.catalogueState.value)
@@ -534,6 +595,26 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         )
         installedPackagesFacade = InstalledPackagesFacade(installedPackagesCoordinator)
         installedPackagesCoordinator.start()
+        // Compose the package-management coordinator after the installed-package
+        // facade is live. It owns source resolution, candidate inspection, trust
+        // confirmation, and delegates committed mutations to the facade. All network
+        // and disk I/O runs on Dispatchers.IO; startup is non-blocking.
+        val packageStoreRoot = java.io.File(noBackupFilesDir, "installed-lua-packages")
+        val gitHubHttpClient = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val gitHubSourceClient = dev.nilp0inter.subspace.dependency.RealGitHubPackageSourceClient(
+            dev.nilp0inter.subspace.dependency.OkHttpGitHubTransport(gitHubHttpClient),
+        )
+        packageManagementCoordinator = PackageManagementCoordinator(
+            facade = installedPackagesFacade,
+            sourceClient = gitHubSourceClient,
+            providerRegistry = providerRegistry,
+            storeRoot = packageStoreRoot,
+            serviceScope = serviceScope,
+        )
+        packageManagementCoordinator.start()
         carTelecomStarter = CarTelecomStarter(
             context = this,
             serviceScope = serviceScope,
@@ -812,12 +893,24 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     hostAudioCoordinator.close()
                     agentRuntimeGraph.playback.close()
                     agentRuntimeGraph.deferredAudioPlayback.close()
+                    // Shutdown package management first (source resolution, inspection).
+                    // It depends on the installed-package facade, which depends on the
+                    // repository. Tear down in dependency order.
+                    if (::packageManagementCoordinator.isInitialized) {
+                        packageManagementCoordinator.shutdown()
+                    }
                     // Stop package publication and close the repository before runtime
                     // generations are torn down, so no new providers appear during teardown.
                     if (::installedPackagesCoordinator.isInitialized) {
                         installedPackagesCoordinator.shutdown()
                     }
+                    if (::pluginLogSink.isInitialized) {
+                        pluginLogSink.close()
+                    }
                     runtimeRegistry.shutdownAndAwait()
+                    withTimeoutOrNull(500L) {
+                        logSinkWorkerJob?.join()
+                    }
                     openAiProfileOperations.close()
                     textOutputService.close()
                     runtimeInvocationBoundary.close()
@@ -1018,6 +1111,52 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     fun phonePttReleased(channelId: String) {
         pttDispatcher.dispatchPttReleased(PttSource.Phone)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Package-management intents — fire-and-forget wrappers that delegate to
+    // the service-owned coordinator on serviceScope. The UI never touches
+    // OkHttp, files, streams, or repository transactions directly.
+    // ──────────────────────────────────────────────────────────────────────
+
+    fun resolvePackageRepository(url: String) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        packageManagementCoordinator.resolveRepository(url)
+    }
+
+    fun selectPackageRelease(releaseId: String) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        serviceScope.launch { packageManagementCoordinator.selectRelease(releaseId) }
+    }
+
+    fun confirmPackageInstall(acknowledged: Boolean) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        serviceScope.launch { packageManagementCoordinator.confirmTrustAndInstall(acknowledged) }
+    }
+
+    fun rollbackPackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        serviceScope.launch { packageManagementCoordinator.confirmRollback(repositoryId, confirmed = true) }
+    }
+
+    fun removePackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        serviceScope.launch { packageManagementCoordinator.confirmRemove(repositoryId, confirmed = true) }
+    }
+
+    fun cancelPackageInspection() {
+        if (!::packageManagementCoordinator.isInitialized) return
+        packageManagementCoordinator.cancelInspection()
+    }
+
+    fun refreshPackageManagement(url: String) {
+        if (!::packageManagementCoordinator.isInitialized) return
+        packageManagementCoordinator.refresh(url)
+    }
+
+    fun cleanupPackageManagementRouteExit() {
+        if (!::packageManagementCoordinator.isInitialized) return
+        packageManagementCoordinator.cleanupRouteExit()
     }
 
     fun setInputMode(mode: InputMode): Boolean = setInputMode(mode, InputModeSelection.User)

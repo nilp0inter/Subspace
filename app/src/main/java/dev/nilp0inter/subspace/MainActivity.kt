@@ -41,6 +41,7 @@ import dev.nilp0inter.subspace.ui.InitialSetupScreen
 import dev.nilp0inter.subspace.ui.MainDashboardScreen
 import dev.nilp0inter.subspace.ui.MonitorScreen
 import dev.nilp0inter.subspace.ui.LogAnalysisScreen
+import dev.nilp0inter.subspace.ui.PackageManagementScreen
 import dev.nilp0inter.subspace.ui.OpenAiProfileManagementScreen
 import dev.nilp0inter.subspace.ui.OpenAiProfileUiError
 import dev.nilp0inter.subspace.ui.OpenAiProfileUiItem
@@ -48,6 +49,15 @@ import dev.nilp0inter.subspace.ui.OpenAiProfileUiMutationResult
 import dev.nilp0inter.subspace.ui.PttUiActions
 import dev.nilp0inter.subspace.ui.bootstrapRootSurface
 import dev.nilp0inter.subspace.ui.theme.SubspaceTheme
+
+internal fun exitDashboardRoute(
+    isPackageManagement: Boolean,
+    cleanup: () -> Unit,
+    setMainRoute: () -> Unit,
+) {
+    if (isPackageManagement) cleanup()
+    setMainRoute()
+}
 
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<PttForegroundService?>(null)
@@ -102,6 +112,12 @@ class MainActivity : ComponentActivity() {
                 ?: remember { mutableStateOf(dev.nilp0inter.subspace.service.LogLevel.Debug) }
             val currentTagLevels by currentService?.tagLogLevelsFlow?.collectAsStateWithLifecycle()
                 ?: remember { mutableStateOf(emptyMap()) }
+            val packageManagementSummary by currentService?.packageManagementState?.collectAsStateWithLifecycle()
+                ?: remember { mutableStateOf(dev.nilp0inter.subspace.service.PackageManagementSummary(
+                    emptyList(),
+                    dev.nilp0inter.subspace.service.PackageManagementState.Idle,
+                    dev.nilp0inter.subspace.service.OperationGeneration(0L),
+                )) }
 
             var dashboardRoute by rememberSaveable { mutableStateOf(DashboardRoute.Main) }
             var configuredChannelId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -233,9 +249,17 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun navigateBack() {
+                        exitDashboardRoute(
+                            isPackageManagement = dashboardRoute == DashboardRoute.PackageManagement,
+                            cleanup = {
+                                currentServiceState?.cleanupPackageManagementRouteExit()
+                            },
+                            setMainRoute = {
+                                dashboardRoute = DashboardRoute.Main
+                            },
+                        )
                         configuredChannelId = null
                         creatingImplementationId = null
-                        dashboardRoute = DashboardRoute.Main
                     }
 
                     override fun navigateToLogAnalysis() {
@@ -244,6 +268,39 @@ class MainActivity : ComponentActivity() {
 
                     override fun navigateToOpenAiProfiles() {
                         dashboardRoute = DashboardRoute.OpenAiProfiles
+                    }
+
+                    override fun navigateToPackageManagement() {
+                        dashboardRoute = DashboardRoute.PackageManagement
+                    }
+
+                    override fun resolvePackageRepository(url: String) {
+                        currentServiceState?.resolvePackageRepository(url)
+                    }
+
+                    override fun selectPackageRelease(releaseId: String) {
+                        currentServiceState?.selectPackageRelease(releaseId)
+                    }
+
+                    override fun confirmPackageInstall(acknowledged: Boolean) {
+                        currentServiceState?.confirmPackageInstall(acknowledged)
+                    }
+
+                    override fun rollbackPackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity) {
+                        currentServiceState?.rollbackPackage(repositoryId)
+                    }
+
+                    override fun removePackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity) {
+                        currentServiceState?.removePackage(repositoryId)
+                    }
+
+                    override fun cancelPackageInspection() {
+                        currentServiceState?.cancelPackageInspection()
+                    }
+
+
+                    override fun refreshPackageManagement(url: String) {
+                        currentServiceState?.refreshPackageManagement(url)
                     }
 
                     override fun phonePttPressed(channelId: String) {
@@ -445,6 +502,13 @@ class MainActivity : ComponentActivity() {
                                     onDelete = actions::deleteProfile,
                                     onBack = actions::navigateBack,
                                 )
+
+                                DashboardRoute.PackageManagement -> {
+                                    PackageManagementScreen(
+                                        summary = packageManagementSummary,
+                                        actions = actions,
+                                    )
+                                }
                             }
                         }
                     }
@@ -490,6 +554,7 @@ class MainActivity : ComponentActivity() {
         ChannelCreation,
         LogAnalysis,
         OpenAiProfiles,
+        PackageManagement,
     }
 
     private fun resolveVoiceSetupIntent(issue: OfflineNavigationVoiceIssue?): Intent {

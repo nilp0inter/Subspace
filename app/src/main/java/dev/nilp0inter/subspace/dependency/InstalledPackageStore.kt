@@ -2,6 +2,8 @@ package dev.nilp0inter.subspace.dependency
 
 import dev.nilp0inter.subspace.lua.LuaPackageMaterializer
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
+import dev.nilp0inter.subspace.lua.PluginLogSink
+import dev.nilp0inter.subspace.lua.NoOpPluginLogSink
 import dev.nilp0inter.subspace.lua.actor.ActorPolicy
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.InstalledProviderBinding
@@ -155,7 +157,8 @@ internal object StrictIndexCodec {
   "asset": {
     "assetId": ${encodeJsonString(source.asset.assetId)},
     "name": ${encodeJsonString(source.asset.name)}
-  }
+  },
+  "ownerId": ${encodeJsonString(source.ownerId)}
 }"""
     }
 
@@ -272,7 +275,7 @@ internal object StrictIndexCodec {
     }
 
     private fun decodeSourceRecord(map: Map<String, Any?>, expectedRepoId: GitHubRepositoryIdentity): PackageSourceRecord {
-        validateNoUnknownKeys(map, setOf("repositoryId", "coordinates", "release", "asset"))
+        validateNoUnknownKeys(map, setOf("repositoryId", "coordinates", "release", "asset", "ownerId"))
 
         val repositoryIdStr = requireNonNullKey(map, "repositoryId").asString()
         val repositoryId = GitHubRepositoryIdentity(repositoryIdStr)
@@ -299,7 +302,9 @@ internal object StrictIndexCodec {
         val name = requireNonNullKey(assetMap, "name").asString()
         val asset = GitHubAssetIdentity(assetId, name)
 
-        return PackageSourceRecord(repositoryId, coordinates, release, asset)
+        val ownerId = requireNonNullKey(map, "ownerId").asString()
+
+        return PackageSourceRecord(repositoryId, coordinates, release, asset, ownerId)
     }
 
     // Helper functions
@@ -482,9 +487,11 @@ internal fun interface FaultInjector {
  */
 public class InstalledPackageStore internal constructor(
     private val storeRoot: File,
-    private val faultInjector: FaultInjector
+    private val faultInjector: FaultInjector,
+    private val logSink: PluginLogSink = NoOpPluginLogSink
 ) {
     public constructor(storeRoot: File) : this(storeRoot, FaultInjector.NOOP)
+    internal constructor(storeRoot: File, logSink: PluginLogSink) : this(storeRoot, FaultInjector.NOOP, logSink)
     internal val stagingDir = File(storeRoot, "staging")
     internal val contentDir = File(storeRoot, "content/sha256")
     private val currentFile = File(storeRoot, "index.json")
@@ -819,7 +826,7 @@ public class InstalledPackageStore internal constructor(
                     throw PackageException(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
                 }
 
-                val binding = LuaPackageMaterializer.materialize(validatedRevision, bridge, ActorPolicy.startingEvidence())
+                val binding = LuaPackageMaterializer.materialize(validatedRevision, bridge, ActorPolicy.startingEvidence(), logSink = logSink)
                 bindings[implId] = binding
             } catch (e: PackageException) {
                 failures[implId] = e.failure

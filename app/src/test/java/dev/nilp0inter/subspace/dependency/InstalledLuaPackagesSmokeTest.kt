@@ -320,6 +320,7 @@ class InstalledLuaPackagesSmokeTest {
         coordinates = GitHubRepositoryCoordinates("smoke-owner", "smoke-repository"),
         release = GitHubReleaseIdentity("456", "v1", false),
         asset = GitHubAssetIdentity("789", "smoke-package.zip"),
+        ownerId = "9000001",
     )
 
     private fun availableFingerprint(

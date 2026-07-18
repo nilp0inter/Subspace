@@ -10,9 +10,11 @@ import dev.nilp0inter.subspace.dependency.PackageOutcome
 import dev.nilp0inter.subspace.dependency.PackageSourceRecord
 import dev.nilp0inter.subspace.dependency.PackageValidationBounds
 import dev.nilp0inter.subspace.dependency.StoredPackageRevision
+import dev.nilp0inter.subspace.dependency.StoredProviderRecord
 import dev.nilp0inter.subspace.dependency.toPackageUnavailable
 import dev.nilp0inter.subspace.dependency.toPackageUnavailableProjection
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
+import dev.nilp0inter.subspace.lua.PluginLogSink
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
 import dev.nilp0inter.subspace.model.ChannelProviderError
@@ -89,12 +91,13 @@ internal class InstalledPackagesCoordinator(
     storeRoot: File,
     private val providerRegistry: ChannelImplementationProviderRegistry,
     bridge: LuaKernelBridge,
+    logSink: PluginLogSink,
     private val onCatalogueReconcile: suspend () -> Unit,
     private val serviceScope: CoroutineScope,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     bounds: PackageValidationBounds = PackageValidationBounds.DEFAULT,
 ) {
-    private val store = InstalledPackageStore(storeRoot)
+    private val store = InstalledPackageStore(storeRoot, logSink)
     private val closed = AtomicBoolean(false)
 
     private val operationMutex = Mutex()
@@ -416,6 +419,17 @@ internal class InstalledPackagesCoordinator(
         is InstalledProvidersRejectionReason.RevisionOverflow -> "revision_overflow"
     }
 
+    internal fun committedSnapshot(): Map<GitHubRepositoryIdentity, StoredProviderRecord> {
+        return try {
+            when (val result = store.loadIndex()) {
+                is PackageOutcome.Success -> result.value.index.providers.toMap()
+                is PackageOutcome.Failure -> emptyMap()
+            }
+        } catch (_: Throwable) {
+            emptyMap()
+        }
+    }
+
     private companion object {
         const val DIAGNOSTIC_TAG = "InstalledPackages"
         const val DIGEST_PREFIX_LENGTH = 12
@@ -445,4 +459,11 @@ internal class InstalledPackagesFacade(private val coordinator: InstalledPackage
         coordinator.remove(repositoryId)
 
     suspend fun shutdown() = coordinator.shutdown()
+
+    /**
+     * Immutable snapshot of the committed installed index for package-management
+     * summaries. Never exposes content paths, source bytes, or store clients.
+     */
+    fun committedSnapshot(): Map<GitHubRepositoryIdentity, StoredProviderRecord> =
+        coordinator.committedSnapshot()
 }

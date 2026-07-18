@@ -42,4 +42,12 @@ interface PttUiActions {
     fun deleteProfile(id: String): OpenAiProfileUiMutationResult
     fun testProfile(id: String)
     fun refreshProfile(id: String)
+    fun navigateToPackageManagement()
+    fun resolvePackageRepository(url: String)
+    fun selectPackageRelease(releaseId: String)
+    fun confirmPackageInstall(acknowledged: Boolean)
+    fun rollbackPackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity)
+    fun removePackage(repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity)
+    fun cancelPackageInspection()
+    fun refreshPackageManagement(url: String)
 }

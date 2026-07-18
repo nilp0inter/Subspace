@@ -268,6 +268,7 @@ class PackageValidatorContractTest {
         coordinates = coordinates,
         release = GitHubReleaseIdentity("456", "v1.0.0", false),
         asset = GitHubAssetIdentity("789", "package.zip"),
+        ownerId = "9000001",
     )
 
     private fun manifest(

@@ -18,6 +18,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicInteger
 
 enum class LogLevel(val androidLevel: Int, val label: String) {
     Verbose(android.util.Log.VERBOSE, "V"),
@@ -51,7 +52,8 @@ private val LOG_DATE_FORMAT = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 object SubspaceLogger {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val channel = Channel<LogEntry>(capacity = Channel.UNLIMITED)
-
+    private val pendingPluginLogCount = AtomicInteger(0)
+    private const val MAX_PENDING_PLUGIN_LOGS = 500
     private val _entries = MutableStateFlow<List<LogEntry>>(emptyList())
     val entries: StateFlow<List<LogEntry>> = _entries.asStateFlow()
 
@@ -145,6 +147,9 @@ object SubspaceLogger {
 
     private suspend fun dispatchLoop() {
         for (entry in channel) {
+            if (entry.tag == "LuaChannel") {
+                pendingPluginLogCount.decrementAndGet()
+            }
             try {
                 appendToDisk(entry)
             } catch (_: Exception) {
@@ -223,7 +228,13 @@ object SubspaceLogger {
         return level.ordinal >= threshold.ordinal
     }
 
-    fun log(level: LogLevel, tag: String, message: String, throwable: Throwable? = null) {
+    fun log(
+        level: LogLevel,
+        tag: String,
+        message: String,
+        throwable: Throwable? = null,
+        timestamp: Long = System.currentTimeMillis()
+    ) {
         if (!shouldLog(tag, level)) return
 
         // Mirror to Android Logcat
@@ -238,13 +249,49 @@ object SubspaceLogger {
 
         // Push to disk channel (non-blocking)
         val entry = LogEntry(
-            timestamp = System.currentTimeMillis(),
+            timestamp = timestamp,
             level = level,
             tag = tag,
             message = message,
             throwable = throwable,
         )
         channel.trySend(entry)
+    }
+
+    fun tryLogPlugin(
+        level: LogLevel,
+        tag: String,
+        message: String,
+        timestamp: Long
+    ): Boolean {
+        if (!shouldLog(tag, level)) return false
+
+        while (true) {
+            val current = pendingPluginLogCount.get()
+            if (current >= MAX_PENDING_PLUGIN_LOGS) {
+                return false
+            }
+            if (pendingPluginLogCount.compareAndSet(current, current + 1)) {
+                break
+            }
+        }
+
+        // Mirror to Android Logcat
+        AndroidLog.println(level.androidLevel, tag, message)
+
+        // Push to disk channel (non-blocking)
+        val entry = LogEntry(
+            timestamp = timestamp,
+            level = level,
+            tag = tag,
+            message = message,
+            throwable = null,
+        )
+        val sent = channel.trySend(entry).isSuccess
+        if (!sent) {
+            pendingPluginLogCount.decrementAndGet()
+        }
+        return sent
     }
 
     fun d(tag: String, message: String) = log(LogLevel.Debug, tag, message)
