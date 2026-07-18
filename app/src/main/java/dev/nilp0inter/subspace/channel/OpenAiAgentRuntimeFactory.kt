@@ -12,6 +12,7 @@ import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
 import dev.nilp0inter.subspace.channel.capability.opaqueAudioRecording
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
@@ -37,6 +38,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 class OpenAiAgentBuiltInProvider : ChannelImplementationProvider {
     override val descriptor = dev.nilp0inter.subspace.model.BuiltInChannelDescriptors.openAiAgent
+    override val fingerprint = ProviderRevisionFingerprint.BUILTIN
 
     override suspend fun constructRuntime(request: ChannelRuntimeConstructionRequest): ChannelRuntimeConstructionResult {
         val configuration = OpenAiAgentProviderConfigurationCodec.decode(request.configuration.payload)

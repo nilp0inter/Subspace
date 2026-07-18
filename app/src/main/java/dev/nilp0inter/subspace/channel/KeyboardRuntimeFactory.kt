@@ -21,6 +21,7 @@ import dev.nilp0inter.subspace.model.BuiltInChannelDescriptors
 import dev.nilp0inter.subspace.model.ChannelConfigurationField
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
@@ -41,6 +42,7 @@ import kotlinx.coroutines.flow.asStateFlow
 class KeyboardBuiltInProvider(
     initialProfiles: Collection<HostProfile> = listOf(HostProfile.LINUX_US),
 ) : ChannelImplementationProvider {
+    override val fingerprint = ProviderRevisionFingerprint.BUILTIN
     @Volatile
     private var currentDescriptor = keyboardDescriptor(initialProfiles)
 

@@ -36,8 +36,10 @@ import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelDefinition
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
 import dev.nilp0inter.subspace.service.ChannelPreparationReason
 import dev.nilp0inter.subspace.service.ChannelRuntimeRegistry
@@ -65,6 +67,55 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.junit.runner.RunWith
+
+/** Test-only identity for generic Lua provider behavior. */
+private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
+
+/**
+ * Constructs a test Lua provider with fixed identity and presentation.
+ * Tests that need custom identity/presentation should use LuaChannelImplementationProvider.create.
+ */
+private fun testLuaProvider(
+    image: ImmutableProgramImage,
+    bridge: LuaKernelBridge,
+    policy: ActorPolicy = ActorPolicy.startingEvidence(),
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    programImage = image,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, actorPolicy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, actorPolicy)
+    },
+    bridge = bridge,
+    actorPolicy = policy,
+)
+
+/**
+ * Constructs a test Lua provider from an image creation result (success or failure).
+ * Used for testing error projection paths.
+ */
+private fun testLuaProviderFromResult(
+    imageResult: ProgramImageCreationResult,
+    bridge: LuaKernelBridge,
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.fromImageResult(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    imageResult = imageResult,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, policy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
+    },
+    bridge = bridge,
+)
 
 /**
  * Device-only conformance and evidence workload for the promoted internal Lua actor runtime.
@@ -753,7 +804,7 @@ class LuaActorInstrumentationTest {
                 sourceMap = mapOf("plugin.incompatible" to "return { startup = function() end }"),
                 requirements = LuaProgramRequirements(LUA_VERSION, "subspace-lua-device-incompatible"),
             )
-            fixture(LuaChannelImplementationProvider.fromCreationResult(incompatible, LuaNativeKernelBridge())).use { fixture ->
+            fixture(testLuaProviderFromResult(incompatible, LuaNativeKernelBridge())).use { fixture ->
                 val definition = definition("incompatible")
                 fixture.install(definition)
                 val unavailable = awaitProviderFailure(fixture.registry, definition.id, "compatibility")
@@ -839,7 +890,7 @@ class LuaActorInstrumentationTest {
         private fun fixture(
             image: ImmutableProgramImage,
             policy: ActorPolicy = policy(),
-        ): RegistryFixture = fixture(LuaChannelImplementationProvider(image, LuaNativeKernelBridge(), policy))
+        ): RegistryFixture = fixture(testLuaProvider(image, LuaNativeKernelBridge(), policy))
 
         private fun fixture(provider: LuaChannelImplementationProvider): RegistryFixture {
             val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -897,7 +948,7 @@ class LuaActorInstrumentationTest {
         private fun definition(id: String, name: String = id): ChannelDefinition = ChannelDefinition(
             id = id,
             name = name,
-            implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+            implementationId = TEST_LUA_IMPLEMENTATION_ID,
             enabled = true,
             configSchemaVersion = 1,
             configPayload = OpaqueJsonObject.fromJsonObject(JSONObject()),

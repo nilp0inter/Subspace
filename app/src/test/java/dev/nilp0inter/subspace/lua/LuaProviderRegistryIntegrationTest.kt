@@ -34,6 +34,7 @@ import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
 import dev.nilp0inter.subspace.model.ProviderConfigurationResult
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineDispatcher
@@ -56,6 +57,53 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+
+/** Test-only identity for generic Lua provider behavior. */
+private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
+
+/**
+ * Constructs a test Lua provider with fixed identity and presentation.
+ * Tests that need custom identity/presentation should use LuaChannelImplementationProvider.create.
+ */
+private fun testLuaProvider(
+    image: ImmutableProgramImage,
+    bridge: LuaKernelBridge,
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    programImage = image,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, policy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
+    },
+    bridge = bridge,
+)
+
+/**
+ * Constructs a test Lua provider from an image creation result (success or failure).
+ * Used for testing error projection paths.
+ */
+private fun testLuaProviderFromResult(
+    imageResult: ProgramImageCreationResult,
+    bridge: LuaKernelBridge,
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.fromImageResult(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    imageResult = imageResult,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, policy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
+    },
+    bridge = bridge,
+)
 
 /**
  * Exercises the Lua provider solely through the ordinary provider and runtime registries.
@@ -81,7 +129,7 @@ class LuaProviderRegistryIntegrationTest {
     @Test
     fun `package image activates through ordinary registries and first readiness refresh follows publication`() = runTest {
         val bridge = RecordingKernelBridge()
-        val registry = fixture(LuaChannelImplementationProvider(LuaProviderRegistryFixtures.packageModules(), bridge))
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.packageModules(), bridge))
         val definition = definition("package-channel")
         bridge.firstReadinessObserver = { instanceId ->
             assertTrue(
@@ -114,7 +162,7 @@ class LuaProviderRegistryIntegrationTest {
     @Test
     fun `same Lua provider gives siblings independent generation scopes and closing one preserves the other`() = runTest {
         val bridge = RecordingKernelBridge()
-        val registry = fixture(LuaChannelImplementationProvider(LuaProviderRegistryFixtures.validCallbacks(), bridge))
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.validCallbacks(), bridge))
         val left = definition("left")
         val right = definition("right")
 
@@ -153,7 +201,7 @@ class LuaProviderRegistryIntegrationTest {
     @Test
     fun `replacement closes G before H activation and first readiness refresh`() = runTest {
         val bridge = RecordingKernelBridge()
-        val registry = fixture(LuaChannelImplementationProvider(LuaProviderRegistryFixtures.raceControl(), bridge))
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.raceControl(), bridge))
         val generationG = definition("channel", name = "Generation G")
 
         registry.reconcile(ChannelCatalogueSnapshot(listOf(generationG), generationG.id))
@@ -188,7 +236,7 @@ class LuaProviderRegistryIntegrationTest {
 
         cases.forEachIndexed { index, (image, expectedDetail) ->
             val bridge = RecordingKernelBridge()
-            val registry = fixture(LuaChannelImplementationProvider(image, bridge))
+            val registry = fixture(testLuaProvider(image, bridge))
             val definition = definition("rejected-$index")
 
             registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
@@ -200,7 +248,7 @@ class LuaProviderRegistryIntegrationTest {
             val error = (unavailable.reason as? ChannelPreparationReason.Provider)?.error
                 ?: throw AssertionError("expected provider failure, got ${unavailable.reason}")
             assertEquals(
-                ChannelProviderError.RuntimeConstructionFailed(LUA_CHANNEL_IMPLEMENTATION_ID, expectedDetail),
+                ChannelProviderError.RuntimeConstructionFailed(TEST_LUA_IMPLEMENTATION_ID, expectedDetail),
                 error,
             )
             assertEquals(1, bridge.createdStateIds.size)
@@ -219,7 +267,7 @@ class LuaProviderRegistryIntegrationTest {
     fun `ordinary provider composition has no Lua registration and Lua definitions have typed missing-provider unavailability`() = runTest {
         assertFalse(
             "ordinary built-in descriptor composition must not expose the test-only Lua provider",
-            BuiltInChannelDescriptors.all.any { it.implementationId == LUA_CHANNEL_IMPLEMENTATION_ID },
+            BuiltInChannelDescriptors.all.any { it.implementationId == TEST_LUA_IMPLEMENTATION_ID },
         )
 
         val registry = fixture()
@@ -231,7 +279,7 @@ class LuaProviderRegistryIntegrationTest {
             as? ChannelPreparationAvailability.Unavailable
             ?: throw AssertionError("expected unregistered Lua definition to be unavailable")
         assertEquals(
-            ChannelProviderError.MissingProvider(LUA_CHANNEL_IMPLEMENTATION_ID),
+            ChannelProviderError.MissingProvider(TEST_LUA_IMPLEMENTATION_ID),
             (unavailable.reason as? ChannelPreparationReason.Provider)?.error,
         )
         assertFalse("missing-provider resolution must not create an actor", ActorRuntimeFactory.isCreateAttempted)
@@ -244,7 +292,7 @@ class LuaProviderRegistryIntegrationTest {
     fun `Lua provider projects exact compatibility failure without creating a native state`() = runTest {
         val bridge = RecordingKernelBridge()
         val registry = fixture(
-            LuaChannelImplementationProvider.fromCreationResult(LuaProviderRegistryFixtures.incompatibleApi(), bridge),
+            testLuaProviderFromResult(LuaProviderRegistryFixtures.incompatibleApi(), bridge),
         )
         val definition = definition("incompatible")
 
@@ -256,7 +304,7 @@ class LuaProviderRegistryIntegrationTest {
             ?: throw AssertionError("expected typed compatibility unavailability")
         assertEquals(
             ChannelProviderError.RuntimeCompatibilityFailure(
-                implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+                implementationId = TEST_LUA_IMPLEMENTATION_ID,
                 requirement = "apiVersion",
                 requiredVersion = "subspace-lua-v999",
                 supportedVersion = API_VERSION,
@@ -271,7 +319,7 @@ class LuaProviderRegistryIntegrationTest {
     @Test
     fun `Lua provider routes lifecycle readiness input cache and SOS through the generation gate`() = runTest {
         val bridge = RecordingKernelBridge()
-        val registry = fixture(LuaChannelImplementationProvider(lifecycleImage(), bridge))
+        val registry = fixture(testLuaProvider(lifecycleImage(), bridge))
         val definition = definition("lifecycle")
 
         registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
@@ -337,7 +385,7 @@ class LuaProviderRegistryIntegrationTest {
         val bridge = RecordingKernelBridge()
         val pausedWorker = PausableWorkerDispatcher(StandardTestDispatcher(testScheduler))
         val registry = fixture(
-            provider = LuaChannelImplementationProvider(LuaProviderRegistryFixtures.validCallbacks(), bridge),
+            provider = testLuaProvider(LuaProviderRegistryFixtures.validCallbacks(), bridge),
             worker = RuntimeWorkerDispatcher.fromDispatcher(pausedWorker),
         )
         val definition = definition("shutdown")
@@ -417,7 +465,7 @@ class LuaProviderRegistryIntegrationTest {
     private fun definition(
         id: String,
         name: String = id,
-        implementationId: ChannelImplementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+        implementationId: ChannelImplementationId = TEST_LUA_IMPLEMENTATION_ID,
     ): ChannelDefinition = ChannelDefinition(
         id = id,
         name = name,

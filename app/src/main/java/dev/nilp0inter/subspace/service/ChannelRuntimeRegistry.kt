@@ -20,6 +20,8 @@ import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
 import dev.nilp0inter.subspace.model.GenerationExecutionContext
 import dev.nilp0inter.subspace.model.GenerationExecutionContextImpl
 import dev.nilp0inter.subspace.model.ProviderConfigurationResult
+import dev.nilp0inter.subspace.model.ChannelImplementationId
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -73,6 +75,8 @@ class ChannelRuntimeRegistry(
         val definition: ChannelDefinition,
         val generation: RuntimeGeneration,
         var snapshotState: ChannelRuntimeSnapshot,
+        val implementationId: ChannelImplementationId,
+        val providerFingerprint: ProviderRevisionFingerprint?,
     ) {
         var retired = false
         var activeLeases = 0
@@ -92,10 +96,12 @@ class ChannelRuntimeRegistry(
         definition: ChannelDefinition,
         generation: RuntimeGeneration,
         snapshotState: ChannelRuntimeSnapshot,
+        implementationId: ChannelImplementationId,
+        providerFingerprint: ProviderRevisionFingerprint,
         val capabilities: RevocableChannelCapabilityScope,
         val gate: RuntimeGenerationInvocationGate,
         val generationContext: GenerationExecutionContextImpl,
-    ) : RuntimeEntry(definition, generation, snapshotState) {
+    ) : RuntimeEntry(definition, generation, snapshotState, implementationId, providerFingerprint) {
         /** A detached runtime can arrive after a pending generation's gate has already closed. */
         val detachedRuntimeCloseOwner = AtomicBoolean(false)
         val detachedRuntimeCloseFinished = CompletableDeferred<Unit>()
@@ -105,6 +111,8 @@ class ChannelRuntimeRegistry(
         definition: ChannelDefinition,
         generation: RuntimeGeneration,
         snapshotState: ChannelRuntimeSnapshot,
+        implementationId: ChannelImplementationId,
+        providerFingerprint: ProviderRevisionFingerprint,
         capabilities: RevocableChannelCapabilityScope,
         gate: RuntimeGenerationInvocationGate,
         generationContext: GenerationExecutionContextImpl,
@@ -115,17 +123,37 @@ class ChannelRuntimeRegistry(
          * current/ready/authorized/startable until this completes.
          */
         val predecessorClosed: CompletableDeferred<Unit>? = null,
-    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate, generationContext)
+    ) : LifecycleEntry(
+        definition,
+        generation,
+        snapshotState,
+        implementationId,
+        providerFingerprint,
+        capabilities,
+        gate,
+        generationContext,
+    )
 
     private class LiveEntry(
         definition: ChannelDefinition,
         generation: RuntimeGeneration,
         snapshotState: ChannelRuntimeSnapshot,
+        implementationId: ChannelImplementationId,
+        providerFingerprint: ProviderRevisionFingerprint,
         capabilities: RevocableChannelCapabilityScope,
         gate: RuntimeGenerationInvocationGate,
         generationContext: GenerationExecutionContextImpl,
         val runtime: ChannelRuntime,
-    ) : LifecycleEntry(definition, generation, snapshotState, capabilities, gate, generationContext) {
+    ) : LifecycleEntry(
+        definition,
+        generation,
+        snapshotState,
+        implementationId,
+        providerFingerprint,
+        capabilities,
+        gate,
+        generationContext,
+    ) {
         var readinessRefreshJob: Job? = null
     }
 
@@ -133,11 +161,15 @@ class ChannelRuntimeRegistry(
         definition: ChannelDefinition,
         generation: RuntimeGeneration,
         snapshotState: ChannelRuntimeSnapshot,
-    ) : RuntimeEntry(definition, generation, snapshotState)
+        implementationId: ChannelImplementationId,
+        providerFingerprint: ProviderRevisionFingerprint?,
+    ) : RuntimeEntry(definition, generation, snapshotState, implementationId, providerFingerprint)
 
     private data class ConstructionPlan(
         val entry: PendingEntry,
         val provider: ChannelImplementationProvider,
+        val implementationId: ChannelImplementationId,
+        val providerFingerprint: ProviderRevisionFingerprint,
         val summary: String,
     )
 
@@ -166,14 +198,57 @@ class ChannelRuntimeRegistry(
 
             snapshot.definitions.forEach { definition ->
                 val existing = entries[definition.id]
-                if (existing == null) {
-                    installDefinitionLocked(definition, constructionPlans, predecessorClosed = null)
-                } else if (existing.definition != definition) {
-                    retireLocked(existing, stops, closures)
+
+                if (!definition.enabled) {
+                    val disabledRetained = existing is UnavailableEntry &&
+                        existing.definition == definition &&
+                        existing.implementationId == definition.implementationId
+                    if (!disabledRetained) {
+                        if (existing != null) {
+                            retireLocked(existing, stops, closures)
+                        }
+                        entries[definition.id] = unavailableEntry(
+                            definition,
+                            RuntimeGeneration.next(),
+                            ChannelPreparationReason.Disabled,
+                            null,
+                        )
+                    }
+                    return@forEach
+                }
+
+                val resolution = providers.resolve(definition.implementationId)
+                val canKeep = when (resolution) {
+                    is ChannelProviderResolution.Available -> {
+                        existing != null &&
+                            existing.definition == definition &&
+                            existing.implementationId == definition.implementationId &&
+                            existing.providerFingerprint == resolution.provider.fingerprint
+                    }
+                    is ChannelProviderResolution.Missing -> {
+                        existing != null &&
+                            existing is UnavailableEntry &&
+                            existing.definition == definition &&
+                            existing.implementationId == definition.implementationId &&
+                            providerReasonMatches(existing, resolution.error)
+                    }
+                    is ChannelProviderResolution.Unavailable -> {
+                        existing != null &&
+                            existing is UnavailableEntry &&
+                            existing.definition == definition &&
+                            existing.implementationId == definition.implementationId &&
+                            providerReasonMatches(existing, resolution.error)
+                    }
+                }
+
+                if (!canKeep) {
+                    if (existing != null) {
+                        retireLocked(existing, stops, closures)
+                    }
                     installDefinitionLocked(
                         definition,
                         constructionPlans,
-                        predecessorClosed = inheritedPredecessorBarrier(existing),
+                        predecessorClosed = existing?.let { inheritedPredecessorBarrier(it) },
                     )
                 }
             }
@@ -391,6 +466,14 @@ class ChannelRuntimeRegistry(
                     null,
                 )
             }
+            is ChannelProviderResolution.Unavailable -> {
+                entries[definition.id] = unavailableEntry(
+                    definition,
+                    generation,
+                    ChannelPreparationReason.Provider(resolution.error),
+                    null,
+                )
+            }
             is ChannelProviderResolution.Available -> {
                 val descriptor = resolution.provider.descriptor
                 val scope = RevocableChannelCapabilityScope(
@@ -414,13 +497,21 @@ class ChannelRuntimeRegistry(
                         ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.ProviderInitialising),
                         descriptor.presentation.summary,
                     ),
+                    definition.implementationId,
+                    resolution.provider.fingerprint,
                     scope,
                     gate,
                     context,
                     predecessorClosed,
                 )
                 entries[definition.id] = pending
-                constructionPlans += ConstructionPlan(pending, resolution.provider, descriptor.presentation.summary)
+                constructionPlans += ConstructionPlan(
+                    pending,
+                    resolution.provider,
+                    definition.implementationId,
+                    resolution.provider.fingerprint,
+                    descriptor.presentation.summary,
+                )
             }
         }
     }
@@ -536,11 +627,13 @@ class ChannelRuntimeRegistry(
                         implementationId = plan.entry.definition.implementationId,
                         enabled = plan.entry.definition.enabled,
                     ),
+                    plan.entry.implementationId,
+                    plan.entry.providerFingerprint!!,
                     plan.entry.capabilities,
                     plan.entry.gate,
                     plan.entry.generationContext,
                     runtime,
-                ).also { 
+                ).also {
                     entries[plan.entry.definition.id] = it
                     publishAggregateLocked()
                 }
@@ -615,6 +708,7 @@ class ChannelRuntimeRegistry(
                     plan.entry.generation,
                     ChannelPreparationReason.Provider(error),
                     plan.summary,
+                    plan.provider.fingerprint,
                 )
                 publishAggregateLocked()
             }
@@ -631,6 +725,7 @@ class ChannelRuntimeRegistry(
                     plan.entry.generation,
                     ChannelPreparationReason.RuntimeFailed(message),
                     plan.summary,
+                    plan.provider.fingerprint,
                 )
                 publishAggregateLocked()
             }
@@ -791,11 +886,30 @@ class ChannelRuntimeRegistry(
         generation: RuntimeGeneration,
         reason: ChannelPreparationReason,
         summary: String?,
+        providerFingerprint: ProviderRevisionFingerprint? = null,
     ): UnavailableEntry = UnavailableEntry(
         definition,
         generation,
         snapshotFor(definition, ChannelPreparationAvailability.Unavailable(reason), summary),
+        definition.implementationId,
+        providerFingerprint,
     )
+
+    /**
+     * Returns true when the existing unavailable entry's typed provider error matches the
+     * newly resolved [ChannelProviderError], so reconciliation can retain the entry without
+     * churn. A mismatch (reason transition) returns false, causing the caller to retire and
+     * reinstall with the updated reason.
+     */
+    private fun providerReasonMatches(
+        entry: RuntimeEntry,
+        error: ChannelProviderError,
+    ): Boolean {
+        val preparation = entry.snapshotState.preparation
+        return preparation is ChannelPreparationAvailability.Unavailable &&
+            preparation.reason is ChannelPreparationReason.Provider &&
+            preparation.reason.error == error
+    }
 
     private fun snapshotFor(
         definition: ChannelDefinition,

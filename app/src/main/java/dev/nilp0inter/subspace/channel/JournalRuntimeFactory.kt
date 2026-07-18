@@ -15,6 +15,7 @@ import dev.nilp0inter.subspace.channel.capability.JournalStorageCapability
 import dev.nilp0inter.subspace.channel.capability.opaqueAudioRecording
 import dev.nilp0inter.subspace.model.BuiltInChannelDescriptors
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
@@ -33,6 +34,7 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Provider-backed Journal runtime construction with no filesystem or controller authority. */
 class JournalBuiltInProvider : ChannelImplementationProvider {
     override val descriptor = BuiltInChannelDescriptors.journal
+    override val fingerprint = ProviderRevisionFingerprint.BUILTIN
 
     override suspend fun constructRuntime(
         request: ChannelRuntimeConstructionRequest,

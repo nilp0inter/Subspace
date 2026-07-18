@@ -41,6 +41,14 @@ internal class ServiceChannelManager(
                     ),
                 )
             }
+            is ChannelProviderResolution.Unavailable -> {
+                return ChannelRepositoryMutationResult.Failure(
+                    ChannelRepositoryError.ProviderMigration(
+                        definitionId = "new",
+                        error = resolution.error,
+                    ),
+                )
+            }
         }
         return channelRepository.addChannel(
             ChannelDefinition(
@@ -63,6 +71,11 @@ internal class ServiceChannelManager(
         val provider = when (val resolution = providerRegistry.resolve(definition.implementationId)) {
             is ChannelProviderResolution.Available -> resolution.provider
             is ChannelProviderResolution.Missing -> {
+                return ChannelRepositoryMutationResult.Failure(
+                    ChannelRepositoryError.ProviderMigration(channelId, resolution.error),
+                )
+            }
+            is ChannelProviderResolution.Unavailable -> {
                 return ChannelRepositoryMutationResult.Failure(
                     ChannelRepositoryError.ProviderMigration(channelId, resolution.error),
                 )

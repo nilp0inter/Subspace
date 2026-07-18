@@ -14,12 +14,16 @@ import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
 import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
 import dev.nilp0inter.subspace.channel.capability.RevocableChannelCapabilityScope
 import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.model.ChannelImplementationId
+import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
 import dev.nilp0inter.subspace.model.GenerationExecutionContextImpl
 import dev.nilp0inter.subspace.model.GenerationAdmission
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import dev.nilp0inter.subspace.service.ChannelActivationResult
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
@@ -44,6 +48,30 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+
+/** Test-only identity for generic Lua provider behavior. */
+private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
+
+/**
+ * Constructs a test Lua provider with fixed identity and presentation.
+ */
+private fun testLuaProvider(
+    image: ImmutableProgramImage,
+    bridge: LuaKernelBridge,
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    programImage = image,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, policy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
+    },
+    bridge = bridge,
+)
 
 /**
  * Behavioral tests for the provider-neutral adapter seam. The retained bridge
@@ -765,7 +793,7 @@ class LuaAdapterRuntimeTest {
         val definition = ChannelDefinition(
             id = instanceId,
             name = "Lua adapter",
-            implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+            implementationId = TEST_LUA_IMPLEMENTATION_ID,
             enabled = true,
             configSchemaVersion = 1,
             configPayload = OpaqueJsonObject.fromJsonObject(org.json.JSONObject()),
@@ -782,11 +810,11 @@ class LuaAdapterRuntimeTest {
             host = NoCapabilitiesHost,
         )
         bridge.retainedCallbacks = callbacks
-        val result = LuaChannelImplementationProvider(image, bridge).constructRuntime(
+        val result = testLuaProvider(image, bridge).constructRuntime(
             ChannelRuntimeConstructionRequest(
                 definition = definition,
                 configuration = ValidatedChannelConfiguration(
-                    implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
+                    implementationId = TEST_LUA_IMPLEMENTATION_ID,
                     schemaVersion = 1,
                     payload = definition.configPayload,
                 ),

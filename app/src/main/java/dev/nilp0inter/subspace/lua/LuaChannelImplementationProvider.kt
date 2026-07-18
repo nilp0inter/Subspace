@@ -1,6 +1,9 @@
 package dev.nilp0inter.subspace.lua
 
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
+import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
+import dev.nilp0inter.subspace.model.GenerationExecutionContext
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.lua.actor.ActorConstructResult
 import dev.nilp0inter.subspace.lua.actor.ActorPolicy
 import dev.nilp0inter.subspace.lua.actor.ActorRuntimeCreationResult
@@ -21,9 +24,6 @@ import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Stable internal implementation identifier; intentionally absent from built-in registration. */
-internal val LUA_CHANNEL_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
-
 /**
  * Host-supplied Lua implementation provider.
  *
@@ -32,38 +32,70 @@ internal val LUA_CHANNEL_IMPLEMENTATION_ID = ChannelImplementationId("internal:l
  * the provider itself is lazy and creates neither a Lua actor nor a Lua state.
  */
 internal class LuaChannelImplementationProvider private constructor(
+    private val implementationId: ChannelImplementationId,
+    private val presentation: ChannelPresentationMetadata,
     private val imageResult: ProgramImageCreationResult,
+    override val fingerprint: ProviderRevisionFingerprint,
+    private val actorFactory: (GenerationExecutionContext, ChannelCapabilityScope, LuaKernelBridge, ActorPolicy) -> ActorRuntimeCreationResult,
     private val bridge: LuaKernelBridge,
     private val actorPolicy: ActorPolicy,
     private val validationBounds: ValidationBounds,
 ) : ChannelImplementationProvider {
-    constructor(
-        programImage: ImmutableProgramImage,
-        bridge: LuaKernelBridge,
-        actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
-        validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
-    ) : this(ProgramImageCreationResult.Success(programImage), bridge, actorPolicy, validationBounds)
 
     companion object {
         private val RECOGNIZED_CALLBACKS = setOf(
             "startup", "handle_lifecycle", "handle_input", "handle_sos", "handle_readiness",
         )
-        fun fromCreationResult(
-            imageResult: ProgramImageCreationResult,
+
+        fun create(
+            implementationId: ChannelImplementationId,
+            presentation: ChannelPresentationMetadata,
+            programImage: ImmutableProgramImage,
+            fingerprint: ProviderRevisionFingerprint,
+            actorFactory: (GenerationExecutionContext, ChannelCapabilityScope, LuaKernelBridge, ActorPolicy) -> ActorRuntimeCreationResult,
             bridge: LuaKernelBridge,
             actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
             validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
-        ) = LuaChannelImplementationProvider(imageResult, bridge, actorPolicy, validationBounds)
+        ) = LuaChannelImplementationProvider(
+            implementationId = implementationId,
+            presentation = presentation,
+            imageResult = ProgramImageCreationResult.Success(programImage),
+            fingerprint = fingerprint,
+            actorFactory = actorFactory,
+            bridge = bridge,
+            actorPolicy = actorPolicy,
+            validationBounds = validationBounds,
+        )
+
+        /**
+         * Test-visible factory that accepts a [ProgramImageCreationResult] directly,
+         * allowing tests to exercise failure-projection paths with incompatible images.
+         */
+        internal fun fromImageResult(
+            implementationId: ChannelImplementationId,
+            presentation: ChannelPresentationMetadata,
+            imageResult: ProgramImageCreationResult,
+            fingerprint: ProviderRevisionFingerprint,
+            actorFactory: (GenerationExecutionContext, ChannelCapabilityScope, LuaKernelBridge, ActorPolicy) -> ActorRuntimeCreationResult,
+            bridge: LuaKernelBridge,
+            actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
+            validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
+        ) = LuaChannelImplementationProvider(
+            implementationId = implementationId,
+            presentation = presentation,
+            imageResult = imageResult,
+            fingerprint = fingerprint,
+            actorFactory = actorFactory,
+            bridge = bridge,
+            actorPolicy = actorPolicy,
+            validationBounds = validationBounds,
+        )
     }
 
     override val descriptor = ChannelImplementationDescriptor(
-        implementationId = LUA_CHANNEL_IMPLEMENTATION_ID,
-        presentation = ChannelPresentationMetadata(
-            label = "Lua channel",
-            summary = "LUA RUNTIME",
-            unavailableMessage = "Lua program could not be constructed.",
-        ),
-        configuration = LuaEmptyConfigurationProvider,
+        implementationId = implementationId,
+        presentation = presentation,
+        configuration = LuaEmptyConfigurationProvider(implementationId),
         configurationFields = emptyList(),
         requiredCapabilities = emptySet<ChannelCapability>(),
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
@@ -91,11 +123,11 @@ internal class LuaChannelImplementationProvider private constructor(
         }
 
         val actor = when (
-            val result = ActorRuntimeFactory.createForGeneration(
-                generationContext = request.generationContext,
-                capabilities = request.capabilities,
-                bridge = bridge,
-                policy = actorPolicy,
+            val result = actorFactory(
+                request.generationContext,
+                request.capabilities,
+                bridge,
+                actorPolicy,
             )
         ) {
             is ActorRuntimeCreationResult.Success -> result.actor
@@ -236,8 +268,9 @@ internal class LuaChannelImplementationProvider private constructor(
 }
 
 /** Minimal schema boundary; Lua source is never decoded from configuration. */
-private object LuaEmptyConfigurationProvider : ChannelConfigurationProvider {
-    override val implementationId: ChannelImplementationId = LUA_CHANNEL_IMPLEMENTATION_ID
+private class LuaEmptyConfigurationProvider(
+    override val implementationId: ChannelImplementationId
+) : ChannelConfigurationProvider {
     override val currentSchemaVersion: Int = 1
 
     override fun defaultPayload(): OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(JSONObject())

@@ -19,6 +19,7 @@ import dev.nilp0inter.subspace.model.AgentOperationId
 import dev.nilp0inter.subspace.model.AgentRunId
 import dev.nilp0inter.subspace.model.BuiltInChannelDescriptors
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionResult
@@ -34,6 +35,7 @@ import kotlinx.coroutines.flow.asStateFlow
 /** Provider-backed Debug runtime construction without controller, model-path, or service access. */
 class DebugBuiltInProvider : ChannelImplementationProvider {
     override val descriptor = BuiltInChannelDescriptors.debug
+    override val fingerprint = ProviderRevisionFingerprint.BUILTIN
 
     override suspend fun constructRuntime(
         request: ChannelRuntimeConstructionRequest,

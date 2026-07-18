@@ -12,7 +12,7 @@ value class ChannelImplementationId(val value: String) {
     override fun toString(): String = value
 
     companion object {
-        private val IMPLEMENTATION_ID = Regex("[a-z][a-z0-9._-]*:[a-z][a-z0-9._-]*")
+        private val IMPLEMENTATION_ID = Regex("[a-z][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*")
     }
 }
 

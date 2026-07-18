@@ -6,16 +6,21 @@ import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
 import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
+import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.lua.ImmutableProgramImage
 import dev.nilp0inter.subspace.lua.LuaChannelImplementationProvider
+import dev.nilp0inter.subspace.lua.LuaKernelBridge
 import dev.nilp0inter.subspace.lua.LuaNativeKernelBridge
 import dev.nilp0inter.subspace.lua.LuaProgramRequirements
 import dev.nilp0inter.subspace.lua.ProgramImageCreationResult
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
+import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
 import dev.nilp0inter.subspace.model.ChannelProviderError
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runCurrent
@@ -23,6 +28,31 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+
+/** Test-only identity for generic Lua provider behavior. */
+private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
+
+/**
+ * Constructs a test Lua provider from an image creation result (success or failure).
+ * Used for testing error projection paths.
+ */
+private fun testLuaProviderFromResult(
+    imageResult: ProgramImageCreationResult,
+    bridge: LuaKernelBridge,
+): LuaChannelImplementationProvider = LuaChannelImplementationProvider.fromImageResult(
+    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+    presentation = ChannelPresentationMetadata(
+        label = "Lua channel",
+        summary = "LUA RUNTIME",
+        unavailableMessage = "Lua program could not be constructed.",
+    ),
+    imageResult = imageResult,
+    fingerprint = ProviderRevisionFingerprint("builtin"),
+    actorFactory = { context, capabilities, kernelBridge, policy ->
+        ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
+    },
+    bridge = bridge,
+)
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RuntimeCompatibilityFailureProjectionTest {
@@ -43,7 +73,7 @@ class RuntimeCompatibilityFailureProjectionTest {
                 ),
             )
             assertTrue("${case.requirement}: expected incompatible image creation", creation is ProgramImageCreationResult.Failure)
-            val provider = LuaChannelImplementationProvider.fromCreationResult(
+            val provider = testLuaProviderFromResult(
                 imageResult = creation,
                 bridge = LuaNativeKernelBridge(),
             )

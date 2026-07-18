@@ -228,6 +228,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         get() = openAiProfileFacade.dynamicChoiceResolver
     private lateinit var coreInitializer: ServiceCoreInitializer
     private lateinit var providerRegistry: ChannelImplementationProviderRegistry
+    /** Service-owned installed-package coordinator; started after built-in registration. */
+    private lateinit var installedPackagesCoordinator: InstalledPackagesCoordinator
+    /** Internal facade exposing installed-package state and mutations for host actions. */
+    private lateinit var installedPackagesFacade: InstalledPackagesFacade
+    internal val installedPackages: InstalledPackagesFacade get() = installedPackagesFacade
     private val _channelDescriptors = MutableStateFlow<List<ChannelImplementationDescriptor>>(emptyList())
     val channelDescriptors: StateFlow<List<ChannelImplementationDescriptor>> = _channelDescriptors.asStateFlow()
     private lateinit var runtimeInvocationBoundary: RuntimeInvocationBoundary
@@ -512,6 +517,23 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 )
             }
         )
+        // Compose the service-owned installed-package coordinator after synchronous
+        // built-in registration and runtime-registry construction. Package loading runs
+        // asynchronously on Dispatchers.IO; built-in providers and foreground-service
+        // startup proceed without waiting for package I/O. Lua remains dormant until the
+        // runtime registry constructs a generation for a matching catalogue instance.
+        installedPackagesCoordinator = InstalledPackagesCoordinator(
+            storeRoot = java.io.File(noBackupFilesDir, "installed-lua-packages"),
+            providerRegistry = providerRegistry,
+            bridge = dev.nilp0inter.subspace.lua.LuaNativeKernelBridge(),
+            onCatalogueReconcile = {
+                _channelDescriptors.value = providerRegistry.descriptors()
+                runtimeRegistry.reconcile(channelRepository.catalogueState.value)
+            },
+            serviceScope = serviceScope,
+        )
+        installedPackagesFacade = InstalledPackagesFacade(installedPackagesCoordinator)
+        installedPackagesCoordinator.start()
         carTelecomStarter = CarTelecomStarter(
             context = this,
             serviceScope = serviceScope,
@@ -790,6 +812,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     hostAudioCoordinator.close()
                     agentRuntimeGraph.playback.close()
                     agentRuntimeGraph.deferredAudioPlayback.close()
+                    // Stop package publication and close the repository before runtime
+                    // generations are torn down, so no new providers appear during teardown.
+                    if (::installedPackagesCoordinator.isInitialized) {
+                        installedPackagesCoordinator.shutdown()
+                    }
                     runtimeRegistry.shutdownAndAwait()
                     openAiProfileOperations.close()
                     textOutputService.close()

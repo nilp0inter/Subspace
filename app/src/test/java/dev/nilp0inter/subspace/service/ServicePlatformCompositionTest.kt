@@ -12,10 +12,12 @@ import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -62,8 +64,11 @@ class ServicePlatformCompositionTest {
             name = "Replacement",
             configPayload = opaque("""{"stage":2,"profile":"new"}"""),
         )
-        registry.reconcile(ChannelCatalogueSnapshot(listOf(replacement, sibling), replacement.id))
+        val replacementReconcile = async {
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(replacement, sibling), replacement.id))
+        }
         runCurrent()
+        assertFalse(replacementReconcile.isCompleted)
         val replacementRuntime = provider.runtimes.single { it.profile == "new" }
         assertEquals(0, oldRuntime.closeCount)
         assertEquals(listOf("alpha", "beta"), registry.runtimeSnapshots.value.entries.map { it.id })
@@ -76,6 +81,7 @@ class ServicePlatformCompositionTest {
             "late competing terminal signal",
         )
         releaseGate.complete(Unit)
+        replacementReconcile.await()
         advanceUntilIdle()
 
         assertEquals(listOf("released:old", "closed:old"), oldRuntime.events)
@@ -116,10 +122,10 @@ class ServicePlatformCompositionTest {
         )
         assertEquals(1, siblingRuntime.closeCount)
         assertTrue(registry.prepareInput(sibling.id) is ChannelInputAcceptance.Unavailable)
-        assertEquals(
-            listOf("alpha:0:REVOKED", "alpha:1:REVOKED", "beta:0:REVOKED"),
-            capabilityHost.cleanup,
-        )
+        val acquiredScopeCleanups = capabilityHost.acquisitions.map { identity ->
+            "${identity.channelInstanceId}:${identity.runtimeGeneration.value}:REVOKED"
+        }
+        assertEquals(acquiredScopeCleanups, capabilityHost.cleanup)
     }
 
     private fun definition(id: String, name: String, profile: String): ChannelDefinition = ChannelDefinition(

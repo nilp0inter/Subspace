@@ -67,6 +67,91 @@ sealed interface ChannelProviderError {
         override val message =
             "Runtime compatibility failure for $implementationId: $requirement requires $requiredVersion (supported $supportedVersion)"
     }
+
+    /**
+     * An installed package provider that was committed to the installed-package index but
+     * could not be materialized (archive corruption, compatibility failure, integrity
+     * mismatch, etc.). The provider remains in the durable catalogue but cannot construct
+     * a runtime until the user explicitly updates, rolls back, or removes the package.
+     *
+     * [category] and [detail] are an exhaustive normalized projection of the underlying
+     * typed package failure; the model layer does not import or depend on the package
+     * failure sealed hierarchy. An adapter in the dependency layer performs the mapping.
+     */
+    data class PackageUnavailable(
+        override val implementationId: ChannelImplementationId,
+        val category: PackageUnavailableCategory,
+        val detail: PackageUnavailableDetail,
+    ) : ChannelProviderError {
+        override val message =
+            "Installed package provider $implementationId is unavailable: $category/$detail"
+    }
+
+    /**
+     * Normalized package-unavailability category mirroring the package failure hierarchy.
+     * Adding a new package failure category REQUIRES adding a matching entry here.
+     */
+    enum class PackageUnavailableCategory {
+        FORMAT,
+        IDENTITY,
+        COMPATIBILITY,
+        INTEGRITY,
+        STORAGE,
+        RECOVERY,
+        MUTATION,
+        ROLLBACK,
+        LOADING,
+        SHUTDOWN,
+    }
+
+    /**
+     * Exhaustive normalized failure-code enum. Every package failure detail across all
+     * categories MUST have exactly one matching entry. The adapter enforces exhaustiveness
+     * at compile time via a sealed `when` over the source hierarchy.
+     */
+    enum class PackageUnavailableDetail {
+        INVALID_ZIP,
+        UNEXPECTED_ENTRY,
+        MISSING_MANIFEST,
+        MALFORMED_MANIFEST,
+        DUPLICATE_KEYS,
+        UNKNOWN_FIELDS,
+        INVALID_ENTRY_MODULE,
+        INVALID_MODULE_GRAMMAR,
+        COLLISION,
+        BYTECODE_PROHIBITED,
+        UNSUPPORTED_COMPRESSION,
+        ENCRYPTED_ENTRY,
+        BOUNDS_EXCEEDED,
+        REPOSITORY_ID_MISMATCH,
+        RESERVED_NAMESPACE_CLAIM,
+        UNSUPPORTED_MANIFEST_VERSION,
+        LUA_VERSION_INCOMPATIBLE,
+        API_VERSION_INCOMPATIBLE,
+        DIGEST_MISMATCH,
+        CORRUPTED_ARCHIVE,
+        HASH_COMPUTATION_FAILED,
+        WRITE_FAILED,
+        COMMIT_FAILED,
+        INSUFFICIENT_SPACE,
+        INDEX_CORRUPT,
+        RECOVERY_INDEX_INVALID,
+        ORPHAN_CLEANUP_FAILED,
+        COMMIT_STATE_AMBIGUOUS,
+        SERIALIZATION_VIOLATION,
+        CONCURRENT_MUTATION,
+        STAGE_FAILED,
+        NOT_INSTALLED,
+        NO_ROLLBACK_REVISION,
+        ROLLBACK_VALIDATION_FAILED,
+        LOAD_CANCELLED,
+        STALE_PUBLICATION,
+        LOAD_TIMEOUT,
+        RECONCILIATION_FAILED,
+        PUBLICATION_REJECTED,
+        SHUTDOWN_IN_PROGRESS,
+        TRANSACTION_ABORTED,
+    }
 }
 
 sealed interface ProviderConfigurationResult {
@@ -380,8 +465,26 @@ sealed interface ChannelRuntimeConstructionResult {
     data class Failure(val error: ChannelProviderError) : ChannelRuntimeConstructionResult
 }
 
+@JvmInline
+public value class ProviderRevisionFingerprint(val value: String) {
+    init {
+        require(value.isNotBlank()) {
+            "Fingerprint must not be blank"
+        }
+    }
+
+    public companion object {
+        public val BUILTIN = ProviderRevisionFingerprint("builtin")
+        public fun fromDigest(digest: dev.nilp0inter.subspace.dependency.ArtifactDigest): ProviderRevisionFingerprint {
+            return ProviderRevisionFingerprint(digest.value)
+        }
+    }
+}
+
 interface ChannelImplementationProvider {
     val descriptor: ChannelImplementationDescriptor
+    val fingerprint: ProviderRevisionFingerprint
+        get() = ProviderRevisionFingerprint.BUILTIN
 
     suspend fun constructRuntime(request: ChannelRuntimeConstructionRequest): ChannelRuntimeConstructionResult
 }
@@ -394,6 +497,7 @@ sealed interface ChannelProviderRegistrationResult {
 sealed interface ChannelProviderResolution {
     data class Available(val provider: ChannelImplementationProvider) : ChannelProviderResolution
     data class Missing(val error: ChannelProviderError.MissingProvider) : ChannelProviderResolution
+    data class Unavailable(val error: ChannelProviderError.PackageUnavailable) : ChannelProviderResolution
 }
 
 sealed interface ChannelDescriptorResolution {
@@ -405,27 +509,310 @@ interface ChannelImplementationDescriptorResolver {
     fun resolveDescriptor(implementationId: ChannelImplementationId): ChannelDescriptorResolution
 }
 
+public data class InstalledProviderBinding(
+    val repositoryId: dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity,
+    val expectedDigest: dev.nilp0inter.subspace.dependency.ArtifactDigest,
+    val provider: ChannelImplementationProvider,
+)
+
+public sealed interface InstalledProvidersPublicationResult {
+    public data class Success(val snapshotRevision: Long) : InstalledProvidersPublicationResult
+    public data class Rejected(val error: InstalledProvidersRejectionReason) : InstalledProvidersPublicationResult
+}
+
+public sealed interface InstalledProvidersRejectionReason {
+    public data class InvalidId(val id: ChannelImplementationId, val detail: String) : InstalledProvidersRejectionReason
+    public data class ReservedCollision(val id: ChannelImplementationId) : InstalledProvidersRejectionReason
+    public data class AgreementMismatch(val id: ChannelImplementationId, val detail: String) : InstalledProvidersRejectionReason
+    public data class MissingRevision(val id: ChannelImplementationId) : InstalledProvidersRejectionReason
+    public data class DuplicateValue(val id: ChannelImplementationId) : InstalledProvidersRejectionReason
+    public data class RevisionOverflow(val message: String) : InstalledProvidersRejectionReason
+}
+
+private data class InstalledProviderGlobalFallback(
+    val category: ChannelProviderError.PackageUnavailableCategory,
+    val detail: ChannelProviderError.PackageUnavailableDetail,
+)
+
+private data class RegistryState(
+    val revision: Long,
+    val resolutionMap: Map<ChannelImplementationId, ChannelImplementationProvider>,
+    val installedBindings: Map<ChannelImplementationId, InstalledProviderBinding>,
+    val installedFailures: Map<ChannelImplementationId, ChannelProviderError.PackageUnavailable>,
+    val globalFallback: InstalledProviderGlobalFallback? = null,
+)
+
+private data class ValidatedCandidateInfo(
+    val id: ChannelImplementationId,
+    val binding: InstalledProviderBinding,
+    val expectedFingerprint: ProviderRevisionFingerprint,
+)
+
 /** Deterministic insertion-ordered registry; a duplicate never replaces the original provider. */
 class ChannelImplementationProviderRegistry : ChannelImplementationDescriptorResolver {
-    private val providers = LinkedHashMap<ChannelImplementationId, ChannelImplementationProvider>()
+    private val builtIns = LinkedHashMap<ChannelImplementationId, ChannelImplementationProvider>()
+
+    @Volatile
+    private var state: RegistryState = RegistryState(
+        revision = 0L,
+        resolutionMap = emptyMap(),
+        installedBindings = emptyMap(),
+        installedFailures = emptyMap(),
+        globalFallback = null,
+    )
+
+    val snapshotRevision: Long
+        get() = state.revision
 
     fun register(provider: ChannelImplementationProvider): ChannelProviderRegistrationResult {
         val id = provider.descriptor.implementationId
-        if (providers.containsKey(id)) {
+        return registerInternal(id, provider)
+    }
+
+    @Synchronized
+    private fun registerInternal(id: ChannelImplementationId, provider: ChannelImplementationProvider): ChannelProviderRegistrationResult {
+        if (state.revision > 0L) {
             return ChannelProviderRegistrationResult.Rejected(ChannelProviderError.DuplicateRegistration(id))
         }
-        providers[id] = provider
+        if (dev.nilp0inter.subspace.dependency.InstalledProviderId.isInstalled(id)) {
+            return ChannelProviderRegistrationResult.Rejected(ChannelProviderError.DuplicateRegistration(id))
+        }
+        if (builtIns.containsKey(id)) {
+            return ChannelProviderRegistrationResult.Rejected(ChannelProviderError.DuplicateRegistration(id))
+        }
+        builtIns[id] = provider
+        updateState()
         return ChannelProviderRegistrationResult.Registered
     }
 
+    fun publishInstalledProviders(
+        candidate: Map<ChannelImplementationId, InstalledProviderBinding>,
+        unavailable: Map<ChannelImplementationId, ChannelProviderError.PackageUnavailable> = emptyMap(),
+    ): InstalledProvidersPublicationResult {
+        if (state.revision == Long.MAX_VALUE) {
+            return InstalledProvidersPublicationResult.Rejected(
+                InstalledProvidersRejectionReason.RevisionOverflow("Monotonic revision overflowed")
+            )
+        }
+
+        val validatedCandidates = ArrayList<ValidatedCandidateInfo>(candidate.size)
+        val uniqueProviders = java.util.HashSet<ChannelImplementationProvider>()
+        val uniqueRepoIds = java.util.HashSet<dev.nilp0inter.subspace.dependency.GitHubRepositoryIdentity>()
+        val allIds = java.util.HashSet<ChannelImplementationId>()
+
+        for ((id, binding) in candidate) {
+            if (isBuiltInId(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.ReservedCollision(id)
+                )
+            }
+            val provider = binding.provider
+            val providerId = provider.descriptor.implementationId
+            val configId = provider.descriptor.configuration.implementationId
+            val providerFingerprint = provider.fingerprint
+            val expectedFingerprint = ProviderRevisionFingerprint.fromDigest(binding.expectedDigest)
+
+            val expectedDerivedId = dev.nilp0inter.subspace.dependency.InstalledProviderId.derive(binding.repositoryId)
+            if (id != expectedDerivedId) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.InvalidId(id, "ID does not match derived identity: expected $expectedDerivedId")
+                )
+            }
+            if (providerId != id) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.AgreementMismatch(id, "Provider descriptor ID does not match key")
+                )
+            }
+            if (configId != id) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.AgreementMismatch(id, "Provider configuration ID does not match key")
+                )
+            }
+            if (providerFingerprint != expectedFingerprint) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.AgreementMismatch(id, "Provider fingerprint does not match expected fingerprint")
+                )
+            }
+            if (!uniqueProviders.add(provider)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.DuplicateValue(id)
+                )
+            }
+            if (!uniqueRepoIds.add(binding.repositoryId)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.DuplicateValue(id)
+                )
+            }
+            if (!allIds.add(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.DuplicateValue(id)
+                )
+            }
+
+            validatedCandidates.add(ValidatedCandidateInfo(id, binding, expectedFingerprint))
+        }
+
+        // Validate unavailable entries: canonical, installed-namespace, disjoint from candidate,
+        // implementationId agrees with the key, and no duplicate IDs.
+        for ((id, error) in unavailable) {
+            if (isBuiltInId(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.ReservedCollision(id)
+                )
+            }
+            if (!dev.nilp0inter.subspace.dependency.InstalledProviderId.isInstalled(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.InvalidId(id, "Unavailable entry is not a canonical installed provider ID")
+                )
+            }
+            if (error.implementationId != id) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.AgreementMismatch(id, "Unavailable error implementationId does not match key")
+                )
+            }
+            if (!allIds.add(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.DuplicateValue(id)
+                )
+            }
+        }
+
+        return publishInternal(validatedCandidates, unavailable)
+    }
+
+    /**
+     * Fail-closed publication: atomically replaces every installed binding and failure
+     * entry with empty maps and sets an immutable global installed-store failure template.
+     * The revision is incremented so observers see a new generation. Any canonical
+     * github-repository ID that has no explicit entry will resolve to a [PackageUnavailable]
+     * using the supplied category/detail.
+     *
+     * Normal [publishInstalledProviders] clears the global fallback.
+     */
+    fun publishFailClosed(
+        category: ChannelProviderError.PackageUnavailableCategory,
+        detail: ChannelProviderError.PackageUnavailableDetail,
+    ): InstalledProvidersPublicationResult {
+        if (state.revision == Long.MAX_VALUE) {
+            return InstalledProvidersPublicationResult.Rejected(
+                InstalledProvidersRejectionReason.RevisionOverflow("Monotonic revision overflowed")
+            )
+        }
+        return publishFailClosedInternal(category, detail)
+    }
+
+    @Synchronized
+    private fun publishFailClosedInternal(
+        category: ChannelProviderError.PackageUnavailableCategory,
+        detail: ChannelProviderError.PackageUnavailableDetail,
+    ): InstalledProvidersPublicationResult {
+        if (state.revision == Long.MAX_VALUE) {
+            return InstalledProvidersPublicationResult.Rejected(
+                InstalledProvidersRejectionReason.RevisionOverflow("Monotonic revision overflowed")
+            )
+        }
+
+        val newRevision = state.revision + 1L
+        val newResolutionMap = LinkedHashMap<ChannelImplementationId, ChannelImplementationProvider>()
+        newResolutionMap.putAll(builtIns)
+
+        state = RegistryState(
+            revision = newRevision,
+            resolutionMap = java.util.Collections.unmodifiableMap(newResolutionMap),
+            installedBindings = emptyMap(),
+            installedFailures = emptyMap(),
+            globalFallback = InstalledProviderGlobalFallback(
+                category = category,
+                detail = detail,
+            ),
+        )
+        return InstalledProvidersPublicationResult.Success(newRevision)
+    }
+
+    @Synchronized
+    private fun publishInternal(
+        validatedCandidates: List<ValidatedCandidateInfo>,
+        unavailable: Map<ChannelImplementationId, ChannelProviderError.PackageUnavailable>,
+    ): InstalledProvidersPublicationResult {
+        if (state.revision == Long.MAX_VALUE) {
+            return InstalledProvidersPublicationResult.Rejected(
+                InstalledProvidersRejectionReason.RevisionOverflow("Monotonic revision overflowed")
+            )
+        }
+
+        for (info in validatedCandidates) {
+            if (isBuiltInId(info.id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.ReservedCollision(info.id)
+                )
+            }
+        }
+        for ((id, _) in unavailable) {
+            if (isBuiltInId(id)) {
+                return InstalledProvidersPublicationResult.Rejected(
+                    InstalledProvidersRejectionReason.ReservedCollision(id)
+                )
+            }
+        }
+
+        val newRevision = state.revision + 1L
+        val newResolutionMap = LinkedHashMap<ChannelImplementationId, ChannelImplementationProvider>()
+        newResolutionMap.putAll(builtIns)
+        val newInstalledBindings = LinkedHashMap<ChannelImplementationId, InstalledProviderBinding>()
+        for (info in validatedCandidates) {
+            newResolutionMap[info.id] = info.binding.provider
+            newInstalledBindings[info.id] = info.binding
+        }
+        val newInstalledFailures = java.util.Collections.unmodifiableMap(LinkedHashMap(unavailable))
+        state = RegistryState(
+            revision = newRevision,
+            resolutionMap = java.util.Collections.unmodifiableMap(newResolutionMap),
+            installedBindings = java.util.Collections.unmodifiableMap(newInstalledBindings),
+            installedFailures = newInstalledFailures,
+            globalFallback = null,
+        )
+        return InstalledProvidersPublicationResult.Success(newRevision)
+    }
+
+    private fun isBuiltInId(id: ChannelImplementationId): Boolean {
+        return id == BuiltInChannelImplementationIds.JOURNAL ||
+                id == BuiltInChannelImplementationIds.DEBUG ||
+                id == BuiltInChannelImplementationIds.KEYBOARD ||
+                id == BuiltInChannelImplementationIds.OPENAI_AGENT ||
+                id.value.startsWith("builtin:")
+    }
+
+    private fun updateState() {
+        val newResolutionMap = LinkedHashMap<ChannelImplementationId, ChannelImplementationProvider>()
+        newResolutionMap.putAll(builtIns)
+        for ((id, binding) in state.installedBindings) {
+            newResolutionMap[id] = binding.provider
+        }
+        state = RegistryState(
+            revision = state.revision,
+            resolutionMap = java.util.Collections.unmodifiableMap(newResolutionMap),
+            installedBindings = state.installedBindings,
+            installedFailures = state.installedFailures,
+            globalFallback = state.globalFallback,
+        )
+    }
+
     fun resolve(implementationId: ChannelImplementationId): ChannelProviderResolution =
-        providers[implementationId]?.let(ChannelProviderResolution::Available)
+        state.resolutionMap[implementationId]?.let(ChannelProviderResolution::Available)
+            ?: state.installedFailures[implementationId]?.let(ChannelProviderResolution::Unavailable)
+            ?: state.globalFallback?.let { fallback ->
+                if (dev.nilp0inter.subspace.dependency.InstalledProviderId.isInstalled(implementationId)) {
+                    ChannelProviderResolution.Unavailable(
+                        ChannelProviderError.PackageUnavailable(implementationId, fallback.category, fallback.detail)
+                    )
+                } else null
+            }
             ?: ChannelProviderResolution.Missing(ChannelProviderError.MissingProvider(implementationId))
 
-    fun descriptors(): List<ChannelImplementationDescriptor> = providers.values.map { it.descriptor }
+    fun descriptors(): List<ChannelImplementationDescriptor> = state.resolutionMap.values.map { it.descriptor }
 
     override fun resolveDescriptor(implementationId: ChannelImplementationId): ChannelDescriptorResolution =
-        providers[implementationId]?.descriptor?.let(ChannelDescriptorResolution::Available)
+        state.resolutionMap[implementationId]?.descriptor?.let(ChannelDescriptorResolution::Available)
             ?: ChannelDescriptorResolution.Missing(ChannelProviderError.MissingProvider(implementationId))
 }
 
