@@ -5,6 +5,9 @@ import dev.nilp0inter.subspace.channel.capability.DelayedPlaybackCapability
 import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapability
 import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
 import dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio
+import dev.nilp0inter.subspace.channel.capability.dispose
+import dev.nilp0inter.subspace.channel.capability.generationOf
+import dev.nilp0inter.subspace.channel.capability.retainedBytesOf
 import dev.nilp0inter.subspace.model.AgentMessageId
 import dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason
 import dev.nilp0inter.subspace.model.DelayedPlaybackOperationId
@@ -88,14 +91,18 @@ class DelayedPlaybackCoordinator(
      * the next selected-channel admission synthesizes from the persisted text again.
      */
     suspend fun reconcileAfterRestart(): DurableAgentStoreResult<DurableRecoveryPlan> {
-        synchronized(synthesizedAudio) { synthesizedAudio.clear() }
+        val discarded = synchronized(synthesizedAudio) { synthesizedAudio.values.toList().also { synthesizedAudio.clear() } }
+        discarded.forEach { it.dispose() }
         return store.reconcileAfterRestart().also { requestPump() }
     }
 
     fun close() {
-        synchronized(synthesizedAudio) { synthesizedAudio.clear() }
+        val discarded = synchronized(synthesizedAudio) { synthesizedAudio.values.toList().also { synthesizedAudio.clear() } }
+        discarded.forEach { it.dispose() }
         pumpJob?.cancel()
     }
+
+
 
     private fun requestPump() {
         pumpRequested = true
@@ -168,7 +175,7 @@ class DelayedPlaybackCoordinator(
         return when (result) {
             DelayedPlaybackAudioResult.Completed -> when (store.markHeard(message.id)) {
                 is DurableAgentStoreResult.Success -> {
-                    synchronized(synthesizedAudio) { synthesizedAudio.remove(message.id) }
+                    synchronized(synthesizedAudio) { synthesizedAudio.remove(message.id) }?.dispose()
                     true
                 }
                 is DurableAgentStoreResult.Failure -> {
@@ -180,7 +187,7 @@ class DelayedPlaybackCoordinator(
                 store.skipPlaybackAndPause(message.channelInstanceId, message.id)
             ) {
                 is DurableAgentStoreResult.Success -> {
-                    synchronized(synthesizedAudio) { synthesizedAudio.remove(message.id) }
+                    synchronized(synthesizedAudio) { synthesizedAudio.remove(message.id) }?.dispose()
                     true
                 }
                 is DurableAgentStoreResult.Failure -> false
@@ -256,13 +263,127 @@ class DeferredAudioPlaybackCoordinator(
     private val audio: DeferredAudioPlaybackAudioPort,
     private val onStateChanged: suspend () -> Unit = {},
     private val nowMillis: () -> Long = { System.currentTimeMillis() },
-) : DeferredAudioPlaybackCapability {
+    private val limits: DeferredAudioPlaybackCoordinator.Limits = DeferredAudioPlaybackCoordinator.Limits.DEFAULT,
+    private val processQuota: DeferredAudioPlaybackCoordinator.ProcessQuota =
+        DeferredAudioPlaybackCoordinator.ProcessQuota.DEFAULT,
+) : DeferredAudioPlaybackCapability, GenerationCapabilityResource {
     private val mutex = Mutex()
     private val pending = mutableListOf<DeferredAudioEntry>()
     private val wakeJobs = mutableMapOf<DelayedPlaybackOperationId, Job>()
     private var pumpJob: Job? = null
     @Volatile private var pumpRequested = false
+    @Volatile private var closed = false
     private var activeEntry: DeferredAudioEntry? = null
+    private val revokedGenerations = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<String, dev.nilp0inter.subspace.channel.capability.RuntimeGeneration>>()
+
+    // Per-instance quota counters (this coordinator only).
+    private var instanceEntries: Int = 0
+    private var instanceBytes: Long = 0L
+    // Per-channel-instance quota counters, keyed by stable channel ID.
+    private val channelEntries = mutableMapOf<String, Int>()
+    private val channelBytes = mutableMapOf<String, Long>()
+    // Per-runtime-generation quota counters; RuntimeGeneration is process-unique.
+    private val generationEntries = mutableMapOf<dev.nilp0inter.subspace.channel.capability.RuntimeGeneration, Int>()
+    private val generationBytes = mutableMapOf<dev.nilp0inter.subspace.channel.capability.RuntimeGeneration, Long>()
+
+    private fun isRevoked(channelInstanceId: String, generation: dev.nilp0inter.subspace.channel.capability.RuntimeGeneration): Boolean =
+        revokedGenerations.contains(channelInstanceId to generation)
+
+    private fun isAuthorized(entry: DeferredAudioEntry): Boolean =
+        !closed && !isRevoked(entry.channelInstanceId, entry.quotaGeneration)
+    /** Finite positive limits for this deferred playback coordinator instance. */
+    data class Limits(
+        val maxEntriesPerInstance: Int,
+        val maxBytesPerInstance: Long,
+        val maxEntriesPerGeneration: Int,
+        val maxBytesPerGeneration: Long,
+    ) {
+        init {
+            require(maxEntriesPerInstance > 0) { "maxEntriesPerInstance must be positive: $maxEntriesPerInstance" }
+            require(maxBytesPerInstance > 0L) { "maxBytesPerInstance must be positive: $maxBytesPerInstance" }
+            require(maxEntriesPerGeneration > 0) { "maxEntriesPerGeneration must be positive: $maxEntriesPerGeneration" }
+            require(maxBytesPerGeneration > 0L) { "maxBytesPerGeneration must be positive: $maxBytesPerGeneration" }
+        }
+
+        companion object {
+            val DEFAULT = Limits(
+                maxEntriesPerInstance = 32,
+                maxBytesPerInstance = 8L * 1024 * 1024,
+                maxEntriesPerGeneration = 32,
+                maxBytesPerGeneration = 8L * 1024 * 1024,
+            )
+        }
+    }
+
+    /** Shared process-wide deferred playback quota accountant. */
+    class ProcessQuota(
+        maxEntries: Int,
+        maxBytes: Long,
+    ) {
+        init {
+            require(maxEntries > 0) { "maxEntries must be positive: $maxEntries" }
+            require(maxBytes > 0L) { "maxBytes must be positive: $maxBytes" }
+        }
+
+        private val maxEntries = maxEntries
+        private val maxBytes = maxBytes
+        private var entriesUsed: Int = 0
+        private var bytesUsed: Long = 0L
+
+        @Synchronized
+        internal fun tryReserve(entries: Int, bytes: Long): Boolean {
+            if (entries < 0 || bytes < 0L) return false
+            val nextEntries = entriesUsed + entries
+            val nextBytes = bytesUsed + bytes
+            if (nextEntries < entriesUsed || nextBytes < bytesUsed) return false
+            if (nextEntries > maxEntries) return false
+            if (nextBytes > maxBytes) return false
+            entriesUsed = nextEntries
+            bytesUsed = nextBytes
+            return true
+        }
+
+        @Synchronized
+        internal fun forceReserve(entries: Int, bytes: Long) {
+            entriesUsed += entries
+            bytesUsed += bytes
+        }
+
+        @Synchronized
+        internal fun release(entries: Int, bytes: Long) {
+            entriesUsed -= entries
+            bytesUsed -= bytes
+        }
+
+        @Synchronized
+        fun liveEntries(): Int = entriesUsed
+
+        @Synchronized
+        fun retainedBytes(): Long = bytesUsed
+
+        companion object {
+            val DEFAULT = ProcessQuota(maxEntries = 256, maxBytes = 64L * 1024 * 1024)
+        }
+    }
+
+    data class ChannelAccounting(val entries: Int, val bytes: Long)
+
+    internal data class Accounting(
+        val liveEntries: Int,
+        val retainedBytes: Long,
+        val perChannel: Map<String, ChannelAccounting>,
+    )
+
+    /** Snapshot of this coordinator's current quota accounting. */
+    internal fun accounting(): Accounting = synchronized(pending) {
+        Accounting(
+            liveEntries = instanceEntries,
+            retainedBytes = instanceBytes,
+            perChannel = channelEntries.mapValues { (channel, entries) ->
+                ChannelAccounting(entries = entries, bytes = channelBytes[channel] ?: 0L)
+            },
+        )
+    }
 
     private val _pendingCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
     /**
@@ -289,19 +410,94 @@ class DeferredAudioPlaybackCoordinator(
         audio: OpaqueAudioOperation,
         eligibilityDelayMillis: Long,
     ): DelayedPlaybackOutcome {
-        if (!operationIsCurrent(context)) return DelayedPlaybackOutcome.Stale
+        if (!operationIsCurrent(context)) {
+            dispose(audio)
+            return DelayedPlaybackOutcome.Stale
+        }
+        if (isRevoked(context.scope.channelInstanceId, context.scope.runtimeGeneration)) {
+            dispose(audio)
+            return DelayedPlaybackOutcome.Stale
+        }
+        val operationGeneration = generationOf(audio)
+        if (operationGeneration != null && isRevoked(context.scope.channelInstanceId, operationGeneration)) {
+            dispose(audio)
+            return DelayedPlaybackOutcome.Stale
+        }
+        if (operationGeneration != null && operationGeneration != context.scope.runtimeGeneration) {
+            dispose(audio)
+            return DelayedPlaybackOutcome.Stale
+        }
+        if (eligibilityDelayMillis < 0L) {
+            return DelayedPlaybackOutcome.Failed(DelayedPlaybackFailureReason.HOST_FAILURE)
+        }
+
+        val channel = context.scope.channelInstanceId
+        val generation = context.scope.runtimeGeneration
+        val generationKey = generation
+        val retainedBytes = retainedBytesOf(audio)
+        if (retainedBytes < 0L) {
+            return DelayedPlaybackOutcome.Busy
+        }
+
         val now = nowMillis()
         val entry = DeferredAudioEntry(
             operationId = DelayedPlaybackOperationId(UUID.randomUUID().toString()),
-            channelInstanceId = context.scope.channelInstanceId,
+            channelInstanceId = channel,
             audio = audio,
-            eligibleAtMillis = now + eligibilityDelayMillis,
+            generation = operationGeneration,
+            quotaGeneration = generation,
+            eligibleAtMillis = saturatingAdd(now, eligibilityDelayMillis),
+            retainedBytes = retainedBytes,
         )
-        synchronized(pending) {
-            pending.add(entry)
+
+        // Admission preflights every scope and reserves atomically before the
+        // entry is visible to the queue. No sibling can be evicted and no
+        // caller-owned artifact is consumed until this succeeds.
+        val admitted: Boolean? = synchronized(pending) {
+            if (closed || isRevoked(channel, generation)) {
+                null
+            } else {
+                val nextInstanceEntries = instanceEntries + 1
+                val nextInstanceBytes = instanceBytes + retainedBytes
+                val nextChannelEntries = (channelEntries[channel] ?: 0) + 1
+                val nextChannelBytes = (channelBytes[channel] ?: 0L) + retainedBytes
+                val nextGenerationEntries = (generationEntries[generationKey] ?: 0) + 1
+                val nextGenerationBytes = (generationBytes[generationKey] ?: 0L) + retainedBytes
+
+                val localWithinBounds =
+                    nextInstanceEntries > instanceEntries &&
+                        nextInstanceBytes >= instanceBytes &&
+                        nextChannelEntries > (channelEntries[channel] ?: 0) &&
+                        nextChannelEntries <= limits.maxEntriesPerInstance &&
+                        nextChannelBytes >= (channelBytes[channel] ?: 0L) &&
+                        nextChannelBytes <= limits.maxBytesPerInstance &&
+                        nextGenerationEntries > (generationEntries[generationKey] ?: 0) &&
+                        nextGenerationEntries <= limits.maxEntriesPerGeneration &&
+                        nextGenerationBytes >= (generationBytes[generationKey] ?: 0L) &&
+                        nextGenerationBytes <= limits.maxBytesPerGeneration
+                if (!localWithinBounds || !processQuota.tryReserve(1, retainedBytes)) {
+                    false
+                } else {
+                    instanceEntries = nextInstanceEntries
+                    instanceBytes = nextInstanceBytes
+                    channelEntries[channel] = nextChannelEntries
+                    channelBytes[channel] = nextChannelBytes
+                    generationEntries[generationKey] = nextGenerationEntries
+                    generationBytes[generationKey] = nextGenerationBytes
+                    pending.add(entry)
+                    true
+                }
+            }
+        }
+        if (admitted == null) {
+            dispose(audio)
+            return DelayedPlaybackOutcome.Stale
+        }
+        if (!admitted) {
+            return DelayedPlaybackOutcome.Busy
         }
         if (eligibilityDelayMillis > 0L) {
-            scheduleEligibilityWake(entry, eligibilityDelayMillis)
+            scheduleEligibilityWake(entry)
         } else {
             publishPendingCounts()
             requestPump()
@@ -318,24 +514,122 @@ class DeferredAudioPlaybackCoordinator(
     fun onChannelSelected(channelInstanceId: String) {
         requestPump()
     }
+    override suspend fun onGenerationTermination(
+        identity: dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity,
+        termination: dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination,
+    ) {
+        if (termination != dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination.REVOKED) return
+        synchronized(revokedGenerations) {
+            revokedGenerations += identity.channelInstanceId to identity.runtimeGeneration
+        }
+        val removed = synchronized(pending) {
+            pending.filter {
+                it.channelInstanceId == identity.channelInstanceId &&
+                    it.quotaGeneration == identity.runtimeGeneration
+            }.also { entries ->
+                entries.forEach { pending.remove(it) }
+                entries.forEach { entry ->
+                    val channel = entry.channelInstanceId
+                    val generationKey = entry.quotaGeneration
+                    instanceEntries -= 1
+                    instanceBytes -= entry.retainedBytes
+                    val channelEntryCount = (channelEntries[channel] ?: 1) - 1
+                    val channelByteCount = (channelBytes[channel] ?: entry.retainedBytes) - entry.retainedBytes
+                    if (channelEntryCount <= 0) channelEntries.remove(channel) else channelEntries[channel] = channelEntryCount
+                    if (channelByteCount <= 0L) channelBytes.remove(channel) else channelBytes[channel] = channelByteCount
+                    val generationEntryCount = (generationEntries[generationKey] ?: 1) - 1
+                    val generationByteCount = (generationBytes[generationKey] ?: entry.retainedBytes) - entry.retainedBytes
+                    if (generationEntryCount <= 0) generationEntries.remove(generationKey) else generationEntries[generationKey] = generationEntryCount
+                    if (generationByteCount <= 0L) generationBytes.remove(generationKey) else generationBytes[generationKey] = generationByteCount
+                    processQuota.release(1, entry.retainedBytes)
+                }
+            }
+        }
+        removed.forEach { dispose(it.audio) }
+        publishPendingCounts()
+        // An in-flight predecessor may have been the pump's active entry. Wake the pump so
+        // unaffected sibling/successor generations are still considered after it observes stale.
+        if (removed.isNotEmpty()) requestPump()
+    }
 
     fun close() {
-        synchronized(pending) {
-            pending.clear()
-            wakeJobs.values.toList().also { wakeJobs.clear() }
-        }.forEach { it.cancel() }
+        val removed = synchronized(pending) {
+            closed = true
+            pending.toList().also {
+                pending.clear()
+                wakeJobs.values.toList().also { jobs -> wakeJobs.clear(); jobs.forEach { it.cancel() } }
+                it.forEach { entry -> processQuota.release(1, entry.retainedBytes) }
+                clearAccounting()
+            }
+        }
+        removed.forEach { dispose(it.audio) }
         pumpJob?.cancel()
         publishPendingCounts()
     }
+    /** Remove one queued entry and release every scope exactly once. */
+    private fun removeAndRelease(entry: DeferredAudioEntry): Boolean = synchronized(pending) {
+        if (!isAuthorized(entry)) return@synchronized false
+        if (!pending.remove(entry)) return@synchronized false
+        val channel = entry.channelInstanceId
+        val generationKey = entry.quotaGeneration
+        instanceEntries -= 1
+        instanceBytes -= entry.retainedBytes
+        val channelEntryCount = (channelEntries[channel] ?: 1) - 1
+        val channelByteCount = (channelBytes[channel] ?: entry.retainedBytes) - entry.retainedBytes
+        if (channelEntryCount <= 0) channelEntries.remove(channel) else channelEntries[channel] = channelEntryCount
+        if (channelByteCount <= 0L) channelBytes.remove(channel) else channelBytes[channel] = channelByteCount
+        val generationEntryCount = (generationEntries[generationKey] ?: 1) - 1
+        val generationByteCount = (generationBytes[generationKey] ?: entry.retainedBytes) - entry.retainedBytes
+        if (generationEntryCount <= 0) generationEntries.remove(generationKey) else generationEntries[generationKey] = generationEntryCount
+        if (generationByteCount <= 0L) generationBytes.remove(generationKey) else generationBytes[generationKey] = generationByteCount
+        processQuota.release(1, entry.retainedBytes)
+        true
+    }
 
-    private fun scheduleEligibilityWake(entry: DeferredAudioEntry, delayMillis: Long) {
+    /** Release all accounting, used by close after pending entries are detached. */
+    private fun clearAccounting() {
+        instanceEntries = 0
+        instanceBytes = 0L
+        channelEntries.clear()
+        channelBytes.clear()
+        generationEntries.clear()
+        generationBytes.clear()
+    }
+
+
+    /**
+     * Wake at the entry's absolute host eligibility time. The injected clock is authoritative for
+     * eligibility, while coroutine delay only provides a wakeup. Rechecking the absolute deadline
+     * prevents an early wake (clock adjustment) from losing the only retry and avoids real-time or
+     * Lua-side sleeps.
+     */
+    private fun scheduleEligibilityWake(entry: DeferredAudioEntry) {
         val job = scope.launch {
-            kotlinx.coroutines.delay(delayMillis)
+            while (true) {
+                val remaining = synchronized(pending) {
+                    if (!pending.contains(entry)) return@launch
+                    millisUntil(entry.eligibleAtMillis, nowMillis())
+                }
+                if (remaining <= 0L) break
+                kotlinx.coroutines.delay(remaining)
+            }
             synchronized(pending) { wakeJobs.remove(entry.operationId) }
             publishPendingCounts()
             requestPump()
         }
         synchronized(pending) { wakeJobs[entry.operationId] = job }
+    }
+
+    private fun saturatingAdd(base: Long, delta: Long): Long = try {
+        Math.addExact(base, delta)
+    } catch (_: ArithmeticException) {
+        Long.MAX_VALUE
+    }
+
+    private fun millisUntil(deadline: Long, now: Long): Long = try {
+        if (now >= deadline) 0L else Math.subtractExact(deadline, now)
+    } catch (_: ArithmeticException) {
+        Long.MAX_VALUE
     }
 
     private fun requestPump() {
@@ -374,8 +668,19 @@ class DeferredAudioPlaybackCoordinator(
     }
 
     private suspend fun deliver(entry: DeferredAudioEntry): Boolean {
+        if (!isAuthorized(entry)) {
+            if (removeAndRelease(entry)) dispose(entry.audio)
+            publishPendingCounts()
+            return false
+        }
+        // Selection is checked immediately before admission. If it changed after the candidate
+        // snapshot, retain the entry at its channel FIFO head; never route it through the newly
+        // selected channel and do not consume/dispose the still-authorized artifact.
         if (selectedChannel() != entry.channelInstanceId) {
-            synchronized(pending) { pending.remove(entry) }
+            return false
+        }
+        if (!isAuthorized(entry)) {
+            if (removeAndRelease(entry)) dispose(entry.audio)
             publishPendingCounts()
             return false
         }
@@ -386,11 +691,15 @@ class DeferredAudioPlaybackCoordinator(
         } catch (_: Exception) {
             return false
         }
+        // A backend may complete after revocation/close. Do not interpret that completion as a
+        // successful playback or release accounting a successor now owns.
+        if (!isAuthorized(entry)) return false
         return when (result) {
             DelayedPlaybackAudioResult.Completed,
             DelayedPlaybackAudioResult.ExplicitlySkipped,
             -> {
-                synchronized(pending) { pending.remove(entry) }
+                if (!removeAndRelease(entry)) return false
+                dispose(entry.audio)
                 publishPendingCounts()
                 true
             }
@@ -407,7 +716,10 @@ private data class DeferredAudioEntry(
     val operationId: DelayedPlaybackOperationId,
     val channelInstanceId: String,
     val audio: OpaqueAudioOperation,
+    val generation: dev.nilp0inter.subspace.channel.capability.RuntimeGeneration?,
+    val quotaGeneration: dev.nilp0inter.subspace.channel.capability.RuntimeGeneration,
     val eligibleAtMillis: Long = 0L,
+    val retainedBytes: Long = 0L,
 )
 
 /**

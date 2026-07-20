@@ -25,6 +25,8 @@ import java.util.concurrent.CyclicBarrier
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.withLock
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CompletableDeferred
@@ -212,6 +214,61 @@ class ActorRuntimeContractTest {
     }
 
     @Test
+    fun `yielded input releases the actor slot while only its execution owner may resume`() = runTest {
+        val actorScope = scope("input-yield", 50)
+        val bridge = RecordingKernelBridge()
+        val actor = actor(actorScope, bridge, RecordingGate(), this)
+        stageReady(actor)
+
+        try {
+            assertEquals(ActorMailboxResult.Admitted, actor.admitEvent(event(actorScope, "first")))
+            val ownerTask = ActorTaskIdentity(actorScope, ActorTaskId.next())
+            var yieldedIdentity: ActorOperationIdentity? = null
+            val first = actor.dispatchNext {
+                yieldedIdentity = actor.yieldOperation(ownerTask, kernelHandle(501L), deadlineMillis = 1_000)
+                ActorCoroutineResult.Yielded(checkNotNull(yieldedIdentity))
+            }
+            val pending = checkNotNull(yieldedIdentity)
+            assertEquals("Input suspension must return its exact opaque operation owner.", ActorDispatchResult.Yielded(pending), first)
+
+            // A semantic audio wait releases the single serialized Lua entry;
+            // unrelated actor work can run before the original owner resumes.
+            assertEquals(ActorMailboxResult.Admitted, actor.admitEvent(event(actorScope, "second")))
+            assertEquals(
+                ActorDispatchResult.Completed("second"),
+                actor.dispatchNext { ActorCoroutineResult.Completed("second") },
+            )
+
+            val foreignScope = scope("foreign-input", 50)
+            val foreign = pending.copy(
+                scope = foreignScope,
+                taskId = ActorTaskIdentity(foreignScope, pending.taskId.taskId),
+            )
+            assertEquals(
+                "A foreign execution owner must not be able to resume a pending input operation.",
+                ActorOperationOutcome.InvalidOwner,
+                actor.resumeOperation(foreign, ActorTerminal.Completed(foreign, "forged")),
+            )
+            assertEquals(0, bridge.resumeCalls.get())
+
+            assertEquals(
+                ActorOperationOutcome.Resumed(ActorTerminal.Completed(pending, "ok")),
+                actor.resumeOperation(pending, ActorTerminal.Completed(pending, "ok")),
+            )
+            assertEquals(1, bridge.resumeCalls.get())
+            assertEquals(RecordingKernelBridge.ResumeCall(kernelHandle(501L), true, "ok"), bridge.lastResumeCall())
+            assertEquals(
+                "A duplicate terminal must not re-enter the owner coroutine.",
+                ActorOperationOutcome.Stale,
+                actor.resumeOperation(pending, ActorTerminal.Completed(pending, "late")),
+            )
+            assertEquals(1, bridge.resumeCalls.get())
+        } finally {
+            actor.close()
+        }
+    }
+
+    @Test
     fun `task without a whole task deadline survives repeated waits beyond a former generic deadline`() = runTest {
         val actorScope = scope("lifecycle-long-task", 45)
         val formerGenericDeadlineMillis = 5L
@@ -240,6 +297,88 @@ class ActorRuntimeContractTest {
                 listOf(0, 1, 2),
                 checkpoints,
             )
+        } finally {
+            taskScope.cancelAll()
+            taskScope.joinAllWithin(100)
+        }
+    }
+
+    @Test
+    fun `managed task cancellation is delivered and removes the task without a stale successor`() = runTest {
+        val actorScope = scope("task-cancel", 51)
+        val entered = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val taskScope = ActorTaskScope(
+            parentScope = this,
+            scopeIdentity = actorScope,
+            maxConcurrentTasks = 1,
+            perTaskDeadlineMillis = null,
+        )
+
+        try {
+            assertTrue(
+                "A live generation must admit the managed task before cancellation.",
+                taskScope.launch {
+                    entered.complete(Unit)
+                    try {
+                        CompletableDeferred<Unit>().await()
+                    } finally {
+                        cancelled.complete(Unit)
+                    }
+                } != null,
+            )
+            runCurrent()
+            entered.await()
+
+            taskScope.cancelAll()
+            assertTrue(taskScope.joinAllWithin(100))
+            assertTrue("Cancellation must reach the task body cleanup.", cancelled.isCompleted)
+            assertEquals(0, taskScope.activeTaskCount)
+            assertEquals(0, taskScope.totalTaskCount)
+            assertFalse("A closed task scope must not admit a successor.", taskScope.isActive)
+        } finally {
+            taskScope.cancelAll()
+            taskScope.joinAllWithin(100)
+        }
+    }
+    @Test
+    fun `cancelled managed task disposes suspended artifact and ignores late completion`() = runTest {
+        val actorScope = scope("task-cancel-late", 52)
+        val entered = AtomicInteger()
+        val disposed = AtomicInteger()
+        val continuation = AtomicReference<kotlinx.coroutines.CancellableContinuation<String>?>(null)
+        val taskScope = ActorTaskScope(
+            parentScope = this,
+            scopeIdentity = actorScope,
+            maxConcurrentTasks = 1,
+            perTaskDeadlineMillis = null,
+        )
+
+        try {
+            assertTrue(
+                taskScope.launch {
+                    try {
+                        suspendCancellableCoroutine<String> { continuation.set(it) }
+                        entered.incrementAndGet()
+                    } finally {
+                        disposed.incrementAndGet()
+                    }
+                } != null,
+            )
+            runCurrent()
+            assertTrue("Managed task must suspend before cancellation.", continuation.get() != null)
+
+            taskScope.cancelAll()
+            assertTrue(taskScope.joinAllWithin(100))
+            assertEquals("Cancellation must dispose the suspended task exactly once.", 1, disposed.get())
+            assertEquals(0, taskScope.activeTaskCount)
+            assertEquals(0, taskScope.totalTaskCount)
+
+            runCatching { continuation.get()?.resume("late") }
+            runCurrent()
+            assertEquals("Late completion must not re-enter the cancelled coroutine.", 0, entered.get())
+            assertEquals("Late completion must not dispose twice.", 1, disposed.get())
+            assertFalse("A cancelled task scope must not admit a successor.", taskScope.isActive)
         } finally {
             taskScope.cancelAll()
             taskScope.joinAllWithin(100)
@@ -650,6 +789,8 @@ class ActorRuntimeContractTest {
                 ActorOperationOutcome.Stale,
                 actor.resumeOperation(pending, ActorTerminal.Completed(pending, "late completion")),
             )
+            assertEquals("Generation close must not deliver cancellation to Lua.", 0, bridge.cancelCalls.get())
+            assertEquals("Late completion must not consume retired mailbox work.", 0, actor.mailboxDepth)
             assertEquals(0, bridge.resumeCalls.get())
         } finally {
             actor.close()
@@ -1733,6 +1874,7 @@ class ActorRuntimeContractTest {
         override fun invokeStartupCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome = completed()
 
@@ -1742,6 +1884,14 @@ class ActorRuntimeContractTest {
             arguments: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome = completed()
+        override fun invokeInputCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            capturedAudioToken: String,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome = invokeCallback(handle, callbackHandle, arguments, spawnAdmission)
+
 
         override fun startCoroutine(
             handle: LuaStateHandle,

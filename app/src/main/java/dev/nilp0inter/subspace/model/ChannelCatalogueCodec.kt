@@ -96,7 +96,7 @@ object ChannelCatalogueCodec {
         val definitions = decodeDefinitions(root) { definition ->
             val implementationId = when (val kind = definition.getString("kind")) {
                 "JOURNAL" -> BuiltInChannelImplementationIds.JOURNAL
-                "DEBUG" -> BuiltInChannelImplementationIds.DEBUG
+                "DEBUG" -> ChannelImplementationId("builtin:debug")
                 "KEYBOARD" -> BuiltInChannelImplementationIds.KEYBOARD
                 else -> throw LegacyKindException(kind)
             }

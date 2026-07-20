@@ -174,7 +174,7 @@ class JournalRuntime(
                 ) {
                     is CapabilityOperationResult.Success -> journal.storeCapture(
                         entry.value,
-                        opaqueAudioRecording(recording),
+                        opaqueAudioRecording(recording, capabilities.identity.runtimeGeneration),
                     ).mapToUnit()
                     else -> entry.mapToUnit()
                 }

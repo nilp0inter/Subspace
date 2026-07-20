@@ -453,7 +453,6 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         val keyboardProvider = KeyboardBuiltInProvider()
         providerRegistry = ChannelImplementationProviderRegistry().also { providers ->
             check(providers.register(JournalBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
-            check(providers.register(DebugBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
             check(providers.register(keyboardProvider) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
             check(providers.register(OpenAiAgentBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
         }
@@ -482,7 +481,12 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         mediaResponsePlayer = MediaResponsePlayer(audioManager, rawLocalOutput)
         localOutput = MediaResponsePcmOutput(rawLocalOutput, mediaResponsePlayer)
         hostAudioCoordinator = HostAudioCoordinator()
-        playbackRouteResolver = dev.nilp0inter.subspace.audio.ModePlaybackRouteResolver(audioManager, sco)
+        playbackRouteResolver = dev.nilp0inter.subspace.audio.ModePlaybackRouteResolver(
+            audioManager = audioManager,
+            workSco = sco,
+            targetRsmDevice = ::targetRsm,
+            awaitTelecomCaptureRelease = ::awaitTelecomCaptureReleaseForPlayback,
+        )
         audioSessionManager = PttAudioSessionManager(
             scope = serviceScope,
             captureService = captureService,
@@ -543,6 +547,11 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             deferredSelection = { agentRuntimeGraph.deferredAudioPlayback.onChannelSelected(it) },
             newChannelId = { java.util.UUID.randomUUID().toString() },
             log = { message -> SubspaceLogger.d(ROUTE_LOG_TAG, message) },
+            onConfigurationCommitted = { channelId ->
+                serviceScope.launch {
+                    runtimeRegistry.reconcile(channelRepository.catalogueState.value)
+                }
+            },
         )
         serviceScope.launch { agentRuntimeGraph.coordinator.start() }
         capabilityHost = ServiceChannelCapabilityHost(
@@ -683,7 +692,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     val deferred = deferredPending[snapshot.id] ?: 0
                     val status = agentStatuses[snapshot.id]
                     if (status == null) {
-                        // Non-agent channel (e.g. Debug): no agent status to project, but the
+                        // Non-agent channel: no agent status to project, but the
                         // deferred opaque-audio pending count still applies additively.
                         snapshot.copy(pendingCount = deferred)
                     } else {
@@ -841,12 +850,16 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     private fun audioOperationCapability(identity: CapabilityScopeIdentity) =
         AudioOperationCapabilityAdapter(
-            PlaybackResultFactory { samples ->
-                AudioOperationArtifact(dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, SCO_RATE))
+            PlaybackResultFactory { samples, generation ->
+                AudioOperationArtifact(
+                    dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, SCO_RATE),
+                    generation = generation,
+                )
             },
-            RecordingPlaybackResultFactory { recording ->
-                AudioOperationArtifact(recording)
+            RecordingPlaybackResultFactory { recording, generation ->
+                AudioOperationArtifact(recording, generation = generation)
             },
+            identity,
         )
 
     private fun journalCapability(identity: CapabilityScopeIdentity) =
@@ -938,6 +951,24 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
 
     @SuppressLint("MissingPermission")
     private fun targetRsmName(): String? = targetRsm()?.name
+
+    /**
+     * Semantic On-the-road playback cannot inspect or claim a car output while Telecom still
+     * owns capture. The route resolver calls this after host playback admission and before
+     * selecting a physical output.
+     */
+    private suspend fun awaitTelecomCaptureReleaseForPlayback(): Boolean {
+        repeat(160) {
+            if (!TelecomCarPttCoordinator.isCaptureActive() &&
+                audioManager.mode == android.media.AudioManager.MODE_NORMAL &&
+                audioManager.communicationDevice?.type != android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            ) {
+                return true
+            }
+            delay(25)
+        }
+        return false
+    }
 
     @SuppressLint("MissingPermission")
     private fun isRsmHfpConnected(): Boolean = readinessProbe.isRsmHfpConnected()

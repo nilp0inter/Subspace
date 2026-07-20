@@ -9,6 +9,7 @@ import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
 import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
+import dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination
 import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
 import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
 import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
@@ -21,6 +22,10 @@ import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapabilit
 import dev.nilp0inter.subspace.channel.capability.OpenAiCompletionCapability
 import dev.nilp0inter.subspace.channel.capability.OpenAiModelDiscoveryCapability
 import kotlinx.coroutines.withTimeoutOrNull
+
+internal interface GenerationCapabilityResource {
+    suspend fun onGenerationTermination(identity: CapabilityScopeIdentity, termination: CapabilityLeaseTermination)
+}
 
 /**
  * Composition root for instance-scoped capability leases.
@@ -40,6 +45,26 @@ internal class ServiceChannelCapabilityHost(
     private val delayedPlayback: (CapabilityScopeIdentity) -> DelayedPlaybackCapability? = { null },
     private val deferredAudioPlayback: (CapabilityScopeIdentity) -> DeferredAudioPlaybackCapability? = { null },
 ) : ChannelCapabilityHost {
+    override suspend fun onGenerationTermination(
+        identity: CapabilityScopeIdentity,
+        termination: CapabilityLeaseTermination,
+    ) {
+        if (termination != CapabilityLeaseTermination.REVOKED) return
+        // Scheduling leases are deliberately short-lived: a queued playback entry can remain
+        // after its lease is released. Revoke every host-owned generation resource directly so
+        // scope revocation still drains those entries. Each resource performs its own idempotent
+        // instance+generation filtering.
+        deferredAudioPlayback(identity)?.let { resource ->
+            if (resource is GenerationCapabilityResource) {
+                try {
+                    resource.onGenerationTermination(identity, termination)
+                } catch (_: Exception) {
+                    // Resource cleanup is idempotent; a host cleanup failure must not block scope revocation.
+                }
+            }
+        }
+    }
+
     override suspend fun availability(
         identity: CapabilityScopeIdentity,
         key: CapabilityKey<*>,
@@ -63,15 +88,15 @@ internal class ServiceChannelCapabilityHost(
     ): HostedCapabilityAcquisition<T> = (
         when (key) {
             CapabilityKey.TextOutput -> textOutputAcquisition(identity)
-            CapabilityKey.Transcription -> availableOrUnavailable(transcription(identity))
-            CapabilityKey.Synthesis -> availableOrUnavailable(synthesis(identity))
-            CapabilityKey.AudioOperation -> availableOrUnavailable(audioOperation(identity))
-            CapabilityKey.Journal -> availableOrUnavailable(journal(identity))
-            CapabilityKey.OpenAiModelDiscovery -> availableOrUnavailable(openAiModelDiscovery(identity))
-            CapabilityKey.OpenAiCompletion -> availableOrUnavailable(openAiCompletion(identity))
-            CapabilityKey.AsynchronousConversation -> availableOrUnavailable(asynchronousConversation(identity))
-            CapabilityKey.DelayedPlayback -> availableOrUnavailable(delayedPlayback(identity))
-            CapabilityKey.DeferredAudioPlayback -> availableOrUnavailable(deferredAudioPlayback(identity))
+            CapabilityKey.Transcription -> availableOrUnavailable(transcription(identity), identity)
+            CapabilityKey.Synthesis -> availableOrUnavailable(synthesis(identity), identity)
+            CapabilityKey.AudioOperation -> availableOrUnavailable(audioOperation(identity), identity)
+            CapabilityKey.Journal -> availableOrUnavailable(journal(identity), identity)
+            CapabilityKey.OpenAiModelDiscovery -> availableOrUnavailable(openAiModelDiscovery(identity), identity)
+            CapabilityKey.OpenAiCompletion -> availableOrUnavailable(openAiCompletion(identity), identity)
+            CapabilityKey.AsynchronousConversation -> availableOrUnavailable(asynchronousConversation(identity), identity)
+            CapabilityKey.DelayedPlayback -> availableOrUnavailable(delayedPlayback(identity), identity)
+            CapabilityKey.DeferredAudioPlayback -> availableOrUnavailable(deferredAudioPlayback(identity), identity)
         }
     ) as HostedCapabilityAcquisition<T>
 
@@ -87,7 +112,7 @@ internal class ServiceChannelCapabilityHost(
         return (when (preparation) {
             dev.nilp0inter.subspace.channel.TextOutputPreparation.Available -> {
                 if (textOutputService.isReadyForDelivery()) {
-                    available(textOutputService.capabilityFor(identity.channelInstanceId))
+                    available(textOutputService.capabilityFor(identity.channelInstanceId), identity)
                 } else {
                     HostedCapabilityAcquisition.Recoverable(CapabilityUnavailableReason.HOST_NOT_READY)
                 }
@@ -98,12 +123,12 @@ internal class ServiceChannelCapabilityHost(
                 HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
         }) as HostedCapabilityAcquisition<T>
     }
-
     private fun textOutputAcquisition(
         identity: CapabilityScopeIdentity,
     ): HostedCapabilityAcquisition<TextOutputCapability> = when (textOutputService.availability.value) {
         TextOutputAvailability.Available -> available(
             textOutputService.capabilityFor(identity.channelInstanceId),
+            identity,
         )
         TextOutputAvailability.Preparing,
         TextOutputAvailability.Unavailable,
@@ -111,6 +136,7 @@ internal class ServiceChannelCapabilityHost(
         TextOutputAvailability.Closed ->
             HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
     }
+
 
     private fun textOutputAvailability(): CapabilityAvailability = when (textOutputService.availability.value) {
         TextOutputAvailability.Available -> CapabilityAvailability.Available
@@ -125,12 +151,16 @@ internal class ServiceChannelCapabilityHost(
 
     private fun <T : ChannelCapabilityPort> availableOrUnavailable(
         port: T?,
-    ): HostedCapabilityAcquisition<T> = port?.let(::available)
+        identity: CapabilityScopeIdentity,
+    ): HostedCapabilityAcquisition<T> = port?.let { available(it, identity) }
         ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
 
-    private fun <T : ChannelCapabilityPort> available(port: T): HostedCapabilityAcquisition<T> =
-        HostedCapabilityAcquisition.Available(port) {
-            // Capability leases never own shared host services. Per-operation cancellation is
-            // contained by the concrete port before this no-op lease cleanup returns.
+    private fun <T : ChannelCapabilityPort> available(
+        port: T,
+        identity: CapabilityScopeIdentity,
+    ): HostedCapabilityAcquisition<T> = HostedCapabilityAcquisition.Available(port) { termination ->
+        if (termination == CapabilityLeaseTermination.REVOKED && port is GenerationCapabilityResource) {
+            port.onGenerationTermination(identity, termination)
         }
+    }
 }

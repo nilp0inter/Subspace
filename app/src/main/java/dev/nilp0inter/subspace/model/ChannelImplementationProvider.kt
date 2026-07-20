@@ -226,17 +226,20 @@ data class ChannelPresentationMetadata(
 sealed interface ChannelConfigurationField {
     val id: String
     val label: String
+    val help: String?
     val required: Boolean
 
     data class BooleanField(
         override val id: String,
         override val label: String,
+        override val help: String? = null,
         override val required: Boolean = true,
     ) : ChannelConfigurationField
 
     data class TextField(
         override val id: String,
         override val label: String,
+        override val help: String? = null,
         override val required: Boolean = true,
         val multiline: Boolean = false,
     ) : ChannelConfigurationField
@@ -244,6 +247,7 @@ sealed interface ChannelConfigurationField {
     data class ChoiceField(
         override val id: String,
         override val label: String,
+        override val help: String? = null,
         override val required: Boolean = true,
         val choices: List<Choice>,
     ) : ChannelConfigurationField {
@@ -258,6 +262,7 @@ sealed interface ChannelConfigurationField {
         override val id: String,
         override val label: String,
         val source: DynamicConfigurationChoiceSource,
+        override val help: String? = null,
         val dependsOnFieldId: String? = null,
         /** Optional scalar condition for rendering a dependent field. */
         val visibleWhenFieldId: String? = null,
@@ -283,6 +288,7 @@ sealed interface ChannelConfigurationField {
     data class NumberField(
         override val id: String,
         override val label: String,
+        override val help: String? = null,
         override val required: Boolean = true,
         val minimum: Long? = null,
         val maximum: Long? = null,
@@ -292,6 +298,7 @@ sealed interface ChannelConfigurationField {
     data class DirectoryField(
         override val id: String,
         override val label: String,
+        override val help: String? = null,
         override val required: Boolean = true,
     ) : ChannelConfigurationField
 }
@@ -776,7 +783,6 @@ class ChannelImplementationProviderRegistry : ChannelImplementationDescriptorRes
 
     private fun isBuiltInId(id: ChannelImplementationId): Boolean {
         return id == BuiltInChannelImplementationIds.JOURNAL ||
-                id == BuiltInChannelImplementationIds.DEBUG ||
                 id == BuiltInChannelImplementationIds.KEYBOARD ||
                 id == BuiltInChannelImplementationIds.OPENAI_AGENT ||
                 id.value.startsWith("builtin:")
@@ -818,7 +824,6 @@ class ChannelImplementationProviderRegistry : ChannelImplementationDescriptorRes
 
 object BuiltInChannelImplementationIds {
     val JOURNAL = ChannelImplementationId("builtin:journal")
-    val DEBUG = ChannelImplementationId("builtin:debug")
     val KEYBOARD = ChannelImplementationId("builtin:keyboard")
     val OPENAI_AGENT = ChannelImplementationId("builtin:openai-agent")
 }
@@ -855,17 +860,6 @@ object JournalProviderConfigurationCodec : ChannelConfigurationCodec<JournalProv
             put("saveVoice", value.saveVoice)
             put("saveText", value.saveText)
         })
-}
-
-data class DebugProviderConfiguration(val mode: DebugMode)
-
-object DebugProviderConfigurationCodec : ChannelConfigurationCodec<DebugProviderConfiguration> {
-    override fun decode(payload: OpaqueJsonObject): Result<DebugProviderConfiguration> = runCatching {
-        DebugProviderConfiguration(DebugMode.valueOf(payload.toJsonObject().requireString("mode")))
-    }
-
-    override fun encode(value: DebugProviderConfiguration): OpaqueJsonObject =
-        OpaqueJsonObject.fromJsonObject(JSONObject().put("mode", value.mode.name))
 }
 
 data class KeyboardProviderConfiguration(val hostProfileKey: String)
@@ -975,13 +969,6 @@ private object JournalConfigurationProvider : VersionOneConfigurationProvider<Jo
         JournalProviderConfigurationCodec.encode(JournalProviderConfiguration(null, saveVoice = true, saveText = true))
 }
 
-private object DebugConfigurationProvider : VersionOneConfigurationProvider<DebugProviderConfiguration>(
-    BuiltInChannelImplementationIds.DEBUG,
-    DebugProviderConfigurationCodec,
-) {
-    override fun defaultPayload(): OpaqueJsonObject =
-        DebugProviderConfigurationCodec.encode(DebugProviderConfiguration(DebugMode.ECHO))
-}
 
 private object KeyboardConfigurationProvider : VersionOneConfigurationProvider<KeyboardProviderConfiguration>(
     BuiltInChannelImplementationIds.KEYBOARD,
@@ -1027,28 +1014,6 @@ object BuiltInChannelDescriptors {
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
     )
 
-    val debug = ChannelImplementationDescriptor(
-        implementationId = BuiltInChannelImplementationIds.DEBUG,
-        presentation = ChannelPresentationMetadata("Debug Channel", "TEST", "Selected debug mode is unavailable."),
-        configuration = DebugConfigurationProvider,
-        configurationFields = listOf(
-            ChannelConfigurationField.ChoiceField(
-                id = "mode",
-                label = "Mode",
-                choices = DebugMode.entries.map { mode ->
-                    ChannelConfigurationField.ChoiceField.Choice(mode.name, mode.name)
-                },
-            ),
-        ),
-        requiredCapabilities = setOf(
-            ChannelCapability.Transcription,
-            ChannelCapability.Synthesis,
-            ChannelCapability.AudioOperation,
-            ChannelCapability.DeferredAudioPlayback,
-        ),
-        preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
-    )
-
     val keyboard = ChannelImplementationDescriptor(
         implementationId = BuiltInChannelImplementationIds.KEYBOARD,
         presentation = ChannelPresentationMetadata("Keyboard Channel", "BLE HID", "Requires active text-output availability."),
@@ -1075,8 +1040,8 @@ object BuiltInChannelDescriptors {
         ),
         configuration = OpenAiAgentConfigurationProvider,
         configurationFields = listOf(
-            ChannelConfigurationField.DynamicChoiceField("connectionProfileId", "Connection profile", DynamicConfigurationChoiceSource.OPENAI_CONNECTION_PROFILES),
-            ChannelConfigurationField.DynamicChoiceField("modelId", "Model", DynamicConfigurationChoiceSource.OPENAI_MODELS, dependsOnFieldId = "connectionProfileId"),
+            ChannelConfigurationField.DynamicChoiceField("connectionProfileId", "Connection profile", source = DynamicConfigurationChoiceSource.OPENAI_CONNECTION_PROFILES),
+            ChannelConfigurationField.DynamicChoiceField("modelId", "Model", source = DynamicConfigurationChoiceSource.OPENAI_MODELS, dependsOnFieldId = "connectionProfileId"),
             ChannelConfigurationField.TextField("systemPrompt", "System prompt", multiline = true),
             ChannelConfigurationField.BooleanField("keyboardEnabled", "Enable Keyboard tools"),
             ChannelConfigurationField.DynamicChoiceField(
@@ -1100,7 +1065,7 @@ object BuiltInChannelDescriptors {
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = true),
     )
 
-    val all: List<ChannelImplementationDescriptor> = listOf(journal, debug, keyboard, openAiAgent)
+    val all: List<ChannelImplementationDescriptor> = listOf(journal, keyboard, openAiAgent)
 
     val configurationResolver: ChannelImplementationDescriptorResolver = object : ChannelImplementationDescriptorResolver {
         private val descriptors = all.associateBy { it.implementationId }
@@ -1126,7 +1091,9 @@ sealed interface ChannelCatalogueProviderMigrationResult {
 
 /**
  * Migrates every available provider as one in-memory transaction. Missing providers are left
- * byte-for-byte opaque at the payload boundary; any available-provider failure aborts all writes.
+ * byte-for-byte opaque at the payload boundary. On configuration incompatibility the definition
+ * is preserved unchanged so the runtime layer projects a typed unavailable result; no automatic
+ * successor, default, or migrated payload is substituted.
  */
 object ChannelCatalogueProviderMigrator {
     fun migrate(
@@ -1143,9 +1110,9 @@ object ChannelCatalogueProviderMigrator {
                         definition.configPayload,
                     )
                 ) {
-                    is ProviderConfigurationResult.Failure -> {
-                        return ChannelCatalogueProviderMigrationResult.Failure(definition.id, result.error)
-                    }
+                    // Preserve the definition unchanged on incompatibility;
+                    // runtime reconciliation projects the typed unavailable state.
+                    is ProviderConfigurationResult.Failure -> definition
                     is ProviderConfigurationResult.Success -> {
                         val configuration = result.configuration
                         if (configuration.schemaVersion != definition.configSchemaVersion ||

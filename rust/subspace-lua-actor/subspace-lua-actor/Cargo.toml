@@ -44,3 +44,6 @@ serde_json = { version = "=1.0.150", default-features = false, features = ["std"
 [features]
 default = []
 registry-test = []
+
+[dev-dependencies]
+parking_lot = "0.12.5"

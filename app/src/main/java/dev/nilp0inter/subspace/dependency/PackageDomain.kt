@@ -5,9 +5,12 @@ import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.lua.ImmutableProgramImage
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.ArrayList
+import java.util.LinkedHashSet
 
 // 1. Precompile regex and allocation-free checks to satisfy performance directives
 private val CANONICAL_MODULE_REGEX = Regex("^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)*$")
+private val FIELD_ID_REGEX = Regex("^[a-z][a-z0-9_]*$")
 
 private fun isPositiveDecimal(value: String): Boolean {
     if (value.isEmpty()) return false
@@ -26,6 +29,54 @@ private fun isLowercaseSha256(value: String): Boolean {
         if (!((c in '0'..'9') || (c in 'a'..'f'))) return false
     }
     return true
+}
+
+private fun escapeJson(s: String): String {
+    val sb = java.lang.StringBuilder()
+    for (i in 0 until s.length) {
+        val c = s[i]
+        when (c) {
+            '"' -> sb.append("\\\"")
+            '\\' -> sb.append("\\\\")
+            '\n' -> sb.append("\\n")
+            '\r' -> sb.append("\\r")
+            '\t' -> sb.append("\\t")
+            else -> {
+                if (c.code in 0x00..0x1F) {
+                    sb.append(String.format("\\u%04x", c.code))
+                } else {
+                    sb.append(c)
+                }
+            }
+        }
+    }
+    return sb.toString()
+}
+
+private fun calculateDefaultPayloadSize(fields: List<ConfigurationFieldDeclaration>): Int {
+    val sortedFields = fields.sortedBy { it.id }
+    val sb = java.lang.StringBuilder()
+    sb.append("{")
+    for (i in sortedFields.indices) {
+        if (i > 0) {
+            sb.append(",")
+        }
+        val f = sortedFields[i]
+        sb.append("\"").append(escapeJson(f.id)).append("\":")
+        when (f) {
+            is ConfigurationFieldDeclaration.BooleanField -> {
+                sb.append(if (f.default) "true" else "false")
+            }
+            is ConfigurationFieldDeclaration.IntegerField -> {
+                sb.append(f.default.toString())
+            }
+            is ConfigurationFieldDeclaration.StringField -> {
+                sb.append("\"").append(escapeJson(f.default)).append("\"")
+            }
+        }
+    }
+    sb.append("}")
+    return sb.toString().toByteArray(java.nio.charset.StandardCharsets.UTF_8).size
 }
 
 /**
@@ -188,7 +239,9 @@ public data class PackageManifest(
     val packageVersion: String,
     val entryModule: String,
     val presentation: PackagePresentation,
-    val runtime: RuntimeRequirements
+    val runtime: RuntimeRequirements,
+    val configuration: PackageConfigurationDeclaration,
+    val capabilities: Set<String>
 ) {
     init {
         require(manifestVersion == 1) {
@@ -202,6 +255,9 @@ public data class PackageManifest(
         }
         require(entryModule.matches(CANONICAL_MODULE_REGEX)) {
             "Entry module name is invalid: $entryModule"
+        }
+        require(PackageCapability.ALL.containsAll(capabilities)) {
+            "Capabilities must only contain known values from PackageCapability.ALL. Unknown capabilities: ${capabilities - PackageCapability.ALL}"
         }
     }
 }
@@ -280,7 +336,8 @@ public sealed interface PackageFailure {
         MUTATION,
         ROLLBACK,
         LOADING,
-        SHUTDOWN
+        SHUTDOWN,
+        CAPABILITY
     }
 
     public data class Format(
@@ -304,6 +361,18 @@ public sealed interface PackageFailure {
         UNSUPPORTED_COMPRESSION,
         ENCRYPTED_ENTRY,
         BOUNDS_EXCEEDED
+    }
+
+    public data class Capability(
+        val detail: CapabilityDetail,
+        override val implementationId: ChannelImplementationId? = null
+    ) : PackageFailure {
+        override val category = FailureCategory.CAPABILITY
+    }
+
+    public enum class CapabilityDetail {
+        UNKNOWN_CAPABILITY_ID,
+        DUPLICATE_CAPABILITY_ID
     }
 
     public data class Identity(
@@ -465,3 +534,418 @@ public data class PackageValidationBounds(
         )
     }
 }
+
+/**
+ * 1.1: Bounded exact-key configuration limits.
+ */
+public object PackageConfigurationLimits {
+    public const val MAX_FIELDS: Int = 32
+    public const val MAX_FIELD_ID_BYTES: Int = 64
+    public const val MAX_LABEL_BYTES: Int = 128
+    public const val MAX_HELP_BYTES: Int = 512
+    public const val MAX_CHOICES: Int = 64
+    public const val MAX_STRING_VALUE_BYTES: Int = 16384 // 16 KiB
+    public const val MAX_PAYLOAD_BYTES: Int = 65536 // 64 KiB
+}
+
+/**
+ * 1.1: Stable public capability identifiers.
+ */
+public object PackageCapability {
+    public const val AUDIO_TRANSCRIPTION: String = "audio.transcription"
+    public const val AUDIO_SYNTHESIS: String = "audio.synthesis"
+    public const val AUDIO_PLAYBACK: String = "audio.playback"
+
+    public val ALL: Set<String> = Collections.unmodifiableSet(
+        LinkedHashSet(listOf(AUDIO_TRANSCRIPTION, AUDIO_SYNTHESIS, AUDIO_PLAYBACK))
+    )
+}
+
+/**
+ * 1.1: Sealed class representing configuration field declarations.
+ */
+public sealed class ConfigurationFieldDeclaration {
+    public abstract val id: String
+    public abstract val type: ConfigurationFieldType
+    public abstract val default: Any
+
+    public class StringField(
+        override val id: String,
+        override val default: String,
+        allowedValues: List<String>?
+    ) : ConfigurationFieldDeclaration() {
+        override val type: ConfigurationFieldType = ConfigurationFieldType.STRING
+        public val allowedValues: List<String>? = allowedValues?.let { Collections.unmodifiableList(ArrayList(it)) }
+
+        init {
+            require(id.matches(FIELD_ID_REGEX)) {
+                "Field ID does not match pattern ^[a-z][a-z0-9_]*$: $id"
+            }
+            require(id.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+                "Field ID length must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes: $id"
+            }
+            require(default.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_STRING_VALUE_BYTES) {
+                "Default value size must not exceed ${PackageConfigurationLimits.MAX_STRING_VALUE_BYTES} bytes: $default"
+            }
+            if (this.allowedValues != null) {
+                require(this.allowedValues.isNotEmpty()) {
+                    "Allowed values must not be empty if present"
+                }
+                val uniqueValues = mutableSetOf<String>()
+                for (v in this.allowedValues) {
+                    require(v.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_STRING_VALUE_BYTES) {
+                        "Allowed value size must not exceed ${PackageConfigurationLimits.MAX_STRING_VALUE_BYTES} bytes: $v"
+                    }
+                    require(uniqueValues.add(v)) {
+                        "Duplicate allowed value: $v"
+                    }
+                }
+                require(default in uniqueValues) {
+                    "Default value '$default' must be in allowed values: ${this.allowedValues}"
+                }
+            }
+        }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is StringField) return false
+            return id == other.id && default == other.default && allowedValues == other.allowedValues
+        }
+
+        override fun hashCode(): Int {
+            var result = id.hashCode()
+            result = 31 * result + default.hashCode()
+            result = 31 * result + (allowedValues?.hashCode() ?: 0)
+            return result
+        }
+
+        override fun toString(): String = "StringField(id='$id', default='$default', allowedValues=$allowedValues)"
+    }
+
+    public class BooleanField(
+        override val id: String,
+        override val default: Boolean
+    ) : ConfigurationFieldDeclaration() {
+        override val type: ConfigurationFieldType = ConfigurationFieldType.BOOLEAN
+
+        init {
+            require(id.matches(FIELD_ID_REGEX)) {
+                "Field ID does not match pattern ^[a-z][a-z0-9_]*$: $id"
+            }
+            require(id.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+                "Field ID length must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes: $id"
+            }
+        }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is BooleanField) return false
+            return id == other.id && default == other.default
+        }
+
+        override fun hashCode(): Int = 31 * id.hashCode() + default.hashCode()
+
+        override fun toString(): String = "BooleanField(id='$id', default=$default)"
+    }
+
+    public class IntegerField(
+        override val id: String,
+        override val default: Long,
+        val minimum: Long?,
+        val maximum: Long?
+    ) : ConfigurationFieldDeclaration() {
+        override val type: ConfigurationFieldType = ConfigurationFieldType.INTEGER
+
+        init {
+            require(id.matches(FIELD_ID_REGEX)) {
+                "Field ID does not match pattern ^[a-z][a-z0-9_]*$: $id"
+            }
+            require(id.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+                "Field ID length must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes: $id"
+            }
+            if (minimum != null && maximum != null) {
+                require(minimum <= maximum) {
+                    "minimum ($minimum) must be <= maximum ($maximum)"
+                }
+            }
+            if (minimum != null) {
+                require(default >= minimum) {
+                    "default ($default) must be >= minimum ($minimum)"
+                }
+            }
+            if (maximum != null) {
+                require(default <= maximum) {
+                    "default ($default) must be <= maximum ($maximum)"
+                }
+            }
+        }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is IntegerField) return false
+            return id == other.id && default == other.default && minimum == other.minimum && maximum == other.maximum
+        }
+
+        override fun hashCode(): Int {
+            var result = id.hashCode()
+            result = 31 * result + default.hashCode()
+            result = 31 * result + (minimum?.hashCode() ?: 0)
+            result = 31 * result + (maximum?.hashCode() ?: 0)
+            return result
+        }
+
+        override fun toString(): String = "IntegerField(id='$id', default=$default, minimum=$minimum, maximum=$maximum)"
+    }
+}
+
+/**
+ * 1.1: Configuration field type enum.
+ */
+public enum class ConfigurationFieldType {
+    STRING,
+    BOOLEAN,
+    INTEGER
+}
+
+/**
+ * 1.1: Configuration data declaration.
+ */
+public class ConfigurationDataDeclaration(
+    fields: List<ConfigurationFieldDeclaration>
+) {
+    public val fields: List<ConfigurationFieldDeclaration> = Collections.unmodifiableList(ArrayList(fields))
+
+    init {
+        require(this.fields.size <= PackageConfigurationLimits.MAX_FIELDS) {
+            "Configuration fields count must not exceed ${PackageConfigurationLimits.MAX_FIELDS}: ${this.fields.size}"
+        }
+        val ids = mutableSetOf<String>()
+        for (f in this.fields) {
+            require(ids.add(f.id)) {
+                "Duplicate field ID: ${f.id}"
+            }
+        }
+        val payloadSize = calculateDefaultPayloadSize(this.fields)
+        require(payloadSize <= PackageConfigurationLimits.MAX_PAYLOAD_BYTES) {
+            "Default configuration payload size of $payloadSize bytes exceeds the limit of ${PackageConfigurationLimits.MAX_PAYLOAD_BYTES} bytes"
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ConfigurationDataDeclaration) return false
+        return fields == other.fields
+    }
+
+    override fun hashCode(): Int = fields.hashCode()
+
+    override fun toString(): String = "ConfigurationDataDeclaration(fields=$fields)"
+}
+
+/**
+ * 1.1: UI control enum.
+ */
+public enum class UiControl(val value: String) {
+    TEXT("text"),
+    TOGGLE("toggle"),
+    NUMBER("number"),
+    CHOICE("choice")
+}
+
+/**
+ * 1.1: UI choice representation.
+ */
+public class UiChoice(
+    val value: String,
+    val label: String
+) {
+    init {
+        require(value.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_STRING_VALUE_BYTES) {
+            "Choice value size must not exceed ${PackageConfigurationLimits.MAX_STRING_VALUE_BYTES} bytes"
+        }
+        require(label.isNotBlank()) {
+            "Choice label must not be blank"
+        }
+        require(label.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_LABEL_BYTES) {
+            "Choice label size must not exceed ${PackageConfigurationLimits.MAX_LABEL_BYTES} bytes"
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is UiChoice) return false
+        return value == other.value && label == other.label
+    }
+
+    override fun hashCode(): Int = 31 * value.hashCode() + label.hashCode()
+
+    override fun toString(): String = "UiChoice(value='$value', label='$label')"
+}
+
+/**
+ * 1.1: UI field declaration.
+ */
+public class UiFieldDeclaration(
+    val field: String,
+    val control: UiControl,
+    val label: String,
+    val help: String?,
+    choices: List<UiChoice>?
+) {
+    public val choices: List<UiChoice>? = choices?.let { Collections.unmodifiableList(ArrayList(it)) }
+
+    init {
+        require(field.matches(FIELD_ID_REGEX)) {
+            "Field ID does not match pattern ^[a-z][a-z0-9_]*$: $field"
+        }
+        require(field.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+            "Field ID length must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes: $field"
+        }
+        require(label.isNotBlank()) {
+            "Label must not be blank"
+        }
+        require(label.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_LABEL_BYTES) {
+            "Label length must not exceed ${PackageConfigurationLimits.MAX_LABEL_BYTES} bytes: $label"
+        }
+        if (help != null) {
+            require(help.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_HELP_BYTES) {
+                "Help string length must not exceed ${PackageConfigurationLimits.MAX_HELP_BYTES} bytes"
+            }
+        }
+        if (control == UiControl.CHOICE) {
+            require(this.choices != null) {
+                "Choices must not be null for CHOICE control"
+            }
+            require(this.choices.isNotEmpty() && this.choices.size <= PackageConfigurationLimits.MAX_CHOICES) {
+                "Choices count must be between 1 and ${PackageConfigurationLimits.MAX_CHOICES} for CHOICE control: ${this.choices.size}"
+            }
+            val uniqueValues = mutableSetOf<String>()
+            val uniqueLabels = mutableSetOf<String>()
+            for (choice in this.choices) {
+                require(uniqueValues.add(choice.value)) {
+                    "Duplicate choice value: ${choice.value}"
+                }
+                require(uniqueLabels.add(choice.label)) {
+                    "Duplicate choice label: ${choice.label}"
+                }
+            }
+        } else {
+            require(this.choices == null) {
+                "Choices must be null for non-CHOICE control: $control"
+            }
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is UiFieldDeclaration) return false
+        return field == other.field &&
+                control == other.control &&
+                label == other.label &&
+                help == other.help &&
+                choices == other.choices
+    }
+
+    override fun hashCode(): Int {
+        var result = field.hashCode()
+        result = 31 * result + control.hashCode()
+        result = 31 * result + label.hashCode()
+        result = 31 * result + (help?.hashCode() ?: 0)
+        result = 31 * result + (choices?.hashCode() ?: 0)
+        return result
+    }
+
+    override fun toString(): String =
+        "UiFieldDeclaration(field='$field', control=$control, label='$label', help=$help, choices=$choices)"
+}
+
+/**
+ * 1.1: Configuration UI declaration.
+ */
+public class ConfigurationUiDeclaration(
+    fields: List<UiFieldDeclaration>
+) {
+    public val fields: List<UiFieldDeclaration> = Collections.unmodifiableList(ArrayList(fields))
+
+    init {
+        require(this.fields.size <= PackageConfigurationLimits.MAX_FIELDS) {
+            "UI fields count must not exceed ${PackageConfigurationLimits.MAX_FIELDS}: ${this.fields.size}"
+        }
+        val fieldNames = mutableSetOf<String>()
+        for (f in this.fields) {
+            require(fieldNames.add(f.field)) {
+                "Duplicate UI field reference: ${f.field}"
+            }
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ConfigurationUiDeclaration) return false
+        return fields == other.fields
+    }
+
+    override fun hashCode(): Int = fields.hashCode()
+
+    override fun toString(): String = "ConfigurationUiDeclaration(fields=$fields)"
+}
+
+/**
+ * 1.1: Package configuration declaration.
+ */
+public class PackageConfigurationDeclaration(
+    val data: ConfigurationDataDeclaration,
+    val ui: ConfigurationUiDeclaration
+) {
+    init {
+        val dataFieldIds = data.fields.map { it.id }.toSet()
+        val uiFieldIds = ui.fields.map { it.field }.toSet()
+        require(dataFieldIds == uiFieldIds) {
+            "Configuration data field IDs ($dataFieldIds) must exactly match UI field references ($uiFieldIds)"
+        }
+
+        val dataMap = data.fields.associateBy { it.id }
+        for (uiField in ui.fields) {
+            val dataField = dataMap[uiField.field]!!
+            when (dataField) {
+                is ConfigurationFieldDeclaration.StringField -> {
+                    if (dataField.allowedValues == null) {
+                        require(uiField.control == UiControl.TEXT) {
+                            "String field without allowedValues must use TEXT control, got: ${uiField.control}"
+                        }
+                    } else {
+                        require(uiField.control == UiControl.CHOICE) {
+                            "String field with allowedValues must use CHOICE control, got: ${uiField.control}"
+                        }
+                        val allowedSet = dataField.allowedValues.toSet()
+                        val choiceSet = uiField.choices?.map { it.value }?.toSet() ?: emptySet()
+                        require(allowedSet == choiceSet) {
+                            "UI choices ($choiceSet) must exactly match allowed values ($allowedSet) for field ${dataField.id}"
+                        }
+                    }
+                }
+                is ConfigurationFieldDeclaration.BooleanField -> {
+                    require(uiField.control == UiControl.TOGGLE) {
+                        "Boolean field must use TOGGLE control, got: ${uiField.control}"
+                    }
+                }
+                is ConfigurationFieldDeclaration.IntegerField -> {
+                    require(uiField.control == UiControl.NUMBER) {
+                        "Integer field must use NUMBER control, got: ${uiField.control}"
+                    }
+                }
+            }
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PackageConfigurationDeclaration) return false
+        return data == other.data && ui == other.ui
+    }
+
+    override fun hashCode(): Int = 31 * data.hashCode() + ui.hashCode()
+
+    override fun toString(): String = "PackageConfigurationDeclaration(data=$data, ui=$ui)"
+}
+

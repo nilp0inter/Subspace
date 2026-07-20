@@ -431,7 +431,7 @@ class PackageManagementCoordinatorTest {
     private data class Download(val coordinates: GitHubRepositoryCoordinates, val asset: GitHubReleaseAsset)
 
     private fun packageArchive(repositoryId: String, version: String, marker: String, luaVersion: String = LUA_VERSION): ByteArray {
-        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Coordinator package","summary":"Coordinator transaction fixture"},"runtime":{"luaVersion":"$luaVersion","apiVersion":"$API_VERSION"}}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Coordinator package","summary":"Coordinator transaction fixture"},"runtime":{"luaVersion":"$luaVersion","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
@@ -520,7 +520,7 @@ class PackageManagementCoordinatorTest {
         override fun snapshot(handle: LuaStateHandle): LuaKernelOutcome = error("not used")
         override fun close(handle: LuaStateHandle): LuaKernelOutcome = error("not used")
         override fun loadProgramImage(handle: LuaStateHandle, entryPoint: String, sourceMap: Map<String, String>): LuaKernelOutcome = error("not used")
-        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
+        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, config: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
         override fun invokeCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, arguments: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
         override fun startCoroutine(handle: LuaStateHandle, coroutineId: LuaCoroutineId, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
     }

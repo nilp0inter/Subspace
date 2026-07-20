@@ -277,6 +277,244 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
         }
     }
 
+    @Test
+    fun `released diagnostics removal and reinstall lifecycle clears and restores provider registration`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = installReleasedArtifact(root, bridge, providers)
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-lifecycle", implementationId)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(channel.id)?.preparation)
+            val firstState = bridge.createdStateIds.single()
+            assertEquals(1, bridge.createdStateIds.size)
+
+            // Remove the provider via the repository
+            val repo = repository(root, bridge, providers)
+            val removed = success(repo.remove(sourceRecord().repositoryId))
+            assertEquals(MutationResult.Removed(implementationId), removed)
+            assertTrue(
+                "Removed provider must be absent from the registry",
+                providers.resolve(implementationId) is ChannelProviderResolution.Missing,
+            )
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertTrue(
+                "Removed provider state must be closed",
+                bridge.closedStateIds.contains(firstState),
+            )
+
+            // Reinstall the same artifact
+            val reinstalled = success(repo.installOrUpdate(ByteArrayInputStream(releasedArtifact()), sourceRecord()))
+            assertEquals(MutationResult.Installed(implementationId), reinstalled)
+            assertTrue(
+                "Reinstalled provider must be available in the registry",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(channel.id)?.preparation)
+            assertEquals("Reinstall must create a fresh state", 2, bridge.createdStateIds.size)
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
+    @Test
+    fun `released diagnostics metadata-only audio callback with opaque userdata ignored and reclaimed`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = installReleasedArtifact(root, bridge, providers)
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-userdata", implementationId)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            val target = (registry.prepareInput(channel.id) as? ChannelInputAcceptance.Accepted)?.target
+                ?: throw AssertionError("Ready diagnostics package must accept PTT")
+
+            // Simulate a capture with opaque userdata (non-null captured audio token)
+            target.onInputStarted(FakeInputSession(sampleRate = 44_100))
+            val result = target.onInputReleased(RecordedPcm(ShortArray(22_050), 44_100))
+            assertEquals(ChannelInputResult.None, result)
+            (target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
+
+            val event = bridge.inputEvents.single() as LuaValue.Map
+            assertEquals(setOf("event", "session", "metadata"), event.pairs.keys)
+            assertEquals(LuaValue.StringValue("capture"), event.pairs["event"])
+
+            val metadata = event.pairs["metadata"] as? LuaValue.Map
+                ?: throw AssertionError("PTT callback must receive a metadata object")
+            assertEquals(setOf("duration_ms", "sample_rate", "channels"), metadata.pairs.keys)
+            assertEquals(LuaValue.Number(500.0), metadata.pairs["duration_ms"])
+            assertEquals(LuaValue.Number(44_100.0), metadata.pairs["sample_rate"])
+            assertEquals(LuaValue.Number(1.0), metadata.pairs["channels"])
+
+            // Opaque audio userdata must never cross the Lua boundary
+            assertFalse("Audio payload must never reach the Lua callback", "payload" in event.pairs)
+            assertFalse("Raw audio must never reach the Lua callback", "audio" in event.pairs)
+            assertFalse("Capture token must never reach the Lua callback", "captured_audio" in event.pairs)
+            assertFalse("Audio reference must never reach the Lua callback", "audio_ref" in event.pairs)
+            assertEquals("Exactly one input event must be recorded", 1, bridge.inputEvents.size)
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
+    @Test
+    fun `released diagnostics neutral SOS reaches the generic runtime callback`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = installReleasedArtifact(root, bridge, providers)
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-sos-neutral", implementationId)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+
+            assertEquals(ChannelPreparationAvailability.Available, registry.dispatchSos(channel.id))
+            assertEquals(
+                listOf(LuaValue.Map(mapOf("event" to LuaValue.StringValue("sos")))),
+                bridge.sosEvents,
+            )
+            assertEquals("SOS must dispatch exactly once per call", 1, bridge.sosEvents.size)
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
+    @Test
+    fun `released diagnostics explicit update recovery after old-release failure through the full provider path`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = InstalledProviderId.derive(sourceRecord().repositoryId)
+            val repository = repository(root, bridge, providers)
+
+            // v1.0.0 must fail at the strict manifest decoder before any state or provider registration
+            val historicalBytes = historicalArtifact(HISTORICAL_V1_0_0_PATH, HISTORICAL_V1_0_0_SHA256)
+            val installAttempt = repository.installOrUpdate(ByteArrayInputStream(historicalBytes), sourceRecord())
+            val failure = (installAttempt as? PackageOutcome.Failure)?.error
+            assertTrue(
+                "Old v1.0.0 release must fail as FORMAT/MALFORMED_MANIFEST: $failure",
+                failure is PackageFailure.Format && failure.detail == PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            )
+            assertTrue(
+                "Old-release failure must not register a provider",
+                providers.resolve(implementationId) is ChannelProviderResolution.Missing,
+            )
+            assertEquals(
+                "Old-release failure must not create a Lua state",
+                0,
+                bridge.createdStateIds.size,
+            )
+
+            // Explicit update to v1.2.0 must succeed
+            assertEquals(
+                MutationResult.Installed(implementationId),
+                success(repository.installOrUpdate(ByteArrayInputStream(releasedArtifact()), sourceRecord())),
+            )
+            assertTrue(
+                "Provider must be available after explicit update recovery",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+
+            // Runtime becomes ready through the ordinary provider path
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-update-recovery", implementationId)
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+
+            // Startup received the detached empty configuration snapshot
+            assertEquals(1, bridge.startupConfigs.size)
+            val startupConfig = bridge.startupConfigs.single() as LuaValue.Map
+            assertEquals(
+                setOf("schema_version", "values"),
+                startupConfig.pairs.keys,
+            )
+            assertEquals(
+                LuaValue.Number(1.0),
+                startupConfig.pairs["schema_version"],
+            )
+            val values = startupConfig.pairs["values"] as? LuaValue.Map
+                ?: throw AssertionError("Startup config must contain a 'values' map")
+            assertTrue(
+                "Empty-configuration package must have no values in the startup snapshot",
+                values.pairs.isEmpty(),
+            )
+
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
+    @Test
+    fun `released diagnostics reinstall same version and rollback with no prior revision`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = installReleasedArtifact(root, bridge, providers)
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-reinstall-rollback", implementationId)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+            val firstStateCount = bridge.createdStateIds.size
+
+            // Reinstall the same artifact produces Reinstalled (same digest, no new revision)
+            val repository = repository(root, bridge, providers)
+            assertEquals(
+                MutationResult.Reinstalled(implementationId),
+                success(repository.installOrUpdate(ByteArrayInputStream(releasedArtifact()), sourceRecord())),
+            )
+            assertTrue(
+                "Provider must remain available after reinstall of the same digest",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+            assertEquals(
+                "Reinstall of same digest must not create a new Lua state",
+                firstStateCount,
+                bridge.createdStateIds.size,
+            )
+
+            // Rollback must fail with NO_ROLLBACK_REVISION (single version, no prior revision)
+            val rollbackOutcome = repository.rollback(sourceRecord().repositoryId)
+            val rollbackFailure = (rollbackOutcome as? PackageOutcome.Failure)?.error
+            assertTrue(
+                "Rollback must fail with NO_ROLLBACK_REVISION: $rollbackFailure",
+                rollbackFailure is PackageFailure.Rollback
+                    && rollbackFailure.detail == PackageFailure.RollbackDetail.NO_ROLLBACK_REVISION,
+            )
+
+            // Provider and runtime remain available after the failed rollback
+            assertTrue(
+                "Provider must still be available after failed rollback",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+            assertEquals(
+                "Existing state must not be closed after a failed rollback",
+                firstStateCount,
+                bridge.createdStateIds.size - bridge.closedStateIds.size,
+            )
+
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
     private suspend fun TestScope.installReleasedArtifact(
         root: File,
         bridge: RecordingDiagnosticsKernelBridge,
@@ -350,9 +588,9 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
     private fun sourceRecord(): PackageSourceRecord = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
         coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
-        release = GitHubReleaseIdentity("1", "v1.0.0", false),
-        asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
-        ownerId = "9000001",
+        release = GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false),
+        asset = GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"),
+        ownerId = OFFICIAL_OWNER_ID,
     )
 
     private fun releasedArtifact(): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(RESOURCE_PATH)) {
@@ -362,6 +600,19 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
             assertEquals("The runtime fixture must remain the exact reviewed release artifact.", ARTIFACT_SHA256, sha256(bytes))
         }
     }
+
+    private fun historicalArtifact(resourcePath: String, expectedSha256: String): ByteArray =
+        requireNotNull(javaClass.classLoader?.getResourceAsStream(resourcePath)) {
+            "Missing pinned historical diagnostics fixture $resourcePath"
+        }.use { stream ->
+            stream.readBytes().also { bytes ->
+                assertEquals(
+                    "Historical fixture $resourcePath must remain byte-exact",
+                    expectedSha256,
+                    sha256(bytes),
+                )
+            }
+        }
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -404,6 +655,7 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
         val sosEvents = mutableListOf<LuaValue>()
         val startupAdmissionResults = mutableListOf<Int>()
         val startedCoroutines = mutableListOf<Long>()
+        val startupConfigs = mutableListOf<LuaValue>()
 
         override fun create(config: LuaKernelConfig): LuaKernelOutcome {
             val id = nextStateId++
@@ -458,8 +710,10 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
         override fun invokeStartupCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome {
+            startupConfigs += config
             val admitted = mutableListOf<Long>()
             repeat(startupSpawnCount) { index ->
                 val coroutineId = index + 1L
@@ -489,6 +743,17 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
                 completed(handle)
             }
             else -> completed(handle)
+        }
+
+        override fun invokeInputCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            capturedAudioToken: String,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome {
+            inputEvents += arguments
+            return completed(handle, "{\"ok\":true}")
         }
 
         override fun startCoroutine(
@@ -553,6 +818,11 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
     private companion object {
         const val RESOURCE_PATH = "diagnostics-channel/subspace-channel.zip"
         const val REPOSITORY_ID = "1305223892"
-        const val ARTIFACT_SHA256 = "a1609ba59e3bac16dbcdf03532f9774848aaf18ec46137e6bda7cecc012c6b87"
+        const val RELEASE_ID = "356470779"
+        const val ASSET_ID = "482931807"
+        const val OFFICIAL_OWNER_ID = "1224006"
+        const val ARTIFACT_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
+        const val HISTORICAL_V1_0_0_PATH = "diagnostics-channel/historical/v1.0.0/subspace-channel.zip"
+        const val HISTORICAL_V1_0_0_SHA256 = "a1609ba59e3bac16dbcdf03532f9774848aaf18ec46137e6bda7cecc012c6b87"
     }
 }

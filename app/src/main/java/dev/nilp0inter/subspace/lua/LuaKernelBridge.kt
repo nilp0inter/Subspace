@@ -92,15 +92,15 @@ internal interface LuaKernelBridge {
         entryPoint: String,
         sourceMap: Map<String, String>
     ): LuaKernelOutcome
-
     /**
-     * Invoke the startup callback with Lua's zero-argument call semantics.
-     * This is intentionally distinct from event callback invocation, whose
-     * single [LuaValue] argument is encoded as one Lua argument.
+     * Invoke the startup callback with one normalized configuration argument.
+     * The [config] represents the detached snapshot of the package declaration's
+     * validated configuration (`{schema_version = 1, values = {...}}`).
      */
     fun invokeStartupCallback(
         handle: LuaStateHandle,
         callbackHandle: LuaCallbackHandle,
+        config: LuaValue,
         spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
     ): LuaKernelOutcome
 
@@ -116,6 +116,22 @@ internal interface LuaKernelBridge {
     ): LuaKernelOutcome
 
     /**
+     * Invoke handle_input in a host-managed coroutine. Native bridges override
+     * this with a coroutine entrypoint; the default keeps lightweight bridges
+     * source-compatible while preserving synchronous behavior for other calls.
+     */
+    fun invokeInputCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        capturedAudioToken: String,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
+    ): LuaKernelOutcome = LuaKernelOutcome.RuntimeFailure(
+        stateId = handle.stateId.value,
+        generation = handle.generation.value,
+        diagnostic = "opaque audio input requires a native kernel bridge",
+    )
+    /**
      * Start a spawned background coroutine.
      */
     fun startCoroutine(
@@ -128,10 +144,16 @@ internal interface LuaKernelBridge {
 /** Native callback port: 0 accepted, 1 closed, 2 capacity exhausted. */
 internal interface LuaSpawnAdmission {
     fun admitTask(coroutineId: Long): Int
+    fun admitTranscription(operationId: Long, token: String): Int
+    fun admitSynthesis(operationId: Long, paramsJson: String): Int
+    fun admitPlayback(operationId: Long, token: String, delaySeconds: Double): Int
 
     companion object {
         fun rejecting(): LuaSpawnAdmission = object : LuaSpawnAdmission {
             override fun admitTask(coroutineId: Long): Int = 1
+            override fun admitTranscription(operationId: Long, token: String): Int = 1
+            override fun admitSynthesis(operationId: Long, paramsJson: String): Int = 1
+            override fun admitPlayback(operationId: Long, token: String, delaySeconds: Double): Int = 1
         }
     }
 }

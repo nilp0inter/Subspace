@@ -141,7 +141,7 @@ class ChannelBrowseEntryProjectionTest {
                     executionStatus = ChannelExecutionStatus.IDLE,
                     summary = "journal private transcript",
                 ),
-                snapshot("debug-instance", "Debug", "builtin:debug", ChannelPreparationAvailability.Available).copy(
+                snapshot("debug-instance", "Debug", "test:legacy-debug", ChannelPreparationAvailability.Available).copy(
                     executionStatus = ChannelExecutionStatus.PROCESSING,
                     summary = "debug private payload",
                 ),

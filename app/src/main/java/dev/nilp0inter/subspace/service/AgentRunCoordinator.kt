@@ -85,6 +85,7 @@ enum class AgentRunDiagnosticCode {
     PLAYBACK_FAILED,
     PLAYBACK_CANCELLED,
     PLAYBACK_STALE,
+    PLAYBACK_BUSY,
     REPLACED,
     REMOVED,
     SHUTDOWN,
@@ -378,6 +379,7 @@ class AgentRunCoordinator(
             is DelayedPlaybackOutcome.Failed -> diagnostic(run.channelInstanceId, run.id, AgentRunDiagnosticCode.PLAYBACK_FAILED)
             DelayedPlaybackOutcome.Cancelled -> diagnostic(run.channelInstanceId, run.id, AgentRunDiagnosticCode.PLAYBACK_CANCELLED)
             DelayedPlaybackOutcome.Stale -> diagnostic(run.channelInstanceId, run.id, AgentRunDiagnosticCode.PLAYBACK_STALE)
+            DelayedPlaybackOutcome.Busy -> diagnostic(run.channelInstanceId, run.id, AgentRunDiagnosticCode.PLAYBACK_BUSY)
         }
         publish(run.channelInstanceId, AgentRunTerminalOutcome.Completed)
         return true

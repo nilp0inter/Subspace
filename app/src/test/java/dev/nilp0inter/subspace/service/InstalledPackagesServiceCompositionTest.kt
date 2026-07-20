@@ -626,7 +626,7 @@ class InstalledPackagesServiceCompositionTest {
 
     private fun packageArchive(): ByteArray {
         val source = "return { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Service test package","summary":"Installed Lua service composition package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"}}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Service test package","summary":"Installed Lua service composition package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
@@ -821,7 +821,7 @@ class InstalledPackagesServiceCompositionTest {
         override fun loadProgramImage(handle: LuaStateHandle, entryPoint: String, sourceMap: Map<String, String>): LuaKernelOutcome =
             completed(handle, "[\"startup\",\"handle_readiness\"]")
 
-        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(handle, logs = startupLogs)
+        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, config: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(handle, logs = startupLogs)
 
         override fun invokeCallback(
             handle: LuaStateHandle,

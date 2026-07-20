@@ -282,6 +282,15 @@ interface ChannelCapabilityHost {
         key: CapabilityKey<T>,
         timeoutMillis: Long,
     ): HostedCapabilityAcquisition<T>
+    /**
+     * Notifies host-owned generation resources when a runtime scope is revoked. The default is
+     * intentionally empty so capability hosts that do not own deferred resources remain source
+     * compatible. Implementations MUST make this callback idempotent.
+     */
+    suspend fun onGenerationTermination(
+        identity: CapabilityScopeIdentity,
+        termination: CapabilityLeaseTermination,
+    ) {}
 }
 
 /**
@@ -342,11 +351,60 @@ fun interface CapabilityDiagnosticSink {
 /** An opaque captured recording chosen and owned by the host audio lifecycle. */
 sealed interface OpaqueAudioRecording {
     val operationId: String
+
+    /**
+     * Host-owned retained byte cost of this artifact, as measured against
+     * the registry's per-artifact and aggregate byte quotas. Always known
+     * for a fully captured recording.
+     */
+    val retainedBytes: Long
+
+    /**
+     * Capture duration in milliseconds, or `null` when the underlying
+     * backend did not surface duration metadata. The registry enforces the
+     * per-artifact duration bound only when this value is non-null.
+     */
+    val durationMillis: Long?
+
+    /**
+     * Release this artifact's host-owned audio data exactly once. Idempotent.
+     *
+     * Invoked by the host audio registry when the owning execution terminates
+     * or the runtime generation closes without consuming this recording.
+     * After disposal the artifact holds no usable audio data; subsequent
+     * disposal is a no-op.
+     */
+    fun dispose()
 }
 
 /** An opaque synthesized audio artifact. Its samples and route stay host-owned. */
 sealed interface OpaqueSynthesizedAudio {
     val operationId: String
+
+    /**
+     * Host-owned retained byte cost of this artifact, as measured against
+     * the registry's per-artifact and aggregate byte quotas. Always known
+     * for a fully synthesized artifact.
+     */
+    val retainedBytes: Long
+
+    /**
+     * Synthesis duration in milliseconds, or `null` when the synthesizing
+     * backend did not surface duration metadata (for example, when no sample
+     * rate is attached). The registry enforces the per-artifact duration
+     * bound only when this value is non-null.
+     */
+    val durationMillis: Long?
+
+    /**
+     * Release this artifact's host-owned audio data exactly once. Idempotent.
+     *
+     * Invoked by the host audio registry when the owning execution terminates
+     * or the runtime generation closes without consuming this artifact.
+     * After disposal the artifact holds no usable audio data; subsequent
+     * disposal is a no-op.
+     */
+    fun dispose()
 }
 
 /** A lifecycle-bound audio operation whose platform resources remain host-owned. */

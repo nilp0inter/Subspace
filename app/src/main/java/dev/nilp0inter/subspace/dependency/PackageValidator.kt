@@ -622,7 +622,7 @@ public object PackageValidator {
 
             // Validate manifest structure and exact v1 constraints
             val allowedRootKeys = setOf(
-                "manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime"
+                "manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "capabilities"
             )
             if (manifestMap.keys != allowedRootKeys) {
                 val missing = allowedRootKeys - manifestMap.keys
@@ -700,13 +700,264 @@ public object PackageValidator {
                 return PackageOutcome.Failure(PackageFailure.Compatibility(CompatibilityDetail.API_VERSION_INCOMPATIBLE))
             }
 
+            if (!manifestMap.containsKey("configuration") || !manifestMap.containsKey("capabilities")) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+
+            val capabilitiesRaw = manifestMap["capabilities"]
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            if (capabilitiesRaw !is List<*>) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+            val capabilities = LinkedHashSet<String>()
+            for (cap in capabilitiesRaw) {
+                if (cap !is String) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+                if (!PackageCapability.ALL.contains(cap)) {
+                    return PackageOutcome.Failure(PackageFailure.Capability(PackageFailure.CapabilityDetail.UNKNOWN_CAPABILITY_ID))
+                }
+                if (!capabilities.add(cap)) {
+                    return PackageOutcome.Failure(PackageFailure.Capability(PackageFailure.CapabilityDetail.DUPLICATE_CAPABILITY_ID))
+                }
+            }
+
+            val configurationMap = manifestMap["configuration"] as? Map<*, *>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+            val allowedConfigKeys = setOf("schemaVersion", "data", "ui")
+            if (configurationMap.keys != allowedConfigKeys) {
+                val extra = configurationMap.keys - allowedConfigKeys
+                if (extra.isNotEmpty()) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                }
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+
+            val configSchemaVersion = configurationMap["schemaVersion"] as? Int
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            if (configSchemaVersion != 1) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+
+            val dataMap = configurationMap["data"] as? Map<*, *>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+            val allowedDataKeys = setOf("fields", "additionalProperties")
+            for (k in dataMap.keys) {
+                if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                if (!allowedDataKeys.contains(k)) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                }
+            }
+            if (!dataMap.containsKey("additionalProperties") ||
+                dataMap["additionalProperties"] != false
+            ) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+
+            val dataFieldsRaw = dataMap["fields"] as? List<*>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+            val dataFields = ArrayList<ConfigurationFieldDeclaration>()
+            for (fieldItem in dataFieldsRaw) {
+                val fieldMap = fieldItem as? Map<*, *>
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+                val allowedFieldKeys = setOf("id", "type", "default", "allowedValues", "minimum", "maximum")
+                for (k in fieldMap.keys) {
+                    if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    if (!allowedFieldKeys.contains(k)) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                    }
+                }
+
+                val id = fieldMap["id"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val typeStr = fieldMap["type"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                if (!fieldMap.containsKey("default")) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+                val defaultVal = fieldMap["default"]
+
+                val decl = when (typeStr) {
+                    "string" -> {
+                        if (fieldMap.containsKey("minimum") || fieldMap.containsKey("maximum")) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                        val defaultStr = defaultVal as? String
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        val allowedValues = if (fieldMap.containsKey("allowedValues")) {
+                            val avRaw = fieldMap["allowedValues"] as? List<*>
+                                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                            val avList = ArrayList<String>()
+                            for (av in avRaw) {
+                                if (av !is String) {
+                                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                                }
+                                avList.add(av)
+                            }
+                            avList
+                        } else {
+                            null
+                        }
+                        try {
+                            ConfigurationFieldDeclaration.StringField(id, defaultStr, allowedValues)
+                        } catch (e: Exception) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                    }
+                    "boolean" -> {
+                        if (fieldMap.containsKey("allowedValues") || fieldMap.containsKey("minimum") || fieldMap.containsKey("maximum")) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                        val defaultBool = defaultVal as? Boolean
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        try {
+                            ConfigurationFieldDeclaration.BooleanField(id, defaultBool)
+                        } catch (e: Exception) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                    }
+                    "integer" -> {
+                        if (fieldMap.containsKey("allowedValues")) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                        val defaultLong = asLong(defaultVal)
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+                        val minimum = if (fieldMap.containsKey("minimum")) {
+                            asLong(fieldMap["minimum"])
+                                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        } else {
+                            null
+                        }
+
+                        val maximum = if (fieldMap.containsKey("maximum")) {
+                            asLong(fieldMap["maximum"])
+                                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        } else {
+                            null
+                        }
+
+                        try {
+                            ConfigurationFieldDeclaration.IntegerField(id, defaultLong, minimum, maximum)
+                        } catch (e: Exception) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                    }
+                    else -> {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    }
+                }
+                dataFields.add(decl)
+            }
+
+            val uiMap = configurationMap["ui"] as? Map<*, *>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            val allowedUiKeys = setOf("fields")
+            if (uiMap.keys != allowedUiKeys) {
+                val extra = uiMap.keys - allowedUiKeys
+                if (extra.isNotEmpty()) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                }
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+            val uiFieldsRaw = uiMap["fields"] as? List<*>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+            val uiFields = ArrayList<UiFieldDeclaration>()
+            for (uiFieldItem in uiFieldsRaw) {
+                val uiFieldMap = uiFieldItem as? Map<*, *>
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+
+                val allowedUiFieldKeys = setOf("field", "control", "label", "help", "choices")
+                for (k in uiFieldMap.keys) {
+                    if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    if (!allowedUiFieldKeys.contains(k)) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                    }
+                }
+
+                val field = uiFieldMap["field"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val controlStr = uiFieldMap["control"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val control = when (controlStr) {
+                    "text" -> UiControl.TEXT
+                    "toggle" -> UiControl.TOGGLE
+                    "number" -> UiControl.NUMBER
+                    "choice" -> UiControl.CHOICE
+                    else -> return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+                val label = uiFieldMap["label"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val help = if (uiFieldMap.containsKey("help")) {
+                    val hVal = uiFieldMap["help"] as? String
+                        ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    if (hVal.isBlank()) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    }
+                    hVal
+                } else {
+                    null
+                }
+
+                val choices = if (uiFieldMap.containsKey("choices")) {
+                    val choicesRaw = uiFieldMap["choices"] as? List<*>
+                        ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    val choicesList = ArrayList<UiChoice>()
+                    for (choiceItem in choicesRaw) {
+                        val choiceMap = choiceItem as? Map<*, *>
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        val allowedChoiceKeys = setOf("value", "label")
+                        for (k in choiceMap.keys) {
+                            if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                            if (!allowedChoiceKeys.contains(k)) {
+                                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                            }
+                        }
+                        val cVal = choiceMap["value"] as? String
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        val cLabel = choiceMap["label"] as? String
+                            ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        try {
+                            choicesList.add(UiChoice(cVal, cLabel))
+                        } catch (e: Exception) {
+                            return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                        }
+                    }
+                    choicesList
+                } else {
+                    null
+                }
+
+                try {
+                    uiFields.add(UiFieldDeclaration(field, control, label, help, choices))
+                } catch (e: Exception) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+            }
+
+            val configuration = try {
+                PackageConfigurationDeclaration(
+                    ConfigurationDataDeclaration(dataFields),
+                    ConfigurationUiDeclaration(uiFields)
+                )
+            } catch (e: Exception) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+
             val manifest = PackageManifest(
                 manifestVersion = manifestVersion,
                 repositoryId = sourceRecord.repositoryId,
                 packageVersion = packageVersion,
                 entryModule = entryModule,
                 presentation = PackagePresentation(label, summary),
-                runtime = RuntimeRequirements(luaVersion, apiVersion)
+                runtime = RuntimeRequirements(luaVersion, apiVersion),
+                configuration = configuration,
+                capabilities = capabilities
             )
 
             if (!luaSourceMap.containsKey(entryModule)) {
@@ -857,6 +1108,17 @@ public object PackageValidator {
             if (read != -1) remaining -= read
             return read
         }
+    }
+
+    private fun asLong(value: Any?): Long? {
+        if (value is Number) {
+            val doubleVal = value.toDouble()
+            val longVal = value.toLong()
+            if (doubleVal == longVal.toDouble()) {
+                return longVal
+            }
+        }
+        return null
     }
 
     private fun decodeStrictUtf8(bytes: ByteArray): String {

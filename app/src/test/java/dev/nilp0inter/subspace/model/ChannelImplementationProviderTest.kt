@@ -99,13 +99,6 @@ class ChannelImplementationProviderTest {
                 expectedError = ChannelProviderError.InvalidConfiguration::class.java,
             ),
             Case(
-                name = "debug mode must be a declared string",
-                configuration = BuiltInChannelDescriptors.debug.configuration,
-                schemaVersion = 1,
-                payload = opaque("""{"mode":99}"""),
-                expectedError = ChannelProviderError.InvalidConfiguration::class.java,
-            ),
-            Case(
                 name = "keyboard profile must include host and layout",
                 configuration = BuiltInChannelDescriptors.keyboard.configuration,
                 schemaVersion = 1,

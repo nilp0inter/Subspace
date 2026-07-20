@@ -345,6 +345,7 @@ version = "0.1.0"
 dependencies = [
  "jni",
  "mlua",
+ "parking_lot",
  "serde_json",
 ]
 

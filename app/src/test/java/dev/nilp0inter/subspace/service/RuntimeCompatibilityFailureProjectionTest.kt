@@ -9,6 +9,10 @@ import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
 import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.lua.ImmutableProgramImage
 import dev.nilp0inter.subspace.lua.LuaChannelImplementationProvider
+import dev.nilp0inter.subspace.dependency.ConfigurationDataDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationUiDeclaration
+import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
+import dev.nilp0inter.subspace.lua.CompiledConfigurationProvider
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
 import dev.nilp0inter.subspace.lua.LuaNativeKernelBridge
 import dev.nilp0inter.subspace.lua.LuaProgramRequirements
@@ -32,6 +36,12 @@ import org.junit.Test
 /** Test-only identity for generic Lua provider behavior. */
 private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
 
+/** Empty schema-version-1 declaration; mirrors a materialized package with no fields. */
+private fun emptyConfigurationDeclaration(): PackageConfigurationDeclaration = PackageConfigurationDeclaration(
+    ConfigurationDataDeclaration(emptyList()),
+    ConfigurationUiDeclaration(emptyList()),
+)
+
 /**
  * Constructs a test Lua provider from an image creation result (success or failure).
  * Used for testing error projection paths.
@@ -52,6 +62,7 @@ private fun testLuaProviderFromResult(
         ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
     },
     bridge = bridge,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)

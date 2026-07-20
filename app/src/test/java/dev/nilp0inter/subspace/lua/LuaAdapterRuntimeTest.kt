@@ -7,15 +7,36 @@ import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityKey
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeTerminationResult
 import dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityPort
 import dev.nilp0inter.subspace.channel.capability.HostedCapabilityAcquisition
 import dev.nilp0inter.subspace.channel.capability.RevocableChannelCapabilityScope
+import dev.nilp0inter.subspace.dependency.PackageCapability
 import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
+import dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio
+import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
+import dev.nilp0inter.subspace.channel.capability.AudioOperationCapability
+import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
+import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
+import dev.nilp0inter.subspace.channel.capability.Transcription
+import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioRecording
+import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapability
+import dev.nilp0inter.subspace.channel.capability.AgentOperationContext
+import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
+import dev.nilp0inter.subspace.model.DelayedPlaybackOperationId
+import dev.nilp0inter.subspace.model.DelayedPlaybackOutcome
 import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.dependency.ConfigurationDataDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationUiDeclaration
+import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
 import dev.nilp0inter.subspace.model.ChannelRuntimeConstructionRequest
@@ -42,6 +63,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -51,6 +75,12 @@ import org.junit.Test
 
 /** Test-only identity for generic Lua provider behavior. */
 private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
+
+/** Empty schema-version-1 declaration; mirrors a materialized package with no fields. */
+private fun emptyConfigurationDeclaration(): PackageConfigurationDeclaration = PackageConfigurationDeclaration(
+    ConfigurationDataDeclaration(emptyList()),
+    ConfigurationUiDeclaration(emptyList()),
+)
 
 /**
  * Constructs a test Lua provider with fixed identity and presentation.
@@ -73,6 +103,7 @@ private fun testLuaProvider(
     },
     bridge = bridge,
     logSink = logSink,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
 )
 
 /**
@@ -81,6 +112,7 @@ private fun testLuaProvider(
  * callbacks, snapshots, input targets, and close behavior through public
  * [dev.nilp0inter.subspace.service.ChannelRuntime] operations.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class LuaAdapterRuntimeTest {
 
     @Test
@@ -89,7 +121,14 @@ class LuaAdapterRuntimeTest {
         val harness = harness(bridge, setOf("startup", "handle_lifecycle"))
         try {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
-            assertNull("startup must cross the bridge with zero Lua arguments.", bridge.callbackCalls[0].arguments)
+            assertEquals(
+                "startup must cross the bridge with one normalized configuration argument: {schema_version=1, values={}}.",
+                LuaValue.Map(mapOf(
+                    "schema_version" to LuaValue.Number(1.0),
+                    "values" to LuaValue.Map(emptyMap()),
+                )),
+                bridge.callbackCalls[0].arguments,
+            )
 
             assertEquals(
                 listOf("startup", "handle_lifecycle"),
@@ -101,6 +140,386 @@ class LuaAdapterRuntimeTest {
             )
             assertEquals(ChannelPreparationAvailability.Available, harness.runtime.snapshot.value.preparation)
             assertEquals(ChannelExecutionStatus.IDLE, harness.runtime.snapshot.value.executionStatus)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `startup bridge runtime failure fails activation atomically without lifecycle`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", LuaKernelOutcome.RuntimeFailure(41, 7, "bridge error"))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_lifecycle"))
+        try {
+            assertTrue(
+                "A bridge RuntimeFailure during startup must fail activation.",
+                harness.runtime.activate() is ChannelActivationResult.Failed,
+            )
+            assertEquals(
+                "startup must be the only callback invoked; handle_lifecycle must not run after startup failure.",
+                listOf("startup"),
+                bridge.callbackCalls.map { it.name },
+            )
+            assertEquals(
+                ChannelExecutionStatus.FAILED,
+                harness.runtime.snapshot.value.executionStatus,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `activation publishes ready after startup and lifecycle before authorizing staged tasks`() = runTest {
+        val events = mutableListOf<String>()
+        val taskStarted = CompletableDeferred<Unit>()
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", completed(spawnedCoroutines = listOf(301)))
+            beforeCallback = { name -> events += name }
+            onCoroutineStarted = { coroutineId ->
+                events += "task:$coroutineId"
+                taskStarted.complete(Unit)
+            }
+        }
+        val harness = harness(bridge, setOf("startup", "handle_lifecycle"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            assertEquals(
+                "Ready must be published only after both activation callbacks complete.",
+                ChannelPreparationAvailability.Available,
+                harness.runtime.snapshot.value.preparation,
+            )
+            assertEquals(
+                "Startup-admitted work must remain staged until the Ready publication is complete.",
+                listOf("startup", "handle_lifecycle"),
+                events,
+            )
+            assertTrue(bridge.startedCoroutines.isEmpty())
+
+            events += "ready"
+            harness.authorizeStagedTasks()
+            taskStarted.await()
+
+            assertEquals(
+                listOf("startup", "handle_lifecycle", "ready", "task:301"),
+                events,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `startup activation failure discards every admitted task without publishing ready`() = runTest {
+        lateinit var harness: AdapterHarness
+        val events = mutableListOf<String>()
+        val taskRan = AtomicInteger()
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", LuaKernelOutcome.RuntimeFailure(41, 7, "startup failed"))
+            beforeCallback = { name ->
+                events += name
+                if (name == "startup") {
+                    assertTrue(
+                        "A task admitted during startup must be accepted before startup reports failure.",
+                        harness.stageTask { taskRan.incrementAndGet() } is GenerationAdmission.Accepted,
+                    )
+                }
+            }
+        }
+        harness = harness(bridge, setOf("startup", "handle_lifecycle"))
+        try {
+            assertTrue(harness.runtime.activate() is ChannelActivationResult.Failed)
+            assertEquals(listOf("startup"), events)
+            assertFalse(harness.runtime.snapshot.value.preparation is ChannelPreparationAvailability.Available)
+
+            harness.authorizeStagedTasks()
+            assertEquals(0, taskRan.get())
+            assertTrue(bridge.startedCoroutines.isEmpty())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `lifecycle activation failure discards startup tasks without publishing ready`() = runTest {
+        val taskStarted = AtomicInteger()
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", completed(spawnedCoroutines = listOf(302)))
+            enqueue("handle_lifecycle", LuaKernelOutcome.RuntimeFailure(41, 7, "lifecycle failed"))
+            onCoroutineStarted = { taskStarted.incrementAndGet() }
+        }
+        val harness = harness(bridge, setOf("startup", "handle_lifecycle"))
+        try {
+            assertTrue(harness.runtime.activate() is ChannelActivationResult.Failed)
+            assertEquals(
+                listOf("startup", "handle_lifecycle"),
+                bridge.callbackCalls.map { it.name },
+            )
+            assertFalse(harness.runtime.snapshot.value.preparation is ChannelPreparationAvailability.Available)
+
+            harness.authorizeStagedTasks()
+            assertEquals(0, taskStarted.get())
+            assertTrue(
+                "A startup-admitted task must be discarded before any coroutine can start.",
+                bridge.startedCoroutines.isEmpty(),
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `startup configuration is a normalized detached snapshot with schema_version and values`() = runTest {
+        val bridge = RecordingBridge()
+        val harness = harness(bridge, setOf("startup"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            val config = bridge.callbackCalls[0].arguments
+            val map = when (config) {
+                is LuaValue.Map -> config.pairs
+                else -> throw AssertionError(
+                    "Startup argument must be a LuaValue.Map, got ${config?.let { it::class.simpleName }}.",
+                )
+            }
+            assertTrue(
+                "Startup config must contain schema_version key.",
+                map.containsKey("schema_version"),
+            )
+            assertEquals(
+                "Startup config schema_version must be 1.",
+                LuaValue.Number(1.0),
+                map["schema_version"],
+            )
+            assertTrue(
+                "Startup config must contain values key.",
+                map.containsKey("values"),
+            )
+            val values = map["values"]
+            assertTrue(
+                "Startup config values must be a LuaValue.Map: got ${values?.let { it::class.simpleName }}.",
+                values is LuaValue.Map,
+            )
+            assertEquals(
+                "Startup config must have exactly two keys (schema_version, values).",
+                2,
+                map.size,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+
+    @Test
+    fun `startup snapshot values map is empty for a payload-free configuration`() = runTest {
+        val bridge = RecordingBridge()
+        val harness = harness(bridge, setOf("startup"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            val config = bridge.callbackCalls[0].arguments as? LuaValue.Map
+                ?: throw AssertionError("Startup argument must be a LuaValue.Map")
+            val values = config.pairs["values"] as? LuaValue.Map
+                ?: throw AssertionError("Startup config 'values' must be a LuaValue.Map")
+            assertEquals(
+                "Values map must be empty for a payload-free configuration.",
+                0,
+                values.pairs.size,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `independent runtimes receive distinct isolated startup snapshots`() = runTest {
+        val bridge1 = RecordingBridge()
+        val harness1 = harness(bridge1, setOf("startup"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness1.runtime.activate())
+            val config1 = bridge1.callbackCalls[0].arguments as? LuaValue.Map
+                ?: throw AssertionError("Harness 1: startup argument must be a LuaValue.Map")
+
+            val bridge2 = RecordingBridge()
+            val harness2 = harness(bridge2, setOf("startup"))
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness2.runtime.activate())
+                val config2 = bridge2.callbackCalls[0].arguments as? LuaValue.Map
+                    ?: throw AssertionError("Harness 2: startup argument must be a LuaValue.Map")
+
+                assertTrue(
+                    "Each runtime must receive its own detached config instance.",
+                    config1 !== config2,
+                )
+                assertEquals(
+                    "Independent configs must be structurally identical.",
+                    config1,
+                    config2,
+                )
+
+                val values1 = config1.pairs["values"] as? LuaValue.Map
+                    ?: throw AssertionError("Config 1: 'values' must be a LuaValue.Map")
+                val values2 = config2.pairs["values"] as? LuaValue.Map
+                    ?: throw AssertionError("Config 2: 'values' must be a LuaValue.Map")
+                assertTrue(
+                    "Each runtime's values sub-map must be independently allocated.",
+                    values1 !== values2,
+                )
+            } finally {
+                harness2.close()
+            }
+        } finally {
+            harness1.close()
+        }
+    }
+
+    @Test
+    fun `different host runtime generations isolate their startup snapshot copies`() = runTest {
+        val bridge1 = RecordingBridge()
+        val harness1 = harness(
+            bridge = bridge1,
+            callbacks = setOf("startup"),
+            hostRuntimeGeneration = RuntimeGeneration(7),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness1.runtime.activate())
+            val config1 = bridge1.callbackCalls[0].arguments as? LuaValue.Map
+                ?: throw AssertionError("Harness 1: startup argument must be a LuaValue.Map")
+
+            val bridge2 = RecordingBridge()
+            val harness2 = harness(
+                bridge = bridge2,
+                callbacks = setOf("startup"),
+                hostRuntimeGeneration = RuntimeGeneration(8),
+            )
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness2.runtime.activate())
+                val config2 = bridge2.callbackCalls[0].arguments as? LuaValue.Map
+                    ?: throw AssertionError("Harness 2: startup argument must be a LuaValue.Map")
+
+                assertTrue(
+                    "Each host runtime generation must produce a fresh detached config.",
+                    config1 !== config2,
+                )
+                assertEquals(
+                    "Generation-isolated configs must be structurally identical.",
+                    config1,
+                    config2,
+                )
+            } finally {
+                harness2.close()
+            }
+        } finally {
+            harness1.close()
+        }
+    }
+
+    @Test
+    fun `Lua mutation of startup snapshot cannot affect host sibling or later generation`() = runTest {
+        val payload = OpaqueJsonObject.parse(
+            """{"mode":"host","nested":{"enabled":true}}""",
+        ).getOrThrow()
+        val originalPayload = payload.toJsonString()
+        val bridge1 = RecordingBridge()
+        val harness1 = harness(
+            bridge = bridge1,
+            callbacks = setOf("startup"),
+            configPayload = payload,
+            hostRuntimeGeneration = RuntimeGeneration(7),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness1.runtime.activate())
+            val config1 = bridge1.callbackCalls[0].arguments as? LuaValue.Map
+                ?: throw AssertionError("Generation 1 startup argument must be a LuaValue.Map")
+            val values1 = config1.pairs["values"] as? LuaValue.Map
+                ?: throw AssertionError("Generation 1 values must be a LuaValue.Map")
+            val nested1 = values1.pairs["nested"] as? LuaValue.Map
+                ?: throw AssertionError("Generation 1 nested value must be a LuaValue.Map")
+
+            // The recording bridge exposes the detached normalized tree. Mutating its
+            // parser-backed maps models Lua writes to the startup table.
+            @Suppress("UNCHECKED_CAST")
+            val mutableNested = nested1.pairs as MutableMap<String, LuaValue>
+            mutableNested["enabled"] = LuaValue.Bool(false)
+            mutableNested["lua_only"] = LuaValue.StringValue("mutated")
+
+            assertEquals(
+                "Lua mutation must not alter the host-owned encoded payload.",
+                originalPayload,
+                payload.toJsonString(),
+            )
+
+            val bridge2 = RecordingBridge()
+            val harness2 = harness(
+                bridge = bridge2,
+                callbacks = setOf("startup"),
+                configPayload = payload,
+                hostRuntimeGeneration = RuntimeGeneration(7),
+            )
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness2.runtime.activate())
+                val config2 = bridge2.callbackCalls[0].arguments as? LuaValue.Map
+                    ?: throw AssertionError("Sibling startup argument must be a LuaValue.Map")
+                assertEquals(
+                    "Lua mutation must not leak into a sibling generation.",
+                    LuaValue.Map(mapOf(
+                        "schema_version" to LuaValue.Number(1.0),
+                        "values" to LuaValue.Map(mapOf(
+                            "mode" to LuaValue.StringValue("host"),
+                            "nested" to LuaValue.Map(mapOf("enabled" to LuaValue.Bool(true))),
+                        )),
+                    )),
+                    config2,
+                )
+            } finally {
+                harness2.close()
+            }
+        } finally {
+            harness1.close()
+        }
+
+        val bridge3 = RecordingBridge()
+        val harness3 = harness(
+            bridge = bridge3,
+            callbacks = setOf("startup"),
+            configPayload = payload,
+            hostRuntimeGeneration = RuntimeGeneration(8),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness3.runtime.activate())
+            val config3 = bridge3.callbackCalls[0].arguments as? LuaValue.Map
+                ?: throw AssertionError("Later generation startup argument must be a LuaValue.Map")
+            assertEquals(
+                "Lua mutation must not leak into a later generation.",
+                LuaValue.Map(mapOf(
+                    "schema_version" to LuaValue.Number(1.0),
+                    "values" to LuaValue.Map(mapOf(
+                        "mode" to LuaValue.StringValue("host"),
+                        "nested" to LuaValue.Map(mapOf("enabled" to LuaValue.Bool(true))),
+                    )),
+                )),
+                config3,
+            )
+        } finally {
+            harness3.close()
+        }
+    }
+
+    @Test
+    fun `startup bridge validation failure fails activation atomically`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", LuaKernelOutcome.ValidationFailure(41, 7, "invalid callback ownership"))
+        }
+        val harness = harness(bridge, setOf("startup"))
+        try {
+            assertTrue(
+                "A bridge ValidationFailure during startup must fail activation.",
+                harness.runtime.activate() is ChannelActivationResult.Failed,
+            )
+            assertEquals(
+                ChannelExecutionStatus.FAILED,
+                harness.runtime.snapshot.value.executionStatus,
+            )
         } finally {
             harness.close()
         }
@@ -127,6 +546,100 @@ class LuaAdapterRuntimeTest {
             )
         } finally {
             harness.close()
+        }
+    }
+
+    @Test
+    fun `readiness context contains exactly declared public capabilities and projects valid status`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true,"status":"STT"}"""))
+        }
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(
+                ChannelCapability.Transcription,
+                ChannelCapability.Synthesis,
+                ChannelCapability.AudioOperation,
+                ChannelCapability.DeferredAudioPlayback,
+            ),
+            capabilityAvailability = mapOf(
+                ChannelCapability.Transcription to CapabilityAvailability.Available,
+                ChannelCapability.Synthesis to CapabilityAvailability.Recoverable,
+                ChannelCapability.AudioOperation to CapabilityAvailability.Unavailable(
+                    dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
+                ),
+            ),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+
+            val context = bridge.callbackCalls.last { it.name == "handle_readiness" }.arguments as? LuaValue.Map
+                ?: throw AssertionError("Readiness callback must receive a context map")
+            assertEquals(setOf("capabilities"), context.pairs.keys)
+            val capabilities = context.pairs["capabilities"] as? LuaValue.Map
+                ?: throw AssertionError("Readiness context must contain a capabilities map")
+            assertEquals(PackageCapability.ALL, capabilities.pairs.keys)
+            assertEquals(
+                LuaValue.StringValue("available"),
+                capabilities.pairs[PackageCapability.AUDIO_TRANSCRIPTION],
+            )
+            assertEquals(
+                LuaValue.StringValue("recoverable"),
+                capabilities.pairs[PackageCapability.AUDIO_SYNTHESIS],
+            )
+            assertEquals(
+                LuaValue.StringValue("unavailable"),
+                capabilities.pairs[PackageCapability.AUDIO_PLAYBACK],
+            )
+            assertEquals("STT", harness.runtime.snapshot.value.summary)
+            assertTrue(harness.runtime.prepareInput() is ChannelInputAcceptance.Accepted)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `malformed readiness results cache not-ready and one bounded diagnostic`() = runTest {
+        val malformedResults = listOf(
+            "non-table" to "true",
+            "error-table" to """{"error":{"code":"E_READY","detail":"failed"}}""",
+            "missing-ready" to "{}",
+            "non-boolean-ready" to """{"ready":"true"}""",
+            "unknown-key" to """{"ready":true,"extra":1}""",
+            "non-string-status" to """{"ready":true,"status":1}""",
+            "over-bound-status" to """{"ready":true,"status":"${"x".repeat(65_537)}"}""",
+        )
+        for ((name, malformed) in malformedResults) {
+            val bridge = RecordingBridge().apply {
+                enqueue("handle_readiness", completed("""{"ready":true,"status":"prior"}"""))
+                enqueue("handle_readiness", completed(malformed))
+            }
+            val harness = harness(
+                bridge = bridge,
+                callbacks = setOf("startup", "handle_readiness", "handle_input"),
+                declaredCapabilities = setOf(ChannelCapability.Transcription),
+                capabilityAvailability = mapOf(ChannelCapability.Transcription to CapabilityAvailability.Available),
+            )
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.refreshReadiness()
+                assertEquals("prior", harness.runtime.snapshot.value.summary)
+                harness.runtime.refreshReadiness()
+                assertTrue(
+                    "$name: malformed readiness must refuse input",
+                    harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+                )
+                assertEquals("$name: invalid result must retain prior bounded summary", "prior", harness.runtime.snapshot.value.summary)
+                assertEquals("$name: exactly one local diagnostic per malformed refresh", 1, harness.runtime.localDiagnosticSnapshot.size)
+                assertTrue(
+                    "$name: diagnostic must be bounded",
+                    harness.runtime.localDiagnosticSnapshot.single().length <= 512,
+                )
+            } finally {
+                harness.close()
+            }
         }
     }
 
@@ -209,6 +722,67 @@ class LuaAdapterRuntimeTest {
     }
 
     @Test
+    fun `capture admits opaque recording before handing token to handle input`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", completed("""{"ok":true}"""))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            assertEquals(ChannelInputResult.None, target.onInputReleased(RecordedPcm(ShortArray(8), 16_000)))
+
+            val callback = bridge.callbackCalls.last { it.name == "handle_input" }
+            assertTrue("A captured recording must be represented by a non-empty opaque token.", !callback.capturedAudioToken.isNullOrBlank())
+            val event = callback.arguments as? LuaValue.Map
+                ?: throw AssertionError("handle_input must receive a capture event")
+            assertEquals(LuaValue.StringValue("capture"), event.pairs["event"])
+        } finally {
+            harness.close()
+        }
+    }
+
+
+    @Test
+    fun `failed input callback disposes admitted capture token`() = runTest {
+        val bridge = RecordingBridge().apply {
+            throwInputCallback = true
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            target.onInputReleased(RecordedPcm(ShortArray(8), 16_000))
+            assertEquals(ChannelExecutionStatus.FAILED, harness.runtime.snapshot.value.executionStatus)
+
+            val callback = bridge.callbackCalls.last { it.name == "handle_input" }
+            val token = checkNotNull(callback.capturedAudioToken)
+            val event = callback.arguments as? LuaValue.Map
+                ?: throw AssertionError("handle_input must receive a capture event")
+            val sessionId = (event.pairs["session"] as? LuaValue.StringValue)?.value
+                ?: throw AssertionError("capture event must contain its session owner")
+            val registryField = LuaAdapterRuntime::class.java.getDeclaredField("audioRegistry")
+            registryField.isAccessible = true
+            val registry = checkNotNull(registryField.get(harness.runtime)) as LuaOpaqueAudioRegistry
+            assertEquals(
+                LuaOpaqueAudioRegistry.Resolution.Stale,
+                registry.resolve(
+                    LuaOpaqueAudioRegistry.Token(token),
+                    LuaOpaqueAudioRegistry.Owner.Input(sessionId),
+                    LuaOpaqueAudioRegistry.Kind.Captured,
+                ),
+            )
+        } finally {
+            harness.close()
+        }
+    }
+    @Test
     fun `host capture cancellation and failure change snapshots without entering handle input`() = runTest {
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
@@ -230,6 +804,67 @@ class LuaAdapterRuntimeTest {
             assertFalse(
                 "Host-terminal capture paths must not invoke Lua input processing.",
                 bridge.callbackCalls.any { it.name == "handle_input" },
+            )
+        } finally {
+            harness.close()
+        }
+    }
+    @Test
+    fun `cancelled semantic input resumes once with E_CANCELLED and disposes capture before late playback`() = runTest {
+        val playback = ControlledDeferredPlayback()
+        val operation = AudioOperationArtifact(RecordedPcm(shortArrayOf(3, -3), 16_000), operationId = "cancelled-input", generation = RuntimeGeneration(7))
+        val audio = object : AudioOperationCapability {
+            override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+            override suspend fun createPlaybackResult(audio: OpaqueAudioRecording) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+        }
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            audioOperation = audio,
+            deferredAudioPlayback = playback,
+            declaredCapabilities = setOf(ChannelCapability.AudioOperation, ChannelCapability.DeferredAudioPlayback),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+
+            val pending = checkNotNull(harness.runtime.pendingInput())
+            val callback = bridge.callbackCalls.last { it.name == "handle_input" }
+            val token = LuaOpaqueAudioRegistry.Token(checkNotNull(callback.capturedAudioToken))
+            val registry = audioRegistry(harness.runtime)
+            val entriesField = LuaOpaqueAudioRegistry::class.java.getDeclaredField("entries").apply { isAccessible = true }
+            val entry = ((entriesField.get(registry) as Map<*, *>)[token.value])
+                ?: throw AssertionError("capture token must be retained while playback is suspended")
+            val captured = entry.javaClass.getDeclaredField("recording").apply { isAccessible = true }.get(entry)
+            assertEquals(1, playback.calls)
+
+            target.onInputCancelled("host cancellation")
+            runCurrent()
+            assertEquals(listOf(false to "E_CANCELLED"), bridge.resumeCalls)
+            assertNull(harness.runtime.pendingInput())
+            assertEquals(ChannelInputResult.None, release.await())
+            assertTrue("Live cancellation must dispose the unconsumed capture.", captured.javaClass.getDeclaredField("disposed").apply { isAccessible = true }.getBoolean(captured))
+            assertFalse("Cancelled capture must not remain queued for consumption.", registry.owns(token))
+            assertEquals(
+                LuaOpaqueAudioRegistry.Resolution.Stale,
+                registry.resolve(token, LuaOpaqueAudioRegistry.Owner.Input("late"), LuaOpaqueAudioRegistry.Kind.Captured),
+            )
+
+            playback.release(DelayedPlaybackOutcome.Heard(DelayedPlaybackOperationId("late")))
+            runCurrent()
+            assertEquals("Late playback must not re-enter Lua.", listOf(false to "E_CANCELLED"), bridge.resumeCalls)
+            assertEquals("Late playback must not consume an invalidated capture.", 0, registry.accounting().liveTokens)
+            assertEquals(
+                LuaInputResumeResult.Stale,
+                harness.runtime.resumeInput(pending.ownerToken, pending.operationId, true, "late"),
             )
         } finally {
             harness.close()
@@ -265,20 +900,160 @@ class LuaAdapterRuntimeTest {
             readinessHarness.close()
         }
 
-        val inputBridge = RecordingBridge().apply {
+    }
+
+    @Test
+    fun `input coroutine releases slot and resumes only current owner with exact terminal`() = runTest {
+        val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded())
+            enqueue("handle_input", yielded(coroutineId = 51, operationId = 601))
+            resumeOutcomes += yielded(coroutineId = 52, operationId = 602)
+            resumeOutcomes += completed("""{"ok":true}""")
         }
-        val inputHarness = harness(inputBridge, setOf("startup", "handle_readiness", "handle_input"))
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"))
         try {
-            assertEquals(ChannelActivationResult.Ready, inputHarness.runtime.activate())
-            inputHarness.runtime.refreshReadiness()
-            val target = acceptedTarget(inputHarness.runtime)
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
             target.onInputStarted(session(16_000))
-            assertEquals(ChannelInputResult.None, target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)))
-            assertEquals(ChannelExecutionStatus.FAILED, inputHarness.runtime.snapshot.value.executionStatus)
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+
+            val firstPending = checkNotNull(harness.runtime.pendingInput())
+            assertEquals(601L, firstPending.operationId)
+            assertEquals(
+                LuaInputResumeResult.ForeignOwner,
+                harness.runtime.resumeInput("foreign-owner", firstPending.operationId, true, "{}"),
+            )
+            assertEquals(
+                LuaInputResumeResult.Stale,
+                harness.runtime.resumeInput(firstPending.ownerToken, firstPending.operationId + 1L, true, "{}"),
+            )
+            assertTrue("Rejected owner/operation terminals must not enter the bridge.", bridge.resumeCalls.isEmpty())
+
+            assertEquals(
+                LuaInputResumeResult.Accepted,
+                harness.runtime.resumeInput(firstPending.ownerToken, firstPending.operationId, true, "{}"),
+            )
+            runCurrent()
+            val chainedPending = checkNotNull(harness.runtime.pendingInput())
+            assertEquals(firstPending.ownerToken, chainedPending.ownerToken)
+            assertEquals(602L, chainedPending.operationId)
+            assertEquals(
+                LuaInputResumeResult.Accepted,
+                harness.runtime.resumeInput(chainedPending.ownerToken, chainedPending.operationId, true, "{}"),
+            )
+
+            assertEquals(ChannelInputResult.None, release.await())
+            assertNull(harness.runtime.pendingInput())
+            assertEquals(ChannelExecutionStatus.SUCCESS, harness.runtime.snapshot.value.executionStatus)
+            assertEquals(listOf(true, true), bridge.resumeCalls.map { it.first })
         } finally {
-            inputHarness.close()
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `semantic playback duplicate and revoked completions consume and resume at most once`() = runTest {
+        val playback = ControlledDeferredPlayback()
+        val operation = AudioOperationArtifact(RecordedPcm(shortArrayOf(3, -3), 16_000), operationId = "race-audio", generation = RuntimeGeneration(7))
+        val audio = object : AudioOperationCapability {
+            override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+            override suspend fun createPlaybackResult(audio: OpaqueAudioRecording) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+        }
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            audioOperation = audio,
+            deferredAudioPlayback = playback,
+            declaredCapabilities = setOf(ChannelCapability.AudioOperation, ChannelCapability.DeferredAudioPlayback),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate()); harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime); target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }; runCurrent()
+            val pending = checkNotNull(harness.runtime.pendingInput())
+            bridge.playbackLabel = "playback:${bridge.lastCapturedToken}:0"
+            playback.release(DelayedPlaybackOutcome.Pending(DelayedPlaybackOperationId("queued")))
+            assertEquals(ChannelInputResult.None, release.await()); assertEquals(1, playback.calls); assertEquals(1, bridge.resumeCalls.size)
+            assertEquals(LuaInputResumeResult.Stale, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, false, "E_HOST_FAILURE"))
+            assertEquals(1, bridge.resumeCalls.size); assertEquals(1, playback.consumeCount)
+            harness.retireGeneration()
+            assertEquals(LuaInputResumeResult.Closed, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, true, "late")); assertEquals(1, bridge.resumeCalls.size)
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun `semantic audio error boundary preserves allowlisted codes and bounds unknown detail`() {
+        val normalizer = Class.forName("dev.nilp0inter.subspace.lua.LuaAdapterRuntimeKt")
+            .getDeclaredMethod("normalizeSemanticAudioError", String::class.java)
+            .apply { isAccessible = true }
+        val allowed = listOf(
+            "E_INVALID_ARGUMENT", "E_INVALID_VALUE", "E_INVALID_CONTEXT",
+            "E_CAPABILITY_UNDECLARED", "E_UNAVAILABLE", "E_BUSY", "E_TIMEOUT",
+            "E_CANCELLED", "E_CLOSED", "E_STALE", "E_HOST_FAILURE",
+        )
+        for (code in allowed) assertEquals(code, normalizer.invoke(null, code))
+        for (detail in listOf(
+            "exception-like /endpoint=https://secret.example credential=top-secret transport reset",
+            "unknown host failure detail",
+        )) {
+            val normalized = normalizer.invoke(null, detail) as String
+            assertEquals("E_HOST_FAILURE", normalized)
+            assertFalse(normalized.contains("secret.example"))
+            assertFalse(normalized.contains("top-secret"))
+            assertFalse(normalized.contains("transport reset"))
+        }
+    }
+
+    @Test
+    fun `lifecycle readiness and SOS remain synchronous when their bridge callback yields`() = runTest {
+        val lifecycleBridge = RecordingBridge().apply {
+            enqueue("startup", completed())
+            enqueue("handle_lifecycle", yielded())
+        }
+        val lifecycleHarness = harness(lifecycleBridge, setOf("startup", "handle_lifecycle"))
+        try {
+            assertTrue("A yielded lifecycle callback must fail activation synchronously.", lifecycleHarness.runtime.activate() is ChannelActivationResult.Failed)
+            assertEquals(listOf("startup", "handle_lifecycle"), lifecycleBridge.callbackCalls.map { it.name })
+        } finally {
+            lifecycleHarness.close()
+        }
+
+        val readinessBridge = RecordingBridge().apply {
+            enqueue("handle_readiness", yielded())
+        }
+        val readinessHarness = harness(readinessBridge, setOf("startup", "handle_readiness", "handle_input"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, readinessHarness.runtime.activate())
+            readinessHarness.runtime.refreshReadiness()
+            assertTrue(
+                "A yielded readiness callback must be locally contained as not-ready.",
+                readinessHarness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(ChannelExecutionStatus.IDLE, readinessHarness.runtime.snapshot.value.executionStatus)
+        } finally {
+            readinessHarness.close()
+        }
+
+        val sosBridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_sos", yielded())
+        }
+        val sosHarness = harness(sosBridge, setOf("startup", "handle_readiness", "handle_sos"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, sosHarness.runtime.activate())
+            sosHarness.runtime.refreshReadiness()
+            val before = sosHarness.runtime.snapshot.value
+            sosHarness.runtime.handleSos()
+            assertEquals("SOS yield must be contained without a second entry.", before, sosHarness.runtime.snapshot.value)
+            assertEquals(1, sosBridge.callbackCalls.count { it.name == "handle_sos" })
+        } finally {
+            sosHarness.close()
         }
     }
 
@@ -540,7 +1315,7 @@ class LuaAdapterRuntimeTest {
             enqueue("startup", completed(spawnedCoroutines = listOf(110)))
             startCoroutineOutcomes += yielded(coroutineId = 110, operationId = 20, value = "sleep:1")
         }
-        val harness = harness(bridge, setOf("startup"), timers::await)
+        val harness = harness(bridge, setOf("startup"), timerDelay = { delayMillis -> timers.await(delayMillis) })
         try {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
             harness.authorizeStagedTasks()
@@ -564,7 +1339,7 @@ class LuaAdapterRuntimeTest {
             enqueue("startup", completed(spawnedCoroutines = listOf(111)))
             startCoroutineOutcomes += yielded(coroutineId = 111, operationId = 21, value = "sleep:1")
         }
-        val successHarness = harness(successBridge, setOf("startup"), successTimers::await)
+        val successHarness = harness(successBridge, setOf("startup"), timerDelay = { delayMillis -> successTimers.await(delayMillis) })
         try {
             assertEquals(ChannelActivationResult.Ready, successHarness.runtime.activate())
             successHarness.authorizeStagedTasks()
@@ -582,7 +1357,7 @@ class LuaAdapterRuntimeTest {
             enqueue("startup", completed(spawnedCoroutines = listOf(112)))
             startCoroutineOutcomes += yielded(coroutineId = 112, operationId = 22, value = "sleep:1")
         }
-        val closeHarness = harness(closeBridge, setOf("startup"), closeTimers::await)
+        val closeHarness = harness(closeBridge, setOf("startup"), timerDelay = { delayMillis -> closeTimers.await(delayMillis) })
         try {
             assertEquals(ChannelActivationResult.Ready, closeHarness.runtime.activate())
             closeHarness.authorizeStagedTasks()
@@ -877,22 +1652,526 @@ class LuaAdapterRuntimeTest {
         }
     }
 
-    private suspend fun acceptedTarget(runtime: LuaAdapterRuntime) =
-        (runtime.prepareInput() as? ChannelInputAcceptance.Accepted)?.target
-            ?: throw AssertionError("Expected input acceptance")
+    @Test
+    fun `malformed and out-of-range native sleep labels are rejected without timer admission`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", completed(spawnedCoroutines = listOf(120, 121, 122, 123)))
+            startCoroutineOutcomes += yielded(coroutineId = 120, operationId = 30, value = "sleep:-1")
+            startCoroutineOutcomes += yielded(coroutineId = 121, operationId = 31, value = "sleep:NaN")
+            startCoroutineOutcomes += yielded(coroutineId = 122, operationId = 32, value = "sleep:Infinity")
+            startCoroutineOutcomes += yielded(coroutineId = 123, operationId = 33, value = "sleep:86401")
+        }
+        val harness = harness(bridge, setOf("startup"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
 
-    private fun session(sampleRate: Int): ChannelAudioInputSession = object : ChannelAudioInputSession {
-        override val frames = emptyFlow<ShortArray>()
-        override val sampleRate: Int = sampleRate
+            assertEquals(
+                listOf(
+                    false to "E_INVALID_YIELD",
+                    false to "E_INVALID_YIELD",
+                    false to "E_INVALID_YIELD",
+                    false to "E_INVALID_YIELD",
+                ),
+                bridge.resumeCalls,
+            )
+        } finally {
+            harness.close()
+        }
     }
 
-    private suspend fun harness(
+    @Test
+    fun `sleep timeout resumes a still-live task which may issue another operation`() = runTest {
+        val timers = ControlledTimerDelay()
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", completed(spawnedCoroutines = listOf(124)))
+            startCoroutineOutcomes += yielded(coroutineId = 124, operationId = 34, value = "sleep:1")
+            resumeOutcomes += yielded(coroutineId = 124, operationId = 35, value = "sleep:0")
+        }
+        val harness = harness(bridge, setOf("startup"), timerDelay = { delayMillis -> timers.await(delayMillis) })
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
+            timers.awaitPending()
+            timers.release(1)
+            runCurrent()
+            assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls)
+
+            timers.awaitPending()
+            timers.assertPending(listOf(1_000L, 0L, 100L))
+            timers.release(1)
+            assertEquals(
+                "The timeout continuation remains owned by the live task and may schedule a subsequent sleep.",
+                listOf(false to "E_TIMEOUT", true to ""),
+                bridge.resumeCalls,
+            )
+            timers.releaseAll()
+        } finally {
+            harness.close()
+        }
+    }
+
+    // ── Callback table construction (fail closed) ────────────────────────
+
+    @Test
+    fun `missing required startup callback fails construction`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.retainedCallbacks = setOf("handle_readiness")
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "Construction must fail when 'startup' callback is absent from the returned callback list.",
+            result is ChannelRuntimeConstructionResult.Failure,
+        )
+        assertEquals("The partially constructed actor must be closed on callback validation failure.", 1, bridge.closeCalls.get())
+    }
+
+    @Test
+    fun `empty callback list without startup fails construction`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.retainedCallbacks = emptySet()
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "Construction must fail when the callback list is empty and contains no 'startup'.",
+            result is ChannelRuntimeConstructionResult.Failure,
+        )
+    }
+
+    @Test
+    fun `unknown callback keys are silently ignored during callback table construction`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.retainedCallbacks = setOf("startup", "unknown_1", "unknown_2", "foo", "bar")
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "Construction must succeed when 'startup' is present alongside unknown keys.",
+            result is ChannelRuntimeConstructionResult.Success,
+        )
+    }
+
+    @Test
+    fun `all recognized optional callbacks are accepted during construction`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.retainedCallbacks = setOf(
+            "startup", "handle_lifecycle", "handle_input", "handle_sos", "handle_readiness",
+        )
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "Construction must succeed when all recognized callbacks are present.",
+            result is ChannelRuntimeConstructionResult.Success,
+        )
+    }
+
+    @Test
+    fun `a loadProgramImage bridge failure fails construction without a partial runtime`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.failImageLoad = true
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "A bridge RuntimeFailure during loadProgramImage must fail construction without creating a runtime.",
+            result is ChannelRuntimeConstructionResult.Failure,
+        )
+        assertEquals("The state must be closed after image loading failure.", 1, bridge.closeCalls.get())
+    }
+
+    @Test
+    fun `duplicate callback name in bridge result fails construction`() = runTest {
+        val bridge = RecordingBridge()
+        bridge.rawCallbackNamesJson = """["startup","startup"]"""
+        val result = constructRuntimeResult(bridge)
+        assertTrue(
+            "Construction must fail when a callback name is duplicated.",
+            result is ChannelRuntimeConstructionResult.Failure,
+        )
+    }
+
+    @Test
+    fun `undeclared transcription rejects before host acquisition or backend call`() = runTest {
+        val backend = CountingTranscription()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), transcription = backend)
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+            assertEquals(0, harness.capabilityHost.acquireCalls)
+            assertEquals(0, harness.capabilityHost.availabilityCalls)
+            assertEquals(0, harness.capabilityHost.prepareCalls)
+            assertEquals(0, backend.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `undeclared synthesis rejects before host acquisition or backend call`() = runTest {
+        val backend = CountingSynthesis()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), synthesis = backend)
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+            assertEquals(0, harness.capabilityHost.acquireCalls)
+            assertEquals(0, harness.capabilityHost.availabilityCalls)
+            assertEquals(0, harness.capabilityHost.prepareCalls)
+            assertEquals(0, backend.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `playback requires both typed capabilities and rejects before either acquire`() = runTest {
+        val declarations: List<Set<ChannelCapability>> = listOf(
+            emptySet(),
+            setOf(ChannelCapability.AudioOperation),
+            setOf(ChannelCapability.DeferredAudioPlayback),
+        )
+        declarations.forEachIndexed { index, declared ->
+            val audio = CountingAudioOperation()
+            val playback = ControlledDeferredPlayback()
+            val bridge = RecordingBridge().apply {
+                enqueue("handle_readiness", completed("""{"ready":true}"""))
+                enqueue("handle_input", yielded(coroutineId = 710L + index, operationId = 810L + index, value = "playback:{token}:0"))
+            }
+            val harness = harness(
+                bridge,
+                setOf("startup", "handle_readiness", "handle_input"),
+                audioOperation = audio,
+                deferredAudioPlayback = playback,
+                declaredCapabilities = declared,
+            )
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.refreshReadiness()
+                val target = acceptedTarget(harness.runtime)
+                target.onInputStarted(session(16_000))
+                val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+                runCurrent()
+                assertEquals(ChannelInputResult.None, release.await())
+                assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+                assertEquals(0, harness.capabilityHost.acquireCalls)
+                assertEquals(0, harness.capabilityHost.availabilityCalls)
+                assertEquals(0, harness.capabilityHost.prepareCalls)
+                assertEquals(0, audio.calls)
+                assertEquals(0, playback.calls)
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `declared unavailable transcription normalizes without fallback`() = runTest {
+        val backend = CountingTranscription()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            transcription = backend,
+            declaredCapabilities = setOf(ChannelCapability.Transcription),
+            capabilityAvailability = mapOf(ChannelCapability.Transcription to CapabilityAvailability.Available),
+            unavailableCapabilities = mapOf(ChannelCapability.Transcription to CapabilityUnavailableReason.MODEL_NOT_READY),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_UNAVAILABLE"), bridge.resumeCalls)
+            assertEquals(1, harness.capabilityHost.acquireCalls)
+            assertEquals(0, backend.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `declared unavailable synthesis normalizes without fallback`() = runTest {
+        val backend = CountingSynthesis()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            synthesis = backend,
+            declaredCapabilities = setOf(ChannelCapability.Synthesis),
+            capabilityAvailability = mapOf(ChannelCapability.Synthesis to CapabilityAvailability.Available),
+            unavailableCapabilities = mapOf(ChannelCapability.Synthesis to CapabilityUnavailableReason.RESOURCE_BUSY),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_UNAVAILABLE"), bridge.resumeCalls)
+            assertEquals(1, harness.capabilityHost.acquireCalls)
+            assertEquals(0, backend.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `declared unavailable playback does not fall back to deferred scheduling`() = runTest {
+        val audio = CountingAudioOperation()
+        val playback = ControlledDeferredPlayback()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            audioOperation = audio,
+            deferredAudioPlayback = playback,
+            declaredCapabilities = setOf(ChannelCapability.AudioOperation, ChannelCapability.DeferredAudioPlayback),
+            capabilityAvailability = mapOf(
+                ChannelCapability.AudioOperation to CapabilityAvailability.Available,
+                ChannelCapability.DeferredAudioPlayback to CapabilityAvailability.Available,
+            ),
+            unavailableCapabilities = mapOf(ChannelCapability.AudioOperation to CapabilityUnavailableReason.HOST_NOT_READY),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_UNAVAILABLE"), bridge.resumeCalls)
+            assertEquals(1, harness.capabilityHost.acquireCalls)
+            assertEquals(0, audio.calls)
+            assertEquals(0, playback.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `revocation updates readiness projection and closes a previously accepted call`() = runTest {
+        val backend = CountingTranscription()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_readiness", completed("""{"ready":false}"""))
+            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            transcription = backend,
+            declaredCapabilities = setOf(ChannelCapability.Transcription),
+            capabilityAvailability = mapOf(ChannelCapability.Transcription to CapabilityAvailability.Available),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            val initialContext = bridge.callbackCalls.last { it.name == "handle_readiness" }.arguments as LuaValue.Map
+            val initialCapabilities = initialContext.pairs["capabilities"] as LuaValue.Map
+            assertEquals(LuaValue.StringValue("available"), initialCapabilities.pairs[PackageCapability.AUDIO_TRANSCRIPTION])
+
+            assertEquals(CapabilityScopeTerminationResult.Revoked, harness.capabilityScope.revoke())
+            harness.runtime.refreshReadiness()
+            val revokedContext = bridge.callbackCalls.last { it.name == "handle_readiness" }.arguments as LuaValue.Map
+            val revokedCapabilities = revokedContext.pairs["capabilities"] as LuaValue.Map
+            assertEquals(LuaValue.StringValue("unavailable"), revokedCapabilities.pairs[PackageCapability.AUDIO_TRANSCRIPTION])
+            assertTrue(harness.runtime.prepareInput() is ChannelInputAcceptance.Refused)
+
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertEquals(listOf(false to "E_CLOSED"), bridge.resumeCalls)
+            assertEquals(0, harness.capabilityHost.acquireCalls)
+            assertEquals(0, backend.calls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `configuration mode changes cannot authorize undeclared semantic operations`() = runTest {
+        listOf("host", "fallback").forEachIndexed { index, mode ->
+            val backend = CountingTranscription()
+            val bridge = RecordingBridge().apply {
+                enqueue("handle_readiness", completed("""{"ready":true}"""))
+                enqueue("handle_input", yielded(coroutineId = 900L + index, operationId = 901L + index, value = "transcribe:{token}"))
+            }
+            val harness = harness(
+                bridge,
+                setOf("startup", "handle_readiness", "handle_input"),
+                transcription = backend,
+                configPayload = OpaqueJsonObject.parse("""{"mode":"$mode"}""").getOrThrow(),
+            )
+            try {
+                assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.refreshReadiness()
+                val target = acceptedTarget(harness.runtime)
+                target.onInputStarted(session(16_000))
+                val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+                runCurrent()
+                assertEquals(ChannelInputResult.None, release.await())
+                assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+                assertEquals(0, harness.capabilityHost.acquireCalls)
+                assertEquals(0, harness.capabilityHost.availabilityCalls)
+                assertEquals(0, backend.calls)
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `transcription timeout preserves captured token and late completion is stale`() = runTest {
+        val backend = LateTranscription()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(coroutineId = 601, operationId = 701, value = "transcribe:{token}"))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), transcription = backend,
+            declaredCapabilities = setOf(ChannelCapability.Transcription),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate()); harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime); target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }; runCurrent()
+            val pending = checkNotNull(harness.runtime.pendingInput())
+            testScheduler.advanceTimeBy(30_001L); runCurrent()
+            assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls)
+            val registry = audioRegistry(harness.runtime)
+            assertEquals(1, registry.accounting().liveTokens)
+            assertTrue(registry.accounting().retainedBytes > 0L)
+            backend.complete(); runCurrent(); release.await()
+            assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls)
+            assertEquals(LuaInputResumeResult.Stale, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, true, "late"))
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun `synthesis timeout disposes late artifact without registry delivery`() = runTest {
+        val backend = LateSynthesis()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(coroutineId = 602, operationId = 702, value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+        }
+        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), synthesis = backend,
+            declaredCapabilities = setOf(ChannelCapability.Synthesis),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate()); harness.runtime.refreshReadiness(); val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000)); val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }; runCurrent()
+            val pending = checkNotNull(harness.runtime.pendingInput()); testScheduler.advanceTimeBy(30_001L); runCurrent()
+            assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls); backend.complete(); runCurrent(); release.await()
+            assertTrue(backend.artifact.javaClass.getDeclaredField("disposed").apply { isAccessible = true }.getBoolean(backend.artifact)); assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls)
+            assertEquals(LuaInputResumeResult.Stale, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, true, "late"))
+        } finally { harness.close() }
+    }
+
+    @Test
+    fun `playback timeout does not consume token or issue a second resume`() = runTest {
+        val playback = ControlledDeferredPlayback()
+        val operation = AudioOperationArtifact(RecordedPcm(shortArrayOf(2), 16_000), operationId = "op", generation = RuntimeGeneration(7))
+        val audio = object : AudioOperationCapability {
+            override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+            override suspend fun createPlaybackResult(audio: OpaqueAudioRecording) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+        }
+        val bridge = RecordingBridge().apply { enqueue("handle_readiness", completed("""{"ready":true}""")); enqueue("handle_input", yielded(coroutineId = 603, operationId = 703, value = "playback:{token}:0")) }
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            audioOperation = audio,
+            deferredAudioPlayback = playback,
+            declaredCapabilities = setOf(ChannelCapability.AudioOperation, ChannelCapability.DeferredAudioPlayback),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate()); harness.runtime.refreshReadiness(); val target = acceptedTarget(harness.runtime); target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }; runCurrent(); val pending = checkNotNull(harness.runtime.pendingInput()); val registry = audioRegistry(harness.runtime); testScheduler.advanceTimeBy(30_001L); runCurrent()
+            assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls); assertEquals(0, registry.accounting().liveTokens)
+            playback.release(DelayedPlaybackOutcome.Heard(DelayedPlaybackOperationId("late"))); runCurrent(); release.await(); assertEquals(listOf(false to "E_TIMEOUT"), bridge.resumeCalls); assertEquals(0, registry.accounting().liveTokens)
+            assertEquals(LuaInputResumeResult.Stale, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, true, "late"))
+        } finally { harness.close() }
+    }
+
+    private fun audioRegistry(runtime: LuaAdapterRuntime): LuaOpaqueAudioRegistry {
+        val field = LuaAdapterRuntime::class.java.getDeclaredField("audioRegistry"); field.isAccessible = true
+        return checkNotNull(field.get(runtime)) as LuaOpaqueAudioRegistry
+    }
+
+    private class CountingTranscription : TranscriptionCapability {
+        var calls = 0
+        override suspend fun transcribe(recording: OpaqueAudioRecording): CapabilityOperationResult<Transcription> {
+            calls++
+            return CapabilityOperationResult.Success(Transcription("counted"))
+        }
+    }
+
+    private class CountingSynthesis : SynthesisCapability {
+        var calls = 0
+        private val artifact = dev.nilp0inter.subspace.channel.capability.SynthesizedAudioArtifact(floatArrayOf(1f), generation = RuntimeGeneration(7))
+        override suspend fun synthesize(request: SpeechSynthesisRequest): CapabilityOperationResult<OpaqueSynthesizedAudio> {
+            calls++
+            return CapabilityOperationResult.Success(artifact)
+        }
+    }
+
+    private class CountingAudioOperation : AudioOperationCapability {
+        var calls = 0
+        private val operation = AudioOperationArtifact(RecordedPcm(shortArrayOf(1), 16_000), operationId = "counted", generation = RuntimeGeneration(7))
+        override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio): CapabilityOperationResult<OpaqueAudioOperation> {
+            calls++
+            return CapabilityOperationResult.Success(operation)
+        }
+        override suspend fun createPlaybackResult(audio: OpaqueAudioRecording): CapabilityOperationResult<OpaqueAudioOperation> {
+            calls++
+            return CapabilityOperationResult.Success(operation)
+        }
+    }
+
+    private class LateTranscription : TranscriptionCapability {
+        private var continuation: kotlin.coroutines.Continuation<CapabilityOperationResult<Transcription>>? = null
+        override suspend fun transcribe(recording: OpaqueAudioRecording): CapabilityOperationResult<Transcription> = suspendCoroutine { continuation = it }
+        fun complete() { continuation?.resume(CapabilityOperationResult.Success(Transcription("late"))) }
+    }
+    private class LateSynthesis : SynthesisCapability {
+        val artifact = dev.nilp0inter.subspace.channel.capability.SynthesizedAudioArtifact(floatArrayOf(1f), generation = RuntimeGeneration(7)); private var continuation: kotlin.coroutines.Continuation<CapabilityOperationResult<OpaqueSynthesizedAudio>>? = null
+        override suspend fun synthesize(request: SpeechSynthesisRequest): CapabilityOperationResult<OpaqueSynthesizedAudio> = suspendCoroutine { continuation = it }
+        fun complete() { continuation?.resume(CapabilityOperationResult.Success(artifact)) }
+    }
+
+
+    /** Replicates [harness] setup but returns the raw result instead of asserting success. */
+    private suspend fun constructRuntimeResult(
         bridge: RecordingBridge,
-        callbacks: Set<String>,
-        timerDelay: suspend (Long) -> Unit = { delay(it) },
-        logSink: PluginLogSink = NoOpPluginLogSink,
         hostRuntimeGeneration: RuntimeGeneration = RuntimeGeneration(7),
-    ): AdapterHarness {
+    ): ChannelRuntimeConstructionResult {
         val instanceId = "lua-adapter"
         val generation = hostRuntimeGeneration
         val parentJob = SupervisorJob()
@@ -900,7 +2179,7 @@ class LuaAdapterRuntimeTest {
         val workers = RuntimeWorkerDispatcher.fromDispatcher(Dispatchers.Unconfined)
         val boundary = RuntimeInvocationBoundary(workers)
         val gate = boundary.openGeneration(instanceId, generation, parentScope)
-        val context = GenerationExecutionContextImpl(instanceId, gate, parentScope, timerDelay)
+        val context = GenerationExecutionContextImpl(instanceId, gate, parentScope, { delay(it) })
         val definition = ChannelDefinition(
             id = instanceId,
             name = "Lua adapter",
@@ -920,8 +2199,85 @@ class LuaAdapterRuntimeTest {
             declaredCapabilities = emptySet(),
             host = NoCapabilitiesHost,
         )
+        val provider = testLuaProvider(image, bridge)
+        return provider.constructRuntime(
+            ChannelRuntimeConstructionRequest(
+                definition = definition,
+                configuration = ValidatedChannelConfiguration(
+                    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+                    schemaVersion = 1,
+                    payload = definition.configPayload,
+                ),
+                capabilities = capabilities,
+                generationContext = context,
+            ),
+        )
+    }
+
+    private suspend fun acceptedTarget(runtime: LuaAdapterRuntime) =
+        (runtime.prepareInput() as? ChannelInputAcceptance.Accepted)?.target
+            ?: throw AssertionError("Expected input acceptance")
+
+    private fun session(sampleRate: Int): ChannelAudioInputSession = object : ChannelAudioInputSession {
+        override val frames = emptyFlow<ShortArray>()
+        override val sampleRate: Int = sampleRate
+    }
+    private suspend fun harness(
+        bridge: RecordingBridge,
+        callbacks: Set<String>,
+        transcription: TranscriptionCapability? = null,
+        synthesis: SynthesisCapability? = null,
+        audioOperation: AudioOperationCapability? = null,
+        deferredAudioPlayback: DeferredAudioPlaybackCapability? = null,
+        timerDelay: suspend (Long) -> Unit = { delay(it) },
+        logSink: PluginLogSink = NoOpPluginLogSink,
+        hostRuntimeGeneration: RuntimeGeneration = RuntimeGeneration(7),
+        configPayload: OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(org.json.JSONObject()),
+        declaredCapabilities: Set<ChannelCapability> = emptySet(),
+        capabilityAvailability: Map<ChannelCapability, CapabilityAvailability> = emptyMap(),
+        unavailableCapabilities: Map<ChannelCapability, CapabilityUnavailableReason> = emptyMap(),
+    ): AdapterHarness {
+        val instanceId = "lua-adapter"
+        val generation = hostRuntimeGeneration
+        val parentJob = SupervisorJob()
+        val parentScope = CoroutineScope(Dispatchers.Unconfined + parentJob)
+        val workers = RuntimeWorkerDispatcher.fromDispatcher(Dispatchers.Unconfined)
+        val boundary = RuntimeInvocationBoundary(workers)
+        val gate = boundary.openGeneration(instanceId, generation, parentScope)
+        val context = GenerationExecutionContextImpl(instanceId, gate, parentScope, timerDelay)
+        val definition = ChannelDefinition(
+            id = instanceId,
+            name = "Lua adapter",
+            implementationId = TEST_LUA_IMPLEMENTATION_ID,
+            enabled = true,
+            configSchemaVersion = 1,
+            configPayload = configPayload,
+        )
+        val image = (ImmutableProgramImage.create(
+            entryPoint = "main",
+            sourceMap = mapOf("main" to "return { startup = function() end }"),
+            requirements = LuaProgramRequirements(LUA_VERSION, API_VERSION),
+        ) as? ProgramImageCreationResult.Success)?.image
+            ?: throw AssertionError("Test image must validate")
+        val capabilityHost = ScriptedCapabilitiesHost(
+            availabilityByCapability = capabilityAvailability,
+            transcription = transcription,
+            synthesis = synthesis,
+            audioOperation = audioOperation,
+            deferredAudioPlayback = deferredAudioPlayback,
+            unavailableByCapability = unavailableCapabilities,
+        )
+        val capabilities = RevocableChannelCapabilityScope(
+            identity = CapabilityScopeIdentity(instanceId, generation),
+            declaredCapabilities = declaredCapabilities,
+            host = capabilityHost,
+        )
         bridge.retainedCallbacks = callbacks
-        val result = testLuaProvider(image, bridge, logSink).constructRuntime(
+        val result = testLuaProvider(
+            image,
+            bridge,
+            logSink,
+        ).constructRuntime(
             ChannelRuntimeConstructionRequest(
                 definition = definition,
                 configuration = ValidatedChannelConfiguration(
@@ -935,7 +2291,7 @@ class LuaAdapterRuntimeTest {
         )
         val runtime = (result as? ChannelRuntimeConstructionResult.Success)?.runtime as? LuaAdapterRuntime
             ?: throw AssertionError("Expected a validated Lua adapter runtime, got $result")
-        return AdapterHarness(runtime, context, boundary, parentJob)
+        return AdapterHarness(runtime, capabilities, capabilityHost, context, boundary, parentJob)
     }
 
     private class ControlledTimerDelay {
@@ -973,6 +2329,8 @@ class LuaAdapterRuntimeTest {
 
     private class AdapterHarness(
         val runtime: LuaAdapterRuntime,
+        val capabilityScope: RevocableChannelCapabilityScope,
+        val capabilityHost: ScriptedCapabilitiesHost,
         private val context: GenerationExecutionContextImpl,
         private val boundary: RuntimeInvocationBoundary,
         private val parentJob: Job,
@@ -1016,12 +2374,14 @@ class LuaAdapterRuntimeTest {
         fun authorizeStagedTasks() {
             context.authorizeStagedTasksAfterReady().forEach { it.start() }
         }
+        fun stageTask(task: suspend () -> Unit): GenerationAdmission<Unit> = context.admitTask(task)
 
         suspend fun close() {
             if (closed) return
             closed = true
             runtime.close()
             context.closeAndDrain()
+            capabilityScope.revoke()
             boundary.close()
             parentJob.cancel()
         }
@@ -1043,6 +2403,69 @@ class LuaAdapterRuntimeTest {
             key: CapabilityKey<T>,
             timeoutMillis: Long,
         ): HostedCapabilityAcquisition<T> = HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+    }
+    private class ScriptedCapabilitiesHost(
+        private val availabilityByCapability: Map<ChannelCapability, CapabilityAvailability>,
+        private val transcription: TranscriptionCapability? = null,
+        private val synthesis: SynthesisCapability? = null,
+        private val audioOperation: AudioOperationCapability? = null,
+        private val deferredAudioPlayback: DeferredAudioPlaybackCapability? = null,
+        private val unavailableByCapability: Map<ChannelCapability, CapabilityUnavailableReason> = emptyMap(),
+    ) : ChannelCapabilityHost {
+        var availabilityCalls = 0
+            private set
+        var acquireCalls = 0
+            private set
+        var prepareCalls = 0
+            private set
+
+        override suspend fun availability(identity: CapabilityScopeIdentity, key: CapabilityKey<*>): CapabilityAvailability {
+            availabilityCalls++
+            return availabilityByCapability[key.capability] ?: CapabilityAvailability.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        override suspend fun <T : ChannelCapabilityPort> acquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+        ): HostedCapabilityAcquisition<T> {
+            unavailableByCapability[key.capability]?.let { reason ->
+                acquireCalls++
+                return HostedCapabilityAcquisition.Unavailable(reason) as HostedCapabilityAcquisition<T>
+            }
+            acquireCalls++
+            return when (key) {
+                CapabilityKey.Transcription -> transcription?.let { HostedCapabilityAcquisition.Available(it) { } }
+                    ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+                CapabilityKey.Synthesis -> synthesis?.let { HostedCapabilityAcquisition.Available(it) { } }
+                    ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+                CapabilityKey.AudioOperation -> audioOperation?.let { HostedCapabilityAcquisition.Available(it) { } }
+                    ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+                CapabilityKey.DeferredAudioPlayback -> deferredAudioPlayback?.let { HostedCapabilityAcquisition.Available(it) { } }
+                    ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+                else -> HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+            } as HostedCapabilityAcquisition<T>
+        }
+
+        override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+            timeoutMillis: Long,
+        ): HostedCapabilityAcquisition<T> {
+            prepareCalls++
+            return acquire(identity, key)
+        }
+    }
+    private class ControlledDeferredPlayback : DeferredAudioPlaybackCapability {
+        var calls = 0
+        var consumeCount = 0
+        private var waiter: CompletableDeferred<DelayedPlaybackOutcome>? = null
+        override suspend fun scheduleAudio(context: AgentOperationContext, audio: OpaqueAudioOperation, eligibilityDelayMillis: Long): DelayedPlaybackOutcome {
+            calls++
+            val deferred = CompletableDeferred<DelayedPlaybackOutcome>(); waiter = deferred
+            return deferred.await()
+        }
+        fun release(outcome: DelayedPlaybackOutcome) { waiter?.complete(outcome); consumeCount++ }
     }
 
     private data class InputCase(
@@ -1085,6 +2508,7 @@ class LuaAdapterRuntimeTest {
     private data class CallbackCall(
         val name: String,
         val arguments: LuaValue?,
+        val capturedAudioToken: String? = null,
     )
     private data class SpawnAdmission(
         val caller: String,
@@ -1093,6 +2517,8 @@ class LuaAdapterRuntimeTest {
     )
     private class RecordingBridge : LuaKernelBridge {
         val callbackCalls = mutableListOf<CallbackCall>()
+        var playbackLabel: String? = null
+        var lastCapturedToken: String? = null
         val closeCalls = AtomicInteger()
         val startedCoroutines = mutableListOf<Long>()
         val resumeCalls = mutableListOf<Pair<Boolean, String>>()
@@ -1103,7 +2529,11 @@ class LuaAdapterRuntimeTest {
         var onCoroutineStarted: ((Long) -> Unit)? = null
         var onCoroutineResumed: (() -> Unit)? = null
         var retainedCallbacks: Set<String> = setOf("startup")
+        var failImageLoad: Boolean = false
+        /** When non-null, overrides [retainedCallbacks] for the raw JSON callback list. */
+        var rawCallbackNamesJson: String? = null
         var beforeCallback: ((String) -> Unit)? = null
+        var throwInputCallback: Boolean = false
         private val scriptedCallbacks = mutableMapOf<String, ArrayDeque<LuaKernelOutcome>>()
 
         fun enqueue(name: String, outcome: LuaKernelOutcome) {
@@ -1132,21 +2562,37 @@ class LuaAdapterRuntimeTest {
         }
         override fun cancel(operation: LuaOperationHandle): LuaKernelOutcome = LuaKernelOutcome.Cancelled(41, 7, operation.operationId.value)
         override fun interrupt(handle: LuaStateHandle): LuaKernelOutcome = LuaKernelOutcome.Interrupted(41, 7, "interrupted", 0)
-        override fun snapshot(handle: LuaStateHandle): LuaKernelOutcome = LuaKernelOutcome.Snapshot(41, 7, 0, 0, 0, 0, 0, LUA_VERSION, "recording", "recording")
+        override fun snapshot(handle: LuaStateHandle): LuaKernelOutcome = LuaKernelOutcome.Snapshot(
+            stateId = 41,
+            generation = 7,
+            currentBytes = 0,
+            peakBytes = 0,
+            deniedAllocations = 0,
+            bridgeBytes = 0,
+            elapsedNanos = 0,
+            luaVersion = LUA_VERSION,
+            bindingVersion = "recording",
+            topology = "recording",
+        )
         override fun close(handle: LuaStateHandle): LuaKernelOutcome {
             closeCalls.incrementAndGet()
             return LuaKernelOutcome.Closed(41, 7)
         }
-
         override fun loadProgramImage(handle: LuaStateHandle, entryPoint: String, sourceMap: Map<String, String>): LuaKernelOutcome =
-            completed(org.json.JSONArray(retainedCallbacks.toList()).toString())
-
+            if (failImageLoad) {
+                LuaKernelOutcome.RuntimeFailure(41, 7, "simulated image load failure")
+            } else {
+                completed(
+                    rawCallbackNamesJson ?: org.json.JSONArray(retainedCallbacks.toList()).toString()
+                )
+            }
         override fun invokeStartupCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome {
-            callbackCalls += CallbackCall(callbackHandle.name, null)
+            callbackCalls += CallbackCall(callbackHandle.name, config)
             beforeCallback?.invoke(callbackHandle.name)
             return admitSpawned(
                 "startup",
@@ -1169,7 +2615,23 @@ class LuaAdapterRuntimeTest {
                 spawnAdmission,
             )
         }
-
+        override fun invokeInputCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            capturedAudioToken: String,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome {
+            lastCapturedToken = capturedAudioToken
+            callbackCalls += CallbackCall(callbackHandle.name, arguments, capturedAudioToken)
+            if (throwInputCallback) throw IllegalStateException("simulated input bridge failure")
+            beforeCallback?.invoke(callbackHandle.name)
+            val scripted = scriptedCallbacks[callbackHandle.name]?.removeFirstOrNull() ?: completed()
+            val outcome = if (scripted is LuaKernelOutcome.Yielded && scripted.value?.contains("{token}") == true) {
+                scripted.copy(value = scripted.value.replace("{token}", capturedAudioToken))
+            } else scripted
+            return admitSpawned("input", outcome, spawnAdmission)
+        }
         override fun startCoroutine(
             handle: LuaStateHandle,
             coroutineId: LuaCoroutineId,

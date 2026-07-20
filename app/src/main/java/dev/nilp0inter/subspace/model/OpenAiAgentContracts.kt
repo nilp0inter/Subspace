@@ -362,6 +362,13 @@ sealed interface DelayedPlaybackOutcome {
     data class Failed(val reason: DelayedPlaybackFailureReason) : DelayedPlaybackOutcome
     data object Cancelled : DelayedPlaybackOutcome
     data object Stale : DelayedPlaybackOutcome
+    /**
+     * The deferred queue is at capacity. Returned before the caller's audio
+     * handle is consumed, before any partial entry is created, before any
+     * sibling entry is evicted, and before any reroute. The caller retains
+     * ownership of the artifact and MUST dispose it.
+     */
+    data object Busy : DelayedPlaybackOutcome
 }
 
 enum class DelayedPlaybackFailureReason {

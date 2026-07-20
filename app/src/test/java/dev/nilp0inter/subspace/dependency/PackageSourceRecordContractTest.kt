@@ -47,6 +47,11 @@ class PackageSourceRecordContractTest {
                             entryModule = "plugin",
                             presentation = PackagePresentation("Package", "Package summary"),
                             runtime = RuntimeRequirements("lua-test", "api-test"),
+                            configuration = PackageConfigurationDeclaration(
+                                ConfigurationDataDeclaration(emptyList()),
+                                ConfigurationUiDeclaration(emptyList())
+                            ),
+                            capabilities = emptySet(),
                         ),
                         sourceRecord = source,
                     ),

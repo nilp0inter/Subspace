@@ -102,40 +102,74 @@ class ServiceChannelManagerTest {
     }
 
     @Test
-    fun `successful selection notifies both playback paths before recording its complete diagnostic`() {
-        val events = mutableListOf<String>()
+    fun `valid configuration update triggers onConfigurationCommitted`() {
+        val commitEvents = mutableListOf<String>()
         withFixture(
-            definitions = listOf(primaryDefinition(), secondaryDefinition()),
-            immediateSelection = { events += "immediate:$it" },
-            deferredSelection = { events += "deferred:$it" },
-            log = { events += "log:$it" },
+            onConfigurationCommitted = { channelId -> commitEvents += channelId },
         ) { fixture ->
-            assertTrue(fixture.manager.selectChannel(SECONDARY_ID))
-
             assertEquals(
-                listOf(
-                    "immediate:$SECONDARY_ID",
-                    "deferred:$SECONDARY_ID",
-                    "log:CHANNEL_SELECT requested=$SECONDARY_ID previous=$PRIMARY_ID selected=true active=$SECONDARY_ID",
-                ),
-                events,
+                ChannelRepositoryMutationResult.Success,
+                fixture.manager.updateChannelConfiguration(PRIMARY_ID, opaque("""{"mode":"updated"}""")),
             )
+            assertEquals(listOf(PRIMARY_ID), commitEvents)
         }
     }
 
     @Test
-    fun `failed selection does not notify either playback path`() {
-        val immediateSelections = mutableListOf<String>()
-        val deferredSelections = mutableListOf<String>()
+    fun `two same-provider instances retain independent payloads after create`() {
+        var idCounter = 0
         withFixture(
-            immediateSelection = { immediateSelections += it },
-            deferredSelection = { deferredSelections += it },
+            definitions = listOf(primaryDefinition()),
+            newChannelId = { "created-${idCounter++}" },
         ) { fixture ->
-            assertFalse(fixture.manager.selectChannel("absent"))
+            val firstPayload = opaque("""{"mode":"first-instance"}""")
+            assertEquals(ChannelRepositoryMutationResult.Success, fixture.manager.createChannel(
+                TEST_IMPLEMENTATION_ID, "First", firstPayload,
+            ))
+            val secondPayload = opaque("""{"mode":"second-instance"}""")
+            assertEquals(ChannelRepositoryMutationResult.Success, fixture.manager.createChannel(
+                TEST_IMPLEMENTATION_ID, "Second", secondPayload,
+            ))
 
-            assertTrue(immediateSelections.isEmpty())
-            assertTrue(deferredSelections.isEmpty())
+            val defs = fixture.repository.catalogueState.value.definitions
+            assertEquals(3, defs.size)
+            assertTrue(defs.any { it.configPayload.toJsonString() == firstPayload.toJsonString() })
+            assertTrue(defs.any { it.configPayload.toJsonString() == secondPayload.toJsonString() })
         }
+    }
+
+    @Test
+    fun `update one same-provider instance does not affect sibling payload`() = withFixture(
+        definitions = listOf(primaryDefinition(), siblingDefinition()),
+    ) { fixture ->
+        val siblingPayloadBefore = fixture.repository.catalogueState.value.definitions
+            .first { it.id == SIBLING_ID }.configPayload.toJsonString()
+
+        assertEquals(
+            ChannelRepositoryMutationResult.Success,
+            fixture.manager.updateChannelConfiguration(PRIMARY_ID, opaque("""{"mode":"primary-updated"}""")),
+        )
+
+        val defs = fixture.repository.catalogueState.value.definitions
+        val primary = defs.first { it.id == PRIMARY_ID }
+        val sibling = defs.first { it.id == SIBLING_ID }
+        assertEquals("""{"mode":"primary-updated"}""", primary.configPayload.toJsonString())
+        assertEquals(siblingPayloadBefore, sibling.configPayload.toJsonString())
+    }
+
+    @Test
+    fun `update one same-provider instance preserves catalogue order and active selection`() = withFixture(
+        definitions = listOf(primaryDefinition(), siblingDefinition(), secondaryDefinition()),
+    ) { fixture ->
+        assertEquals(
+            ChannelRepositoryMutationResult.Success,
+            fixture.manager.updateChannelConfiguration(SIBLING_ID, opaque("""{"mode":"sibling-updated"}""")),
+        )
+
+        val snapshot = fixture.repository.catalogueState.value
+        assertEquals(PRIMARY_ID, snapshot.activeChannelId)
+        assertEquals(3, snapshot.definitions.size)
+        assertEquals(listOf(PRIMARY_ID, SIBLING_ID, SECONDARY_ID), snapshot.definitions.map { it.id })
     }
 
     private fun withFixture(
@@ -144,6 +178,8 @@ class ServiceChannelManagerTest {
         immediateSelection: (String) -> Unit = {},
         deferredSelection: (String) -> Unit = {},
         log: (String) -> Unit = {},
+        newChannelId: () -> String = { CREATED_ID },
+        onConfigurationCommitted: (String) -> Unit = {},
         block: (Fixture) -> Unit,
     ) {
         val provider = TestProvider(TEST_IMPLEMENTATION_ID, PROVIDER_DEFAULT_PAYLOAD)
@@ -167,8 +203,9 @@ class ServiceChannelManagerTest {
                 providerRegistry = managerRegistry,
                 immediateSelection = immediateSelection,
                 deferredSelection = deferredSelection,
-                newChannelId = { CREATED_ID },
+                newChannelId = newChannelId,
                 log = log,
+                onConfigurationCommitted = onConfigurationCommitted,
             )
             block(Fixture(repository, manager, PROVIDER_DEFAULT_PAYLOAD))
         } finally {
@@ -288,6 +325,7 @@ class ServiceChannelManagerTest {
         val MISSING_IMPLEMENTATION_ID = ChannelImplementationId("test:missing")
         const val PRIMARY_ID = "primary"
         const val SECONDARY_ID = "secondary"
+        const val SIBLING_ID = "sibling"
         const val CREATED_ID = "created"
         val PROVIDER_DEFAULT_PAYLOAD = opaque("""{"mode":"provider-default"}""")
 
@@ -307,6 +345,15 @@ class ServiceChannelManagerTest {
             enabled = true,
             configSchemaVersion = TestProvider.SCHEMA_VERSION,
             configPayload = opaque("""{"mode":"secondary"}"""),
+        )
+
+        fun siblingDefinition(): ChannelDefinition = ChannelDefinition(
+            id = SIBLING_ID,
+            name = "Sibling",
+            implementationId = TEST_IMPLEMENTATION_ID,
+            enabled = true,
+            configSchemaVersion = TestProvider.SCHEMA_VERSION,
+            configPayload = opaque("""{"mode":"sibling"}"""),
         )
 
         fun opaque(encoded: String): OpaqueJsonObject = OpaqueJsonObject.parse(encoded).getOrThrow()

@@ -206,7 +206,7 @@ class KeyboardRuntime(
             }
             _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
             val transcription = capabilities.useCapability(CapabilityKey.Transcription) { capability ->
-                capability.transcribe(opaqueAudioRecording(recording))
+                capability.transcribe(opaqueAudioRecording(recording, capabilities.identity.runtimeGeneration))
             }
             val text = (transcription as? CapabilityOperationResult.Success)?.value?.text
             if (text == null) {

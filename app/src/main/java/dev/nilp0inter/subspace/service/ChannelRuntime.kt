@@ -33,6 +33,17 @@ sealed interface ChannelPreparationReason {
     data object ModelUnavailable : ChannelPreparationReason {
         override val message: String = "Selected model is unavailable"
     }
+
+    /**
+     * The provider's configuration schema rejects the instance's preserved payload.
+     * The definition and payload remain unchanged; the instance is unavailable until
+     * the provider is rolled back/updated to a compatible revision.
+     */
+    data class ConfigurationIncompatible(
+        val error: ChannelProviderError.InvalidConfiguration,
+    ) : ChannelPreparationReason {
+        override val message: String = "Configuration is incompatible with the current provider"
+    }
     data object RuntimeBusy : ChannelPreparationReason { override val message = "Channel is busy" }
     data object RuntimeTimedOut : ChannelPreparationReason { override val message = "Channel operation timed out" }
     data object RuntimeCancelled : ChannelPreparationReason { override val message = "Channel operation was cancelled" }

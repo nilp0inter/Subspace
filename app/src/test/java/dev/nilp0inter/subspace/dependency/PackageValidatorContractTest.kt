@@ -2,6 +2,10 @@ package dev.nilp0inter.subspace.dependency
 
 import dev.nilp0inter.subspace.lua.API_VERSION
 import dev.nilp0inter.subspace.lua.LUA_VERSION
+import dev.nilp0inter.subspace.lua.ImmutableProgramImage
+import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
+import dev.nilp0inter.subspace.lua.LuaProgramRequirements
+import dev.nilp0inter.subspace.lua.ProgramImageCreationResult
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -48,12 +52,12 @@ class PackageValidatorContractTest {
         val cases = listOf(
             ManifestCase("missing root field", base.replace("\"packageVersion\":\"1.0.0\",", ""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("missing nested field", base.replace("\"summary\":\"Package summary\"", ""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
-            ManifestCase("unknown root field", base.dropLast(1) + ",\"capabilities\":[]}", PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("unknown root field", base.dropLast(1) + ",\"extraField\":true}", PackageFailure.FormatDetail.UNKNOWN_FIELDS),
             ManifestCase("unknown nested field", base.replace("\"summary\":\"Package summary\"", "\"summary\":\"Package summary\",\"extra\":true"), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
             ManifestCase("duplicate key", base.replace("\"repositoryId\":\"123\"", "\"repositoryId\":\"123\",\"repositoryId\":\"123\""), PackageFailure.FormatDetail.DUPLICATE_KEYS),
             ManifestCase("mistyped manifest version", base.replace("\"manifestVersion\":1", "\"manifestVersion\":\"1\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("mistyped repository identity", base.replace("\"repositoryId\":\"123\"", "\"repositoryId\":123"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
-            ManifestCase("mistyped presentation", "{\"manifestVersion\":1,\"repositoryId\":\"123\",\"packageVersion\":\"1.0.0\",\"entryModule\":\"main\",\"presentation\":[],\"runtime\":{\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\":\"$API_VERSION\"}}", PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped presentation", "{\"manifestVersion\":1,\"repositoryId\":\"123\",\"packageVersion\":\"1.0.0\",\"entryModule\":\"main\",\"presentation\":[],\"runtime\":{\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\":\"$API_VERSION\"},\"configuration\":{\"data\":{\"fields\":[]},\"ui\":{\"fields\":[]}},\"capabilities\":[]}", PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank package version", base.replace("\"packageVersion\":\"1.0.0\"", "\"packageVersion\":\" \\t\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank label", base.replace("\"label\":\"Package\"", "\"label\":\"\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank summary", base.replace("\"summary\":\"Package summary\"", "\"summary\":\" \\n\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
@@ -248,6 +252,11 @@ class PackageValidatorContractTest {
         assertTrue("$case should fail as FORMAT/$detail but was $failure", failure is PackageFailure.Format && failure.detail == detail)
     }
 
+    private fun assertCapability(outcome: PackageOutcome<*>, detail: PackageFailure.CapabilityDetail, case: String) {
+        val failure = (outcome as? PackageOutcome.Failure)?.error
+        assertTrue("$case should fail as CAPABILITY/$detail but was $failure", failure is PackageFailure.Capability && failure.detail == detail)
+    }
+
     private fun assertCompatibility(outcome: PackageOutcome<*>, detail: PackageFailure.CompatibilityDetail, case: String) {
         val failure = (outcome as? PackageOutcome.Failure)?.error
         assertTrue("$case should fail as COMPATIBILITY/$detail but was $failure", failure is PackageFailure.Compatibility && failure.detail == detail)
@@ -275,7 +284,16 @@ class PackageValidatorContractTest {
         repositoryId: String = "123",
         packageVersion: String = "1.0.0",
         entryModule: String = "main",
-    ): String = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$packageVersion","entryModule":"$entryModule","presentation":{"label":"Package","summary":"Package summary"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"}}"""
+        configuration: String = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""",
+        capabilities: String = "[]",
+        injectAdditionalProperties: Boolean = true,
+    ): String {
+        var resolvedConfig = configuration
+        if (injectAdditionalProperties && resolvedConfig.contains("\"data\":{") && !resolvedConfig.contains("\"additionalProperties\"")) {
+            resolvedConfig = resolvedConfig.replace("\"data\":{", "\"data\":{\"additionalProperties\":false,")
+        }
+        return """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$packageVersion","entryModule":"$entryModule","presentation":{"label":"Package","summary":"Package summary"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":$resolvedConfig,"capabilities":$capabilities}"""
+    }
 
     private fun archiveBytes(
         manifest: String = manifest(),
@@ -486,6 +504,966 @@ class PackageValidatorContractTest {
         val localVersionNeeded: Int = versionNeeded,
         val localExtra: ByteArray = extra,
     )
+
+    private inline fun <reified T : Throwable> assertThrows(block: () -> Unit) {
+        try {
+            block()
+            org.junit.Assert.fail("Expected ${T::class.java.simpleName} to be thrown")
+        } catch (e: Throwable) {
+            if (e !is T) {
+                throw AssertionError("Expected ${T::class.java.simpleName} but got ${e::class.java.simpleName}", e)
+            }
+        }
+    }
+
+    @Test
+    fun `package capabilities define stable identifiers with defensive immutability`() {
+        assertEquals("audio.transcription", PackageCapability.AUDIO_TRANSCRIPTION)
+        assertEquals("audio.synthesis", PackageCapability.AUDIO_SYNTHESIS)
+        assertEquals("audio.playback", PackageCapability.AUDIO_PLAYBACK)
+
+        assertEquals(
+            setOf("audio.transcription", "audio.synthesis", "audio.playback"),
+            PackageCapability.ALL
+        )
+
+        assertThrows<UnsupportedOperationException> {
+            (PackageCapability.ALL as MutableSet<String>).add("audio.extra")
+        }
+    }
+
+    @Test
+    fun `package configuration limits define finite limits`() {
+        assertEquals(32, PackageConfigurationLimits.MAX_FIELDS)
+        assertEquals(64, PackageConfigurationLimits.MAX_FIELD_ID_BYTES)
+        assertEquals(128, PackageConfigurationLimits.MAX_LABEL_BYTES)
+        assertEquals(512, PackageConfigurationLimits.MAX_HELP_BYTES)
+        assertEquals(64, PackageConfigurationLimits.MAX_CHOICES)
+        assertEquals(16384, PackageConfigurationLimits.MAX_STRING_VALUE_BYTES)
+        assertEquals(65536, PackageConfigurationLimits.MAX_PAYLOAD_BYTES)
+    }
+
+    @Test
+    fun `configuration field declaration string field constructor invariants and immutability`() {
+        val valid = ConfigurationFieldDeclaration.StringField("valid_id", "default", listOf("default", "other"))
+        assertEquals("valid_id", valid.id)
+        assertEquals("default", valid.default)
+        assertEquals(listOf("default", "other"), valid.allowedValues)
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("Invalid_Id", "default", null)
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("1id", "default", null)
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("", "default", null)
+        }
+        val tooLongId = "a".repeat(65)
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField(tooLongId, "default", null)
+        }
+
+        val largeDefault = "a".repeat(16385)
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("id", largeDefault, null)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("id", "default", emptyList())
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("id", "default", listOf("other"))
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("id", "default", listOf("default", "default"))
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.StringField("id", "default", listOf("default", "a".repeat(16385)))
+        }
+
+        val mutableInput = mutableListOf("default", "other")
+        val field = ConfigurationFieldDeclaration.StringField("id", "default", mutableInput)
+        mutableInput.add("third")
+        assertEquals(2, field.allowedValues?.size)
+        assertFalse(field.allowedValues!!.contains("third"))
+
+        assertThrows<UnsupportedOperationException> {
+            (field.allowedValues as MutableList<String>).add("third")
+        }
+    }
+
+    @Test
+    fun `configuration field declaration boolean field constructor invariants`() {
+        val valid = ConfigurationFieldDeclaration.BooleanField("valid_id", true)
+        assertEquals("valid_id", valid.id)
+        assertTrue(valid.default)
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.BooleanField("Invalid_Id", true)
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.BooleanField("", true)
+        }
+    }
+
+    @Test
+    fun `configuration field declaration integer field constructor invariants`() {
+        val valid = ConfigurationFieldDeclaration.IntegerField("valid_id", 10L, 0L, 20L)
+        assertEquals("valid_id", valid.id)
+        assertEquals(10L, valid.default)
+        assertEquals(0L, valid.minimum)
+        assertEquals(20L, valid.maximum)
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.IntegerField("Invalid_Id", 10L, null, null)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.IntegerField("id", 10L, 20L, 10L)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.IntegerField("id", 5L, 10L, 20L)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationFieldDeclaration.IntegerField("id", 25L, 10L, 20L)
+        }
+    }
+
+    @Test
+    fun `configuration data declaration constructor invariants and immutability`() {
+        val fields = listOf(
+            ConfigurationFieldDeclaration.StringField("s", "val", null),
+            ConfigurationFieldDeclaration.BooleanField("b", true),
+            ConfigurationFieldDeclaration.IntegerField("i", 42L, null, null)
+        )
+        val decl = ConfigurationDataDeclaration(fields)
+        assertEquals(3, decl.fields.size)
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationDataDeclaration(
+                listOf(
+                    ConfigurationFieldDeclaration.StringField("id", "a", null),
+                    ConfigurationFieldDeclaration.BooleanField("id", true)
+                )
+            )
+        }
+
+        val oversizedFields = (1..33).map { i ->
+            ConfigurationFieldDeclaration.BooleanField("b_$i", true)
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationDataDeclaration(oversizedFields)
+        }
+
+        val mutableInput = fields.toMutableList()
+        val dataDecl = ConfigurationDataDeclaration(mutableInput)
+        mutableInput.add(ConfigurationFieldDeclaration.BooleanField("extra", false))
+        assertEquals(3, dataDecl.fields.size)
+
+        assertThrows<UnsupportedOperationException> {
+            (dataDecl.fields as MutableList<ConfigurationFieldDeclaration>).add(
+                ConfigurationFieldDeclaration.BooleanField("extra", false)
+            )
+        }
+    }
+
+    @Test
+    fun `ui choice constructor invariants`() {
+        val valid = UiChoice("val", "label")
+        assertEquals("val", valid.value)
+        assertEquals("label", valid.label)
+
+        assertThrows<IllegalArgumentException> {
+            UiChoice("a".repeat(16385), "label")
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiChoice("val", "   ")
+        }
+        assertThrows<IllegalArgumentException> {
+            UiChoice("val", "")
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiChoice("val", "a".repeat(129))
+        }
+    }
+
+    @Test
+    fun `ui field declaration constructor invariants and immutability`() {
+        val choices = listOf(UiChoice("v1", "L1"), UiChoice("v2", "L2"))
+        val validChoice = UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select option", "Help message", choices)
+        assertEquals("choice_field", validChoice.field)
+        assertEquals(UiControl.CHOICE, validChoice.control)
+        assertEquals("Select option", validChoice.label)
+        assertEquals("Help message", validChoice.help)
+        assertEquals(choices, validChoice.choices)
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("ChoiceField", UiControl.CHOICE, "Select option", null, choices)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "", null, choices)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "a".repeat(129), null, choices)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", "a".repeat(513), choices)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, null)
+        }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, emptyList())
+        }
+
+        val oversizedChoices = (1..65).map { i -> UiChoice("v_$i", "L_$i") }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, oversizedChoices)
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration(
+                "choice_field",
+                UiControl.CHOICE,
+                "Select",
+                null,
+                listOf(UiChoice("v1", "L1"), UiChoice("v1", "L2"))
+            )
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration(
+                "choice_field",
+                UiControl.CHOICE,
+                "Select",
+                null,
+                listOf(UiChoice("v1", "L1"), UiChoice("v2", "L1"))
+            )
+        }
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("text_field", UiControl.TEXT, "Label", null, choices)
+        }
+
+        val mutableInput = choices.toMutableList()
+        val uiField = UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, mutableInput)
+        mutableInput.add(UiChoice("v3", "L3"))
+        assertEquals(2, uiField.choices?.size)
+
+        assertThrows<UnsupportedOperationException> {
+            (uiField.choices as MutableList<UiChoice>).add(UiChoice("v3", "L3"))
+        }
+    }
+
+    @Test
+    fun `configuration ui declaration constructor invariants and immutability`() {
+        val fields = listOf(
+            UiFieldDeclaration("text_field", UiControl.TEXT, "Text label", null, null),
+            UiFieldDeclaration("toggle_field", UiControl.TOGGLE, "Toggle label", null, null)
+        )
+        val valid = ConfigurationUiDeclaration(fields)
+        assertEquals(2, valid.fields.size)
+
+        assertThrows<IllegalArgumentException> {
+            ConfigurationUiDeclaration(
+                listOf(
+                    UiFieldDeclaration("field_1", UiControl.TEXT, "Label 1", null, null),
+                    UiFieldDeclaration("field_1", UiControl.TOGGLE, "Label 2", null, null)
+                )
+            )
+        }
+
+        val oversizedFields = (1..33).map { i ->
+            UiFieldDeclaration("f_$i", UiControl.TOGGLE, "L_$i", null, null)
+        }
+        assertThrows<IllegalArgumentException> {
+            ConfigurationUiDeclaration(oversizedFields)
+        }
+
+        val mutableInput = fields.toMutableList()
+        val uiDecl = ConfigurationUiDeclaration(mutableInput)
+        mutableInput.add(UiFieldDeclaration("extra", UiControl.TOGGLE, "Extra", null, null))
+        assertEquals(2, uiDecl.fields.size)
+
+        assertThrows<UnsupportedOperationException> {
+            (uiDecl.fields as MutableList<UiFieldDeclaration>).add(
+                UiFieldDeclaration("extra", UiControl.TOGGLE, "Extra", null, null)
+            )
+        }
+    }
+
+    @Test
+    fun `package configuration declaration constructor invariants`() {
+        val data = ConfigurationDataDeclaration(
+            listOf(
+                ConfigurationFieldDeclaration.StringField("str_unconstrained", "default", null),
+                ConfigurationFieldDeclaration.StringField("str_constrained", "v1", listOf("v1", "v2")),
+                ConfigurationFieldDeclaration.BooleanField("bool", false),
+                ConfigurationFieldDeclaration.IntegerField("int", 10L, 0L, 100L)
+            )
+        )
+        val ui = ConfigurationUiDeclaration(
+            listOf(
+                UiFieldDeclaration("str_unconstrained", UiControl.TEXT, "Text label", null, null),
+                UiFieldDeclaration("str_constrained", UiControl.CHOICE, "Choice label", null, listOf(UiChoice("v1", "L1"), UiChoice("v2", "L2"))),
+                UiFieldDeclaration("bool", UiControl.TOGGLE, "Toggle label", null, null),
+                UiFieldDeclaration("int", UiControl.NUMBER, "Number label", null, null)
+            )
+        )
+
+        val config = PackageConfigurationDeclaration(data, ui)
+        assertEquals(data, config.data)
+        assertEquals(ui, config.ui)
+
+        val mismatchedUi1 = ConfigurationUiDeclaration(
+            ui.fields + UiFieldDeclaration("extra_ui", UiControl.TEXT, "Extra label", null, null)
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(data, mismatchedUi1)
+        }
+
+        val mismatchedData1 = ConfigurationDataDeclaration(
+            data.fields + ConfigurationFieldDeclaration.BooleanField("extra_data", true)
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(mismatchedData1, ui)
+        }
+
+        val badData1 = ConfigurationDataDeclaration(
+            listOf(ConfigurationFieldDeclaration.StringField("f", "v", null))
+        )
+        val badUi1 = ConfigurationUiDeclaration(
+            listOf(UiFieldDeclaration("f", UiControl.CHOICE, "Label", null, listOf(UiChoice("v", "L"))))
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(badData1, badUi1)
+        }
+
+        val badData2 = ConfigurationDataDeclaration(
+            listOf(ConfigurationFieldDeclaration.StringField("f", "v", listOf("v", "other")))
+        )
+        val badUi2 = ConfigurationUiDeclaration(
+            listOf(UiFieldDeclaration("f", UiControl.TEXT, "Label", null, null))
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(badData2, badUi2)
+        }
+
+        val badData3 = ConfigurationDataDeclaration(
+            listOf(ConfigurationFieldDeclaration.BooleanField("f", true))
+        )
+        val badUi3 = ConfigurationUiDeclaration(
+            listOf(UiFieldDeclaration("f", UiControl.NUMBER, "Label", null, null))
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(badData3, badUi3)
+        }
+
+        val badData4 = ConfigurationDataDeclaration(
+            listOf(ConfigurationFieldDeclaration.IntegerField("f", 10L, null, null))
+        )
+        val badUi4 = ConfigurationUiDeclaration(
+            listOf(UiFieldDeclaration("f", UiControl.TOGGLE, "Label", null, null))
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(badData4, badUi4)
+        }
+
+        val badUiChoice1 = ConfigurationUiDeclaration(
+            listOf(
+                UiFieldDeclaration(
+                    "str_constrained",
+                    UiControl.CHOICE,
+                    "Choice label",
+                    null,
+                    listOf(UiChoice("v1", "L1"))
+                ),
+                UiFieldDeclaration("str_unconstrained", UiControl.TEXT, "Text label", null, null),
+                UiFieldDeclaration("bool", UiControl.TOGGLE, "Toggle label", null, null),
+                UiFieldDeclaration("int", UiControl.NUMBER, "Number label", null, null)
+            )
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(data, badUiChoice1)
+        }
+
+        val badUiChoice2 = ConfigurationUiDeclaration(
+            listOf(
+                UiFieldDeclaration(
+                    "str_constrained",
+                    UiControl.CHOICE,
+                    "Choice label",
+                    null,
+                    listOf(UiChoice("v1", "L1"), UiChoice("v2", "L2"), UiChoice("v3", "L3"))
+                ),
+                UiFieldDeclaration("str_unconstrained", UiControl.TEXT, "Text label", null, null),
+                UiFieldDeclaration("bool", UiControl.TOGGLE, "Toggle label", null, null),
+                UiFieldDeclaration("int", UiControl.NUMBER, "Number label", null, null)
+            )
+        )
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(data, badUiChoice2)
+        }
+    }
+
+    @Test
+    fun `package manifest and validated revision retain explicit configuration and capabilities with no defaults`() {
+        val identity = GitHubRepositoryIdentity("123")
+        val config = PackageConfigurationDeclaration(
+            ConfigurationDataDeclaration(emptyList()),
+            ConfigurationUiDeclaration(emptyList())
+        )
+        val capabilities = setOf(PackageCapability.AUDIO_TRANSCRIPTION)
+
+        val manifest = PackageManifest(
+            manifestVersion = 1,
+            repositoryId = identity,
+            packageVersion = "1.0.0",
+            entryModule = "main",
+            presentation = PackagePresentation("Label", "Summary"),
+            runtime = RuntimeRequirements("lua-test", "api-test"),
+            configuration = config,
+            capabilities = capabilities
+        )
+
+        // Verify manifest retains explicit values
+        assertEquals(config, manifest.configuration)
+        assertEquals(capabilities, manifest.capabilities)
+
+        // Verify validated revision retains explicit values via manifest
+        val digest = ArtifactDigest("a".repeat(64))
+        val imageResult = ImmutableProgramImage.create(
+            entryPoint = "main",
+            sourceMap = mapOf("main" to SOURCE),
+            requirements = LuaProgramRequirements(LUA_VERSION, API_VERSION)
+        ) as ProgramImageCreationResult.Success
+
+        val revision = ValidatedPackageRevision(
+            digest = digest,
+            manifest = manifest,
+            sourceRecord = sourceRecord(),
+            sourceMap = mapOf("main" to SOURCE),
+            programImage = imageResult.image,
+            fingerprint = ProviderRevisionFingerprint.fromDigest(digest)
+        )
+        assertEquals(manifest, revision.manifest)
+        assertEquals(config, revision.manifest.configuration)
+        assertEquals(capabilities, revision.manifest.capabilities)
+
+        // Assert no defaults via reflection (proving compile-time property)
+        val declaredConstructors = PackageManifest::class.java.declaredConstructors
+        assertTrue("PackageManifest must define at least one constructor", declaredConstructors.isNotEmpty())
+        for (constructor in declaredConstructors) {
+            val types = constructor.parameterTypes.toList()
+            assertTrue("Constructor must require PackageConfigurationDeclaration: $constructor", types.contains(PackageConfigurationDeclaration::class.java))
+            assertTrue("Constructor must require Set: $constructor", types.contains(java.util.Set::class.java))
+        }
+    }
+
+    @Test
+    fun `strict manifest decoding for configuration and capabilities validation`() = withTemporaryDirectory { root ->
+        val validManifest = manifest()
+        expectSuccess(validate(root, archiveBytes(manifest = validManifest), sourceRecord()))
+
+        val defaultConfigStr = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}"""
+        val replaced = validManifest.replace("\"configuration\":$defaultConfigStr,", "")
+        val invalidRootCases = listOf(
+            ManifestCase("missing configuration", replaced, PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing capabilities", validManifest.replace(",\"capabilities\":[]", ""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null configuration", validManifest.replace(defaultConfigStr, "null"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null capabilities", validManifest.replace("[]}", "null}"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped configuration", validManifest.replace(defaultConfigStr, "[]"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped capabilities", validManifest.replace("[]}", "{} }"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate configuration", validManifest.replace("\"configuration\":", "\"configuration\":$defaultConfigStr,\"configuration\":"), PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate capabilities", validManifest.replace("\"capabilities\":", "\"capabilities\":[],\"capabilities\":"), PackageFailure.FormatDetail.DUPLICATE_KEYS),
+        )
+
+        invalidRootCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
+
+        // Capabilities validation
+        assertCapability(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[\"audio.nonexistent\"]")), sourceRecord()),
+            PackageFailure.CapabilityDetail.UNKNOWN_CAPABILITY_ID,
+            "unknown capability"
+        )
+        assertCapability(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[\"audio.playback\",\"audio.playback\"]")), sourceRecord()),
+            PackageFailure.CapabilityDetail.DUPLICATE_CAPABILITY_ID,
+            "duplicate capability values"
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[123]")), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "non-string in capabilities"
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[null]")), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "null inside capabilities"
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[[\"audio.playback\"]]")), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "nested array in capabilities"
+        )
+
+        // Configuration level validations
+        val configCases = listOf(
+            // configuration.data level
+            ManifestCase("missing data in configuration", manifest(configuration = """{"schemaVersion":1,"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing ui in configuration", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in configuration", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{"fields":[]},"extra":1}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("null data in configuration", manifest(configuration = """{"schemaVersion":1,"data":null,"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped data in configuration", manifest(configuration = """{"schemaVersion":1,"data":[],"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            
+            // data.fields level
+            ManifestCase("missing fields in data", manifest(configuration = """{"schemaVersion":1,"data":{},"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[],"extra":1},"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("null fields in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":null},"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped fields in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":{}},"ui":{"fields":[]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing additionalProperties in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{"fields":[]}}""", injectAdditionalProperties = false), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("additionalProperties true in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":true},"ui":{"fields":[]}}""", injectAdditionalProperties = false), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+
+            // ui.fields level
+            ManifestCase("missing fields in ui", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in ui", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{"fields":[],"extra":1}}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("null fields in ui", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{"fields":null}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped fields in ui", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[]},"ui":{"fields":{}}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+
+        configCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
+
+        // Configuration field validations
+        val fieldCases = listOf(
+            // Missing, unknown, null, mistyped in field declaration
+            ManifestCase("missing id in field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing type in field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing default in field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean"}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in field object", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true,"extra":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("null field id", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":null,"type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null field type", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":null,"default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null field default", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":null}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("invalid field id pattern", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"Foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"Foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("invalid type value", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"float","default":1.0}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate field id", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true},{"id":"foo","type":"string","default":"bar"}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key minimum in StringField", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"bar","minimum":1}]},"ui":{"fields":[{"field":"foo","control":"text","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key allowedValues in BooleanField", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true,"allowedValues":[]}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate key inside field object", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.DUPLICATE_KEYS),
+
+            // type mismatch
+            ManifestCase("boolean type mismatch", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":"true"}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("string type mismatch", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":123}]},"ui":{"fields":[{"field":"foo","control":"text","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("integer type mismatch", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":true}]},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+
+            // String allowedValues
+            ManifestCase("empty allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"bar","allowedValues":[]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("default not in allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"bar","allowedValues":["baz"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"baz","label":"Baz"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"bar","allowedValues":["bar","bar"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"bar","label":"Bar"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null inside allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"bar","allowedValues":["bar",null]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"bar","label":"Bar"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+
+            // Integer bounds
+            ManifestCase("minimum greater than maximum", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":5,"minimum":10,"maximum":2}]},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("default less than minimum", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":1,"minimum":2}]},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("default greater than maximum", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":10,"maximum":5}]},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+
+        fieldCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
+
+        // Configuration UI field validations
+        val uiFieldCases = listOf(
+            ManifestCase("missing field in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing control in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing label in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo","extra":1}]}}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("null field in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":null,"control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null control in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":null,"label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null label in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":null}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("explicit null help in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo","help":null}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("invalid field reference pattern in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"Foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("invalid control value in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"checkbox","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("blank label in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"   "}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate field in ui fields", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"},{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+
+            // Choices in UI field
+            ManifestCase("choices missing for choice control", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("choices present for toggle control", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo","choices":[]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("empty choices for choice control", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate choice value", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a","b"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":"A"},{"value":"a","label":"B"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate choice label", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a","b"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":"A"},{"value":"b","label":"A"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("blank choice label", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":""}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null inside choices", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[null]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("missing value in choice object", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"label":"A"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown key in choice object", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":"A","extra":1}]}]}}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("explicit null choices in ui field", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":null}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+
+        uiFieldCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
+
+        // Data / UI matching validation
+        val matchingCases = listOf(
+            ManifestCase("extra field in UI not in data", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"},{"field":"bar","control":"text","label":"Bar"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("extra field in data not in UI", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true},{"id":"bar","type":"string","default":"x"}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("control mismatch: boolean-text", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}]},"ui":{"fields":[{"field":"foo","control":"text","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("control mismatch: string-choice without allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a"}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":"A"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("control mismatch: string-text with allowedValues", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}]},"ui":{"fields":[{"field":"foo","control":"text","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("control mismatch: integer-toggle", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":1}]},"ui":{"fields":[{"field":"foo","control":"toggle","label":"Foo"}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("choices mismatch: allowedValues-choices set inequality", manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a","b"]}]},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","label":"A"}]}]}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+
+        matchingCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
+    }
+
+    @Test
+    fun `enforce configuration bounds and capabilities validation limits`() = withTemporaryDirectory { root ->
+        // 1. Field ID limit (64 UTF-8 bytes)
+        // Boundary (64 bytes)
+        val validFieldId = "a" + "0".repeat(63)
+        val validFieldIdManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"$validFieldId","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"$validFieldId","control":"toggle","label":"label"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validFieldIdManifest), sourceRecord()))
+
+        // Over limit (65 bytes)
+        val invalidFieldId = "a" + "0".repeat(64)
+        val invalidFieldIdManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"$invalidFieldId","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"$invalidFieldId","control":"toggle","label":"label"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidFieldIdManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Field ID over 64 bytes")
+
+        // 2. Label limit (128 UTF-8 bytes)
+        // Boundary (128 bytes)
+        val validLabel = "a".repeat(128)
+        val validLabelManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"$validLabel"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validLabelManifest), sourceRecord()))
+
+        // Over limit (129 bytes)
+        val invalidLabel = "a".repeat(129)
+        val invalidLabelManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"$invalidLabel"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidLabelManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Label over 128 bytes")
+
+        // Non-ASCII label boundary (e.g. multi-byte characters: each is 3 bytes, so 42 chars = 126 bytes; 43 chars = 129 bytes)
+        val validMultiByteLabel = "中".repeat(42) // 126 bytes
+        val validMultiByteLabelManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"$validMultiByteLabel"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validMultiByteLabelManifest), sourceRecord()))
+
+        val invalidMultiByteLabel = "中".repeat(43) // 129 bytes
+        val invalidMultiByteLabelManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"$invalidMultiByteLabel"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidMultiByteLabelManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Multi-byte label over 128 bytes")
+
+        // 3. Help string limit (512 UTF-8 bytes)
+        // Boundary (512 bytes)
+        val validHelp = "a".repeat(512)
+        val validHelpManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"label","help":"$validHelp"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validHelpManifest), sourceRecord()))
+
+        // Over limit (513 bytes)
+        val invalidHelp = "a".repeat(513)
+        val invalidHelpManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"label","help":"$invalidHelp"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidHelpManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Help over 512 bytes")
+
+        // 4. Choice count limit (64 choices)
+        // Boundary (64 choices)
+        val validChoicesList = (1..64).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
+        val validAllowedValuesList = (1..64).map { "\"v$it\"" }.joinToString(",")
+        val validChoiceManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"v1","allowedValues":[$validAllowedValuesList]}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"choice","label":"label","choices":[$validChoicesList]}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validChoiceManifest), sourceRecord()))
+
+        // Over limit (65 choices)
+        val invalidChoicesList = (1..65).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
+        val invalidAllowedValuesList = (1..65).map { "\"v$it\"" }.joinToString(",")
+        val invalidChoiceManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"v1","allowedValues":[$invalidAllowedValuesList]}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"choice","label":"label","choices":[$invalidChoicesList]}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidChoiceManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Choices count over 64")
+
+        // 5. Individual string limit (16 KiB = 16384 bytes)
+        // Boundary (16384 bytes)
+        val validStringVal = "a".repeat(16384)
+        val validStringManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"$validStringVal"}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"text","label":"label"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = validStringManifest), sourceRecord()))
+
+        // Over limit (16385 bytes)
+        val invalidStringVal = "a".repeat(16385)
+        val invalidStringManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"$invalidStringVal"}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"text","label":"label"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = invalidStringManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Individual string over 16 KiB")
+
+        // 6. Canonical default payload limit (64 KiB = 65536 bytes)
+        val s16376 = "a".repeat(16376)
+        val s16375 = "a".repeat(16375)
+        val payloadBoundaryManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"f1","type":"string","default":"$s16376"},{"id":"f2","type":"string","default":"$s16376"},{"id":"f3","type":"string","default":"$s16376"},{"id":"f4","type":"string","default":"$s16375"}],"additionalProperties":false},"ui":{"fields":[{"field":"f1","control":"text","label":"l1"},{"field":"f2","control":"text","label":"l2"},{"field":"f3","control":"text","label":"l3"},{"field":"f4","control":"text","label":"l4"}]}}""")
+        expectSuccess(validate(root, archiveBytes(manifest = payloadBoundaryManifest), sourceRecord()))
+
+        // Over limit (65537 bytes)
+        val payloadOverLimitManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"f1","type":"string","default":"$s16376"},{"id":"f2","type":"string","default":"$s16376"},{"id":"f3","type":"string","default":"$s16376"},{"id":"f4","type":"string","default":"$s16376"}],"additionalProperties":false},"ui":{"fields":[{"field":"f1","control":"text","label":"l1"},{"field":"f2","control":"text","label":"l2"},{"field":"f3","control":"text","label":"l3"},{"field":"f4","control":"text","label":"l4"}]}}""")
+        assertFormat(validate(root, archiveBytes(manifest = payloadOverLimitManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Canonical payload over 64 KiB")
+    }
+
+    @Test
+    fun `package capabilities preserves order in manifest`() = withTemporaryDirectory { root ->
+        val manifest1 = manifest(capabilities = "[\"audio.playback\",\"audio.synthesis\"]")
+        val revision1 = expectSuccess(validate(root, archiveBytes(manifest = manifest1), sourceRecord()))
+        assertEquals(listOf("audio.playback", "audio.synthesis"), revision1.manifest.capabilities.toList())
+
+        val manifest2 = manifest(capabilities = "[\"audio.transcription\",\"audio.playback\"]")
+        val revision2 = expectSuccess(validate(root, archiveBytes(manifest = manifest2), sourceRecord()))
+        assertEquals(listOf("audio.transcription", "audio.playback"), revision2.manifest.capabilities.toList())
+    }
+
+    @Test
+    fun `duplicate keys at every nesting level are rejected`() = withTemporaryDirectory { root ->
+        val base = manifest()
+        val cases = listOf(
+            ManifestCase("duplicate label in presentation",
+                base.replace("\"label\":\"Package\",\"summary\"", "\"label\":\"Package\",\"label\":\"Package\",\"summary\""),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate luaVersion in runtime",
+                base.replace("\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\"",
+                    "\"luaVersion\":\"$LUA_VERSION\",\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\""),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate data key in configuration",
+                base.replace("\"data\":{\"fields\":[],\"additionalProperties\":false},\"ui\"",
+                    "\"data\":{\"fields\":[],\"additionalProperties\":false},\"data\":{\"fields\":[],\"additionalProperties\":false},\"ui\""),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate fields key in data",
+                base.replace("\"data\":{\"fields\":[],\"additionalProperties\":false}",
+                    "\"data\":{\"fields\":[],\"fields\":[],\"additionalProperties\":false}"),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate fields key in ui",
+                base.replace("\"ui\":{\"fields\":[]}", "\"ui\":{\"fields\":[],\"fields\":[]}"),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate field key in ui field object",
+                manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","field":"foo","control":"toggle","label":"Foo"}]}}""", injectAdditionalProperties = false),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+            ManifestCase("duplicate value key in choice object",
+                manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"a","allowedValues":["a"]}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"choice","label":"Foo","choices":[{"value":"a","value":"a","label":"A"}]}]}}""", injectAdditionalProperties = false),
+                PackageFailure.FormatDetail.DUPLICATE_KEYS),
+        )
+        cases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name,
+            )
+        }
+    }
+
+    @Test
+    fun `valid empty diagnostics declarations validate and produce empty revision`() = withTemporaryDirectory { root ->
+        val revision = expectSuccess(validate(root, archiveBytes(manifest = manifest()), sourceRecord()))
+
+        assertTrue("data fields should be empty for diagnostics-style declaration", revision.manifest.configuration.data.fields.isEmpty())
+        assertTrue("ui fields should be empty for diagnostics-style declaration", revision.manifest.configuration.ui.fields.isEmpty())
+        assertTrue("capabilities should be empty for diagnostics-style declaration", revision.manifest.capabilities.isEmpty())
+    }
+
+    @Test
+    fun `old artifact without evolved declarations is rejected`() = withTemporaryDirectory { root ->
+        val oldManifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"1.0.0","entryModule":"main","presentation":{"label":"Package","summary":"Package summary"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"}}"""
+
+        assertFormat(
+            validate(root, archiveBytes(manifest = oldManifest), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "old artifact without configuration and capabilities",
+        )
+    }
+
+    @Test
+    fun `failed validation cleans up staging file with no partial retention`() = withTemporaryDirectory { root ->
+        // Invalid ZIP content
+        val stagingFile1 = File(root, "staging1.zip")
+        val outcome1 = PackageValidator.validatePackage(
+            ByteArrayInputStream(ByteArray(10)),
+            sourceRecord(),
+            stagingFile1,
+            generousBounds(),
+        )
+        assertTrue("invalid ZIP should fail", outcome1 is PackageOutcome.Failure)
+        assertFalse("staging file must be deleted after invalid ZIP failure", stagingFile1.exists())
+
+        // Valid ZIP but malformed manifest
+        val stagingFile2 = File(root, "staging2.zip")
+        val badManifestArchive = strictZip(listOf(
+            FixtureEntry("manifest.json", "not json".toByteArray(UTF_8)),
+            FixtureEntry("lua/", ByteArray(0), directory = true),
+            FixtureEntry("lua/main.lua", SOURCE.toByteArray(UTF_8)),
+        ))
+        val outcome2 = PackageValidator.validatePackage(
+            ByteArrayInputStream(badManifestArchive),
+            sourceRecord(),
+            stagingFile2,
+            generousBounds(),
+        )
+        assertTrue("malformed manifest should fail", outcome2 is PackageOutcome.Failure)
+        assertFalse("staging file must be deleted after malformed manifest failure", stagingFile2.exists())
+
+        // Valid ZIP and manifest but incompatible runtime
+        val stagingFile3 = File(root, "staging3.zip")
+        val incompatibleArchive = archiveBytes(manifest = manifest().replace(API_VERSION, "subspace-lua-v2"))
+        val outcome3 = PackageValidator.validatePackage(
+            ByteArrayInputStream(incompatibleArchive),
+            sourceRecord(),
+            stagingFile3,
+            generousBounds(),
+        )
+        assertTrue("incompatible runtime should fail", outcome3 is PackageOutcome.Failure)
+        assertFalse("staging file must be deleted after compatibility failure", stagingFile3.exists())
+
+        // Artifact exceeds size bound
+        val stagingFile4 = File(root, "staging4.zip")
+        val validArchive = archiveBytes()
+        val outcome4 = PackageValidator.validatePackage(
+            ByteArrayInputStream(validArchive),
+            sourceRecord(),
+            stagingFile4,
+            bounds(maxArtifactBytes = validArchive.size.toLong() - 1),
+        )
+        assertTrue("oversized artifact should fail", outcome4 is PackageOutcome.Failure)
+        assertFalse("staging file must be deleted after bounds failure", stagingFile4.exists())
+    }
+
+    @Test
+    fun `integer field accepts exact boundary defaults and rejects non-integer values`() = withTemporaryDirectory { root ->
+        // Default at minimum boundary (should pass)
+        expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":5,"minimum":5,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()))
+
+        // Default at maximum boundary (should pass)
+        expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":10,"minimum":5,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()))
+
+        // Non-integer default (1.5) should fail
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":1.5,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "non-integer default 1.5",
+        )
+
+        // Non-integer minimum (2.5) should fail
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":5,"minimum":2.5,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "non-integer minimum 2.5",
+        )
+
+        // Non-integer maximum (7.5) should fail
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":5,"minimum":0,"maximum":7.5}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "non-integer maximum 7.5",
+        )
+
+        // Int64 min boundary with no bounds (should pass)
+        expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":-9223372036854775808}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()))
+
+        // Int64 max boundary with no bounds (should pass)
+        expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"integer","default":9223372036854775807}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"number","label":"Foo"}]}}""", injectAdditionalProperties = false)), sourceRecord()))
+        Unit
+    }
+
+    @Test
+    fun `configuration schema version requires exactly integer one`() = withTemporaryDirectory { root ->
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":2,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "schema version 2",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":"1","data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "string schema version",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "missing schema version",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":null,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "null schema version",
+        )
+    }
+
+    @Test
+    fun `entry module validation rejects blank invalid and missing entry modules`() = withTemporaryDirectory { root ->
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest().replace("\"entryModule\":\"main\"", "\"entryModule\":\"\"")), sourceRecord()),
+            PackageFailure.FormatDetail.INVALID_MODULE_GRAMMAR,
+            "blank entry module",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest().replace("\"entryModule\":\"main\"", "\"entryModule\":\"Main\"")), sourceRecord()),
+            PackageFailure.FormatDetail.INVALID_MODULE_GRAMMAR,
+            "uppercase entry module",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest().replace("\"entryModule\":\"main\"", "\"entryModule\":\"1invalid\"")), sourceRecord()),
+            PackageFailure.FormatDetail.INVALID_MODULE_GRAMMAR,
+            "entry module starting with digit",
+        )
+
+        // Entry module not in source map
+        val entries = listOf(
+            FixtureEntry("manifest.json", manifest().toByteArray(UTF_8)),
+            FixtureEntry("lua/", ByteArray(0), directory = true),
+            FixtureEntry("lua/other.lua", SOURCE.toByteArray(UTF_8)),
+        )
+        assertFormat(
+            validate(root, strictZip(entries), sourceRecord()),
+            PackageFailure.FormatDetail.INVALID_ENTRY_MODULE,
+            "entry module not in source map",
+        )
+    }
+
+    @Test
+    fun `additionalProperties must be exactly boolean false`() = withTemporaryDirectory { root ->
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":"false"},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "string additionalProperties",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":0},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "integer additionalProperties",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":null},"ui":{"fields":[]}}""", injectAdditionalProperties = false)), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "null additionalProperties",
+        )
+    }
 
     private companion object {
         private const val LOCAL_SIGNATURE = 0x04034b50L

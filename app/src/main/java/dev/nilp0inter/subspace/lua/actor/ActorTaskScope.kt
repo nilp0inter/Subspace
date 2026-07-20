@@ -15,7 +15,9 @@ import java.util.concurrent.atomic.AtomicLong
  * Bounded by the generation's lifetime and invocation gate. Tracks every
  * actor task so that generation retirement cancels or drains all descendants
  * and no work escapes the generation to become process-global. Enforces
- * maximum concurrent tasks and per-task deadlines.
+ * maximum concurrent tasks. A task remains live until its function returns,
+ * fails, or the owning generation closes; no generic wall-clock expiry is
+ * applied.
  *
  * The scope is a mechanism owned by the runtime. It does not create threads
  * and does not execute outside the generation's invocation gate. It is not a
@@ -25,11 +27,14 @@ internal class ActorTaskScope(
     parentScope: CoroutineScope,
     private val scopeIdentity: CapabilityScopeIdentity,
     private val maxConcurrentTasks: Int,
+    // Retained for source compatibility with existing host policy callers.
+    // Generic task lifetime cutoffs are intentionally not applied; deadlines
+    // belong to individual yielded operations.
+    @Suppress("UNUSED_PARAMETER")
     private val perTaskDeadlineMillis: Long?,
 ) {
     init {
         require(maxConcurrentTasks > 0) { "Max concurrent tasks must be positive" }
-        require(perTaskDeadlineMillis == null || perTaskDeadlineMillis > 0) { "Per-task deadline must be positive" }
     }
 
     private val supervisorJob = SupervisorJob(
@@ -71,11 +76,7 @@ internal class ActorTaskScope(
         val identity = ActorTaskIdentity(scope = scopeIdentity, taskId = taskId)
         val job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             try {
-                if (perTaskDeadlineMillis != null) {
-                    withTimeoutOrNull(perTaskDeadlineMillis) { task(identity) }
-                } else {
-                    task(identity)
-                }
+                task(identity)
             } catch (_: CancellationException) {
                 // generation cancelled — expected during retirement
             }

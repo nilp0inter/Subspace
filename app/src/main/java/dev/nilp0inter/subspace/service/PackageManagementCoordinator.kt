@@ -701,6 +701,7 @@ internal class PackageManagementCoordinator(
         is PackageFailure.Shutdown -> GitHubSourceFailure.LifecycleClosed
         is PackageFailure.Recovery -> GitHubSourceFailure.InvalidPackage
         is PackageFailure.Loading -> GitHubSourceFailure.InvalidPackage
+        is PackageFailure.Capability -> GitHubSourceFailure.InvalidPackage
     }
 
     private fun cleanupInspectStaging() {

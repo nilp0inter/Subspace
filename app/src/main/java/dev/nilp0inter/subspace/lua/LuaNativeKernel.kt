@@ -132,6 +132,15 @@ internal object LuaNativeKernel {
         spawnAdmission: LuaSpawnAdmission,
     ): String
 
+    /** Host-managed handle_input coroutine entrypoint. */
+    external fun nativeInvokeInputCallback(
+        stateId: Long,
+        generation: Long,
+        argumentsJson: String,
+        capturedAudioToken: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): String
+
     external fun nativeStartCoroutine(
         stateId: Long,
         generation: Long,

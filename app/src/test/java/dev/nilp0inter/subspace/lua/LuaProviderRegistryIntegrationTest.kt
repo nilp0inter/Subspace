@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.lua
 
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
+import dev.nilp0inter.subspace.audio.RecordedPcm
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityKey
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityHost
@@ -26,6 +27,13 @@ import dev.nilp0inter.subspace.service.ChannelRuntime
 import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
 import dev.nilp0inter.subspace.model.ChannelConfigurationMigrationStep
 import dev.nilp0inter.subspace.model.ChannelConfigurationProvider
+import dev.nilp0inter.subspace.dependency.ConfigurationDataDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationFieldDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationUiDeclaration
+import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
+import dev.nilp0inter.subspace.dependency.UiChoice
+import dev.nilp0inter.subspace.dependency.UiControl
+import dev.nilp0inter.subspace.dependency.UiFieldDeclaration
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
@@ -61,6 +69,12 @@ import org.junit.Test
 /** Test-only identity for generic Lua provider behavior. */
 private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
 
+/** Empty schema-version-1 declaration; mirrors a materialized package with no fields. */
+private fun emptyConfigurationDeclaration(): PackageConfigurationDeclaration = PackageConfigurationDeclaration(
+    ConfigurationDataDeclaration(emptyList()),
+    ConfigurationUiDeclaration(emptyList()),
+)
+
 /**
  * Constructs a test Lua provider with fixed identity and presentation.
  * Tests that need custom identity/presentation should use LuaChannelImplementationProvider.create.
@@ -68,6 +82,7 @@ private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
 private fun testLuaProvider(
     image: ImmutableProgramImage,
     bridge: LuaKernelBridge,
+    declaration: PackageConfigurationDeclaration = emptyConfigurationDeclaration(),
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -81,15 +96,31 @@ private fun testLuaProvider(
         ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
     },
     bridge = bridge,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, declaration),
 )
 
-/**
- * Constructs a test Lua provider from an image creation result (success or failure).
- * Used for testing error projection paths.
- */
+/** Schema used by configured black-box fixtures; the value crosses the real startup path. */
+private fun configuredDeclaration(): PackageConfigurationDeclaration {
+    val mode = ConfigurationFieldDeclaration.StringField(
+        id = "mode",
+        default = "ECHO",
+        allowedValues = listOf("ECHO", "STT"),
+    )
+    return PackageConfigurationDeclaration(
+        ConfigurationDataDeclaration(listOf(mode)),
+        ConfigurationUiDeclaration(listOf(
+            UiFieldDeclaration("mode", UiControl.CHOICE, "Mode", null, listOf(
+                UiChoice("ECHO", "Echo"),
+                UiChoice("STT", "Speech to text"),
+            )),
+        )),
+    )
+}
+
 private fun testLuaProviderFromResult(
     imageResult: ProgramImageCreationResult,
     bridge: LuaKernelBridge,
+    declaration: PackageConfigurationDeclaration = emptyConfigurationDeclaration(),
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.fromImageResult(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -103,7 +134,9 @@ private fun testLuaProviderFromResult(
         ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
     },
     bridge = bridge,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, declaration),
 )
+
 
 /**
  * Exercises the Lua provider solely through the ordinary provider and runtime registries.
@@ -149,8 +182,16 @@ class LuaProviderRegistryIntegrationTest {
             "the real registry/provider/adapter path must expose the package-backed ready channel",
             prepareAndReleaseInput(registry, definition.id),
         )
+        val startupConfig = bridge.callbackCalls.first { it.name == "startup" }.arguments
+        assertEquals(
+            LuaValue.Map(mapOf(
+                "schema_version" to LuaValue.Number(1.0),
+                "values" to LuaValue.Map(emptyMap()),
+            )),
+            startupConfig,
+        )
         assertEquals(1, bridge.firstReadinessObserved)
-
+        assertEquals("package-local helper module must be loaded by the real image path", 1, bridge.packageImagesAccepted)
         shutdownClosed(registry)
         assertEquals(
             "the state created for this explicit test provider must be closed during registry shutdown",
@@ -158,6 +199,86 @@ class LuaProviderRegistryIntegrationTest {
             bridge.closedStateIds.toSet(),
         )
     }
+
+    @Test
+    fun `empty and configured startup snapshots stay detached across same-provider instances`() = runTest {
+        val bridge = RecordingKernelBridge()
+        val declaration = configuredDeclaration()
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.validCallbacks(), bridge, declaration))
+        val left = definition("configured-left", configPayload = payload("ECHO"))
+        val right = definition("configured-right", configPayload = payload("STT"))
+
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(left, right), left.id))
+        runCurrent()
+
+        val startupCalls = bridge.callbackCalls.filter { it.name == "startup" }
+        assertEquals("both configured instances must cross startup", 2, startupCalls.size)
+        val leftConfig = startupCalls[0].arguments as? LuaValue.Map
+            ?: throw AssertionError("left startup must receive a normalized table")
+        val rightConfig = startupCalls[1].arguments as? LuaValue.Map
+            ?: throw AssertionError("right startup must receive a normalized table")
+        assertEquals(
+            LuaValue.Map(mapOf("mode" to LuaValue.StringValue("ECHO"))),
+            leftConfig.pairs["values"],
+        )
+        assertEquals(
+            LuaValue.Map(mapOf("mode" to LuaValue.StringValue("STT"))),
+            rightConfig.pairs["values"],
+        )
+        assertTrue("each provider generation receives a detached startup table", leftConfig !== rightConfig)
+        assertTrue(
+            "each provider generation receives a detached values table",
+            leftConfig.pairs["values"] !== rightConfig.pairs["values"],
+        )
+        assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(left.id)?.preparation)
+        assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(right.id)?.preparation)
+
+        shutdownClosed(registry)
+    }
+
+    @Test
+    fun `proactive startup timers are admitted for an unselected instance through the runtime registry`() = runTest {
+        val bridge = RecordingKernelBridge()
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.proactiveTimer(), bridge))
+        val selected = definition("timer-selected")
+        val unselected = definition("timer-unselected")
+
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(selected, unselected), selected.id))
+        runCurrent()
+
+        assertEquals("both instances must construct independent states", 2, bridge.createdStateIds.size)
+        assertEquals(
+            "startup-admitted timer work must start for both selected and unselected instances",
+            2,
+            bridge.events.count { it.startsWith("coroutine:") },
+        )
+        assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(unselected.id)?.preparation)
+
+        shutdownClosed(registry)
+    }
+
+    @Test
+    fun `normalized nil error table is projected as a failed terminal without throwing`() = runTest {
+        val bridge = RecordingKernelBridge()
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.normalizedError(), bridge))
+        val definition = definition("normalized-error")
+
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+        val accepted = registry.prepareInput(definition.id) as? ChannelInputAcceptance.Accepted
+            ?: throw AssertionError("normalized-error fixture must accept input")
+        accepted.target.onInputReleased(RecordedPcm(shortArrayOf(1), 8_000))
+        (accepted.target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
+
+        assertEquals(ChannelExecutionStatus.FAILED, registry.getRuntimeSnapshot(definition.id)?.executionStatus)
+        assertEquals(
+            "normalized-error input must invoke exactly one handle_input callback through the registry path",
+            1,
+            bridge.callbackCalls.count { it.name == "handle_input" },
+        )
+        shutdownClosed(registry)
+    }
+
 
     @Test
     fun `same Lua provider gives siblings independent generation scopes and closing one preserves the other`() = runTest {
@@ -223,6 +344,31 @@ class LuaProviderRegistryIntegrationTest {
         )
         assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(generationH.id)?.preparation)
 
+        shutdownClosed(registry)
+    }
+
+    @Test
+    fun `configuration replacement closes predecessor before fresh configured generation startup`() = runTest {
+        val bridge = RecordingKernelBridge()
+        val registry = fixture(testLuaProvider(LuaProviderRegistryFixtures.raceControl(), bridge, configuredDeclaration()))
+        val generationG = definition("configured-replacement", configPayload = payload("ECHO"))
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(generationG), generationG.id))
+        runCurrent()
+        val gState = bridge.createdStateIds.single()
+
+        val generationH = generationG.copy(configPayload = payload("STT"))
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(generationH), generationH.id))
+        runCurrent()
+        val hState = bridge.createdStateIds.last()
+        val gClose = bridge.events.indexOf("close:$gState")
+        val hStartup = bridge.events.indexOf("callback:$hState:startup")
+        assertTrue("predecessor must close before replacement startup", gClose >= 0 && gClose < hStartup)
+        val startupModes = bridge.callbackCalls.filter { it.name == "startup" }.map {
+            val config = it.arguments as LuaValue.Map
+            ((config.pairs["values"] as LuaValue.Map).pairs["mode"] as LuaValue.StringValue).value
+        }
+        assertEquals(listOf("ECHO", "STT"), startupModes)
+        assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(generationH.id)?.preparation)
         shutdownClosed(registry)
     }
 
@@ -317,6 +463,27 @@ class LuaProviderRegistryIntegrationTest {
     }
 
     @Test
+    fun `source-bound image rejection projects before native state creation`() = runTest {
+        val imageResult = LuaProviderRegistryFixtures.sourceBound()
+        val expectedDetail = (imageResult as? ProgramImageCreationResult.Failure)?.error?.message
+            ?: throw AssertionError("source-bound fixture must be rejected immutably")
+        val bridge = RecordingKernelBridge()
+        val registry = fixture(testLuaProviderFromResult(imageResult, bridge))
+        val definition = definition("source-bound")
+        registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+        val unavailable = registry.getRuntimeSnapshot(definition.id)?.preparation
+            as? ChannelPreparationAvailability.Unavailable
+            ?: throw AssertionError("expected source-bound provider unavailability")
+        assertEquals(
+            ChannelProviderError.RuntimeConstructionFailed(TEST_LUA_IMPLEMENTATION_ID, expectedDetail),
+            (unavailable.reason as? ChannelPreparationReason.Provider)?.error,
+        )
+        assertTrue("source validation must precede state creation", bridge.createdStateIds.isEmpty())
+        shutdownClosed(registry)
+    }
+
+    @Test
     fun `Lua provider routes lifecycle readiness input cache and SOS through the generation gate`() = runTest {
         val bridge = RecordingKernelBridge()
         val registry = fixture(testLuaProvider(lifecycleImage(), bridge))
@@ -332,9 +499,12 @@ class LuaProviderRegistryIntegrationTest {
         assertEquals(ChannelPreparationAvailability.Available, registry.dispatchSos(definition.id))
         assertEquals(
             listOf(
-                CallbackCall("startup", null),
+                CallbackCall("startup", LuaValue.Map(mapOf(
+                    "schema_version" to LuaValue.Number(1.0),
+                    "values" to LuaValue.Map(emptyMap()),
+                ))),
                 CallbackCall("handle_lifecycle", LuaValue.Map(mapOf("event" to LuaValue.StringValue("ready")))),
-                CallbackCall("handle_readiness", LuaValue.Map(emptyMap())),
+                CallbackCall("handle_readiness", LuaValue.Map(mapOf("capabilities" to LuaValue.Map(emptyMap())))),
                 CallbackCall("handle_sos", LuaValue.Map(mapOf("event" to LuaValue.StringValue("sos")))),
             ),
             bridge.callbackCalls.map { CallbackCall(it.name, it.arguments) },
@@ -466,14 +636,18 @@ class LuaProviderRegistryIntegrationTest {
         id: String,
         name: String = id,
         implementationId: ChannelImplementationId = TEST_LUA_IMPLEMENTATION_ID,
+        configPayload: OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(org.json.JSONObject()),
     ): ChannelDefinition = ChannelDefinition(
         id = id,
         name = name,
         implementationId = implementationId,
         enabled = true,
         configSchemaVersion = 1,
-        configPayload = OpaqueJsonObject.fromJsonObject(org.json.JSONObject()),
+        configPayload = configPayload,
     )
+
+    private fun payload(mode: String): OpaqueJsonObject =
+        OpaqueJsonObject.fromJsonObject(org.json.JSONObject().put("mode", mode))
 
     private fun lifecycleImage(): ImmutableProgramImage = when (val image = ImmutableProgramImage.create(
         entryPoint = "plugin.lifecycle",
@@ -708,14 +882,22 @@ class LuaProviderRegistryIntegrationTest {
         override fun invokeStartupCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome {
             val state = state(handle)
             if (state.closed) return closed(handle)
             callbackNames += callbackHandle.name
-            callbackCalls += CallbackCall(callbackHandle.name, null)
+            callbackCalls += CallbackCall(callbackHandle.name, config)
             events += "callback:${state.id}:${callbackHandle.name}"
-            return admitSpawned("startup", completed(handle), spawnAdmission)
+            return admitSpawned(
+                "startup",
+                completed(
+                    handle,
+                    spawnedCoroutines = if (scenarios[state.id] == "plugin.proactive") listOf(state.id * 100L) else null,
+                ),
+                spawnAdmission,
+            )
         }
 
         override fun invokeCallback(
@@ -737,18 +919,48 @@ class LuaProviderRegistryIntegrationTest {
                 callbackHandle.name,
                 when (callbackHandle.name) {
                     "handle_readiness" -> completed(handle, "{\"ready\":true}")
-                    "handle_input" -> completed(handle, "{\"ok\":true}")
+                    "handle_input" -> if (scenarios[state.id] == "plugin.normalized_error") {
+                        completed(handle, "{\"error\":{\"code\":\"E_INVALID_VALUE\",\"detail\":\"invalid input\"}}")
+                    } else {
+                        completed(handle, "{\"ok\":true}")
+                    }
                     else -> completed(handle)
                 },
                 spawnAdmission,
             )
         }
+        override fun invokeInputCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            capturedAudioToken: String,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome {
+            val state = state(handle)
+            if (state.closed) return closed(handle)
+            callbackNames += callbackHandle.name
+            callbackCalls += CallbackCall(callbackHandle.name, arguments)
+            events += "callback:${state.id}:${callbackHandle.name}"
+            return admitSpawned(
+                callbackHandle.name,
+                if (scenarios[state.id] == "plugin.normalized_error") {
+                    completed(handle, "{\"error\":{\"code\":\"E_INVALID_VALUE\",\"detail\":\"invalid input\"}}")
+                } else {
+                    completed(handle, "{\"ok\":true}")
+                },
+                spawnAdmission,
+            )
+        }
+
 
         override fun startCoroutine(
             handle: LuaStateHandle,
             coroutineId: LuaCoroutineId,
             spawnAdmission: LuaSpawnAdmission,
-        ): LuaKernelOutcome = admitSpawned("start:${coroutineId.value}", completed(handle), spawnAdmission)
+        ): LuaKernelOutcome {
+            events += "coroutine:${handle.stateId.value}:${coroutineId.value}"
+            return admitSpawned("start:${coroutineId.value}", completed(handle), spawnAdmission)
+        }
 
         private fun state(handle: LuaStateHandle): State = states[handle.stateId.value]
             ?: error("unknown recording state ${handle.stateId.value}")

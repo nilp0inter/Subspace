@@ -8,6 +8,7 @@ import dev.nilp0inter.subspace.model.ChannelRepository
 import dev.nilp0inter.subspace.model.ChannelRepositoryError
 import dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
+import dev.nilp0inter.subspace.model.ProviderConfigurationResult
 
 /**
  * Focused owner of provider-backed channel creation, configuration update,
@@ -17,6 +18,10 @@ import dev.nilp0inter.subspace.model.OpaqueJsonObject
  * Selection notification order is immediate then deferred, with the selection
  * diagnostic emitted only after both notifications. A failed selection notifies
  * neither coordinator.
+ *
+ * Configuration replacement is triggered atomically through [onConfigurationCommitted]
+ * after a valid payload is persisted: the predecessor is stopped, drained, and closed
+ * before a fresh generation with the new payload is started.
  */
 internal class ServiceChannelManager(
     private val channelRepository: ChannelRepository,
@@ -25,6 +30,7 @@ internal class ServiceChannelManager(
     private val deferredSelection: (channelInstanceId: String) -> Unit,
     private val newChannelId: () -> String,
     private val log: (String) -> Unit,
+    private val onConfigurationCommitted: (channelId: String) -> Unit = {},
 ) {
     fun createChannel(
         implementationId: ChannelImplementationId,
@@ -81,12 +87,28 @@ internal class ServiceChannelManager(
                 )
             }
         }
-        return channelRepository.updateChannel(channelId) { old ->
+        // Reject invalid payloads before touching the catalogue.
+        when (val validation = provider.descriptor.configuration.migrateAndValidate(
+            provider.descriptor.configuration.currentSchemaVersion,
+            payload,
+        )) {
+            is ProviderConfigurationResult.Failure -> {
+                return ChannelRepositoryMutationResult.Failure(
+                    ChannelRepositoryError.ProviderMigration(channelId, validation.error),
+                )
+            }
+            is ProviderConfigurationResult.Success -> { /* proceed */ }
+        }
+        val result = channelRepository.updateChannel(channelId) { old ->
             old.copy(
                 configSchemaVersion = provider.descriptor.configuration.currentSchemaVersion,
                 configPayload = payload,
             )
         }
+        if (result is ChannelRepositoryMutationResult.Success) {
+            onConfigurationCommitted(channelId)
+        }
+        return result
     }
 
     fun selectChannel(id: String): Boolean {

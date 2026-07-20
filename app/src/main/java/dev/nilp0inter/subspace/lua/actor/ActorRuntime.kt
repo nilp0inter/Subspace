@@ -107,14 +107,15 @@ internal class ActorRuntime(
         latch.latchFailed()
     }
 
-    /** Invokes startup while the program image is starting, fenced against actor close. */
+    /** Invokes startup with configuration while the program image is starting, fenced against actor close. */
     suspend fun invokeProgramImageStartup(
         callback: dev.nilp0inter.subspace.lua.LuaCallbackHandle,
+        config: dev.nilp0inter.subspace.lua.LuaValue,
         spawnAdmission: LuaSpawnAdmission,
     ): ActorGateResult<LuaKernelOutcome> {
         val handle = stateHandle ?: return ActorGateResult.Closed
         if (latch.phase != ActorLifecyclePhase.STARTING || isClosed) return ActorGateResult.Closed
-        return trackGateContinuation { bridge.invokeStartupCallback(handle, callback, spawnAdmission) }
+        return trackGateContinuation { bridge.invokeStartupCallback(handle, callback, config, spawnAdmission) }
     }
 
     /** Invokes a named program-image callback while the actor is starting or live. */
@@ -128,6 +129,24 @@ internal class ActorRuntime(
             return ActorGateResult.Closed
         }
         return trackGateContinuation { bridge.invokeCallback(handle, callback, arguments, spawnAdmission) }
+    }
+
+    /**
+     * Invokes handle_input through the host-managed coroutine bridge. A yielded
+     * native operation returns immediately, releasing the actor continuation
+     * slot; only the exact owner may later call [resumeProgramImageCoroutine].
+     */
+    suspend fun invokeProgramImageInputCallback(
+        callback: dev.nilp0inter.subspace.lua.LuaCallbackHandle,
+        arguments: dev.nilp0inter.subspace.lua.LuaValue,
+        capturedAudioToken: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        val handle = stateHandle ?: return ActorGateResult.Closed
+        if (!latch.isLive || isClosed) return ActorGateResult.Closed
+        return trackGateContinuation {
+            bridge.invokeInputCallback(handle, callback, arguments, capturedAudioToken, spawnAdmission)
+        }
     }
 
     /** Starts one host-admitted background coroutine through the generation gate. */

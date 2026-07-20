@@ -18,6 +18,35 @@ It is not:
 Future OpenSpec changes and versioned interface specifications will turn selected parts of this
 vision into concrete requirements.
 
+### Pre-release v1 development policy
+
+The Lua runtime, Subspace API, package format, and plugin contracts remain one evolving
+pre-release v1 until the complete v1 vision has been implemented and every hard-coded Kotlin
+channel has been migrated to an external Lua plugin with equivalent behavior.
+
+During this pre-release phase:
+
+- `v1` identifies the target first production release, not a frozen compatibility promise;
+- intermediate implementations and published test packages are development proofs rather than
+  supported production releases;
+- archived OpenSpec changes record the contracts implemented and verified at that point in
+  development, but do not freeze those contracts or create compatibility obligations;
+- later changes may revise any incomplete v1 callback, module, package, configuration,
+  capability, lifecycle, or data contract directly;
+- every affected in-tree caller, external development plugin, package fixture, and published test
+  artifact is updated through a clean cutover;
+- the host does not retain compatibility shims, parallel API generations, migration paths,
+  version ranges, aliases, or deprecated intermediate behavior solely to support an earlier
+  pre-release v1 state; and
+- API v2 design and production compatibility policy begin only after the complete v1 feature set
+  has shipped.
+
+Feature parity includes migration of the current Journal, Debug, Keyboard, and OpenAI Agent
+implementations from hard-coded Kotlin providers to external Lua packages using the same public
+plugin system available to other publishers. Until that condition is met, an archived
+specification means "implemented and verified at that development stage," not "permanently
+versioned."
+
 ## Motivation
 
 The current Kotlin channels—Journal, Debug, Keyboard, and OpenAI Agent—were built to discover

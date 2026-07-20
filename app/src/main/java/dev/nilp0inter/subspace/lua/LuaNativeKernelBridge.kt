@@ -259,12 +259,23 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
     override fun invokeStartupCallback(
         handle: LuaStateHandle,
         callbackHandle: LuaCallbackHandle,
+        config: LuaValue,
         spawnAdmission: LuaSpawnAdmission,
     ): LuaKernelOutcome {
         if (callbackHandle.stateHandle != handle) {
             return invalidCallbackOwnership(handle, callbackHandle)
         }
-        return invokeCallbackJson(handle, callbackHandle, "", spawnAdmission)
+        val argumentsJson = when (val encoding = config.toJsonString()) {
+            is JsonEncodingResult.Success -> encoding.json
+            is JsonEncodingResult.Failure -> {
+                return LuaKernelOutcome.ValidationFailure(
+                    stateId = handle.stateId.value,
+                    generation = handle.generation.value,
+                    diagnostic = encoding.diagnostic,
+                )
+            }
+        }
+        return invokeCallbackJson(handle, callbackHandle, argumentsJson, spawnAdmission)
     }
 
     override fun invokeCallback(
@@ -287,6 +298,51 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
             }
         }
         return invokeCallbackJson(handle, callbackHandle, argumentsJson, spawnAdmission)
+    }
+
+    override fun invokeInputCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        capturedAudioToken: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (callbackHandle.stateHandle != handle || callbackHandle.name != "handle_input") {
+            return invalidCallbackOwnership(handle, callbackHandle)
+        }
+        val argumentsJson = when (val encoding = arguments.toJsonString()) {
+            is JsonEncodingResult.Success -> encoding.json
+            is JsonEncodingResult.Failure -> {
+                return LuaKernelOutcome.ValidationFailure(
+                    stateId = handle.stateId.value,
+                    generation = handle.generation.value,
+                    diagnostic = encoding.diagnostic,
+                )
+            }
+        }
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val json = try {
+            LuaNativeKernel.nativeInvokeInputCallback(
+                handle.stateId.value,
+                handle.generation.value,
+                argumentsJson,
+                capturedAudioToken,
+                spawnAdmission,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeInvokeInputCallback link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
     }
 
     private fun invalidCallbackOwnership(

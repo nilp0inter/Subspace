@@ -263,7 +263,7 @@ class ServiceAgentRuntimeCompositionTest {
             selectedChannel = { catalogue.value.activeChannelId },
             modelDiscovery = mockk<OpenAiSdkModelDiscoveryService>(relaxed = true),
             completion = completion,
-            synthesize = { CapabilityOperationResult.Success(SynthesizedAudioArtifact(floatArrayOf(0.5f))) },
+            synthesize = { CapabilityOperationResult.Success(SynthesizedAudioArtifact(floatArrayOf(0.5f), generation = RuntimeGeneration(0))) },
             play = play,
             playOperation = playOperation,
             textOutput = { textOutput },

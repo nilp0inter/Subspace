@@ -5,6 +5,9 @@ import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
 import dev.nilp0inter.subspace.audio.ChannelInputTarget
 import dev.nilp0inter.subspace.audio.RecordedPcm
+import dev.nilp0inter.subspace.channel.capability.AgentOperationContext
+import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
 import dev.nilp0inter.subspace.channel.capability.CapabilityAvailability
 import dev.nilp0inter.subspace.channel.capability.CapabilityKey
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
@@ -21,6 +24,9 @@ import dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome
 import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
 import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
 import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
+import dev.nilp0inter.subspace.model.ActorRuntimeHostContext
+import dev.nilp0inter.subspace.model.AgentOperationId
+import dev.nilp0inter.subspace.model.AgentRunId
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelConfigurationField
 import dev.nilp0inter.subspace.model.ChannelConfigurationMigrationStep
@@ -632,7 +638,7 @@ class ChannelRuntimeRegistryTest {
         assertEquals(listOf("effect:channel:$predecessorGeneration:before-replacement", "G:terminal-started"), events)
 
         val replacementDefinition = original.copy(configPayload = opaque("{\"version\":2,\"revision\":2}"))
-        val replacement = async {
+        val replacement = backgroundScope.async {
             fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(replacementDefinition), replacementDefinition.id))
         }
         runCurrent()
@@ -658,6 +664,8 @@ class ChannelRuntimeRegistryTest {
         )
 
         terminalMayComplete.complete(Unit)
+        runCurrent()
+        assertTrue("Terminal callback must complete", terminal.isCompleted)
         assertEquals(ChannelInputResult.None, terminal.await())
         committed.lease.releaseCommittedTargetLease()
         replacement.await()
@@ -1248,6 +1256,101 @@ class ChannelRuntimeRegistryTest {
 
         fixture.registry.shutdownAndAwait()
     }
+
+    @Test
+    fun `two same provider instances both become available after reconciliation`() = runTest {
+        val provider = TestProvider(ChannelImplementationId("test:shared"))
+        val fixture = fixture(provider)
+        val first = definition("first", "test:shared")
+        val second = definition("second", "test:shared")
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(first, second), first.id))
+        runCurrent()
+
+        assertEquals(2, provider.runtimes.size)
+        val snapshots = fixture.registry.getAllRuntimeSnapshots()
+        assertEquals(first.id, snapshots[0].id)
+        assertEquals(second.id, snapshots[1].id)
+        assertEquals(ChannelPreparationAvailability.Available, snapshots[0].preparation)
+        assertEquals(ChannelPreparationAvailability.Available, snapshots[1].preparation)
+        assertEquals(0, provider.runtimes[0].closeCount.get())
+        assertEquals(0, provider.runtimes[1].closeCount.get())
+
+        fixture.registry.shutdownAndAwait()
+        assertEquals(1, provider.runtimes[0].closeCount.get())
+        assertEquals(1, provider.runtimes[1].closeCount.get())
+    }
+    @Test
+    fun `reconciliation revokes removed generation and preserves reinstalled successor and sibling`() = runTest {
+        val backend = RegistryGatedAudio()
+        val quota = DeferredAudioPlaybackCoordinator.ProcessQuota(Int.MAX_VALUE, Long.MAX_VALUE)
+        val deferred = DeferredAudioPlaybackCoordinator(
+            scope = this,
+            selectedChannel = { "alpha" },
+            operationIsCurrent = { true },
+            audio = backend,
+            processQuota = quota,
+        )
+        val host = RegistryDeferredCapabilityHost(deferred)
+        val artifacts = mutableListOf<AudioOperationArtifact>()
+        val provider = TestProvider(ChannelImplementationId("test:deferred")).apply {
+            requiredCapabilities = setOf(ChannelCapability.DeferredAudioPlayback)
+            constructResult = { request ->
+                val identity = (request.generationContext as ActorRuntimeHostContext).actorIdentity
+                val acquisition = request.capabilities.acquire(CapabilityKey.DeferredAudioPlayback)
+                val lease = (acquisition as? CapabilityAcquisition.Available)?.lease
+                    ?: error("deferred capability must be available")
+                val artifact = AudioOperationArtifact(
+                    RecordedPcm(shortArrayOf(1), 16_000),
+                    operationId = "${identity.channelInstanceId}-${identity.runtimeGeneration.value}",
+                    generation = identity.runtimeGeneration,
+                )
+                artifacts += artifact
+                val context = AgentOperationContext(
+                    scope = identity,
+                    runId = AgentRunId("run-${identity.channelInstanceId}-${identity.runtimeGeneration.value}"),
+                    operationId = AgentOperationId("op-${identity.channelInstanceId}-${identity.runtimeGeneration.value}"),
+                )
+                lease.use { capability ->
+                    CapabilityOperationResult.Success(capability.scheduleAudio(context, artifact))
+                }
+                val runtime = TestRuntime(request.definition)
+                runtimes += runtime
+                ChannelRuntimeConstructionResult.Success(runtime)
+            }
+        }
+        val fixture = fixture(provider, capabilityHost = host)
+        val alpha = definition("alpha", "test:deferred")
+        val sibling = definition("sibling", "test:deferred")
+
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(alpha, sibling), alpha.id))
+        runCurrent()
+        backend.started.await()
+        val predecessor = artifacts.first { it.operationId.startsWith("alpha-") }
+        val siblingArtifact = artifacts.first { it.operationId.startsWith("sibling-") }
+
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(sibling), sibling.id))
+        runCurrent()
+        assertTrue("removal must revoke predecessor generation", predecessor.isDisposed)
+        assertFalse("removal of alpha must preserve sibling", siblingArtifact.isDisposed)
+        assertEquals(1, deferred.accounting().liveEntries)
+
+        // The late completion belongs to the retired predecessor and must not consume sibling state.
+        backend.complete(DelayedPlaybackAudioResult.Busy)
+        runCurrent()
+
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(alpha, sibling), alpha.id))
+        runCurrent()
+        assertEquals("reinstall must construct exactly one successor", 3, artifacts.size)
+        val successor = artifacts.last { it.operationId.startsWith("alpha-") }
+        assertFalse("reinstalled generation must retain its queued artifact", successor.isDisposed)
+        assertFalse("sibling generation must remain operable", siblingArtifact.isDisposed)
+        assertEquals(2, deferred.accounting().liveEntries)
+
+        fixture.registry.shutdownAndAwait()
+        assertTrue("service/registry shutdown must revoke sibling generation", siblingArtifact.isDisposed)
+        assertEquals(0, quota.liveEntries())
+    }
+
     private fun TestScope.fixture(
         vararg providers: TestProvider,
         callbackTimeoutMillis: Long = 1_000,
@@ -1309,8 +1412,11 @@ class ChannelRuntimeRegistryTest {
     private fun providerError(snapshot: ChannelRuntimeSnapshot): ChannelProviderError {
         val unavailable = snapshot.preparation as? ChannelPreparationAvailability.Unavailable
             ?: throw AssertionError("Expected unavailable provider entry, got ${snapshot.preparation}")
-        return (unavailable.reason as? ChannelPreparationReason.Provider)?.error
-            ?: throw AssertionError("Expected provider reason, got ${unavailable.reason}")
+        return when (val reason = unavailable.reason) {
+            is ChannelPreparationReason.Provider -> reason.error
+            is ChannelPreparationReason.ConfigurationIncompatible -> reason.error
+            else -> throw AssertionError("Expected provider or configuration incompatible reason, got $reason")
+        }
     }
 
     private data class RegistryFixture(val registry: ChannelRuntimeRegistry)
@@ -1644,6 +1750,59 @@ class ChannelRuntimeRegistryTest {
             key: CapabilityKey<T>,
             timeoutMillis: Long,
         ): HostedCapabilityAcquisition<T> = acquire(identity, key)
+    }
+
+    private class RegistryDeferredCapabilityHost(
+        private val coordinator: DeferredAudioPlaybackCoordinator,
+    ) : ChannelCapabilityHost {
+        override suspend fun availability(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<*>,
+        ): CapabilityAvailability = if (key == CapabilityKey.DeferredAudioPlayback) {
+            CapabilityAvailability.Available
+        } else {
+            CapabilityAvailability.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        override suspend fun <T : ChannelCapabilityPort> acquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+        ): HostedCapabilityAcquisition<T> = if (key == CapabilityKey.DeferredAudioPlayback) {
+            HostedCapabilityAcquisition.Available(coordinator) { termination ->
+                if (termination == CapabilityLeaseTermination.REVOKED) {
+                    coordinator.onGenerationTermination(identity, termination)
+                }
+            } as HostedCapabilityAcquisition<T>
+        } else {
+            HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
+        }
+
+        override suspend fun <T : ChannelCapabilityPort> prepareAndAcquire(
+            identity: CapabilityScopeIdentity,
+            key: CapabilityKey<T>,
+            timeoutMillis: Long,
+        ): HostedCapabilityAcquisition<T> = acquire(identity, key)
+    }
+
+    private class RegistryGatedAudio : DeferredAudioPlaybackAudioPort {
+        val started = CompletableDeferred<Unit>()
+        private val completion = CompletableDeferred<DelayedPlaybackAudioResult>()
+        private var firstCall = true
+
+        override suspend fun playOperationIfAdmitted(
+            channelInstanceId: String,
+            audio: OpaqueAudioOperation,
+        ): DelayedPlaybackAudioResult {
+            if (!firstCall) return DelayedPlaybackAudioResult.Busy
+            firstCall = false
+            started.complete(Unit)
+            return completion.await()
+        }
+
+        fun complete(result: DelayedPlaybackAudioResult) {
+            completion.complete(result)
+        }
     }
 
     private object NoCapabilities : ChannelCapabilityHost {

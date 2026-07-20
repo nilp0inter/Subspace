@@ -193,6 +193,80 @@ class InstalledProviderRuntimeReconciliationTest {
     }
 
     @Test
+    fun `configuration payload change drains predecessor before successor activation`() = runTest {
+        val providers = ChannelImplementationProviderRegistry()
+        val fixture = fixture(providers)
+        val id = installedId("313")
+        val initialDefinition = definition("config-change", id)
+        val events = mutableListOf<String>()
+        val provider = RecordingInstalledProvider("313", digest('c'), events)
+        publish(providers, provider.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(initialDefinition), initialDefinition.id))
+        runCurrent()
+
+        val predecessor = provider.runtimes.single()
+        val terminalMayFinish = CompletableDeferred<Unit>()
+        predecessor.prepare = {
+            ChannelInputAcceptance.Accepted(object : ChannelInputTarget {
+                override fun onInputStarted(session: ChannelAudioInputSession) = Unit
+
+                override suspend fun onInputReleased(recording: RecordedPcm): ChannelInputResult {
+                    events += "G:terminal-started"
+                    terminalMayFinish.await()
+                    events += "G:terminal-finished"
+                    return ChannelInputResult.None
+                }
+
+                override fun onInputCancelled(reason: String) = Unit
+                override fun onInputFailed(reason: String) = Unit
+            })
+        }
+        val committed = committed(fixture.registry.prepareInput(initialDefinition.id))
+        val terminal = async { committed.target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+        runCurrent()
+        assertEquals(listOf("G:${predecessor.stateId}:activate", "G:terminal-started"), events)
+
+        // Same provider, same fingerprint, different config payload.
+        val replacedDefinition = initialDefinition.copy(
+            configPayload = OpaqueJsonObject.fromJsonObject(JSONObject().put("revision", 2)),
+        )
+        val cutover = async {
+            fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(replacedDefinition), replacedDefinition.id))
+        }
+        runCurrent()
+        assertEquals(2, provider.runtimes.size)
+        val successor = provider.runtimes.last()
+        assertNotEquals(predecessor.generation, successor.generation)
+        assertFalse(cutover.isCompleted)
+        assertEquals(0, predecessor.closeCount.get())
+        assertEquals(0, events.count { it.startsWith("H:") })
+        assertEquals(
+            listOf("G:${predecessor.stateId}:activate", "G:terminal-started"),
+            events,
+        )
+
+        terminalMayFinish.complete(Unit)
+        assertEquals(ChannelInputResult.None, terminal.await())
+        committed.lease.releaseCommittedTargetLease()
+        cutover.await()
+        runCurrent()
+
+        assertEquals(
+            listOf(
+                "G:${predecessor.stateId}:activate",
+                "G:terminal-started",
+                "G:terminal-finished",
+                "G:${predecessor.stateId}:close",
+                "H:${successor.stateId}:activate",
+            ),
+            events,
+        )
+        assertEquals(1, predecessor.closeCount.get())
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(initialDefinition.id))
+        shutdown(fixture.registry)
+    }
+
+    @Test
     fun `stale generation timer task callback and operation completion cannot mutate successor`() = runTest {
         val providers = ChannelImplementationProviderRegistry()
         val fixture = fixture(providers)
@@ -444,6 +518,176 @@ class InstalledProviderRuntimeReconciliationTest {
         shutdown(fixture.registry)
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // Task 2.7: Incompatible update preserves payload, projects unavailable,
+    //           no successor/default, rollback restores availability.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `incompatible update preserves exact payload and definition and projects unavailable`() = runTest {
+        val providers = ChannelImplementationProviderRegistry()
+        val fixture = fixture(providers)
+        val id = installedId("1007")
+        val definition = definition("incompatible-update", id)
+        val events = mutableListOf<String>()
+        val v1 = RecordingInstalledProvider("1007", digest('1'), events)
+        publish(providers, v1.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        val v1Runtime = v1.runtimes.single()
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(definition.id))
+        assertEquals(v1.fingerprint, v1.records.single().fingerprint)
+
+        // Update to v2 with a configuration provider that rejects the existing payload.
+        val v2 = ConfigurationRejectingInstalledProvider("1007", digest('2'), events)
+        publish(providers, v2.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        // The predecessor must have been closed.
+        assertEquals(1, v1Runtime.closeCount.get())
+        // No successor runtime must exist: configuration was rejected by migrateAndValidate
+        // before constructRuntime is ever called.
+        assertEquals(0, v2.runtimes.size)
+        assertEquals(0, v2.constructionAttempts.get())
+        // The entry must project a typed InvalidConfiguration error.
+        val error = providerError(requireNotNull(fixture.registry.getRuntimeSnapshot(definition.id)))
+        assertTrue("Expected InvalidConfiguration error, got ${error::class.simpleName}: $error",
+            error is ChannelProviderError.InvalidConfiguration)
+        assertTrue(error.message.contains("rejected"))
+        // No successor runtime should be created.
+        assertTrue("v2 must not have constructed any runtime", v2.runtimes.isEmpty())
+        shutdown(fixture.registry)
+    }
+
+    @Test
+    fun `incompatible update does not create default or successor substitute`() = runTest {
+        val providers = ChannelImplementationProviderRegistry()
+        val fixture = fixture(providers)
+        val id = installedId("2007")
+        val definition = definition("no-default-substitute", id)
+        val v1 = RecordingInstalledProvider("2007", digest('1'))
+        publish(providers, v1.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        val predecessor = v1.runtimes.single()
+
+        // v2 rejects the existing payload; v3 also rejects it (simulating two updates
+        // with incompatible declarations). Neither should create a runtime.
+        val v2 = ConfigurationRejectingInstalledProvider("2007", digest('2'))
+        val v3 = ConfigurationRejectingInstalledProvider("2007", digest('3'))
+        publish(providers, v2.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+        assertEquals("v2 must not construct a successor runtime", 0, v2.runtimes.size)
+        assertEquals(0, v2.constructionAttempts.get())
+
+        publish(providers, v3.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+        assertEquals("v3 must not construct a successor runtime either", 0, v3.runtimes.size)
+        assertEquals(0, v3.constructionAttempts.get())
+
+        // The provider error must carry the expected typed failure, not a
+        // default runtime, fallback provider, or migration.
+        val error = providerError(requireNotNull(fixture.registry.getRuntimeSnapshot(definition.id)))
+        assertTrue("Expected InvalidConfiguration error, got ${error::class.simpleName}: $error",
+            error is ChannelProviderError.InvalidConfiguration)
+        // Predecessor must remain retired (closed).
+        assertEquals(1, predecessor.closeCount.get())
+        shutdown(fixture.registry)
+    }
+
+    @Test
+    fun `explicit rollback restores availability after incompatible update`() = runTest {
+        val providers = ChannelImplementationProviderRegistry()
+        val fixture = fixture(providers)
+        val id = installedId("3007")
+        val definition = definition("rollback-restores", id)
+        val events = mutableListOf<String>()
+        val v1 = RecordingInstalledProvider("3007", digest('1'), events)
+        publish(providers, v1.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        val v1Runtime = v1.runtimes.single()
+        val v1Generation = v1Runtime.generation
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(definition.id))
+
+        // Update to v2 with rejecting configuration.
+        val v2 = ConfigurationRejectingInstalledProvider("3007", digest('2'), events)
+        publish(providers, v2.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        assertEquals(1, v1Runtime.closeCount.get())
+        assertEquals(0, v2.runtimes.size)
+        assertTrue(providerError(requireNotNull(fixture.registry.getRuntimeSnapshot(definition.id))) is ChannelProviderError.InvalidConfiguration)
+
+        // Rollback: publish v1 again (simulating repository rollback to a compatible revision).
+        val rollback = RecordingInstalledProvider("3007", digest('1'), events)
+        publish(providers, rollback.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(definition), definition.id))
+        runCurrent()
+
+        // Availability must be restored with a fresh runtime generation.
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(definition.id))
+        assertEquals(1, rollback.runtimes.size)
+        val restored = rollback.runtimes.single()
+        assertNotEquals("rollback must produce a new generation, distinct from the original", v1Generation, restored.generation)
+        assertNotEquals("rollback must produce a fresh state ID", v1Runtime.stateId, restored.stateId)
+        assertEquals(0, v2.runtimes.size)
+        assertEquals(listOf(rollback.fingerprint), rollback.records.map(ConstructionRecord::fingerprint))
+        shutdown(fixture.registry)
+    }
+
+    @Test
+    fun `incompatible update on multiple instances with same provider projects each independently`() = runTest {
+        val providers = ChannelImplementationProviderRegistry()
+        val fixture = fixture(providers)
+        val id = installedId("4007")
+        val leftDef = definition("left-instance", id)
+        val rightDef = definition("right-instance", id)
+        val v1 = RecordingInstalledProvider("4007", digest('a'))
+        publish(providers, v1.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(leftDef, rightDef), leftDef.id))
+        runCurrent()
+
+        assertEquals(2, v1.runtimes.size)
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(leftDef.id))
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(rightDef.id))
+
+        // Update to rejecting provider.
+        val rejector = ConfigurationRejectingInstalledProvider("4007", digest('b'))
+        publish(providers, rejector.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(leftDef, rightDef), leftDef.id))
+        runCurrent()
+
+        // Both instances must project the same typed error independently.
+        assertEquals(ChannelProviderError.InvalidConfiguration::class.java, providerError(requireNotNull(fixture.registry.getRuntimeSnapshot(leftDef.id)))::class.java)
+        assertEquals(ChannelProviderError.InvalidConfiguration::class.java, providerError(requireNotNull(fixture.registry.getRuntimeSnapshot(rightDef.id)))::class.java)
+        assertEquals(0, rejector.runtimes.size)
+        assertEquals(0, rejector.constructionAttempts.get())
+
+        // Each predecessor was closed independently.
+        assertEquals(1, v1.runtimes[0].closeCount.get())
+        assertEquals(1, v1.runtimes[1].closeCount.get())
+
+        // Rollback restores both.
+        val rollback = RecordingInstalledProvider("4007", digest('a'))
+        publish(providers, rollback.binding())
+        fixture.registry.reconcile(ChannelCatalogueSnapshot(listOf(leftDef, rightDef), leftDef.id))
+        runCurrent()
+
+        assertEquals(2, rollback.runtimes.size)
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(leftDef.id))
+        assertEquals(ChannelPreparationAvailability.Available, fixture.registry.preparation(rightDef.id))
+        assertNotEquals(rollback.runtimes[0].generation, rollback.runtimes[1].generation)
+        shutdown(fixture.registry)
+    }
+
     private fun TestScope.fixture(providers: ChannelImplementationProviderRegistry): Fixture = Fixture(
         ChannelRuntimeRegistry(
             providers = providers,
@@ -527,8 +771,11 @@ class InstalledProviderRuntimeReconciliationTest {
     private fun providerError(snapshot: ChannelRuntimeSnapshot): ChannelProviderError {
         val unavailable = snapshot.preparation as? ChannelPreparationAvailability.Unavailable
             ?: throw AssertionError("Expected typed unavailable projection, got ${snapshot.preparation}")
-        return (unavailable.reason as? ChannelPreparationReason.Provider)?.error
-            ?: throw AssertionError("Expected provider reason, got ${unavailable.reason}")
+        return when (val reason = unavailable.reason) {
+            is ChannelPreparationReason.Provider -> reason.error
+            is ChannelPreparationReason.ConfigurationIncompatible -> reason.error
+            else -> throw AssertionError("Expected Provider or ConfigurationIncompatible reason, got $reason")
+        }
     }
 
     private data class Fixture(val registry: ChannelRuntimeRegistry)
@@ -600,6 +847,74 @@ class InstalledProviderRuntimeReconciliationTest {
 
         private fun valid(schemaVersion: Int, payload: OpaqueJsonObject): ProviderConfigurationResult =
             ProviderConfigurationResult.Success(ValidatedChannelConfiguration(implementationId, schemaVersion, payload))
+    }
+
+    /**
+     * Configuration provider that always rejects validation, simulating an incompatible
+     * package declaration update. Used to test incompatible update preservation and rollback.
+     */
+    private class RejectingConfiguration(
+        override val implementationId: ChannelImplementationId,
+    ) : ChannelConfigurationProvider {
+        override val currentSchemaVersion: Int = 1
+
+        override fun defaultPayload(): OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(JSONObject())
+
+        override fun validate(schemaVersion: Int, payload: OpaqueJsonObject): ProviderConfigurationResult = reject()
+
+        override fun migrateStep(
+            fromSchemaVersion: Int,
+            payload: OpaqueJsonObject,
+        ): ChannelConfigurationMigrationStep = ChannelConfigurationMigrationStep.Success(payload)
+
+        override fun migrateAndValidate(schemaVersion: Int, payload: OpaqueJsonObject): ProviderConfigurationResult = reject()
+
+        private fun reject(): ProviderConfigurationResult = ProviderConfigurationResult.Failure(
+            ChannelProviderError.InvalidConfiguration(
+                implementationId, 1, "existing configuration rejected by updated declaration",
+            ),
+        )
+    }
+
+    /**
+     * Provider that refuses any existing configuration, simulating a package revision whose
+     * updated declaration is incompatible with preserved instance payloads.
+     */
+    private class ConfigurationRejectingInstalledProvider(
+        repositoryId: String,
+        private val digest: ArtifactDigest,
+        private val events: MutableList<String>? = null,
+    ) : ChannelImplementationProvider {
+        private val repository = GitHubRepositoryIdentity(repositoryId)
+        private val implementationId = InstalledProviderId.derive(repository)
+        val constructionAttempts = AtomicInteger()
+        val records = mutableListOf<ConstructionRecord>()
+        val runtimes = mutableListOf<RecordingRuntime>()
+
+        override val fingerprint: ProviderRevisionFingerprint = ProviderRevisionFingerprint.fromDigest(digest)
+        override val descriptor: ChannelImplementationDescriptor = ChannelImplementationDescriptor(
+            implementationId = implementationId,
+            presentation = ChannelPresentationMetadata("Rejecting $repositoryId", "rejecting provider", "unavailable"),
+            configuration = RejectingConfiguration(implementationId),
+            configurationFields = emptyList(),
+            requiredCapabilities = emptySet(),
+            preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
+        )
+
+        fun binding(): InstalledProviderBinding = InstalledProviderBinding(repository, digest, this)
+
+        override suspend fun constructRuntime(request: ChannelRuntimeConstructionRequest): ChannelRuntimeConstructionResult {
+            constructionAttempts.incrementAndGet()
+            val stateId = nextStateId.incrementAndGet() + stateNamespace.getAndIncrement() * 10_000
+            val runtime = RecordingRuntime(request, stateId, events, null, false)
+            runtimes += runtime
+            records += ConstructionRecord(fingerprint, runtime.generation, stateId)
+            return ChannelRuntimeConstructionResult.Success(runtime)
+        }
+
+        private companion object {
+            private val nextStateId = AtomicInteger()
+        }
     }
 
     private class RecordingRuntime(

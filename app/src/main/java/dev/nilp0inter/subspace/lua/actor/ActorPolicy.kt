@@ -22,8 +22,8 @@ package dev.nilp0inter.subspace.lua.actor
  *   background tasks and invoking terminal Lua close.
  * @param maxConcurrentTasks maximum concurrent background tasks in the
  *   generation-owned task scope.
- * @param perTaskDeadlineMillis per-task deadline for one background task, or null
- *   for no deadline.
+ * @param perTaskDeadlineMillis retained for source compatibility with older
+ *   host policy construction; generic task wall-clock expiry is not applied.
  * @param timerSlackMillis host-configured non-negative timer margin (slack)
  *   in milliseconds used for operation-specific sleep deadlines.
  */
@@ -72,6 +72,7 @@ internal data class ActorPolicy(
             callbackTimeoutMillis = DEFAULT_CALLBACK_TIMEOUT_MILLIS,
             closeTimeoutMillis = DEFAULT_CLOSE_TIMEOUT_MILLIS,
             maxConcurrentTasks = DEFAULT_MAX_CONCURRENT_TASKS,
+            // Kept as a compatibility value; ActorTaskScope intentionally ignores it.
             perTaskDeadlineMillis = DEFAULT_PER_TASK_DEADLINE_MILLIS,
             timerSlackMillis = DEFAULT_TIMER_SLACK_MILLIS,
         )

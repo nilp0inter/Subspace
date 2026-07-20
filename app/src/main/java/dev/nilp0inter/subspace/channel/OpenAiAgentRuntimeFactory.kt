@@ -189,7 +189,7 @@ class OpenAiAgentRuntime(
             _snapshot.value = _snapshot.value.copy(executionStatus = ChannelExecutionStatus.PROCESSING)
             val transcription = withTimeoutOrNull(MAXIMUM_TRANSCRIPTION_MILLIS) {
                 capabilities.useCapability(CapabilityKey.Transcription) { capability ->
-                    capability.transcribe(opaqueAudioRecording(recording))
+                    capability.transcribe(opaqueAudioRecording(recording, capabilities.identity.runtimeGeneration))
                 }
             } ?: CapabilityOperationResult.Cancelled
             val text = (transcription as? CapabilityOperationResult.Success)?.value?.text?.trim()

@@ -701,12 +701,19 @@ class ChannelRuntimeRegistry(
             return
         }
 
+        val reason = when (error) {
+            is ChannelProviderError.InvalidConfiguration ->
+                ChannelPreparationReason.ConfigurationIncompatible(error)
+            else ->
+                ChannelPreparationReason.Provider(error)
+        }
+
         val closePending = synchronized(lock) {
             if (!isShutdown && entries[plan.entry.definition.id] === plan.entry && !plan.entry.retired) {
                 entries[plan.entry.definition.id] = unavailableEntry(
                     plan.entry.definition,
                     plan.entry.generation,
-                    ChannelPreparationReason.Provider(error),
+                    reason,
                     plan.summary,
                     plan.provider.fingerprint,
                 )

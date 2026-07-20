@@ -12,6 +12,8 @@ import dev.nilp0inter.subspace.lua.LuaSpawnAdmission
 import dev.nilp0inter.subspace.lua.LuaStateHandle
 import dev.nilp0inter.subspace.lua.LuaValue
 import dev.nilp0inter.subspace.model.ChannelImplementationId
+import dev.nilp0inter.subspace.model.ChannelConfigurationField
+import org.json.JSONObject
 import dev.nilp0inter.subspace.model.InstalledProviderBinding
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -322,6 +324,360 @@ class InstalledPackageTransactionsTest {
         }
     }
 
+    @Test
+    fun `load index and materialize parses and rehashes stored bytes rather than trusting cached model`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("123", "456", "789")
+            val provider = InstalledProviderId.derive(source.repositoryId)
+            val v1 = packageArchive("123", "1.0.0", "first")
+            val repository = repository(root, RecordingPublisher(root))
+            success(repository.installOrUpdate(ByteArrayInputStream(v1), source))
+
+            // Mutate index on disk to change manifest capabilities or configuration (say, add a mock capability "audio.playback")
+            val oldIndex = index(root)
+            val record = oldIndex.providers.getValue(source.repositoryId)
+            
+            val mutatedManifest = record.active.manifest.copy(
+                capabilities = record.active.manifest.capabilities + "audio.playback"
+            )
+            val mutatedActive = record.active.copy(manifest = mutatedManifest)
+            val mutatedRecord = record.copy(active = mutatedActive)
+            val mutatedIndex = StoredInstalledIndex(
+                version = oldIndex.version,
+                providers = oldIndex.providers + (source.repositoryId to mutatedRecord)
+            )
+
+            // Commit this mutated index back to index.json manually
+            File(root, "index.json").writeText(StrictIndexCodec.encodeIndex(mutatedIndex), UTF_8)
+
+            // Verify that loadAndMaterialize detects this mismatch and throws a mutation exception
+            val store = InstalledPackageStore(root)
+            val matResult = success(store.loadAndMaterialize(NoopLuaKernelBridge))
+            val failure = matResult.failures[provider]
+            assertTrue("Expected a mutation failure but got $failure", failure is PackageFailure.Mutation)
+            assertEquals(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, (failure as PackageFailure.Mutation).detail)
+
+            val restartedPublisher = RecordingPublisher(root)
+            val restarted = repository(root, restartedPublisher)
+            assertEquals(Unit, success(restarted.loadAndPublish()))
+            restartedPublisher.assertLast(emptySet(), setOf(provider))
+        }
+    }
+
+    @Test
+    fun `corrupt stored-byte isolation handles modified zip file and preserves sibling`() = runTest {
+        withTemporaryDirectory { root ->
+            val sourceA = sourceRecord("123", "456", "789")
+            val sourceB = sourceRecord("124", "457", "790")
+            val providerA = InstalledProviderId.derive(sourceA.repositoryId)
+            val providerB = InstalledProviderId.derive(sourceB.repositoryId)
+            val vA = packageArchive("123", "1.0.0", "first")
+            val vB = packageArchive("124", "1.0.0", "second")
+
+            val publisher = RecordingPublisher(root)
+            val repository = repository(root, publisher)
+            success(repository.installOrUpdate(ByteArrayInputStream(vA), sourceA))
+            success(repository.installOrUpdate(ByteArrayInputStream(vB), sourceB))
+
+            val activeA = index(root).providers.getValue(sourceA.repositoryId).active.digest.value
+            // Overwrite provider A's archive bytes with corruption
+            val fileA = File(root, "content/sha256/$activeA")
+            fileA.setWritable(true)
+            fileA.writeText("corrupt zip file contents", UTF_8)
+            // Verify loadAndMaterialize detects corruption and isolates it
+            val store = InstalledPackageStore(root)
+            val matResult = success(store.loadAndMaterialize(NoopLuaKernelBridge))
+            
+            val failureA = matResult.failures[providerA]
+            assertTrue("Expected integrity/reparse failure on corrupt zip but got $failureA", failureA is PackageFailure.Integrity || failureA is PackageFailure.Format)
+            
+            val bindingB = matResult.bindings[providerB]
+            assertTrue("Sibling package B must be loaded successfully", bindingB != null)
+
+            // Verify loadAndPublish succeeds with isolation
+            val restartedPublisher = RecordingPublisher(root)
+            val restarted = repository(root, restartedPublisher)
+            assertEquals(Unit, success(restarted.loadAndPublish()))
+            restartedPublisher.assertLast(setOf(providerB), setOf(providerA))
+        }
+    }
+
+    @Test
+    fun `load index and materialize does not invoke Lua or register corrupt providers`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("123", "456", "789")
+            val provider = InstalledProviderId.derive(source.repositoryId)
+            val v1 = packageArchive("123", "1.0.0", "first")
+            val repository = repository(root, RecordingPublisher(root))
+            success(repository.installOrUpdate(ByteArrayInputStream(v1), source))
+
+            // Corrupt the ZIP archive
+            val active = index(root).providers.getValue(source.repositoryId).active.digest.value
+            val file = File(root, "content/sha256/$active")
+            file.setWritable(true)
+            file.writeText("invalid zip data", UTF_8)
+            // Use NoopLuaKernelBridge to ensure no Lua creation attempts are made.
+            // If it attempted to compile/materialize/register provider config in Lua,
+            // NoopLuaKernelBridge.create would throw.
+            val store = InstalledPackageStore(root)
+            val matResult = success(store.loadAndMaterialize(NoopLuaKernelBridge))
+
+            assertTrue("Corrupt provider must not produce binding registration", matResult.bindings.isEmpty())
+            assertTrue("Corrupt provider must be in failures", matResult.failures.containsKey(provider))
+        }
+    }
+
+    @Test
+    fun `commit failure during rollback and removal preserves prior authoritative selection`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("123", "456", "789")
+            val provider = InstalledProviderId.derive(source.repositoryId)
+            val v1 = packageArchive("123", "1.0.0", "first")
+            val v2 = packageArchive("123", "2.0.0", "second")
+            val repository = repository(root, RecordingPublisher(root))
+            success(repository.installOrUpdate(ByteArrayInputStream(v1), source))
+            success(repository.installOrUpdate(ByteArrayInputStream(v2), source))
+
+            val beforeRollback = index(root)
+            assertEquals(digest(v2), beforeRollback.providers.getValue(source.repositoryId).active.digest.value)
+            assertEquals(digest(v1), beforeRollback.providers.getValue(source.repositoryId).rollback?.digest?.value)
+
+            // Inject commit failure during rollback (e.g. at CURRENT_TO_BACKUP_MOVE or TEMP_TO_CURRENT_MOVE)
+            val faultedStore = InstalledPackageStore(root, FaultInjector { boundary ->
+                if (boundary == DurableBoundary.TEMP_TO_CURRENT_MOVE) throw IOException("injected rollback commit failure")
+            })
+            val faultedRepo = repository(faultedStore, RecordingPublisher(root))
+            
+            assertFailure(faultedRepo.rollback(source.repositoryId), PackageFailure.StorageDetail.COMMIT_FAILED)
+            assertEquals("Authoritative selection must remain unchanged on rollback commit failure", beforeRollback, index(root))
+
+            // Inject write failure during removal
+            val faultedStoreRemove = InstalledPackageStore(root, FaultInjector { boundary ->
+                if (boundary == DurableBoundary.INDEX_TEMP_WRITE) throw IOException("injected removal write failure")
+            })
+            val faultedRepoRemove = repository(faultedStoreRemove, RecordingPublisher(root))
+            
+            assertFailure(faultedRepoRemove.remove(source.repositoryId), PackageFailure.StorageDetail.WRITE_FAILED)
+            assertEquals("Authoritative selection must remain unchanged on removal commit failure", beforeRollback, index(root))
+        }
+    }
+
+    @Test
+    fun `evolved manifest round-trip preserves exact declarations capabilities and fingerprint after store load and materialize`() = runTest {
+        withTemporaryDirectory { root ->
+            // Package with non-empty configuration and capabilities (task 10.2)
+            val source = sourceRecord("125", "751", "752")
+            val provider = InstalledProviderId.derive(source.repositoryId)
+            val manifest = """{"manifestVersion":1,"repositoryId":"125","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
+            val luaSource = "-- evolved fixture\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+            val archive = strictUnixStoredZip(
+                listOf(
+                    ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
+                    ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                    ZipFixtureEntry("lua/plugin.lua", luaSource.toByteArray(UTF_8), 0b1000000110100100),
+                ),
+            )
+            val expectedDigest = digest(archive)
+            val publisher = RecordingPublisher(root)
+            val repository = repository(root, publisher)
+
+            // Install through store
+            success(repository.installOrUpdate(ByteArrayInputStream(archive), source))
+            val storedIndex = index(root)
+            val storedRecord = storedIndex.providers.getValue(source.repositoryId)
+
+            // Verify stored manifest preserves exact declarations
+            assertEquals(expectedDigest, storedRecord.active.digest.value)
+            assertEquals("125", storedRecord.active.manifest.repositoryId.value)
+            assertEquals(3, storedRecord.active.manifest.configuration.data.fields.size)
+            assertEquals(3, storedRecord.active.manifest.configuration.ui.fields.size)
+            assertEquals(3, storedRecord.active.manifest.capabilities.size)
+
+            // Restart and loadAndMaterialize from stored bytes
+            val restartedPublisher = RecordingPublisher(root)
+            val restarted = repository(root, restartedPublisher)
+            success(restarted.loadAndPublish())
+
+            // Verify publication succeeded with the evolved provider
+            restartedPublisher.assertLast(setOf(provider), emptySet())
+            val binding = restartedPublisher.snapshots.last().bindings.getValue(provider)
+
+            // Verify fingerprint equals the exact digest of committed bytes
+            assertEquals(expectedDigest, binding.provider.fingerprint.value)
+
+            // Verify declaration compilation produced exact fields
+            val fields = binding.provider.descriptor.configurationFields
+            assertEquals(3, fields.size)
+            val modeField = fields.find { it.id == "mode" } as? ChannelConfigurationField.ChoiceField
+                ?: throw AssertionError("mode field must be ChoiceField")
+            assertEquals("Mode", modeField.label)
+            assertEquals(5, modeField.choices.size)
+            assertEquals("ECHO", modeField.choices[0].id)
+            val verboseField = fields.find { it.id == "verbose" } as? ChannelConfigurationField.BooleanField
+                ?: throw AssertionError("verbose field must be BooleanField")
+            assertEquals("Verbose", verboseField.label)
+            val retryField = fields.find { it.id == "retry_count" } as? ChannelConfigurationField.NumberField
+                ?: throw AssertionError("retry_count field must be NumberField")
+            assertEquals("Retry Count", retryField.label)
+            assertEquals(0L, retryField.minimum)
+            assertEquals(10L, retryField.maximum)
+
+            // Verify capability compilation
+            val caps = binding.provider.descriptor.requiredCapabilities
+            assertTrue("must contain Transcription", caps.any { it.stableId == "transcription" })
+            assertTrue("must contain Synthesis", caps.any { it.stableId == "synthesis" })
+            assertTrue("must contain AudioOperation (from playback)", caps.any { it.stableId == "audio-operation" })
+            assertTrue("must contain DeferredAudioPlayback (from playback)", caps.any { it.stableId == "deferred-audio-playback" })
+
+            // Verify defaults compiled correctly
+            val defaults = binding.provider.descriptor.configuration.defaultPayload().toJsonObject()
+            assertEquals("ECHO", defaults.getString("mode"))
+            assertFalse(defaults.getBoolean("verbose"))
+            assertEquals(3L, defaults.getLong("retry_count"))
+        }
+    }
+
+    @Test
+    fun `reopen persisted pre-cutover diagnostics then update and install debug without global index poisoning`() = runTest {
+        withTemporaryDirectory { root ->
+            val historicalBytes = loadResource("diagnostics-channel/historical/v1.1.0/subspace-channel.zip")
+            val diagnosticsUpdate = loadResource("diagnostics-channel/subspace-channel.zip")
+            val debugInstall = loadResource("debug-channel/subspace-channel.zip")
+            val historicalSource = sourceRecord("1305223892", "2", "2").copy(
+                coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
+                release = GitHubReleaseIdentity("2", "v1.1.0", false),
+                asset = GitHubAssetIdentity("2", "subspace-channel.zip"),
+            )
+            val diagnosticsSource = historicalSource.copy(
+                release = GitHubReleaseIdentity("1", "v1.2.0", false),
+                asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
+            )
+            val debugSource = sourceRecord("1306065111", "1", "1").copy(
+                coordinates = GitHubRepositoryCoordinates("nilp0inter", "debug-channel"),
+                release = GitHubReleaseIdentity("1", "v1.0.0", false),
+                asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
+            )
+            val diagnosticsProvider = InstalledProviderId.derive(diagnosticsSource.repositoryId)
+            val debugProvider = InstalledProviderId.derive(debugSource.repositoryId)
+
+            // This is the closest real pre-cutover disk state: exact historical bytes are retained
+            // under their digest, while the prior index caches the old manifest shape that omitted
+            // configuration/capabilities. No new-validator submission is involved in constructing it.
+            writeHistoricalIndex(root, historicalBytes, historicalSource)
+            val historicalMaterialization = success(InstalledPackageStore(root).loadAndMaterialize(NoopLuaKernelBridge))
+            val historicalFailure = historicalMaterialization.failures.getValue(diagnosticsProvider)
+            assertTrue("historical active revision must remain unavailable", historicalFailure is PackageFailure.Format)
+            assertEquals(
+                PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+                (historicalFailure as PackageFailure.Format).detail,
+            )
+ 
+
+            val publications = RecordingPublisher(root)
+            val reopened = repository(root, publications)
+            assertEquals(Unit, success(reopened.loadAndPublish()))
+            publications.assertLast(emptySet(), setOf(diagnosticsProvider))
+
+            assertEquals(
+                MutationResult.Updated(diagnosticsProvider),
+                success(reopened.installOrUpdate(ByteArrayInputStream(diagnosticsUpdate), diagnosticsSource)),
+            )
+            publications.assertLast(setOf(diagnosticsProvider), emptySet())
+
+            assertEquals(
+                MutationResult.Installed(debugProvider),
+                success(reopened.installOrUpdate(ByteArrayInputStream(debugInstall), debugSource)),
+            )
+            publications.assertLast(setOf(diagnosticsProvider, debugProvider), emptySet())
+
+            val committed = index(root).providers
+            assertEquals("1.2.0", committed.getValue(diagnosticsSource.repositoryId).active.manifest.packageVersion)
+            assertEquals(
+                "1.1.0",
+                committed.getValue(diagnosticsSource.repositoryId).rollback?.manifest?.packageVersion,
+            )
+            assertEquals("1.0.0", committed.getValue(debugSource.repositoryId).active.manifest.packageVersion)
+            assertContent(root, digest(historicalBytes), historicalBytes)
+        }
+    }
+
+    @Test
+    fun `manifest mutation isolation preserves sibling provider and reports typed failure`() = runTest {
+        withTemporaryDirectory { root ->
+            // Two providers: one will have its index mutated
+            val sourceA = sourceRecord("126", "753", "754")
+            val sourceB = sourceRecord("127", "755", "756")
+            val providerA = InstalledProviderId.derive(sourceA.repositoryId)
+            val providerB = InstalledProviderId.derive(sourceB.repositoryId)
+
+            // Package A with non-trivial declarations
+            val manifestA = """{"manifestVersion":1,"repositoryId":"126","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Mutation Target","summary":"Target for manifest mutation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO"]}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"Echo"},{"value":"DELAYED_ECHO","label":"Delayed"}]}]}},"capabilities":["audio.playback"]}"""
+            val luaA = "-- target\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+            val archiveA = strictUnixStoredZip(
+                listOf(
+                    ZipFixtureEntry("manifest.json", manifestA.toByteArray(UTF_8), 0b1000000110100100),
+                    ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                    ZipFixtureEntry("lua/plugin.lua", luaA.toByteArray(UTF_8), 0b1000000110100100),
+                ),
+            )
+
+            // Package B (sibling) with different declarations
+            val manifestB = """{"manifestVersion":1,"repositoryId":"127","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Sibling Package","summary":"Sibling for mutation isolation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+            val luaB = "-- sibling\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+            val archiveB = strictUnixStoredZip(
+                listOf(
+                    ZipFixtureEntry("manifest.json", manifestB.toByteArray(UTF_8), 0b1000000110100100),
+                    ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                    ZipFixtureEntry("lua/plugin.lua", luaB.toByteArray(UTF_8), 0b1000000110100100),
+                ),
+            )
+
+            val publisher = RecordingPublisher(root)
+            val repository = repository(root, publisher)
+            success(repository.installOrUpdate(ByteArrayInputStream(archiveA), sourceA))
+            success(repository.installOrUpdate(ByteArrayInputStream(archiveB), sourceB))
+            val digestB = digest(archiveB)
+            val digestA = digest(archiveA)
+
+            // Mutate provider A's index: change the manifest's capabilities (add a fake one)
+            val oldIndex = index(root)
+            val recordA = oldIndex.providers.getValue(sourceA.repositoryId)
+            val mutatedManifest = recordA.active.manifest.copy(
+                capabilities = recordA.active.manifest.capabilities + PackageCapability.AUDIO_TRANSCRIPTION
+            )
+            val mutatedActive = recordA.active.copy(manifest = mutatedManifest)
+            val mutatedRecord = recordA.copy(active = mutatedActive)
+            val mutatedIndex = StoredInstalledIndex(
+                version = oldIndex.version,
+                providers = oldIndex.providers + (sourceA.repositoryId to mutatedRecord)
+            )
+            File(root, "index.json").writeText(StrictIndexCodec.encodeIndex(mutatedIndex), UTF_8)
+
+            // Verify loadAndMaterialize directly detects the mutation on provider A,
+            // and produces a valid binding for provider B
+            val store = InstalledPackageStore(root)
+            val matResult = success(store.loadAndMaterialize(NoopLuaKernelBridge))
+            val failureA = matResult.failures[providerA]
+            assertTrue("Expected SERIALIZATION_VIOLATION but got $failureA", failureA is PackageFailure.Mutation)
+            assertEquals(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, (failureA as PackageFailure.Mutation).detail)
+
+            val bindingB = matResult.bindings[providerB]
+            assertTrue("Sibling provider B must produce a valid binding", bindingB != null)
+            assertEquals(digestB, bindingB!!.provider.fingerprint.value)
+
+            // Verify loadAndPublish publishes B as binding and A as failure
+            val restartedPublisher = RecordingPublisher(root)
+            val restarted = repository(root, restartedPublisher)
+            success(restarted.loadAndPublish())
+            restartedPublisher.assertLast(setOf(providerB), setOf(providerA))
+
+            // Verify B's content is intact
+            assertContent(root, digestB, archiveB)
+            // Verify A's content still exists (the mutation only changed the index, not stored bytes)
+            assertContent(root, digestA, archiveA)
+        }
+    }
+
     private fun repository(root: File, publisher: RecordingPublisher): InstalledPackageRepository =
         repository(InstalledPackageStore(root), publisher)
 
@@ -338,6 +694,62 @@ class InstalledPackageTransactionsTest {
         assertTrue("committed content $digest must exist", File(root, "content/sha256/$digest").readBytes().contentEquals(expected))
     }
 
+    private fun loadResource(path: String): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(path)) {
+        "Missing pinned package fixture: $path"
+    }.use { it.readBytes() }
+
+    private fun writeHistoricalIndex(root: File, archive: ByteArray, source: PackageSourceRecord) {
+        val contentDir = File(root, "content/sha256").apply { mkdirs() }
+        val artifactDigest = digest(archive)
+        File(contentDir, artifactDigest).writeBytes(archive)
+        val historicalManifest = unzipEntry(archive, "manifest.json").toString(UTF_8)
+        val sourceJson = """{
+  "repositoryId": "${source.repositoryId.value}",
+  "coordinates": {
+    "owner": "${source.coordinates.owner}",
+    "repository": "${source.coordinates.repository}"
+  },
+  "release": {
+    "releaseId": "${source.release.releaseId}",
+    "tag": "${source.release.tag}",
+    "isPrerelease": ${source.release.isPrerelease}
+  },
+  "asset": {
+    "assetId": "${source.asset.assetId}",
+    "name": "${source.asset.name}"
+  },
+  "ownerId": "${source.ownerId}"
+}"""
+        val indexJson = """{
+  "version": 1,
+  "providers": {
+    "${source.repositoryId.value}": {
+      "active": {
+        "digest": "$artifactDigest",
+        "manifest": $historicalManifest,
+        "sourceRecord": $sourceJson
+      },
+      "rollback": null
+    }
+  }
+}"""
+        File(root, "index.json").writeText(indexJson, UTF_8)
+    }
+
+    private fun unzipEntry(zipBytes: ByteArray, name: String): ByteArray {
+        java.util.zip.ZipInputStream(ByteArrayInputStream(zipBytes)).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                if (entry.name == name) {
+                    return zis.readBytes()
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+        error("missing entry $name in package fixture")
+    }
+
     private fun sourceRecord(repositoryId: String, releaseId: String, assetId: String): PackageSourceRecord = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(repositoryId),
         coordinates = GitHubRepositoryCoordinates("owner-$repositoryId", "repository-$repositoryId"),
@@ -348,7 +760,7 @@ class InstalledPackageTransactionsTest {
 
     private fun packageArchive(repositoryId: String, version: String, marker: String): ByteArray {
         val source = "-- $marker\\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Transaction package","summary":"Transactional package fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"}}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Transaction package","summary":"Transactional package fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
@@ -535,7 +947,7 @@ class InstalledPackageTransactionsTest {
         override fun snapshot(handle: LuaStateHandle): LuaKernelOutcome = error("not used")
         override fun close(handle: LuaStateHandle): LuaKernelOutcome = error("not used")
         override fun loadProgramImage(handle: LuaStateHandle, entryPoint: String, sourceMap: Map<String, String>): LuaKernelOutcome = error("not used")
-        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
+        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, config: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
         override fun invokeCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, arguments: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
         override fun startCoroutine(handle: LuaStateHandle, coroutineId: LuaCoroutineId, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = error("not used")
     }

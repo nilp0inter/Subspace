@@ -11,6 +11,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -108,22 +110,38 @@ fun ChannelConfigurationScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            descriptor.configurationFields.forEach { field ->
-                if (field.isVisible(values)) {
-                    ChannelConfigurationFieldEditor(
-                        field = field,
-                        configurationOwnerId = configurationOwnerId,
-                        value = values[field.id],
-                        dependencyValue = (field as? ChannelConfigurationField.DynamicChoiceField)
-                            ?.dependsOnFieldId
-                            ?.let(values::get),
-                        choiceResolver = choiceResolver,
-                        onValueChange = {
-                            values[field.id] = it
-                            submissionError = null
-                        },
-                        onPickDirectory = onPickDirectory,
+            if (descriptor.configurationFields.isEmpty()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                ) {
+                    Text(
+                        text = "No configuration required.",
+                        modifier = Modifier.padding(16.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            } else {
+                descriptor.configurationFields.forEach { field ->
+                    if (field.isVisible(values)) {
+                        ChannelConfigurationFieldEditor(
+                            field = field,
+                            configurationOwnerId = configurationOwnerId,
+                            value = values[field.id],
+                            dependencyValue = (field as? ChannelConfigurationField.DynamicChoiceField)
+                                ?.dependsOnFieldId
+                                ?.let(values::get),
+                            choiceResolver = choiceResolver,
+                            onValueChange = {
+                                values[field.id] = it
+                                submissionError = null
+                            },
+                            onPickDirectory = onPickDirectory,
+                        )
+                    }
                 }
             }
 

@@ -39,6 +39,8 @@ internal fun PackageFailure.toPackageUnavailableProjection(): PackageUnavailable
             ChannelProviderError.PackageUnavailableCategory.LOADING
         PackageFailure.FailureCategory.SHUTDOWN ->
             ChannelProviderError.PackageUnavailableCategory.SHUTDOWN
+        PackageFailure.FailureCategory.CAPABILITY ->
+            ChannelProviderError.PackageUnavailableCategory.FORMAT
     }
 
     val detail = when (this) {
@@ -144,6 +146,8 @@ internal fun PackageFailure.toPackageUnavailableProjection(): PackageUnavailable
             PackageFailure.ShutdownDetail.TRANSACTION_ABORTED ->
                 ChannelProviderError.PackageUnavailableDetail.TRANSACTION_ABORTED
         }
+        is PackageFailure.Capability ->
+            ChannelProviderError.PackageUnavailableDetail.MALFORMED_MANIFEST
     }
 
     return PackageUnavailableProjection(category, detail)

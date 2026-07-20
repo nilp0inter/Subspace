@@ -40,8 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use mlua::{
-    chunk::ChunkMode, thread::ThreadStatus, Error as LuaError, Function, HookTriggers, Lua,
-    LuaOptions, StdLib, Table, Thread, Value, VmState,
+    chunk::ChunkMode, thread::ThreadStatus, AnyUserData, Error as LuaError, Function,
+    HookTriggers, Lua, LuaOptions, MetaMethod, StdLib, Table, Thread, UserData, Value, VmState,
 };
 use serde_json::json;
 
@@ -62,11 +62,17 @@ pub enum SpawnAdmission {
     Capacity,
 }
 
-/// Called only while one Lua execution slice is active. The candidate coroutine
-/// has been created but is not retained until this admits it.
 pub trait SpawnAdmitter: Send + Sync {
     fn admit(&self, coroutine_id: i64) -> SpawnAdmission;
+    /// Validate/admit a semantic transcription request. A zero operation id
+    /// is the pre-yield validation probe; nonzero ids begin host work.
+    fn admit_transcription(&self, _operation_id: i64, _token: String) -> i32 { 1 }
+    /// Validate/admit a synthesis request. Zero is the pre-yield probe.
+    fn admit_synthesis(&self, _operation_id: i64, _params_json: String) -> i32 { 1 }
+    /// Validate/admit a playback request. Zero is the pre-yield probe.
+    fn admit_playback(&self, _operation_id: i64, _token: String, _delay_seconds: f64) -> i32 { 1 }
 }
+
 
 impl<F> SpawnAdmitter for F
 where
@@ -74,6 +80,25 @@ where
 {
     fn admit(&self, coroutine_id: i64) -> SpawnAdmission {
         self(coroutine_id)
+    }
+}
+
+/// Normalize host-facing semantic audio failures before they cross into Lua.
+/// Unknown diagnostics intentionally collapse to a language-neutral code.
+fn normalize_audio_error_code(value: &str) -> &'static str {
+    match value {
+        "E_INVALID_ARGUMENT" => "E_INVALID_ARGUMENT",
+        "E_INVALID_VALUE" => "E_INVALID_VALUE",
+        "E_INVALID_CONTEXT" => "E_INVALID_CONTEXT",
+        "E_CAPABILITY_UNDECLARED" => "E_CAPABILITY_UNDECLARED",
+        "E_UNAVAILABLE" => "E_UNAVAILABLE",
+        "E_BUSY" => "E_BUSY",
+        "E_TIMEOUT" => "E_TIMEOUT",
+        "E_CANCELLED" => "E_CANCELLED",
+        "E_CLOSED" => "E_CLOSED",
+        "E_STALE" => "E_STALE",
+        "E_HOST_FAILURE" => "E_HOST_FAILURE",
+        _ => "E_HOST_FAILURE",
     }
 }
 
@@ -111,6 +136,16 @@ fn safe_stdlib() -> StdLib {
 ///
 /// Loaded before user source so entrypoints can call any of these.
 const OPERATION_YIELD_PREFIX: &str = "\0subspace-operation:";
+/// Callback-table contract: one required startup function and these optional functions.
+/// Keeping the native allowlist centralized ensures validation and callback discovery
+/// cannot drift apart; every other key is intentionally ignored.
+const REQUIRED_CALLBACK: &str = "startup";
+const OPTIONAL_CALLBACKS: [&str; 4] = [
+    "handle_lifecycle",
+    "handle_input",
+    "handle_sos",
+    "handle_readiness",
+];
 const SUBSPACE_BOOTSTRAP: &str = r#"
 subspace = subspace or {}
 subspace._operation_yield_prefix = "\0subspace-operation:"
@@ -131,6 +166,9 @@ local host_create_coroutine = subspace.host_create_coroutine
 -- per-thread hook shares the state interrupt flag and instruction budget.
 local native_coroutine_resume = coroutine.resume
 coroutine.create = function(fn)
+  if subspace._evaluating and subspace._evaluating > 0 then
+    error("effect-call-during-load")
+  end
   if type(fn) ~= "function" then
     error("bad argument #1 to 'create' (function expected)", 2)
   end
@@ -177,18 +215,53 @@ subspace.runtime = {
   LUA_RELEASE = "5.4.8",
   API_VERSION = "subspace-lua-v1",
 }
+-- Semantic audio operations validate synchronously before yielding.
+local function transcribe(captured, ...)
+  if select(string.char(35), ...) ~= 0 then return nil, { error = "E_INVALID_ARGUMENT" } end
+  if subspace._evaluating and subspace._evaluating > 0 then error("effect-call-during-load") end
+  local ok, token_or_error = subspace.host_transcribe(captured)
+  if not ok then return nil, { error = token_or_error } end
+  local success, value = subspace.yield_operation("transcribe:" .. token_or_error)
+  if success then return { text = value }, nil end
+  return nil, { error = value }
+end
+local function synthesize(params, ...)
+  if select(string.char(35), ...) ~= 0 or type(params) ~= "table" then return nil, { error = "E_INVALID_ARGUMENT" } end
+  if subspace._evaluating and subspace._evaluating > 0 then error("effect-call-during-load") end
+  local ok, params_json_or_error = subspace.host_synthesize(params)
+  if not ok then return nil, { error = params_json_or_error } end
+  local success, value = subspace.yield_operation("synthesize:" .. params_json_or_error)
+  if success then return value, nil end
+  return nil, { error = value }
+end
+subspace.transcription = { transcribe = transcribe }
+subspace.synthesis = { synthesize = synthesize }
+local function schedule(audio, options, ...)
+  if select(string.char(35), ...) ~= 0 or type(audio) ~= "userdata" or type(options) ~= "table" then return nil, { error = "E_INVALID_ARGUMENT" } end
+  if subspace._evaluating and subspace._evaluating > 0 then error("effect-call-during-load") end
+  local ok, token_or_error, delay = subspace.host_playback(audio, options)
+  if not ok then return nil, { error = token_or_error } end
+  local success, value = subspace.yield_operation("playback:" .. token_or_error .. ":" .. tostring(delay))
+  if success then return { status = "scheduled" }, nil end
+  return nil, { error = value }
+end
+subspace.playback = { schedule = schedule }
 
 -- Preloaded host modules
 subspace._preloaded = {
   ["subspace.runtime"] = subspace.runtime,
   ["subspace.channel"] = subspace.channel,
+  ["subspace.log"] = subspace.log,
+  ["subspace.transcription"] = subspace.transcription,
+  ["subspace.synthesis"] = subspace.synthesis,
+  ["subspace.playback"] = subspace.playback,
 }
 
-subspace.runtime.spawn = function(fn)
+subspace.runtime.spawn = function(fn, ...)
   if subspace._evaluating and subspace._evaluating > 0 then
     error("effect-call-during-load")
   end
-  if type(fn) ~= "function" then
+  if select(string.char(35), ...) ~= 0 or type(fn) ~= "function" then
     return nil, { error = "E_INVALID_ARGUMENT" }
   end
 
@@ -218,11 +291,11 @@ subspace.runtime.spawn = function(fn)
   return true, nil
 end
 
-subspace.runtime.sleep = function(seconds)
+subspace.runtime.sleep = function(seconds, ...)
   if subspace._evaluating and subspace._evaluating > 0 then
     error("effect-call-during-load")
   end
-  if type(seconds) ~= "number" or seconds ~= seconds or seconds == math.huge or seconds == -math.huge or seconds < 0 or seconds > 86400 then
+  if select(string.char(35), ...) ~= 0 or type(seconds) ~= "number" or seconds ~= seconds or seconds == math.huge or seconds == -math.huge or seconds < 0 or seconds > 86400 then
     return nil, { error = "E_INVALID_ARGUMENT" }
   end
   local _, is_main = coroutine.running()
@@ -243,11 +316,11 @@ end
 
 local function make_log_fn(level)
   return function(payload)
-    if type(payload) ~= "table" then
-      return nil, { error = "E_INVALID_VALUE" }
-    end
     if subspace._evaluating and subspace._evaluating > 0 then
       error("effect-call-during-load")
+    end
+    if type(payload) ~= "table" then
+      return nil, { error = "E_INVALID_VALUE" }
     end
     return host_log(level, payload)
   end
@@ -259,8 +332,6 @@ subspace.log = {
   warn = make_log_fn("warn"),
   error = make_log_fn("error"),
 }
-
-subspace._preloaded["subspace.log"] = subspace.log
 
 -- Each program image receives a private, read-only view of host capabilities.
 -- Host closures remain in private backing tables; plugin writes never reach the
@@ -275,10 +346,13 @@ function subspace._new_image_namespace(sources, modules, image_env)
       __metatable = false,
     })
   end
-  local runtime, channel, log = {}, {}, {}
+  local runtime, channel, log, transcription, synthesis, playback = {}, {}, {}, {}, {}, {}
   for key, value in pairs(host.runtime) do runtime[key] = value end
   for key, value in pairs(host.channel) do channel[key] = value end
   for key, value in pairs(host.log) do log[key] = value end
+  for key, value in pairs(host.transcription) do transcription[key] = value end
+  for key, value in pairs(host.synthesis) do synthesis[key] = value end
+  for key, value in pairs(host.playback) do playback[key] = value end
   local private = {
     _sources = sources,
     _modules = modules,
@@ -288,6 +362,9 @@ function subspace._new_image_namespace(sources, modules, image_env)
     runtime = readonly(runtime),
     channel = readonly(channel),
     log = readonly(log),
+    transcription = readonly(transcription),
+    synthesis = readonly(synthesis),
+    playback = readonly(playback),
   }
   private.module_put = function(name, value) modules[tostring(name)] = value end
   private.module_get = function(name) return modules[tostring(name)] end
@@ -299,6 +376,9 @@ function subspace._new_image_namespace(sources, modules, image_env)
     ["subspace.runtime"] = private.runtime,
     ["subspace.channel"] = private.channel,
     ["subspace.log"] = private.log,
+    ["subspace.transcription"] = private.transcription,
+    ["subspace.synthesis"] = private.synthesis,
+    ["subspace.playback"] = private.playback,
   }
   local proxy = readonly(private)
   return proxy
@@ -427,6 +507,8 @@ struct CoroutineState {
     operation: Option<OperationId>,
     label: Option<String>,
     managed_task: bool,
+    /// Whether the currently executing callback/coroutine may issue audio operations.
+    audio_operation_eligible: bool,
 }
 
 /// A terminal operation remains bound to its issuing coroutine so a caller
@@ -514,6 +596,10 @@ enum Command {
         callback_name: String,
         arguments_json: String,
     },
+    InvokeInputCallback {
+        arguments_json: String,
+        captured_audio_token: String,
+    },
     StartCoroutine {
         coroutine_id: i64,
     },
@@ -531,6 +617,51 @@ struct SpawnAuthority {
     thread_identity: usize,
 }
 
+/// Semantic kind of an audio value crossing the Lua boundary.
+///
+/// The token is deliberately only meaningful to the host-side registry. Lua
+/// receives this as native full userdata, never as a scalar or table, so it
+/// cannot manufacture a value that resolves in the registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OpaqueAudioKind {
+    Captured,
+    Synthesized,
+}
+
+/// State-local opaque audio handle carried by Lua full userdata.
+///
+/// Keep this structure free of audio bytes, paths, routes, platform pointers,
+/// and operation identities. Those artifacts remain in the host registry and
+/// are bridged later using `(kind, token)` while validating state/generation/
+/// execution ownership there.
+#[derive(Eq, PartialEq)]
+pub(crate) struct OpaqueAudioUserData {
+    token: String,
+    pub(crate) kind: OpaqueAudioKind,
+}
+
+impl UserData for OpaqueAudioUserData {
+    // No fields or regular methods are registered. mlua creates a protected
+    // userdata metatable (`__metatable = false`) for UserData types. The only
+    // metamethod is a constant representation: tostring must not leak the
+    // token or expose an address that could be treated as a handle.
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_meta_method(MetaMethod::ToString, |_, _, ()| Ok("opaque_audio"));
+    }
+}
+
+/// Construct an opaque audio value for the current Lua state.
+///
+/// Registry admission and ownership checks intentionally live outside this
+/// helper; callers must only invoke it after admission has succeeded.
+pub(crate) fn create_opaque_audio_userdata(
+    lua: &Lua,
+    token: String,
+    kind: OpaqueAudioKind,
+) -> Result<AnyUserData, LuaError> {
+    lua.create_userdata(OpaqueAudioUserData { token, kind })
+}
+
 /// State exclusively owned by host callbacks while Lua is executing.  It is
 /// deliberately disjoint from `EngineInner`: callbacks never borrow, alias, or
 /// re-lock the Lua-owning engine.  Dispatch drains their bounded pending work
@@ -538,6 +669,8 @@ struct SpawnAuthority {
 struct CallbackState {
     dispatch_active: bool,
     evaluating_module: bool,
+    /// Explicit capability for semantic audio operations; independent of spawn authority.
+    audio_operation_eligible: bool,
     module_effect_attempted: bool,
     /// Spawned work admitted by `host_spawn`, including work awaiting dispatch.
     active_managed_tasks: usize,
@@ -562,6 +695,7 @@ impl CallbackState {
         Self {
             dispatch_active: false,
             evaluating_module: false,
+            audio_operation_eligible: false,
             module_effect_attempted: false,
             active_managed_tasks: 0,
             pending_sleep_reservations: 0,
@@ -588,6 +722,7 @@ impl Drop for CallbackDispatchGuard {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.dispatch_active = false;
+        state.audio_operation_eligible = false;
         state.spawn_authority = None;
     }
 }
@@ -720,6 +855,39 @@ impl EngineInner {
                 Ok(format!("{hash:08x}"))
             })
             .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_hash: {e}")))?;
+        let transcription_state = Arc::clone(&callback_state);
+        let host_transcribe_fn = lua
+            .create_function(move |_lua, captured: Value| {
+                let mut state = transcription_state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.dispatch_active {
+                    return Ok((false, "E_INVALID_CONTEXT".to_string()));
+                }
+                if state.evaluating_module {
+                    state.module_effect_attempted = true;
+                    return Err(LuaError::runtime("effect-call-during-load"));
+                }
+                if !state.audio_operation_eligible {
+                    return Ok((false, "E_INVALID_CONTEXT".to_string()));
+                }
+                let userdata = match captured {
+                    Value::UserData(value) => value,
+                    _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())),
+                };
+                let audio = match userdata.borrow::<OpaqueAudioUserData>() {
+                    Ok(value) => value,
+                    Err(_) => return Ok((false, "E_INVALID_ARGUMENT".to_string())),
+                };
+                if audio.kind != OpaqueAudioKind::Captured {
+                    return Ok((false, "E_INVALID_VALUE".to_string()));
+                }
+                let status = state.spawn_admitter.admit_transcription(0, audio.token.clone());
+                if status == 0 {
+                    Ok((true, audio.token.clone()))
+                } else {
+                    Ok((false, match status { 2 => "E_BUSY", 3 => "E_INVALID_ARGUMENT", 4 => "E_INVALID_VALUE", 5 => "E_STALE", 6 => "E_CLOSED", _ => "E_UNAVAILABLE" }.to_string()))
+                }
+            })
+            .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_transcribe: {e}")))?;
 
         let call_state = Arc::clone(&callback_state);
         let host_call_fn = lua
@@ -741,9 +909,41 @@ impl EngineInner {
         // Callback closures capture only disjoint callback state and immutable
         // execution controls; they never borrow or lock `EngineInner`.
         let spawn_state = Arc::clone(&callback_state);
+        let synthesis_state = Arc::clone(&callback_state);
+        let host_synthesize_fn = lua
+            .create_function(move |_lua, params: Value| {
+                let mut state = synthesis_state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.dispatch_active || !state.audio_operation_eligible { return Ok((false, "E_INVALID_CONTEXT".to_string())); }
+                if state.evaluating_module { state.module_effect_attempted = true; return Err(LuaError::runtime("effect-call-during-load")); }
+                let value = match normalize_lua_value(&params, 0) { Ok(v) => v, Err(_) => return Ok((false, "E_INVALID_ARGUMENT".to_string())) };
+                let obj = match value.as_object() { Some(v) => v, None => return Ok((false, "E_INVALID_ARGUMENT".to_string())) };
+                if obj.len() < 3 || obj.len() > 4 || !obj.keys().all(|k| matches!(k.as_str(), "text"|"language"|"voice"|"speed")) { return Ok((false, "E_INVALID_ARGUMENT".to_string())); }
+                let text = match obj.get("text").and_then(|v| v.as_str()) { Some(v) if !v.trim().is_empty() && v.len() <= 16_384 => v, _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())) };
+                let language = match obj.get("language").and_then(|v| v.as_str()) { Some(v) if !v.is_empty() && v.len() <= 64 && v.split('-').all(|p| !p.is_empty() && p.len() <= 8 && p.chars().all(|c| c.is_ascii_alphanumeric())) => v, _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())) };
+                let voice = match obj.get("voice").and_then(|v| v.as_str()) { Some(v) if !v.trim().is_empty() && v.len() <= 128 => v, _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())) };
+                if let Some(speed) = obj.get("speed") { match speed.as_f64() { Some(v) if v.is_finite() && v > 0.0 && v <= 4.0 => {}, _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())) } }
+                let json = serde_json::to_string(&serde_json::json!({"text":text,"language":language,"voice":voice,"speed":obj.get("speed").and_then(|v| v.as_f64()).unwrap_or(1.0)})).unwrap();
+                let status = state.spawn_admitter.admit_synthesis(0, json.clone());
+                if status == 0 { Ok((true, json)) } else { Ok((false, match status { 2 => "E_BUSY", 3 => "E_INVALID_ARGUMENT", 4 => "E_INVALID_VALUE", 6 => "E_CLOSED", _ => "E_UNAVAILABLE" }.to_string())) }
+            })
+            .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_synthesize: {e}")))?;
+        let playback_state = Arc::clone(&callback_state);
+        let host_playback_fn = lua
+            .create_function(move |_lua, (audio_value, options): (Value, Value)| {
+                let mut state = playback_state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.dispatch_active || !state.audio_operation_eligible { return Ok((false, "E_INVALID_CONTEXT".to_string(), 0.0)); }
+                if state.evaluating_module { state.module_effect_attempted = true; return Err(LuaError::runtime("effect-call-during-load")); }
+                let userdata = match audio_value { Value::UserData(value) => value, _ => return Ok((false, "E_INVALID_ARGUMENT".to_string(), 0.0)) };
+                let audio = match userdata.borrow::<OpaqueAudioUserData>() { Ok(value) => value, Err(_) => return Ok((false, "E_INVALID_ARGUMENT".to_string(), 0.0)) };
+                let obj = match normalize_lua_value(&options, 0).ok().and_then(|v| v.as_object().cloned()) { Some(v) => v, None => return Ok((false, "E_INVALID_ARGUMENT".to_string(), 0.0)) };
+                if obj.keys().any(|k| k != "delay_seconds") { return Ok((false, "E_INVALID_ARGUMENT".to_string(), 0.0)); }
+                let delay = match obj.get("delay_seconds") { None => 0.0, Some(v) => match v.as_f64() { Some(v) if v.is_finite() && v >= 0.0 && v <= 86_400.0 => v, _ => return Ok((false, "E_INVALID_VALUE".to_string(), 0.0)) } };
+                let status = state.spawn_admitter.admit_playback(0, audio.token.clone(), delay);
+                if status == 0 { Ok((true, audio.token.clone(), delay)) } else { Ok((false, match status { 2 => "E_BUSY", 3 => "E_INVALID_ARGUMENT", 4 => "E_INVALID_VALUE", 5 => "E_STALE", 6 => "E_CLOSED", _ => "E_UNAVAILABLE" }.to_string(), 0.0)) }
+            })
+            .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_playback: {e}")))?;
         let spawn_interrupt = Arc::clone(&interrupt_flag);
         let spawn_count = Arc::clone(&instruction_count);
-        let spawn_plugin_threads = plugin_created_threads.clone();
         let host_spawn_fn = lua
             .create_function(move |lua, func: Function| {
                 let mut state = spawn_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -760,13 +960,6 @@ impl EngineInner {
                     .map(|authority| authority.thread_identity)
                     != Some(current_thread.to_pointer() as usize)
                 {
-                    let plugin_child = matches!(
-                        spawn_plugin_threads.raw_get::<Value>(current_thread.clone()),
-                        Ok(Value::Boolean(true))
-                    );
-                    if state.latch_invalid_spawn && !plugin_child {
-                        state.unacknowledged_invalid_spawns += 1;
-                    }
                     return Ok((false, Some("E_INVALID_CONTEXT".to_string())));
                 }
                 if state.active_managed_tasks >= max_concurrent_tasks {
@@ -825,7 +1018,7 @@ impl EngineInner {
 
         let sleep_state = Arc::clone(&callback_state);
         let host_prepare_sleep_fn = lua
-            .create_function(move |_lua, seconds: f64| {
+            .create_function(move |lua, seconds: f64| {
                 let mut state = sleep_state.lock().unwrap_or_else(|e| e.into_inner());
                 if !state.dispatch_active {
                     return Err(LuaError::runtime("host callback outside dispatch"));
@@ -836,6 +1029,19 @@ impl EngineInner {
                 }
                 if seconds.is_nan() || seconds.is_infinite() || seconds < 0.0 || seconds > 86400.0 {
                     return Ok((false, Some("E_INVALID_ARGUMENT".to_string())));
+                }
+                // Sleep is authorized only by a host-managed spawned task.
+                // Startup has spawn authority for task admission but runs on
+                // the main thread (rejected by the Lua wrapper); input,
+                // lifecycle, readiness, SOS, and plugin-created children have
+                // no authority and must fail before reserving a timer slot.
+                let current_thread = lua.current_thread();
+                if state
+                    .spawn_authority
+                    .map(|authority| authority.thread_identity)
+                    != Some(current_thread.to_pointer() as usize)
+                {
+                    return Ok((false, Some("E_INVALID_CONTEXT".to_string())));
                 }
                 if state.active_sleep_timers + state.pending_sleep_reservations >= max_timer_slots {
                     return Ok((false, Some("E_BUSY".to_string())));
@@ -928,6 +1134,9 @@ impl EngineInner {
                 .get("subspace")
                 .map_err(|e| Outcome::runtime_failure(format!("subspace global missing: {e}")))?;
             let _ = subspace.set("host_hash", host_hash_fn);
+            let _ = subspace.set("host_transcribe", host_transcribe_fn);
+            let _ = subspace.set("host_synthesize", host_synthesize_fn);
+            let _ = subspace.set("host_playback", host_playback_fn);
             let _ = subspace.set("host_call", host_call_fn);
             let _ = subspace.set("host_spawn", host_spawn_fn);
             let _ = subspace.set(
@@ -1183,20 +1392,12 @@ impl EngineInner {
                 callback_name,
                 arguments_json,
             } => self.handle_invoke_callback(callback_name, arguments_json),
+            Command::InvokeInputCallback {
+                arguments_json,
+                captured_audio_token,
+            } => self.handle_invoke_input_callback(arguments_json, captured_audio_token),
             Command::StartCoroutine { coroutine_id } => self.handle_start_coroutine(coroutine_id),
         };
-        let callback_state = self
-            .callback_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let invocation_violation =
-            callback_state.invocation_violation || callback_state.unacknowledged_invalid_spawns > 0;
-        drop(callback_state);
-        if invocation_violation {
-            outcome = Outcome::runtime_failure(
-                "E_INVALID_CONTEXT: spawn is prohibited in this invocation",
-            );
-        }
         let spawned = self.drain_callback_spawns();
         if !spawned.is_empty() {
             if matches!(
@@ -1241,6 +1442,7 @@ impl EngineInner {
                     operation: None,
                     label: None,
                     managed_task: true,
+                    audio_operation_eligible: true,
                 },
             );
             ids.push(coroutine_id);
@@ -1295,55 +1497,104 @@ impl EngineInner {
             let outcome = Outcome::syntax_failure("binary Lua chunks are not accepted");
             return self.outcome_with_telemetry(outcome);
         }
-        // Track bridge bytes for the source string.
+
         let source_bytes = source.len() as i64 + entrypoint.len() as i64;
+        let previous_bridge_bytes = self.bridge_bytes;
+        self.accountant.sub_bridge(previous_bridge_bytes);
         self.bridge_bytes = source_bytes;
         self.accountant.add_bridge(source_bytes);
 
-        // Load user source in text-only mode.
         let lua = self.lua.as_ref().expect("lua live in handle_load");
-        let load_result = lua.load(&source).set_mode(ChunkMode::Text).exec();
-        if let Err(e) = load_result {
-            self.accountant.sub_bridge(source_bytes);
-            self.bridge_bytes = 0;
-            if is_memory_error(&e) {
+        let subspace: Option<Table> = lua.globals().get("subspace").ok();
+        let previous_modules: Option<Table> = subspace
+            .as_ref()
+            .and_then(|table| table.get("_modules").ok());
+        let previous_entrypoint = self.entrypoint.clone();
+        let previous_entrypoint_name = self.entrypoint_name.clone();
+        let previous_lifecycle = self.lifecycle;
+        macro_rules! rollback_load {
+            ($outcome:expr) => {{
+                if let (Some(table), Some(modules)) = (&subspace, &previous_modules) {
+                    let _ = table.set("_modules", modules.clone());
+                }
+                self.accountant.sub_bridge(source_bytes);
+                self.accountant.add_bridge(previous_bridge_bytes);
+                self.bridge_bytes = previous_bridge_bytes;
+                self.entrypoint = previous_entrypoint.clone();
+                self.entrypoint_name = previous_entrypoint_name.clone();
+                self.lifecycle = previous_lifecycle;
+                return self.outcome_with_telemetry($outcome);
+            }};
+        }
+        let staged_modules = match lua.create_table() {
+            Ok(table) => table,
+            Err(error) if is_memory_error(&error) => {
                 self.accountant.record_denial();
-                let outcome = Outcome::memory_failure(format!("{e}"));
-                return self.outcome_with_telemetry(outcome);
+                rollback_load!(Outcome::memory_failure(format!("failed to stage module cache: {error}")));
             }
-            let outcome = classify_load_error(&e);
-            return self.outcome_with_telemetry(outcome);
+            Err(error) => rollback_load!(Outcome::runtime_failure(format!(
+                "failed to stage module cache: {error}"
+            ))),
+        };
+        if let Some(table) = &subspace {
+            if let Err(error) = table.set("_modules", staged_modules.clone()) {
+                rollback_load!(Outcome::runtime_failure(format!(
+                    "failed to stage module cache: {error}"
+                )));
+            }
         }
 
-        let globals = self
-            .lua
-            .as_ref()
-            .expect("lua live in handle_load")
-            .globals();
+        // Entry chunks are module evaluation too: host calls must be rejected
+        // before they can reserve an operation, timer, log, or task. The guard
+        // is native-state owned so Lua cannot clear it or bypass it via a
+        // copied namespace.
+        {
+            let mut state = self
+                .callback_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.evaluating_module = true;
+            state.module_effect_attempted = false;
+        }
+        let load_result = lua.load(&source).set_mode(ChunkMode::Text).exec();
+        let module_effect_attempted = {
+            let mut state = self
+                .callback_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.evaluating_module = false;
+            state.module_effect_attempted
+        };
+        if module_effect_attempted {
+            rollback_load!(Outcome::runtime_failure("effect-call-during-load"));
+        }
+        if let Err(e) = load_result {
+            if is_memory_error(&e) {
+                self.accountant.record_denial();
+                rollback_load!(Outcome::memory_failure(format!("{e}")));
+            }
+            rollback_load!(classify_load_error(&e));
+        }
+
+        let globals = lua.globals();
         let entry_fn: Result<Function, _> = globals.get(entrypoint.as_str());
         match entry_fn {
             Ok(f) => {
                 self.entrypoint = Some(f);
-                self.entrypoint_name = Some(entrypoint.clone());
+                self.entrypoint_name = Some(entrypoint);
                 self.lifecycle = Lifecycle::Loaded;
                 self.main_coroutine_id = None;
                 self.coroutines.clear();
                 self.terminal_operations.clear();
                 self.terminal_operation_order.clear();
                 self.evicted_terminal_operation_order.clear();
-
                 let outcome =
                     Outcome::new(OutcomeKind::Completed).with("diagnostic", json!("loaded"));
                 self.outcome_with_telemetry(outcome)
             }
-            Err(_) => {
-                self.accountant.sub_bridge(source_bytes);
-                self.bridge_bytes = 0;
-                let outcome = Outcome::validation_failure(format!(
-                    "entrypoint '{entrypoint}' is not a defined global function"
-                ));
-                self.outcome_with_telemetry(outcome)
-            }
+            Err(_) => rollback_load!(Outcome::validation_failure(format!(
+                "entrypoint '{entrypoint}' is not a defined global function"
+            ))),
         }
     }
 
@@ -1395,6 +1646,7 @@ impl EngineInner {
                 operation: None,
                 label: None,
                 managed_task: false,
+                audio_operation_eligible: false,
             },
         );
 
@@ -1430,29 +1682,20 @@ impl EngineInner {
                 .outcome_with_telemetry(self.stale_evicted_terminal_operation(operation_id));
         }
         match self.check_operation(coroutine_id, operation_id) {
-            OperationVerdict::Foreign => {
-                return self.outcome_with_telemetry(Outcome::invalid_ownership(
-                    "coroutine/operation is not live in this state",
-                ))
-            }
-            OperationVerdict::Duplicate => {
-                return self.outcome_with_telemetry(self.echo_terminal(operation_id))
-            }
+            OperationVerdict::Foreign => return self.outcome_with_telemetry(Outcome::invalid_ownership("coroutine/operation is not live in this state")),
+            OperationVerdict::Duplicate => return self.outcome_with_telemetry(self.echo_terminal(operation_id)),
             OperationVerdict::Admit => {}
         }
-
         if self.active_sleep_operations.remove(&operation_id) {
             self.release_sleep_reservation();
         }
-        let thread = {
-            let state = self
-                .coroutines
-                .get_mut(&coroutine_id)
-                .expect("admitted coroutine record disappeared");
+        let (thread, audio_operation_eligible, operation_label) = {
+            let state = self.coroutines.get_mut(&coroutine_id).expect("admitted coroutine record disappeared");
+            let label = state.label.clone().unwrap_or_default();
             state.operation = None;
             state.label = None;
             state.lifecycle = Lifecycle::Running;
-            state.thread.clone()
+            (state.thread.clone(), state.audio_operation_eligible, label)
         };
         self.lifecycle = Lifecycle::Running;
         {
@@ -1460,11 +1703,21 @@ impl EngineInner {
                 .callback_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            state.audio_operation_eligible = audio_operation_eligible;
             state.spawn_authority = Some(SpawnAuthority {
                 thread_identity: thread.to_pointer() as usize,
             });
         }
-        let result = thread.resume::<Value>((success, value));
+        let resume_value = if success && operation_label.starts_with("synthesize:") {
+            let token = value.strip_prefix("synthesized:").unwrap_or(&value).to_string();
+            match self.lua.as_ref().and_then(|lua| create_opaque_audio_userdata(lua, token, OpaqueAudioKind::Synthesized).ok()) {
+                Some(userdata) => Value::UserData(userdata),
+                None => Value::String(self.lua.as_ref().unwrap().create_string("E_HOST_FAILURE").unwrap()),
+            }
+        } else if !success && (operation_label.starts_with("transcribe:") || operation_label.starts_with("synthesize:") || operation_label.starts_with("playback:")) {
+            Value::String(self.lua.as_ref().unwrap().create_string(normalize_audio_error_code(&value)).unwrap())
+        } else { Value::String(self.lua.as_ref().unwrap().create_string(&value).unwrap()) };
+        let result = thread.resume::<Value>((success, resume_value));
         self.callback_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1740,11 +1993,19 @@ impl EngineInner {
             }
             Ok(value) => {
                 self.discard_pending_sleep_reservation();
+                let normalized = match normalize_lua_value(&value, 0) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.release_coroutine(coroutine_id);
+                        self.lifecycle = Lifecycle::Failed;
+                        return Outcome::runtime_failure(format!("E_INVALID_VALUE: {error}"));
+                    }
+                };
                 self.release_coroutine(coroutine_id);
                 self.lifecycle = Lifecycle::Completed;
                 Outcome::new(OutcomeKind::Completed)
                     .with("coroutineId", json!(coroutine_id))
-                    .with("value", json!(value_to_string(&value)))
+                    .with("value", normalized)
             }
             Err(e) => {
                 self.discard_pending_sleep_reservation();
@@ -1802,6 +2063,9 @@ impl EngineInner {
         }
         let previous_source_map = self.source_map.clone();
         let previous_bridge_bytes = self.bridge_bytes;
+        let previous_lifecycle = self.lifecycle;
+        let previous_entrypoint_name = self.entrypoint_name.clone();
+        let previous_main_coroutine_id = self.main_coroutine_id;
         self.accountant.sub_bridge(previous_bridge_bytes);
         self.bridge_bytes = source_bytes;
         self.accountant.add_bridge(source_bytes);
@@ -1851,10 +2115,12 @@ impl EngineInner {
                 let _ = subspace.set("_callbacks", old_callbacks.clone());
                 let _ = subspace.set("_image_env", old_image_env.clone());
                 self.source_map = previous_source_map.clone();
+                self.entrypoint_name = previous_entrypoint_name.clone();
+                self.main_coroutine_id = previous_main_coroutine_id;
                 self.accountant.sub_bridge(source_bytes);
                 self.accountant.add_bridge(previous_bridge_bytes);
                 self.bridge_bytes = previous_bridge_bytes;
-                self.lifecycle = Lifecycle::Loaded;
+                self.lifecycle = previous_lifecycle;
                 return self.outcome_with_telemetry($outcome);
             }};
         }
@@ -2020,28 +2286,23 @@ impl EngineInner {
         if table.metatable().is_some() {
             rollback_image!(Outcome::validation_failure("callback table has metatable"));
         }
-        let startup: Value = match table.raw_get("startup") {
+        let startup: Value = match table.raw_get(REQUIRED_CALLBACK) {
             Ok(v) => v,
             Err(e) => rollback_image!(Outcome::runtime_failure(e.to_string())),
         };
         match startup {
             Value::Function(_) => {}
             Value::Nil => rollback_image!(Outcome::validation_failure(
-                "required callback 'startup' is missing"
+                format!("required callback '{}' is missing", REQUIRED_CALLBACK)
             )),
             _ => rollback_image!(Outcome::validation_failure(format!(
-                "expected function for callback 'startup', got {}",
+                "expected function for callback '{}', got {}",
+                REQUIRED_CALLBACK,
                 startup.type_name()
             ))),
         }
-        let optional_keys = [
-            "handle_lifecycle",
-            "handle_input",
-            "handle_sos",
-            "handle_readiness",
-        ];
-        let mut callbacks_list = vec!["startup".to_string()];
-        for key in optional_keys {
+        let mut callbacks_list = vec![REQUIRED_CALLBACK.to_string()];
+        for key in OPTIONAL_CALLBACKS {
             let cb: Value = match table.raw_get(key) {
                 Ok(v) => v,
                 Err(e) => rollback_image!(Outcome::runtime_failure(e.to_string())),
@@ -2199,11 +2460,117 @@ impl EngineInner {
         self.outcome_with_telemetry(outcome)
     }
 
+    /// Invoke handle_input inside its own Lua coroutine. This is separate from
+    /// synchronous callbacks so semantic host operations may yield and retain
+    /// their exact coroutine/operation owner for later resumption.
+    fn handle_invoke_input_callback(
+        &mut self,
+        arguments_json: String,
+        captured_audio_token: String,
+    ) -> Outcome {
+        let lua = match &self.lua {
+            Some(l) => l,
+            None => return self.outcome_with_telemetry(Outcome::new(OutcomeKind::Closed)),
+        };
+        let args_val: serde_json::Value = if arguments_json.is_empty() {
+            serde_json::Value::Null
+        } else {
+            match serde_json::from_str(&arguments_json) {
+                Ok(value) => value,
+                Err(e) => return self.outcome_with_telemetry(Outcome::validation_failure(
+                    format!("invalid arguments JSON: {e}"),
+                )),
+            }
+        };
+        let event_object = match &args_val {
+            serde_json::Value::Object(object) => object,
+            _ => return self.outcome_with_telemetry(Outcome::validation_failure(
+                "input event must be a table",
+            )),
+        };
+        if event_object.contains_key("audio") {
+            return self.outcome_with_telemetry(Outcome::validation_failure(
+                "input event audio field is reserved",
+            ));
+        }
+        let lua_event = match json_to_lua(lua, &args_val) {
+            Ok(Value::Table(table)) => table,
+            Ok(_) => return self.outcome_with_telemetry(Outcome::validation_failure(
+                "input event must be a table",
+            )),
+            Err(e) => return self.outcome_with_telemetry(Outcome::validation_failure(
+                format!("failed to convert arguments to Lua: {e}"),
+            )),
+        };
+        let callbacks: Table = match lua
+            .globals()
+            .get::<Table>("subspace")
+            .and_then(|subspace: Table| subspace.get("_callbacks"))
+        {
+            Ok(table) => table,
+            Err(e) => return self.outcome_with_telemetry(Outcome::runtime_failure(
+                format!("_callbacks missing: {e}"),
+            )),
+        };
+        let callback_fn: Function = match callbacks.raw_get("handle_input") {
+            Ok(Value::Function(function)) => function,
+            _ => return self.outcome_with_telemetry(Outcome::validation_failure(
+                "callback 'handle_input' not found",
+            )),
+        };
+        let thread = match lua.create_thread(callback_fn) {
+            Ok(thread) => thread,
+            Err(e) => return self.outcome_with_telemetry(Outcome::runtime_failure(
+                format!("failed to create input coroutine: {e}"),
+            )),
+        };
+        self.reset_execution_budget();
+        self.setup_hook(&thread);
+        self.lifecycle = Lifecycle::Running;
+        let coroutine_id = self.next_coroutine_id;
+        self.next_coroutine_id += 1;
+        self.coroutines.insert(
+            coroutine_id,
+            CoroutineState {
+                thread: thread.clone(),
+                lifecycle: Lifecycle::Running,
+                operation: None,
+                label: None,
+                managed_task: false,
+                audio_operation_eligible: true,
+            },
+        );
+        let userdata = match create_opaque_audio_userdata(
+            lua,
+            captured_audio_token,
+            OpaqueAudioKind::Captured,
+        ) {
+            Ok(userdata) => userdata,
+            Err(e) => return self.outcome_with_telemetry(Outcome::runtime_failure(
+                format!("failed to create captured audio userdata: {e}"),
+            )),
+        };
+        // Input callbacks never receive spawn authority; runtime.spawn remains
+        // synchronously denied by the callback-context guard.
+        self.callback_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audio_operation_eligible = true;
+        if let Err(e) = lua_event.set("audio", userdata) {
+            return self.outcome_with_telemetry(Outcome::runtime_failure(
+                format!("failed to attach captured audio userdata: {e}"),
+            ));
+        }
+        let result = thread.resume::<Value>(lua_event);
+        let outcome = self.classify_resume_result(result, &thread, coroutine_id);
+        self.outcome_with_telemetry(outcome)
+    }
+
     fn handle_start_coroutine(&mut self, coroutine_id: i64) -> Outcome {
-        let thread = match self.coroutines.get_mut(&coroutine_id) {
+        let (thread, audio_operation_eligible) = match self.coroutines.get_mut(&coroutine_id) {
             Some(state) if state.lifecycle == Lifecycle::Loaded => {
                 state.lifecycle = Lifecycle::Running;
-                state.thread.clone()
+                (state.thread.clone(), state.audio_operation_eligible)
             }
             Some(_) => {
                 return self.outcome_with_telemetry(Outcome::invalid_ownership(
@@ -2224,6 +2591,7 @@ impl EngineInner {
                 .callback_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            state.audio_operation_eligible = audio_operation_eligible;
             state.spawn_authority = Some(SpawnAuthority {
                 thread_identity: thread.to_pointer() as usize,
             });
@@ -2465,6 +2833,25 @@ impl StateEngine {
             Command::InvokeCallback {
                 callback_name: callback_name.to_string(),
                 arguments_json: arguments_json.to_string(),
+            },
+            admitter,
+        )
+    }
+
+    /// Invoke handle_input in a dedicated host-managed coroutine. The caller
+    /// retains the yielded coroutine/operation pair as its execution owner.
+    pub fn invoke_input_callback_with_spawn_admitter(
+        &self,
+        generation: Generation,
+        arguments_json: &str,
+        captured_audio_token: &str,
+        admitter: Arc<dyn SpawnAdmitter>,
+    ) -> Outcome {
+        self.dispatch_with_spawn_admitter(
+            generation,
+            Command::InvokeInputCallback {
+                arguments_json: arguments_json.to_string(),
+                captured_audio_token: captured_audio_token.to_string(),
             },
             admitter,
         )
@@ -2776,8 +3163,44 @@ fn normalize_lua_value_inner(
             })();
             result
         }
+        Value::UserData(userdata) if userdata.is::<OpaqueAudioUserData>() => {
+            Err("E_INVALID_VALUE: opaque audio userdata is not serializable".to_string())
+        }
         _ => Err("disallowed type".to_string()),
     }
+}
+
+/// Detect opaque audio handles before callback contract validation. Structured
+/// error validation must reject an audio value before inspecting or retaining
+/// any other fields; semantic audio APIs are the only allowed direct boundary.
+fn contains_opaque_audio_userdata(
+    value: &Value,
+    depth: usize,
+    tables: &mut std::collections::HashSet<usize>,
+) -> Result<bool, String> {
+    if depth > 10 {
+        return Ok(false);
+    }
+    match value {
+        Value::UserData(userdata) => Ok(userdata.is::<OpaqueAudioUserData>()),
+        Value::Table(table) => {
+            if !tables.insert(table.to_pointer() as usize) {
+                return Ok(false);
+            }
+            for pair in table.clone().pairs::<Value, Value>() {
+                let (_, child) = pair.map_err(|error| error.to_string())?;
+                if contains_opaque_audio_userdata(&child, depth + 1, tables)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn callback_contains_opaque_audio_userdata(value: &Value) -> Result<bool, String> {
+    contains_opaque_audio_userdata(value, 0, &mut std::collections::HashSet::new())
 }
 
 fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value, mlua::Error> {
@@ -2812,6 +3235,9 @@ fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value, mlua::Erro
 }
 
 fn validate_callback_return(callback_name: &str, value: &Value) -> Result<(), String> {
+    if callback_contains_opaque_audio_userdata(value)? {
+        return Err("E_INVALID_VALUE: opaque audio userdata is not serializable".to_string());
+    }
     match callback_name {
         "startup" | "handle_lifecycle" | "handle_sos" => match value {
             Value::Nil => Ok(()),
@@ -2839,27 +3265,47 @@ fn validate_callback_return(callback_name: &str, value: &Value) -> Result<(), St
         },
         "handle_input" => match value {
             Value::Table(t) => {
+                let mut keys = std::collections::HashSet::new();
+                for pair in t.pairs::<Value, Value>() {
+                    let (key, _) = pair.map_err(|_| "invalid callback result key")?;
+                    let Value::String(key) = key else {
+                        return Err("callback result keys must be strings".to_string());
+                    };
+                    keys.insert(key.to_str().map_err(|_| "invalid callback result key")?.to_string());
+                }
                 let ok_val: Value = t.raw_get("ok").map_err(|e| e.to_string())?;
                 let err_val: Value = t.raw_get("error").map_err(|e| e.to_string())?;
-                if ok_val == Value::Boolean(true) && err_val == Value::Nil {
+                if keys == ["ok"].into_iter().map(str::to_string).collect()
+                    && ok_val == Value::Boolean(true)
+                {
                     Ok(())
-                } else if ok_val == Value::Nil && err_val != Value::Nil {
+                } else if keys == ["error"].into_iter().map(str::to_string).collect()
+                    && ok_val == Value::Nil
+                    && err_val != Value::Nil
+                {
                     let err_table = match err_val {
                         Value::Table(et) => et,
                         _ => return Err("error field must be a table".to_string()),
                     };
-                    let code: String = err_table
-                        .raw_get("code")
-                        .map_err(|_| "missing or invalid code")?;
-                    let detail: String = err_table
-                        .raw_get("detail")
-                        .map_err(|_| "missing or invalid detail")?;
+                    let mut error_keys = std::collections::HashSet::new();
+                    for pair in err_table.pairs::<Value, Value>() {
+                        let (key, _) = pair.map_err(|_| "invalid error key")?;
+                        let Value::String(key) = key else {
+                            return Err("error keys must be strings".to_string());
+                        };
+                        error_keys.insert(key.to_str().map_err(|_| "invalid error key")?.to_string());
+                    }
+                    if error_keys != ["code", "detail"].into_iter().map(str::to_string).collect() {
+                        return Err("error must contain exactly code and detail".to_string());
+                    }
+                    let code: String = err_table.raw_get("code").map_err(|_| "missing or invalid code")?;
+                    let detail: String = err_table.raw_get("detail").map_err(|_| "missing or invalid detail")?;
                     if code.is_empty() || detail.is_empty() {
                         return Err("code and detail must be non-empty".to_string());
                     }
                     Ok(())
                 } else {
-                    Err("expected ok=true or error table".to_string())
+                    Err("expected exactly ok=true or error={code,detail}".to_string())
                 }
             }
             _ => Err("expected table".to_string()),
@@ -2877,3 +3323,51 @@ fn validate_callback_return(callback_name: &str, value: &Value) -> Result<(), St
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_opaque_audio_userdata_safety() {
+        let engine = StateEngine::new(4 * 1024 * 1024, 100, 50000, 16, 16).unwrap();
+        let inner = engine.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let lua = inner.lua.as_ref().unwrap();
+
+        // 1. Create userdata
+        let userdata = create_opaque_audio_userdata(lua, "987654321".to_string(), OpaqueAudioKind::Captured).unwrap();
+        lua.globals().set("u", userdata).unwrap();
+
+        // 2. Verify type
+        let is_userdata: bool = lua.load("type(u) == 'userdata'").eval().unwrap();
+        assert!(is_userdata);
+
+        // 3. Stringify safety: tostring must not leak the token or address
+        let str_rep: String = lua.load("tostring(u)").eval().unwrap();
+        assert_eq!(str_rep, "opaque_audio");
+
+        // 4. Locked metatable: getmetatable(u) must return false, and setmetatable must fail
+        let get_mt_res: mlua::Value = lua.load("getmetatable(u)").eval().unwrap();
+        match get_mt_res {
+            mlua::Value::Boolean(false) => {}
+            other => panic!("Expected metatable of opaque audio to be false, got {:?}", other),
+        }
+
+        let set_mt_fails: bool = lua.load("not pcall(function() setmetatable(u, {}) end)").eval().unwrap();
+        assert!(set_mt_fails);
+
+        // 5. No public fields/methods & no write access
+        let read_field_fails: bool = lua.load("not pcall(function() return u.token end)").eval().unwrap();
+        assert!(read_field_fails);
+
+        let call_method_fails: bool = lua.load("not pcall(function() u:token() end)").eval().unwrap();
+        assert!(call_method_fails);
+        let write_field_fails: bool = lua.load("not pcall(function() u.token = 123 end)").eval().unwrap();
+        assert!(write_field_fails);
+
+        // 6. Call safety: userdata cannot be called as a function
+        let call_fails: bool = lua.load("not pcall(function() u() end)").eval().unwrap();
+        assert!(call_fails);
+    }
+}
+

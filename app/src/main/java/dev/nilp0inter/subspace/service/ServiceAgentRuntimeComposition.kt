@@ -57,10 +57,19 @@ internal object ServiceAgentRuntimeComposition {
                 },
                 audio = object : DelayedPlaybackAudioPort {
                     override suspend fun playIfAdmitted(channelInstanceId: String, audio: OpaqueSynthesizedAudio): DelayedPlaybackAudioResult {
+                        val generation = dev.nilp0inter.subspace.channel.capability.generationOf(audio)
+                            ?: dev.nilp0inter.subspace.channel.capability.RuntimeGeneration.next()
                         val operation = AudioOperationCapabilityAdapter(
-                            PlaybackResultFactory { samples ->
-                                AudioOperationArtifact(dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, 16_000))
+                            PlaybackResultFactory { samples, operationGeneration ->
+                                AudioOperationArtifact(
+                                    dev.nilp0inter.subspace.audio.TtsAudio.toScoPlayback(samples, 16_000),
+                                    generation = operationGeneration,
+                                )
                             },
+                            identity = dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity(
+                                channelInstanceId,
+                                generation,
+                            ),
                         ).createPlaybackResult(audio)
                         val recording = (operation as? CapabilityOperationResult.Success)?.value?.let(::recordedPcmOf)
                             ?: return DelayedPlaybackAudioResult.Failed(dev.nilp0inter.subspace.model.DelayedPlaybackFailureReason.SYNTHESIS_FAILED)

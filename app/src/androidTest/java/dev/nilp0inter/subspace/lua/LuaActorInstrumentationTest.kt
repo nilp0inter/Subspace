@@ -7,6 +7,9 @@ import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.dependency.ConfigurationDataDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationUiDeclaration
+import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
 import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
@@ -34,6 +37,8 @@ import dev.nilp0inter.subspace.lua.actor.ActorRuntime
 import dev.nilp0inter.subspace.lua.actor.ActorStartupResult
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelDefinition
+import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
+import dev.nilp0inter.subspace.model.ChannelProviderResolution
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
 import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
@@ -71,6 +76,12 @@ import org.junit.runner.RunWith
 /** Test-only identity for generic Lua provider behavior. */
 private val TEST_LUA_IMPLEMENTATION_ID = ChannelImplementationId("internal:lua")
 
+/** Empty schema-version-1 declaration; mirrors a materialized package with no fields. */
+private fun emptyConfigurationDeclaration(): PackageConfigurationDeclaration = PackageConfigurationDeclaration(
+    ConfigurationDataDeclaration(emptyList()),
+    ConfigurationUiDeclaration(emptyList()),
+)
+
 /**
  * Constructs a test Lua provider with fixed identity and presentation.
  * Tests that need custom identity/presentation should use LuaChannelImplementationProvider.create.
@@ -93,6 +104,7 @@ private fun testLuaProvider(
     },
     bridge = bridge,
     actorPolicy = policy,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
 )
 
 /**
@@ -115,6 +127,7 @@ private fun testLuaProviderFromResult(
         ActorRuntimeFactory.createForGeneration(context, capabilities, kernelBridge, policy)
     },
     bridge = bridge,
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
 )
 
 /**
@@ -611,6 +624,9 @@ class LuaActorInstrumentationTest {
             compatibilityAndMalformedSourceFailBeforeActivation()
             instructionAndAllocatorFailuresAreContained()
             replacementAndShutdownCloseWithoutStaleEntry()
+            configuredStartupThroughProviderPath()
+            audioModulesThroughProductionJni()
+            noBuiltInDebugResolution()
         }
 
         private fun restrictedSourceAndPackageLoading() = case("provider_restricted_source_package_and_cache") {
@@ -871,6 +887,110 @@ class LuaActorInstrumentationTest {
                 fixture.shutdown()
                 assertEquals("case=shutdown_no_stale_entry", null, fixture.registry.getRuntimeSnapshot(generationH.id))
             }
+        }
+
+        private fun configuredStartupThroughProviderPath() = case("provider_configured_startup") {
+            fixture(image(
+                entry = "plugin.configured",
+                sources = mapOf("plugin.configured" to """
+                    local mode = nil
+                    return {
+                      startup = function(config)
+                        if type(config) ~= "table" or config.schema_version ~= 1 or type(config.values) ~= "table" or config.values.mode ~= "ECHO" then
+                          return { error = { code = "E_INVALID_ARGUMENT", detail = "expected mode=ECHO" } }
+                        end
+                        mode = config.values.mode
+                      end,
+                      handle_readiness = function()
+                        return { ready = mode == "ECHO", status = mode or "" }
+                      end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val definition = ChannelDefinition(
+                    id = "configured",
+                    name = "Configured startup",
+                    implementationId = TEST_LUA_IMPLEMENTATION_ID,
+                    enabled = true,
+                    configSchemaVersion = 1,
+                    configPayload = OpaqueJsonObject.fromJsonObject(JSONObject().put("mode", "ECHO")),
+                )
+                fixture.install(definition)
+                await("configured startup readiness") {
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                assertInputAccepted(fixture.registry, definition.id, "configured startup input")
+            }
+        }
+
+        private fun audioModulesThroughProductionJni() = case("provider_audio_modules") {
+            fixture(image(
+                entry = "plugin.audio",
+                sources = mapOf("plugin.audio" to """
+                    return {
+                      startup = function()
+                        local ok_t, t = pcall(function() return require("subspace.transcription") end)
+                        local ok_s, s = pcall(function() return require("subspace.synthesis") end)
+                        local ok_p, p = pcall(function() return require("subspace.playback") end)
+                        if not ok_t or type(t) ~= "table" then
+                          return { error = { code = "E_MODULE", detail = "subspace.transcription not available" } }
+                        end
+                        if not ok_s or type(s) ~= "table" then
+                          return { error = { code = "E_MODULE", detail = "subspace.synthesis not available" } }
+                        end
+                        if not ok_p or type(p) ~= "table" then
+                          return { error = { code = "E_MODULE", detail = "subspace.playback not available" } }
+                        end
+                      end,
+                      handle_readiness = function() return { ready = true } end,
+                      handle_input = function(event)
+                        if event.event ~= "capture" then return { error = { code = "E_INPUT", detail = "wrong event" } } end
+                        return { ok = true }
+                      end,
+                    }
+                """.trimIndent()),
+            )).use { fixture ->
+                val definition = definition("audio-modules")
+                fixture.install(definition)
+                await("audio modules readiness") {
+                    fixture.registry.getRuntimeSnapshot(definition.id)?.preparation == ChannelPreparationAvailability.Available
+                }
+                assertInputAccepted(fixture.registry, definition.id, "audio modules input")
+            }
+        }
+
+        private fun noBuiltInDebugResolution() = case("provider_no_builtin_debug") {
+            // BuiltInChannelImplementationIds should not declare a DEBUG constant
+            assertEquals(
+                "Expected no DEBUG field in BuiltInChannelImplementationIds",
+                null,
+                BuiltInChannelImplementationIds::class.java.fields.find { it.name == "DEBUG" },
+            )
+            // A registry with only the test Lua provider does not resolve any built-in
+            val providers = ChannelImplementationProviderRegistry()
+            providers.register(testLuaProvider(
+                image(
+                    entry = "plugin.nodebug",
+                    sources = mapOf("plugin.nodebug" to """
+                        return {
+                          startup = function() end,
+                          handle_readiness = function() return { ready = true } end,
+                        }
+                    """.trimIndent()),
+                ),
+                LuaNativeKernelBridge(),
+                policy(),
+            ))
+            val debugId = ChannelImplementationId("builtin:debug")
+            assertTrue(
+                "builtin:debug must be unresolved: ${providers.resolve(debugId)}",
+                providers.resolve(debugId) is ChannelProviderResolution.Missing,
+            )
+            val journalId = BuiltInChannelImplementationIds.JOURNAL
+            assertTrue(
+                "builtin:journal must be unresolved: ${providers.resolve(journalId)}",
+                providers.resolve(journalId) is ChannelProviderResolution.Missing,
+            )
         }
 
         private fun case(label: String, body: () -> Unit) {

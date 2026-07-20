@@ -75,6 +75,16 @@ internal object TelecomCarPttCoordinator {
     fun isCaptureRouteReady(): Boolean =
         lifecycle.currentState == TelecomCarPttLifecycle.State.Recording
 
+    /** True while Telecom is still reserving or owning the capture route. */
+    fun isCaptureActive(): Boolean = when (lifecycle.currentState) {
+        TelecomCarPttLifecycle.State.WaitingForRoute,
+        TelecomCarPttLifecycle.State.Recording,
+        -> true
+        TelecomCarPttLifecycle.State.Idle,
+        TelecomCarPttLifecycle.State.Released,
+        -> false
+    }
+
     fun checkRouteTimeout() {
         lifecycle.checkTimeout(SystemClock.elapsedRealtime())
     }

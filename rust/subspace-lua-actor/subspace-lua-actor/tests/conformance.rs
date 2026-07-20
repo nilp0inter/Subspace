@@ -21,12 +21,17 @@ fn assert_kind(outcome: &Outcome, expected: OutcomeKind) {
 }
 
 fn string_field(outcome: &Outcome, field: &str) -> String {
-    outcome
+    let val = outcome
         .to_json()
         .get(field)
-        .and_then(|value| value.as_str())
-        .unwrap_or_else(|| panic!("missing string field {field}: {:?}", outcome.to_json()))
-        .to_owned()
+        .cloned()
+        .unwrap_or_else(|| panic!("missing field {field}: {:?}", outcome.to_json()));
+    match val {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        other => panic!("expected string, number or bool for field {field}, got {:?}", other),
+    }
 }
 
 fn i64_field(outcome: &Outcome, field: &str) -> i64 {

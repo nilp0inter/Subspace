@@ -18,6 +18,7 @@ import dev.nilp0inter.subspace.audio.ScoRoute
 import dev.nilp0inter.subspace.audio.TelecomCapturePcmOutput
 import dev.nilp0inter.subspace.audio.ResponsePlayer
 import dev.nilp0inter.subspace.channel.capability.AudioOperationArtifact
+import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.model.InputMode
 import dev.nilp0inter.subspace.model.PttSource
 import dev.nilp0inter.subspace.model.ScoState
@@ -1202,7 +1203,7 @@ class PttAudioSessionManagerTest {
         val target = TerminalTarget(
             events = events,
             releasedResult = ChannelInputResult.PlaybackOperation(
-                AudioOperationArtifact(expectedPcm, operationId = "deferred-playback"),
+                AudioOperationArtifact(expectedPcm, operationId = "deferred-playback", generation = RuntimeGeneration(0)),
             ),
         )
         val output = TerminalOutput(events)

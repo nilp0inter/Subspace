@@ -10,6 +10,7 @@ import dev.nilp0inter.subspace.lua.actor.ActorRuntimeCreationResult
 import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
 import dev.nilp0inter.subspace.model.ChannelConfigurationMigrationStep
 import dev.nilp0inter.subspace.model.ChannelConfigurationProvider
+import dev.nilp0inter.subspace.model.ChannelConfigurationField
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
@@ -40,7 +41,10 @@ internal class LuaChannelImplementationProvider private constructor(
     private val bridge: LuaKernelBridge,
     private val actorPolicy: ActorPolicy,
     private val validationBounds: ValidationBounds,
-    private val logSink: PluginLogSink = NoOpPluginLogSink
+    private val logSink: PluginLogSink = NoOpPluginLogSink,
+    private val configurationProvider: ChannelConfigurationProvider,
+    private val configurationProviderFields: List<ChannelConfigurationField> = emptyList(),
+    private val configurationRequiredCapabilities: Set<ChannelCapability> = emptySet(),
 ) : ChannelImplementationProvider {
 
     companion object {
@@ -57,7 +61,10 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge: LuaKernelBridge,
             actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
             validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
-            logSink: PluginLogSink = NoOpPluginLogSink
+            logSink: PluginLogSink = NoOpPluginLogSink,
+            configurationProvider: ChannelConfigurationProvider,
+            configurationFields: List<ChannelConfigurationField> = emptyList(),
+            requiredCapabilities: Set<ChannelCapability> = emptySet(),
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -68,6 +75,9 @@ internal class LuaChannelImplementationProvider private constructor(
             actorPolicy = actorPolicy,
             validationBounds = validationBounds,
             logSink = logSink,
+            configurationProvider = configurationProvider,
+            configurationProviderFields = configurationFields,
+            configurationRequiredCapabilities = requiredCapabilities,
         )
 
         /**
@@ -83,7 +93,10 @@ internal class LuaChannelImplementationProvider private constructor(
             bridge: LuaKernelBridge,
             actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
             validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
-            logSink: PluginLogSink = NoOpPluginLogSink
+            logSink: PluginLogSink = NoOpPluginLogSink,
+            configurationProvider: ChannelConfigurationProvider,
+            configurationFields: List<ChannelConfigurationField> = emptyList(),
+            requiredCapabilities: Set<ChannelCapability> = emptySet(),
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -94,16 +107,18 @@ internal class LuaChannelImplementationProvider private constructor(
             actorPolicy = actorPolicy,
             validationBounds = validationBounds,
             logSink = logSink,
+            configurationProvider = configurationProvider,
+            configurationProviderFields = configurationFields,
+            configurationRequiredCapabilities = requiredCapabilities,
         )
-
     }
 
     override val descriptor = ChannelImplementationDescriptor(
         implementationId = implementationId,
         presentation = presentation,
-        configuration = LuaEmptyConfigurationProvider(implementationId),
-        configurationFields = emptyList(),
-        requiredCapabilities = emptySet<ChannelCapability>(),
+        configuration = configurationProvider,
+        configurationFields = configurationProviderFields,
+        requiredCapabilities = configurationRequiredCapabilities,
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
     )
 
@@ -221,7 +236,10 @@ internal class LuaChannelImplementationProvider private constructor(
                 stateHandle = stateHandle,
                 bridge = bridge,
                 callbacks = callbacks,
+                configuration = request.configuration,
                 logSink = logSink,
+                capabilities = request.capabilities,
+                initialSummary = presentation.summary,
             ),
         )
     }
@@ -274,43 +292,3 @@ internal class LuaChannelImplementationProvider private constructor(
 
 }
 
-/** Minimal schema boundary; Lua source is never decoded from configuration. */
-private class LuaEmptyConfigurationProvider(
-    override val implementationId: ChannelImplementationId
-) : ChannelConfigurationProvider {
-    override val currentSchemaVersion: Int = 1
-
-    override fun defaultPayload(): OpaqueJsonObject = OpaqueJsonObject.fromJsonObject(JSONObject())
-
-    override fun validate(schemaVersion: Int, payload: OpaqueJsonObject): ProviderConfigurationResult {
-        if (schemaVersion != currentSchemaVersion) {
-            return ProviderConfigurationResult.Failure(
-                ChannelProviderError.UnsupportedSchemaVersion(
-                    implementationId,
-                    schemaVersion,
-                    currentSchemaVersion,
-                ),
-            )
-        }
-        return if (payload.toJsonObject().length() == 0) {
-            ProviderConfigurationResult.Success(
-                ValidatedChannelConfiguration(implementationId, schemaVersion, payload),
-            )
-        } else {
-            ProviderConfigurationResult.Failure(
-                ChannelProviderError.InvalidConfiguration(
-                    implementationId,
-                    schemaVersion,
-                    "Lua provider configuration must be empty",
-                ),
-            )
-        }
-    }
-
-    override fun migrateStep(
-        fromSchemaVersion: Int,
-        payload: OpaqueJsonObject,
-    ): ChannelConfigurationMigrationStep = ChannelConfigurationMigrationStep.Failure(
-        ChannelProviderError.UnsupportedSchemaVersion(implementationId, fromSchemaVersion, currentSchemaVersion),
-    )
-}

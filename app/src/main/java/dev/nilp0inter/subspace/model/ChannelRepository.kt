@@ -114,17 +114,6 @@ class ChannelRepository(
                 ),
             ),
         )
-        val debugMode = prefs.getString(KEY_DEBUG_MODE, DebugMode.ECHO.name)
-            ?.let { value -> runCatching { DebugMode.valueOf(value) }.getOrNull() }
-            ?: DebugMode.ECHO
-        val debugDefinition = ChannelDefinition(
-            id = LegacyPreferenceCatalogueSeed.DEBUG_ID,
-            name = LegacyPreferenceCatalogueSeed.DEBUG_NAME,
-            implementationId = BuiltInChannelImplementationIds.DEBUG,
-            enabled = true,
-            configSchemaVersion = 1,
-            configPayload = DebugProviderConfigurationCodec.encode(DebugProviderConfiguration(debugMode)),
-        )
         val hostProfileKey = prefs.getString(KEY_KEYBOARD_HOST_PROFILE, "linux:us") ?: "linux:us"
         val keyboardDefinition = ChannelDefinition(
             id = LegacyPreferenceCatalogueSeed.KEYBOARD_ID,
@@ -136,7 +125,7 @@ class ChannelRepository(
                 KeyboardProviderConfiguration(hostProfileKey.takeIf(::isHostProfileKey) ?: "linux:us"),
             ),
         )
-        val definitions = listOf(journalDefinition, debugDefinition, keyboardDefinition)
+        val definitions = listOf(journalDefinition, keyboardDefinition)
         val preferredActiveId = prefs.getString(KEY_ACTIVE_CHANNEL, LegacyPreferenceCatalogueSeed.JOURNAL_ID)
         return ChannelCatalogueSnapshot(
             definitions = definitions,
@@ -249,8 +238,6 @@ class ChannelRepository(
         private object LegacyPreferenceCatalogueSeed {
             const val JOURNAL_ID = "captains-log"
             const val JOURNAL_NAME = "Journal"
-            const val DEBUG_ID = "debug-channel"
-            const val DEBUG_NAME = "Debug Channel"
             const val KEYBOARD_ID = "keyboard-channel"
             const val KEYBOARD_NAME = "Keyboard Channel"
         }
@@ -259,7 +246,6 @@ class ChannelRepository(
         private const val KEY_BASE_DIRECTORY = "journal_base_directory"
         private const val KEY_SAVE_VOICE = "journal_save_voice"
         private const val KEY_SAVE_TEXT = "journal_save_text"
-        private const val KEY_DEBUG_MODE = "debug_channel_mode"
         private const val KEY_ACTIVE_CHANNEL = "active_channel_id"
         private const val KEY_KEYBOARD_HOST_PROFILE = "keyboard_host_profile"
 

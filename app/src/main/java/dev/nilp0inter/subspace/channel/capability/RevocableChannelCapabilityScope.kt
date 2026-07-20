@@ -114,6 +114,13 @@ class RevocableChannelCapabilityScope(
         if (!state.compareAndSet(ScopeState.OPEN, ScopeState.REVOKED) &&
             !state.compareAndSet(ScopeState.PENDING, ScopeState.REVOKED)
         ) return CapabilityScopeTerminationResult.AlreadyClosed
+        // Notify host-owned resources even when no lease is currently retained. Deferred
+        // playback entries outlive the short capability lease used for scheduling, so lease
+        // cleanup alone cannot revoke those queued entries. The host callback is idempotent and
+        // runs after the scope's terminal state is visible to concurrent callers.
+        runCatching {
+            host.onGenerationTermination(identity, CapabilityLeaseTermination.REVOKED)
+        }
 
         var cleanupFailed = false
         for (lease in leases.toList()) {

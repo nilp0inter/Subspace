@@ -553,5 +553,5 @@ class DelayedPlaybackCoordinatorTest {
         }
     }
     private fun opaqueAudio(operationId: String): OpaqueSynthesizedAudio =
-        SynthesizedAudioArtifact(floatArrayOf(0.25f), operationId)
+        SynthesizedAudioArtifact(floatArrayOf(0.25f), operationId = operationId, generation = RuntimeGeneration(0))
 }

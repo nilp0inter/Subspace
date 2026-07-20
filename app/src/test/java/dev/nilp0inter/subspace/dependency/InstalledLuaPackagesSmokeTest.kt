@@ -17,6 +17,8 @@ import dev.nilp0inter.subspace.lua.LuaSpawnAdmission
 import dev.nilp0inter.subspace.lua.LuaStateHandle
 import dev.nilp0inter.subspace.lua.LuaValue
 import dev.nilp0inter.subspace.lua.LuaPackageMaterializer
+import dev.nilp0inter.subspace.model.ChannelConfigurationField
+import org.json.JSONObject
 import dev.nilp0inter.subspace.model.BuiltInChannelImplementationIds
 import dev.nilp0inter.subspace.model.ChannelCatalogueSnapshot
 import dev.nilp0inter.subspace.model.ChannelDefinition
@@ -34,6 +36,7 @@ import dev.nilp0inter.subspace.service.RuntimeInvocationPolicy
 import dev.nilp0inter.subspace.service.RuntimeWorkerDispatcher
 import dev.nilp0inter.subspace.service.CompositionProvider
 import java.io.ByteArrayInputStream
+import java.security.MessageDigest
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets.UTF_8
@@ -263,6 +266,85 @@ class InstalledLuaPackagesSmokeTest {
         }
     }
 
+    @Test
+    fun `10_2 evolved declaration round-trip through store materializes exact fields capabilities and fingerprint without Lua`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingLuaKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val repository = repository(root, bridge, providers)
+
+            // Package with non-empty configuration and capabilities
+            val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
+            val luaSource = "-- evolved fixture\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+            val archive = strictUnixStoredZip(
+                listOf(
+                    ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
+                    ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                    ZipFixtureEntry("lua/plugin.lua", luaSource.toByteArray(UTF_8), 0b1000000110100100),
+                ),
+            )
+            val expectedDigest = MessageDigest.getInstance("SHA-256").digest(archive).joinToString("") { "%02x".format(it) }
+            val source = sourceRecord()
+
+            // Install through the store
+            success(repository.installOrUpdate(ByteArrayInputStream(archive), source))
+            val implementationId = InstalledProviderId.derive(source.repositoryId)
+
+            // Verify stored index has the evolved manifest
+            val storedIndex = success(InstalledPackageStore(root).loadIndex()).index
+            val storedRecord = requireNotNull(storedIndex.providers[source.repositoryId])
+            assertEquals(expectedDigest, storedRecord.active.digest.value)
+            assertEquals(3, storedRecord.active.manifest.configuration.data.fields.size)
+            assertEquals(3, storedRecord.active.manifest.configuration.ui.fields.size)
+            assertEquals(3, storedRecord.active.manifest.capabilities.size)
+
+            // Restart: loadAndPublish from stored bytes
+            val restartedBridge = RecordingLuaKernelBridge()
+            val restartedProviders = ChannelImplementationProviderRegistry()
+            val restartedRepository = repository(root, restartedBridge, restartedProviders)
+            assertEquals(Unit, success(restartedRepository.loadAndPublish()))
+
+            // Verify the provider resolved with exact fingerprint == digest
+            val resolved = availableFingerprint(restartedProviders, implementationId)
+            assertEquals("Fingerprint must equal exact SHA-256 of committed archive bytes", expectedDigest, resolved.value)
+
+            // Verify declaration compilation produced exact fields from reparsed bytes
+            val descriptor = (restartedProviders.resolve(implementationId) as? ChannelProviderResolution.Available)
+                ?.provider?.descriptor
+                ?: throw AssertionError("Provider must be available after restart")
+            val fields = descriptor.configurationFields
+            assertEquals(3, fields.size)
+            val modeField = fields.find { it.id == "mode" } as? ChannelConfigurationField.ChoiceField
+                ?: throw AssertionError("mode must be ChoiceField")
+            assertEquals("Mode", modeField.label)
+            assertEquals(5, modeField.choices.size)
+            val verboseField = fields.find { it.id == "verbose" } as? ChannelConfigurationField.BooleanField
+                ?: throw AssertionError("verbose must be BooleanField")
+            assertEquals("Verbose", verboseField.label)
+            val retryField = fields.find { it.id == "retry_count" } as? ChannelConfigurationField.NumberField
+                ?: throw AssertionError("retry_count must be NumberField")
+            assertEquals("Retry Count", retryField.label)
+            assertEquals(0L, retryField.minimum)
+            assertEquals(10L, retryField.maximum)
+
+            // Verify capability compilation from reparsed manifest
+            val caps = descriptor.requiredCapabilities
+            assertTrue("must contain Transcription", caps.any { it.stableId == "transcription" })
+            assertTrue("must contain Synthesis", caps.any { it.stableId == "synthesis" })
+            assertTrue("must contain AudioOperation (from playback)", caps.any { it.stableId == "audio-operation" })
+            assertTrue("must contain DeferredAudioPlayback (from playback)", caps.any { it.stableId == "deferred-audio-playback" })
+
+            // Verify defaults compiled correctly
+            val defaults = descriptor.configuration.defaultPayload().toJsonObject()
+            assertEquals("ECHO", defaults.getString("mode"))
+            assertFalse(defaults.getBoolean("verbose"))
+            assertEquals(3L, defaults.getLong("retry_count"))
+
+            // Verify restart materialization does not create Lua states (only runtime does)
+            assertEquals(0, restartedBridge.createdStateIds.size)
+        }
+    }
+
     private fun TestScope.runtimeRegistry(providers: ChannelImplementationProviderRegistry): ChannelRuntimeRegistry =
         ChannelRuntimeRegistry(
             providers = providers,
@@ -348,7 +430,7 @@ class InstalledLuaPackagesSmokeTest {
 
     private fun packageArchive(version: String, sourceMarker: String): ByteArray {
         val source = "-- $sourceMarker\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Smoke package","summary":"Installed Lua smoke package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"}}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Smoke package","summary":"Installed Lua smoke package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
@@ -497,7 +579,12 @@ class InstalledLuaPackagesSmokeTest {
             return completed(handle, "[\"startup\",\"handle_readiness\"]")
         }
 
-        override fun invokeStartupCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome {
+        override fun invokeStartupCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome {
             calls += 1
             callbackNames += callbackHandle.name
             return completed(handle)

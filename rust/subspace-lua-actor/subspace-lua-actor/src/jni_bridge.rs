@@ -61,33 +61,48 @@ use crate::outcome::{Outcome, OutcomeKind};
 use crate::ownership::{Generation, OperationId, StateId};
 use crate::state::{SpawnAdmission, SpawnAdmitter, StateEngine};
 
+struct HostAdmitter {
+    vm: jni::JavaVM,
+    host: GlobalRef,
+}
+
+impl SpawnAdmitter for HostAdmitter {
+    fn admit(&self, coroutine_id: i64) -> SpawnAdmission {
+        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return SpawnAdmission::Closed };
+        match env.call_method(&self.host, "admitTask", "(J)I", &[JValue::Long(coroutine_id)]).and_then(|v| v.i()) {
+            Ok(0) => SpawnAdmission::Accepted,
+            Ok(2) => SpawnAdmission::Capacity,
+            _ => { let _ = env.exception_clear(); SpawnAdmission::Closed }
+        }
+    }
+
+    fn admit_transcription(&self, operation_id: i64, token: String) -> i32 {
+        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
+        let token = match env.new_string(token) { Ok(s) => s, Err(_) => return 1 };
+        let result = env.call_method(&self.host, "admitTranscription", "(JLjava/lang/String;)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(token))]).and_then(|v| v.i());
+        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
+    }
+    fn admit_synthesis(&self, operation_id: i64, params_json: String) -> i32 {
+        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
+        let params = match env.new_string(params_json) { Ok(s) => s, Err(_) => return 1 };
+        let result = env.call_method(&self.host, "admitSynthesis", "(JLjava/lang/String;)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(params))]).and_then(|v| v.i());
+        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
+    }
+    fn admit_playback(&self, operation_id: i64, token: String, delay_seconds: f64) -> i32 {
+        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
+        let token = match env.new_string(token) { Ok(s) => s, Err(_) => return 1 };
+        let result = env.call_method(&self.host, "admitPlayback", "(JLjava/lang/String;D)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(token)), JValue::Double(delay_seconds)]).and_then(|v| v.i());
+        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
+    }
+}
+
 fn spawn_admitter(
     env: &mut JNIEnv,
     host_admitter: JObject,
 ) -> Result<Arc<dyn SpawnAdmitter>, Outcome> {
-    let vm = env
-        .get_java_vm()
-        .map_err(|_| Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"))?;
-    let host: GlobalRef = env
-        .new_global_ref(host_admitter)
-        .map_err(|_| Outcome::runtime_failure("unable to retain host spawn admission"))?;
-    Ok(Arc::new(move |coroutine_id| {
-        let mut callback_env = match vm.attach_current_thread() {
-            Ok(env) => env,
-            Err(_) => return SpawnAdmission::Closed,
-        };
-        match callback_env
-            .call_method(&host, "admitTask", "(J)I", &[JValue::Long(coroutine_id)])
-            .and_then(|value| value.i())
-        {
-            Ok(0) => SpawnAdmission::Accepted,
-            Ok(2) => SpawnAdmission::Capacity,
-            _ => {
-                let _ = callback_env.exception_clear();
-                SpawnAdmission::Closed
-            }
-        }
-    }))
+    let vm = env.get_java_vm().map_err(|_| Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"))?;
+    let host = env.new_global_ref(host_admitter).map_err(|_| Outcome::runtime_failure("unable to retain host spawn admission"))?;
+    Ok(Arc::new(HostAdmitter { vm, host }))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,9 +576,7 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeIn
         };
         let vm = match env.get_java_vm() {
             Ok(vm) => vm,
-            Err(_) => {
-                return Outcome::runtime_failure("unable to acquire JavaVM for spawn admission")
-            }
+            Err(_) => return Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"),
         };
         let host: GlobalRef = match env.new_global_ref(host_admitter) {
             Ok(host) => host,
@@ -588,6 +601,41 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeIn
         });
         with_state(sid, gen, |engine| {
             engine.invoke_callback_with_spawn_admitter(gen, &name, &args, admitter)
+        })
+    })
+}
+
+/// `nativeInvokeInputCallback(stateId: Long, generation: Long, argumentsJson: String, capturedAudioToken: String, hostAdmitter: Object): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeInputCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    arguments_json: JString,
+    captured_audio_token: JString,
+    host_admitter: JObject,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let args = match jstring_to_rust(env, &arguments_json) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("argumentsJson string is invalid"),
+        };
+        let token = match jstring_to_rust(env, &captured_audio_token) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("capturedAudioToken string is invalid"),
+        };
+        let admitter = match spawn_admitter(env, host_admitter) {
+            Ok(admitter) => admitter,
+            Err(outcome) => return outcome,
+        };
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.invoke_input_callback_with_spawn_admitter(
+                generation as Generation,
+                &args,
+                &token,
+                admitter,
+            )
         })
     })
 }
@@ -629,6 +677,7 @@ static JNI_SYMBOLS: &[&str] = &[
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeClose",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeLoadProgramImage",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeCallback",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeInputCallback",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine",
 ];
 

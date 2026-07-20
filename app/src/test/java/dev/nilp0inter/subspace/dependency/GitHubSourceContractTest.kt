@@ -1,5 +1,6 @@
 package dev.nilp0inter.subspace.dependency
 
+import java.security.MessageDigest
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -235,6 +236,78 @@ class GitHubSourceContractTest {
     }
 
     @Test
+    fun `public Diagnostics v1_2_0 provenance resolves downloads and preserves exact bytes`() = runTest {
+        val archive = fixture("diagnostics-channel/subspace-channel.zip")
+        assertEquals(DIAGNOSTICS_SIZE, archive.size.toLong())
+        assertEquals(DIAGNOSTICS_SHA256, sha256(archive))
+        val transport = QueueTransport(
+            response(200, repositoryJson(id = DIAGNOSTICS_REPOSITORY_ID, ownerId = OFFICIAL_OWNER_ID, ownerLogin = "nilp0inter")),
+            response(200, "[${releaseJson(DIAGNOSTICS_RELEASE_ID, DIAGNOSTICS_PUBLISHED_AT, tag = "v1.2.0", assetId = DIAGNOSTICS_ASSET_ID, assetSize = DIAGNOSTICS_SIZE)}]"),
+            response(200, archive, mapOf("Content-Length" to DIAGNOSTICS_SIZE.toString())),
+        )
+        val source = client(transport, bounds(maxExactAssetBytes = DIAGNOSTICS_SIZE))
+        val repository = success(source.resolveRepository(DIAGNOSTICS_COORDINATES))
+        assertEquals(DIAGNOSTICS_REPOSITORY_ID, repository.id.value)
+        assertEquals(OFFICIAL_OWNER_ID, repository.owner.ownerId)
+        val release = success(source.listStableReleaseAssets(DIAGNOSTICS_COORDINATES)).single()
+        assertEquals(DIAGNOSTICS_RELEASE_ID, release.first.releaseId)
+        assertEquals("v1.2.0", release.first.tag)
+        assertEquals(DIAGNOSTICS_PUBLISHED_EPOCH, release.first.publishedAtEpochSeconds)
+        assertEquals(DIAGNOSTICS_ASSET_ID, release.second.assetId)
+        assertEquals(GitHubSourceConfiguration.CANONICAL_ASSET_NAME, release.second.name)
+        assertEquals(DIAGNOSTICS_SIZE, release.second.size)
+        val downloaded = ByteArrayOutputStream()
+        assertEquals(Unit, success(source.downloadAsset(DIAGNOSTICS_COORDINATES, release.second, downloaded)))
+        assertEquals(DIAGNOSTICS_SIZE, downloaded.size().toLong())
+        assertEquals(DIAGNOSTICS_SHA256, sha256(downloaded.toByteArray()))
+        assertTrue(archive.contentEquals(downloaded.toByteArray()))
+        assertEquals(
+            listOf(
+                "https://api.github.com/repos/nilp0inter/diagnostics-channel",
+                "https://api.github.com/repos/nilp0inter/diagnostics-channel/releases",
+                "https://api.github.com/repos/nilp0inter/diagnostics-channel/releases/assets/$DIAGNOSTICS_ASSET_ID",
+            ),
+            transport.requests.map { it.url },
+        )
+    }
+
+    @Test
+    fun `public Debug v1_0_0 provenance resolves downloads and preserves exact bytes`() = runTest {
+        val archive = fixture("debug-channel/subspace-channel.zip")
+        assertEquals(DEBUG_SIZE, archive.size.toLong())
+        assertEquals(DEBUG_SHA256, sha256(archive))
+        val transport = QueueTransport(
+            response(200, repositoryJson(id = DEBUG_REPOSITORY_ID, ownerId = OFFICIAL_OWNER_ID, ownerLogin = "nilp0inter")),
+            response(200, "[${releaseJson(DEBUG_RELEASE_ID, DEBUG_PUBLISHED_AT, tag = "v1.0.0", assetId = DEBUG_ASSET_ID, assetSize = DEBUG_SIZE)}]"),
+            response(200, archive, mapOf("Content-Length" to DEBUG_SIZE.toString())),
+        )
+        val source = client(transport, bounds(maxExactAssetBytes = DEBUG_SIZE))
+        val repository = success(source.resolveRepository(DEBUG_COORDINATES))
+        assertEquals(DEBUG_REPOSITORY_ID, repository.id.value)
+        assertEquals(OFFICIAL_OWNER_ID, repository.owner.ownerId)
+        val release = success(source.listStableReleaseAssets(DEBUG_COORDINATES)).single()
+        assertEquals(DEBUG_RELEASE_ID, release.first.releaseId)
+        assertEquals("v1.0.0", release.first.tag)
+        assertEquals(DEBUG_PUBLISHED_EPOCH, release.first.publishedAtEpochSeconds)
+        assertEquals(DEBUG_ASSET_ID, release.second.assetId)
+        assertEquals(GitHubSourceConfiguration.CANONICAL_ASSET_NAME, release.second.name)
+        assertEquals(DEBUG_SIZE, release.second.size)
+        val downloaded = ByteArrayOutputStream()
+        assertEquals(Unit, success(source.downloadAsset(DEBUG_COORDINATES, release.second, downloaded)))
+        assertEquals(DEBUG_SIZE, downloaded.size().toLong())
+        assertEquals(DEBUG_SHA256, sha256(downloaded.toByteArray()))
+        assertTrue(archive.contentEquals(downloaded.toByteArray()))
+        assertEquals(
+            listOf(
+                "https://api.github.com/repos/nilp0inter/debug-channel",
+                "https://api.github.com/repos/nilp0inter/debug-channel/releases",
+                "https://api.github.com/repos/nilp0inter/debug-channel/releases/assets/$DEBUG_ASSET_ID",
+            ),
+            transport.requests.map { it.url },
+        )
+    }
+
+    @Test
     fun `rate-limit exhaustion is surfaced while inaccessible HTTP failures remain distinct`() = runTest {
         val limited = GitHubRateLimit(limit = 60, remaining = 0, resetTimeEpochSeconds = 1_800_000_000)
         val cases = listOf(
@@ -359,6 +432,13 @@ class GitHubSourceContractTest {
         )
         assertTrue("timed-out operation must not start a transport request", transport.requests.isEmpty())
     }
+
+    private fun fixture(path: String): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(path)) {
+        "Missing immutable public release fixture $path"
+    }.use { it.readBytes() }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
     private fun client(transport: GitHubTransport, bounds: GitHubClientBounds = bounds()): RealGitHubPackageSourceClient =
         RealGitHubPackageSourceClient(transport, bounds)
@@ -493,6 +573,23 @@ class GitHubSourceContractTest {
 
     private companion object {
         private val coordinates = GitHubRepositoryCoordinates("Owner", "Repository")
+        private val DIAGNOSTICS_COORDINATES = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel")
+        private val DEBUG_COORDINATES = GitHubRepositoryCoordinates("nilp0inter", "debug-channel")
+        private const val OFFICIAL_OWNER_ID = "1224006"
+        private const val DIAGNOSTICS_REPOSITORY_ID = "1305223892"
+        private const val DIAGNOSTICS_RELEASE_ID = "356470779"
+        private const val DIAGNOSTICS_ASSET_ID = "482931807"
+        private const val DIAGNOSTICS_PUBLISHED_AT = "2026-07-20T01:58:13Z"
+        private const val DIAGNOSTICS_PUBLISHED_EPOCH = 1784512693L
+        private const val DIAGNOSTICS_SIZE = 5153L
+        private const val DIAGNOSTICS_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
+        private const val DEBUG_REPOSITORY_ID = "1306065111"
+        private const val DEBUG_RELEASE_ID = "356470937"
+        private const val DEBUG_ASSET_ID = "482932674"
+        private const val DEBUG_PUBLISHED_AT = "2026-07-20T01:59:29Z"
+        private const val DEBUG_PUBLISHED_EPOCH = 1784512769L
+        private const val DEBUG_SIZE = 7103L
+        private const val DEBUG_SHA256 = "f90c8c073378659acac1fbb63f100e1d1b180d69b05a154ecefc3cd17887b76a"
 
         private fun response(code: Int, body: String, headers: Map<String, String> = emptyMap()): FakeResponse =
             FakeResponse(code, body.toByteArray(), headers)

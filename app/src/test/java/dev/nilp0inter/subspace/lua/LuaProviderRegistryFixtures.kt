@@ -58,6 +58,32 @@ internal object LuaProviderRegistryFixtures {
         ),
     )
 
+    /** Input callback returns the normalized application-error branch. */
+    fun normalizedError(): ImmutableProgramImage = image(
+        entryPoint = "plugin.normalized_error",
+        sources = mapOf(
+            "plugin.normalized_error" to """
+                return {
+                    startup = function() end,
+                    handle_readiness = function() return { ready = true } end,
+                    handle_input = function(event)
+                        return nil, { code = "E_INVALID_VALUE", detail = "invalid input" }
+                    end,
+                }
+            """.trimIndent(),
+        ),
+    )
+
+
+    /** Invalid module grammar is rejected from the source map before provider state creation. */
+    fun sourceBound(): ProgramImageCreationResult = ImmutableProgramImage.create(
+        entryPoint = "plugin.source_bound",
+        sourceMap = mapOf(
+            "plugin.source_bound" to "return { startup = function() end }",
+            "plugin.bad-module" to "return {}",
+        ),
+        requirements = LuaProgramRequirements(LUA_VERSION, API_VERSION),
+    )
     fun entryEffectAttempt(): ImmutableProgramImage = image(
         entryPoint = "plugin.entry_effect",
         sources = mapOf(

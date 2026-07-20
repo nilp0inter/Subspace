@@ -436,7 +436,7 @@ internal class ServiceCoreInitializer(
 
     /** Transcription capability adapter, or null if STT is not yet constructed. */
     fun transcriptionCapability(identity: CapabilityScopeIdentity): TranscriptionCapability? =
-        transcriptionService?.let(::TranscriptionCapabilityAdapter)
+        transcriptionService?.let { TranscriptionCapabilityAdapter(it, identity) }
 
     /**
      * Synthesis capability adapter, or null if TTS is not yet constructed.
@@ -448,7 +448,7 @@ internal class ServiceCoreInitializer(
         voiceStylePath: () -> String?,
         totalSteps: () -> Int,
     ): SynthesisCapability? = ttsSynthesizer?.let { synthesizer ->
-        SynthesisCapabilityAdapter(synthesizer) { voice ->
+        SynthesisCapabilityAdapter(synthesizer, { voice ->
             if (voice.id != "default") {
                 null
             } else {
@@ -459,7 +459,7 @@ internal class ServiceCoreInitializer(
                     )
                 }
             }
-        }
+        }, identity)
     }
 
     /**

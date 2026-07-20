@@ -34,6 +34,7 @@ class ExternalDiagnosticsChannelContractTest {
         }.use { it.readBytes() }
 
         assertEquals(ARTIFACT_SHA256, sha256(artifact))
+        assertEquals(ARTIFACT_SIZE, artifact.size)
 
         val revision = success(
             PackageValidator.validatePackage(
@@ -44,7 +45,7 @@ class ExternalDiagnosticsChannelContractTest {
         )
 
         assertEquals(GitHubRepositoryIdentity(REPOSITORY_ID), revision.manifest.repositoryId)
-        assertEquals("1.0.0", revision.manifest.packageVersion)
+        assertEquals("1.2.0", revision.manifest.packageVersion)
         assertEquals("plugin", revision.programImage.entryPoint)
         assertEquals(LUA_VERSION, revision.manifest.runtime.luaVersion)
         assertEquals(API_VERSION, revision.manifest.runtime.apiVersion)
@@ -74,9 +75,9 @@ class ExternalDiagnosticsChannelContractTest {
     private fun sourceRecord(): PackageSourceRecord = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
         coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
-        release = GitHubReleaseIdentity("1", "v1.0.0", false),
-        asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
-        ownerId = "9000001",
+        release = GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false),
+        asset = GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"),
+        ownerId = OFFICIAL_OWNER_ID,
     )
 
     private fun <T> success(outcome: PackageOutcome<T>): T = when (outcome) {
@@ -129,6 +130,7 @@ class ExternalDiagnosticsChannelContractTest {
         override fun invokeStartupCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
+            config: LuaValue,
             spawnAdmission: LuaSpawnAdmission,
         ): LuaKernelOutcome = unused()
 
@@ -149,6 +151,10 @@ class ExternalDiagnosticsChannelContractTest {
     private companion object {
         private const val RESOURCE_PATH = "diagnostics-channel/subspace-channel.zip"
         private const val REPOSITORY_ID = "1305223892"
-        private const val ARTIFACT_SHA256 = "a1609ba59e3bac16dbcdf03532f9774848aaf18ec46137e6bda7cecc012c6b87"
+        private const val RELEASE_ID = "356470779"
+        private const val ASSET_ID = "482931807"
+        private const val OFFICIAL_OWNER_ID = "1224006"
+        private const val ARTIFACT_SIZE = 5153
+        private const val ARTIFACT_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
     }
 }

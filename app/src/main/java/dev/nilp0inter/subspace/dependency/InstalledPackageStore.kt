@@ -15,12 +15,25 @@ import java.util.Collections
 import java.util.LinkedHashMap
 
 /**
+ * Trust/shape of the manifest cached in the durable installed-package index.
+ *
+ * [LEGACY_PRE_CUTOVER] is a host-internal recovery carrier only: its empty
+ * declaration values are not authoritative and must never be passed to a
+ * materializer. Exact archive bytes remain authoritative after revalidation.
+ */
+public enum class CachedManifestTrust {
+    EVOLVED_VERIFIED,
+    LEGACY_PRE_CUTOVER
+}
+
+/**
  * 3.1: Stored revision representing a snapshot of a package metadata and artifact digest.
  */
 public data class StoredPackageRevision(
     val digest: ArtifactDigest,
     val manifest: PackageManifest,
-    val sourceRecord: PackageSourceRecord
+    val sourceRecord: PackageSourceRecord,
+    val cachedManifestTrust: CachedManifestTrust = CachedManifestTrust.EVOLVED_VERIFIED
 ) {
     init {
         require(manifest.repositoryId == sourceRecord.repositoryId) {
@@ -120,12 +133,19 @@ internal object StrictIndexCodec {
     private fun encodeRevision(rev: StoredPackageRevision): String {
         return """{
   "digest": ${encodeJsonString(rev.digest.value)},
-  "manifest": ${encodeManifest(rev.manifest).replace("\n", "\n  ")},
+  "manifest": ${encodeManifest(rev.manifest, rev.cachedManifestTrust).replace("\n", "\n  ")},
   "sourceRecord": ${encodeSourceRecord(rev.sourceRecord).replace("\n", "\n  ")}
 }"""
     }
 
-    private fun encodeManifest(manifest: PackageManifest): String {
+    private fun encodeManifest(manifest: PackageManifest, trust: CachedManifestTrust): String {
+        val evolvedFields = if (trust == CachedManifestTrust.EVOLVED_VERIFIED) {
+            """,
+  "configuration": ${encodeConfiguration(manifest.configuration).replace("\n", "\n  ")},
+  "capabilities": ${encodeCapabilities(manifest.capabilities)}"""
+        } else {
+            ""
+        }
         return """{
   "manifestVersion": ${manifest.manifestVersion},
   "repositoryId": ${encodeJsonString(manifest.repositoryId.value)},
@@ -138,8 +158,115 @@ internal object StrictIndexCodec {
   "runtime": {
     "luaVersion": ${encodeJsonString(manifest.runtime.luaVersion)},
     "apiVersion": ${encodeJsonString(manifest.runtime.apiVersion)}
-  }
+  }$evolvedFields
 }"""
+    }
+
+    private fun encodeConfiguration(config: PackageConfigurationDeclaration): String {
+        val sb = StringBuilder()
+        sb.append("{\n")
+        sb.append("  \"schemaVersion\": 1,\n")
+        sb.append("  \"data\": {\n")
+        sb.append("    \"additionalProperties\": false,\n")
+        sb.append("    \"fields\": [\n")
+        for ((idx, field) in config.data.fields.withIndex()) {
+            sb.append("      ").append(encodeDataField(field).replace("\n", "\n      "))
+            if (idx < config.data.fields.size - 1) {
+                sb.append(",")
+            }
+            sb.append("\n")
+        }
+        sb.append("    ]\n")
+        sb.append("  },\n")
+        sb.append("  \"ui\": {\n")
+        sb.append("    \"fields\": [\n")
+        for ((idx, field) in config.ui.fields.withIndex()) {
+            sb.append("      ").append(encodeUiField(field).replace("\n", "\n      "))
+            if (idx < config.ui.fields.size - 1) {
+                sb.append(",")
+            }
+            sb.append("\n")
+        }
+        sb.append("    ]\n")
+        sb.append("  }\n")
+        sb.append("}")
+        return sb.toString()
+    }
+
+    private fun encodeDataField(field: ConfigurationFieldDeclaration): String {
+        val sb = StringBuilder()
+        sb.append("{\n")
+        sb.append("  \"id\": ").append(encodeJsonString(field.id)).append(",\n")
+        when (field) {
+            is ConfigurationFieldDeclaration.StringField -> {
+                sb.append("  \"type\": \"string\",\n")
+                sb.append("  \"default\": ").append(encodeJsonString(field.default))
+                if (field.allowedValues != null) {
+                    sb.append(",\n  \"allowedValues\": [\n")
+                    for ((idx, v) in field.allowedValues.withIndex()) {
+                        sb.append("    ").append(encodeJsonString(v))
+                        if (idx < field.allowedValues.size - 1) sb.append(",")
+                        sb.append("\n")
+                    }
+                    sb.append("  ]")
+                }
+                sb.append("\n")
+            }
+            is ConfigurationFieldDeclaration.BooleanField -> {
+                sb.append("  \"type\": \"boolean\",\n")
+                sb.append("  \"default\": ").append(field.default).append("\n")
+            }
+            is ConfigurationFieldDeclaration.IntegerField -> {
+                sb.append("  \"type\": \"integer\",\n")
+                sb.append("  \"default\": ").append(field.default)
+                if (field.minimum != null) {
+                    sb.append(",\n  \"minimum\": ").append(field.minimum)
+                }
+                if (field.maximum != null) {
+                    sb.append(",\n  \"maximum\": ").append(field.maximum)
+                }
+                sb.append("\n")
+            }
+        }
+        sb.append("}")
+        return sb.toString()
+    }
+
+    private fun encodeUiField(field: UiFieldDeclaration): String {
+        val sb = StringBuilder()
+        sb.append("{\n")
+        sb.append("  \"field\": ").append(encodeJsonString(field.field)).append(",\n")
+        sb.append("  \"control\": ").append(encodeJsonString(field.control.value)).append(",\n")
+        sb.append("  \"label\": ").append(encodeJsonString(field.label))
+        if (field.help != null) {
+            sb.append(",\n  \"help\": ").append(encodeJsonString(field.help))
+        }
+        if (field.choices != null) {
+            sb.append(",\n  \"choices\": [\n")
+            for ((idx, choice) in field.choices.withIndex()) {
+                sb.append("    {\n")
+                sb.append("      \"value\": ").append(encodeJsonString(choice.value)).append(",\n")
+                sb.append("      \"label\": ").append(encodeJsonString(choice.label)).append("\n")
+                sb.append("    }")
+                if (idx < field.choices.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("  ]")
+        }
+        sb.append("\n}")
+        return sb.toString()
+    }
+
+    private fun encodeCapabilities(caps: Set<String>): String {
+        val sb = StringBuilder()
+        sb.append("[\n")
+        for ((idx, cap) in caps.withIndex()) {
+            sb.append("  ").append(encodeJsonString(cap))
+            if (idx < caps.size - 1) sb.append(",")
+            sb.append("\n")
+        }
+        sb.append("]")
+        return sb.toString()
     }
 
     private fun encodeSourceRecord(source: PackageSourceRecord): String {
@@ -238,16 +365,26 @@ internal object StrictIndexCodec {
         val digest = ArtifactDigest(digestVal)
 
         val manifestVal = requireNonNullKey(map, "manifest").asMap()
-        val manifest = decodeManifest(manifestVal, expectedRepoId)
+        val decodedManifest = decodeManifest(manifestVal, expectedRepoId)
 
         val sourceVal = requireNonNullKey(map, "sourceRecord").asMap()
         val sourceRecord = decodeSourceRecord(sourceVal, expectedRepoId)
 
-        return StoredPackageRevision(digest, manifest, sourceRecord)
+        return StoredPackageRevision(
+            digest = digest,
+            manifest = decodedManifest.manifest,
+            sourceRecord = sourceRecord,
+            cachedManifestTrust = decodedManifest.trust
+        )
     }
 
-    private fun decodeManifest(map: Map<String, Any?>, expectedRepoId: GitHubRepositoryIdentity): PackageManifest {
-        validateNoUnknownKeys(map, setOf("manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime"))
+    private data class DecodedManifest(
+        val manifest: PackageManifest,
+        val trust: CachedManifestTrust
+    )
+
+    private fun decodeManifest(map: Map<String, Any?>, expectedRepoId: GitHubRepositoryIdentity): DecodedManifest {
+        validateNoUnknownKeys(map, setOf("manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "capabilities"))
 
         val manifestVersion = requireNonNullKey(map, "manifestVersion").asInt()
         val repositoryIdStr = requireNonNullKey(map, "repositoryId").asString()
@@ -271,7 +408,223 @@ internal object StrictIndexCodec {
         val apiVersion = requireNonNullKey(runtimeMap, "apiVersion").asString()
         val runtime = RuntimeRequirements(luaVersion, apiVersion)
 
-        return PackageManifest(manifestVersion, repositoryId, packageVersion, entryModule, presentation, runtime)
+        val hasConfiguration = map.containsKey("configuration")
+        val hasCapabilities = map.containsKey("capabilities")
+        val legacyCarrier = !hasConfiguration && !hasCapabilities
+        if (hasConfiguration != hasCapabilities) {
+            throw IllegalArgumentException(
+                "configuration and capabilities must be present together or both absent for the pre-cutover carrier"
+            )
+        }
+
+        val configuration: PackageConfigurationDeclaration
+        val capabilities: Set<String>
+        val trust: CachedManifestTrust
+        if (legacyCarrier) {
+            // These empty values only satisfy the host's immutable model. They
+            // are explicitly non-authoritative and are never materialized.
+            configuration = PackageConfigurationDeclaration(
+                ConfigurationDataDeclaration(emptyList()),
+                ConfigurationUiDeclaration(emptyList())
+            )
+            capabilities = emptySet()
+            trust = CachedManifestTrust.LEGACY_PRE_CUTOVER
+        } else {
+            val configVal = requireNonNullKey(map, "configuration").asMap()
+            configuration = decodeConfiguration(configVal)
+
+            val capsVal = requireNonNullKey(map, "capabilities")
+            if (capsVal !is List<*>) {
+                throw IllegalArgumentException("Expected JSON array for capabilities")
+            }
+            val decodedCapabilities = LinkedHashSet<String>()
+            for (cap in capsVal) {
+                if (cap !is String) {
+                    throw IllegalArgumentException("Expected string in capabilities list")
+                }
+                if (!PackageCapability.ALL.contains(cap)) {
+                    throw IllegalArgumentException("Unknown capability ID: $cap")
+                }
+                if (!decodedCapabilities.add(cap)) {
+                    throw IllegalArgumentException("Duplicate capability: $cap")
+                }
+            }
+            capabilities = decodedCapabilities
+            trust = CachedManifestTrust.EVOLVED_VERIFIED
+        }
+
+        return DecodedManifest(
+            manifest = PackageManifest(
+                manifestVersion = manifestVersion,
+                repositoryId = repositoryId,
+                packageVersion = packageVersion,
+                entryModule = entryModule,
+                presentation = presentation,
+                runtime = runtime,
+                configuration = configuration,
+                capabilities = capabilities
+            ),
+            trust = trust
+        )
+    }
+
+    private fun decodeConfiguration(map: Map<String, Any?>): PackageConfigurationDeclaration {
+        validateNoUnknownKeys(map, setOf("schemaVersion", "data", "ui"))
+        val schemaVersion = requireNonNullKey(map, "schemaVersion").asInt()
+        if (schemaVersion != 1) {
+            throw IllegalArgumentException("Unsupported configuration schema version: $schemaVersion")
+        }
+        val dataVal = requireNonNullKey(map, "data").asMap()
+        val data = decodeConfigurationData(dataVal)
+
+        val uiVal = requireNonNullKey(map, "ui").asMap()
+        val ui = decodeConfigurationUi(uiVal)
+
+        return PackageConfigurationDeclaration(data, ui)
+    }
+
+    private fun decodeConfigurationData(map: Map<String, Any?>): ConfigurationDataDeclaration {
+        validateNoUnknownKeys(map, setOf("fields", "additionalProperties"))
+        if (map.containsKey("additionalProperties")) {
+            val addProp = map["additionalProperties"]
+            if (addProp !is Boolean) {
+                throw IllegalArgumentException("additionalProperties must be boolean")
+            }
+        }
+        val fieldsVal = requireNonNullKey(map, "fields")
+        if (fieldsVal !is List<*>) {
+            throw IllegalArgumentException("Expected fields to be array")
+        }
+        val fields = ArrayList<ConfigurationFieldDeclaration>()
+        for (fieldVal in fieldsVal) {
+            val fieldMap = fieldVal.asMap()
+            validateNoUnknownKeys(fieldMap, setOf("id", "type", "default", "allowedValues", "minimum", "maximum"))
+            val id = requireNonNullKey(fieldMap, "id").asString()
+            val typeStr = requireNonNullKey(fieldMap, "type").asString()
+            val defaultVal = requireNonNullKey(fieldMap, "default")
+
+            val decl = when (typeStr) {
+                "string" -> {
+                    if (fieldMap.containsKey("minimum") || fieldMap.containsKey("maximum")) {
+                        throw IllegalArgumentException("String field cannot have minimum or maximum")
+                    }
+                    val defaultStr = defaultVal.asString()
+                    val allowedValues = if (fieldMap.containsKey("allowedValues")) {
+                        val avList = requireNonNullKey(fieldMap, "allowedValues")
+                        if (avList !is List<*>) {
+                            throw IllegalArgumentException("allowedValues must be array")
+                        }
+                        val strings = ArrayList<String>()
+                        for (av in avList) {
+                            strings.add(av.asString())
+                        }
+                        strings
+                    } else {
+                        null
+                    }
+                    ConfigurationFieldDeclaration.StringField(id, defaultStr, allowedValues)
+                }
+                "boolean" -> {
+                    if (fieldMap.containsKey("allowedValues") || fieldMap.containsKey("minimum") || fieldMap.containsKey("maximum")) {
+                        throw IllegalArgumentException("Boolean field cannot have allowedValues, minimum, or maximum")
+                    }
+                    val defaultBool = defaultVal.asBoolean()
+                    ConfigurationFieldDeclaration.BooleanField(id, defaultBool)
+                }
+                "integer" -> {
+                    if (fieldMap.containsKey("allowedValues")) {
+                        throw IllegalArgumentException("Integer field cannot have allowedValues")
+                    }
+                    val defaultLong = asLong(defaultVal)
+                        ?: throw IllegalArgumentException("default must be integer for integer field")
+                    val minimum = if (fieldMap.containsKey("minimum")) {
+                        asLong(fieldMap["minimum"])
+                            ?: throw IllegalArgumentException("minimum must be integer for integer field")
+                    } else {
+                        null
+                    }
+                    val maximum = if (fieldMap.containsKey("maximum")) {
+                        asLong(fieldMap["maximum"])
+                            ?: throw IllegalArgumentException("maximum must be integer for integer field")
+                    } else {
+                        null
+                    }
+                    ConfigurationFieldDeclaration.IntegerField(id, defaultLong, minimum, maximum)
+                }
+                else -> {
+                    throw IllegalArgumentException("Unknown field type: $typeStr")
+                }
+            }
+            fields.add(decl)
+        }
+        return ConfigurationDataDeclaration(fields)
+    }
+
+    private fun decodeConfigurationUi(map: Map<String, Any?>): ConfigurationUiDeclaration {
+        validateNoUnknownKeys(map, setOf("fields"))
+        val fieldsVal = requireNonNullKey(map, "fields")
+        if (fieldsVal !is List<*>) {
+            throw IllegalArgumentException("Expected fields to be array")
+        }
+        val fields = ArrayList<UiFieldDeclaration>()
+        for (fieldVal in fieldsVal) {
+            val fieldMap = fieldVal.asMap()
+            validateNoUnknownKeys(fieldMap, setOf("field", "control", "label", "help", "choices"))
+            val field = requireNonNullKey(fieldMap, "field").asString()
+            val controlStr = requireNonNullKey(fieldMap, "control").asString()
+            val control = when (controlStr) {
+                "text" -> UiControl.TEXT
+                "toggle" -> UiControl.TOGGLE
+                "number" -> UiControl.NUMBER
+                "choice" -> UiControl.CHOICE
+                else -> throw IllegalArgumentException("Unknown ui control: $controlStr")
+            }
+            val label = requireNonNullKey(fieldMap, "label").asString()
+            val help = if (fieldMap.containsKey("help")) {
+                val h = fieldMap["help"]
+                if (h != null) {
+                    val hs = h.asString()
+                    if (hs.isBlank()) throw IllegalArgumentException("help must not be blank")
+                    hs
+                } else null
+            } else {
+                null
+            }
+            val choices = if (fieldMap.containsKey("choices")) {
+                val choicesVal = fieldMap["choices"]
+                if (choicesVal != null && choicesVal != "null") {
+                    if (choicesVal !is List<*>) {
+                        throw IllegalArgumentException("choices must be array")
+                    }
+                    val list = ArrayList<UiChoice>()
+                    for (choiceVal in choicesVal) {
+                        val choiceMap = choiceVal.asMap()
+                        validateNoUnknownKeys(choiceMap, setOf("value", "label"))
+                        val value = requireNonNullKey(choiceMap, "value").asString()
+                        val cLabel = requireNonNullKey(choiceMap, "label").asString()
+                        list.add(UiChoice(value, cLabel))
+                    }
+                    list
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+            fields.add(UiFieldDeclaration(field, control, label, help, choices))
+        }
+        return ConfigurationUiDeclaration(fields)
+    }
+
+    private fun asLong(value: Any?): Long? {
+        if (value is Number) {
+            val doubleVal = value.toDouble()
+            val longVal = value.toLong()
+            if (doubleVal == longVal.toDouble()) {
+                return longVal
+            }
+        }
+        return null
     }
 
     private fun decodeSourceRecord(map: Map<String, Any?>, expectedRepoId: GitHubRepositoryIdentity): PackageSourceRecord {
@@ -772,6 +1125,9 @@ public class InstalledPackageStore internal constructor(
         for ((repoId, record) in index.providers) {
             val implId = InstalledProviderId.derive(repoId)
             val active = record.active
+            // Record is initialized from the index-cached revision and used for
+            // diagnostics if revalidation fails. On the success path it is replaced
+            // below with the reparsed, rehashed revision derived from exact stored bytes.
             records[implId] = active
             val file = File(contentDir, active.digest.value)
 
@@ -799,16 +1155,11 @@ public class InstalledPackageStore internal constructor(
                     }
                 }
 
-                // Check manifest agreement
-                val validatedManifest = validatedRevision.manifest
-                if (validatedManifest.manifestVersion != active.manifest.manifestVersion ||
-                    validatedManifest.repositoryId != active.manifest.repositoryId ||
-                    validatedManifest.packageVersion != active.manifest.packageVersion ||
-                    validatedManifest.entryModule != active.manifest.entryModule ||
-                    validatedManifest.presentation.label != active.manifest.presentation.label ||
-                    validatedManifest.presentation.summary != active.manifest.presentation.summary ||
-                    validatedManifest.runtime.luaVersion != active.manifest.runtime.luaVersion ||
-                    validatedManifest.runtime.apiVersion != active.manifest.runtime.apiVersion) {
+                // Evolved cached manifests must agree with exact bytes. A
+                // pre-cutover carrier has no trusted declarations, so its
+                // placeholder is deliberately excluded from this comparison.
+                if (active.cachedManifestTrust == CachedManifestTrust.EVOLVED_VERIFIED &&
+                    validatedRevision.manifest != active.manifest) {
                     throw PackageException(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
                 }
 
@@ -826,8 +1177,43 @@ public class InstalledPackageStore internal constructor(
                     throw PackageException(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
                 }
 
+                // Identity coherence: the index key must agree with every identity in
+                // the validated revision.  A corrupted index whose key disagrees with
+                // the stored manifest or source identity must be rejected before
+                // materialization, not at the registry (which would reject the entire
+                // batch).
+                if (repoId != validatedRevision.manifest.repositoryId) {
+                    throw PackageException(PackageFailure.Identity(PackageFailure.IdentityDetail.REPOSITORY_ID_MISMATCH, implId))
+                }
+                if (repoId != validatedRevision.sourceRecord.repositoryId) {
+                    throw PackageException(PackageFailure.Identity(PackageFailure.IdentityDetail.REPOSITORY_ID_MISMATCH, implId))
+                }
+
+
                 val binding = LuaPackageMaterializer.materialize(validatedRevision, bridge, ActorPolicy.startingEvidence(), logSink = logSink)
+                // Binding coherence: every descriptor value (implementation ID,
+                // configuration-provider ID, snapshot key, repository-derived ID,
+                // fingerprint, fields, defaults, capability eligibility) derives from
+                // one validated revision and agrees with the snapshot key.
+                if (binding.repositoryId != repoId) {
+                    throw PackageException(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
+                }
+                if (binding.expectedDigest != validatedRevision.digest) {
+                    throw PackageException(PackageFailure.Integrity(PackageFailure.IntegrityDetail.DIGEST_MISMATCH, implId))
+                }
+                if (binding.provider.descriptor.implementationId != implId) {
+                    throw PackageException(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
+                }
+
                 bindings[implId] = binding
+                // Replace the index-cached record with the one reparsed and rehashed
+                // from exact stored bytes, so exposed declarations derive from verified
+                // bytes rather than the trusted index-cached model.
+                records[implId] = StoredPackageRevision(
+                    digest = validatedRevision.digest,
+                    manifest = validatedRevision.manifest,
+                    sourceRecord = validatedRevision.sourceRecord
+                )
             } catch (e: PackageException) {
                 failures[implId] = e.failure
             } catch (e: Exception) {
@@ -893,16 +1279,10 @@ public class InstalledPackageStore internal constructor(
                 is PackageOutcome.Success -> outcome.value
                 is PackageOutcome.Failure -> return PackageOutcome.Failure(outcome.error.withImplId(implId))
             }
-            // Confirm stored manifest/source/digest agreement.
-            val validatedManifest = validatedRevision.manifest
-            if (validatedManifest.manifestVersion != revision.manifest.manifestVersion ||
-                validatedManifest.repositoryId != revision.manifest.repositoryId ||
-                validatedManifest.packageVersion != revision.manifest.packageVersion ||
-                validatedManifest.entryModule != revision.manifest.entryModule ||
-                validatedManifest.presentation.label != revision.manifest.presentation.label ||
-                validatedManifest.presentation.summary != revision.manifest.presentation.summary ||
-                validatedManifest.runtime.luaVersion != revision.manifest.runtime.luaVersion ||
-                validatedManifest.runtime.apiVersion != revision.manifest.runtime.apiVersion) {
+            // Exact archive bytes are authoritative for a legacy carrier;
+            // compare cached declarations only for evolved index entries.
+            if (revision.cachedManifestTrust == CachedManifestTrust.EVOLVED_VERIFIED &&
+                validatedRevision.manifest != revision.manifest) {
                 return PackageOutcome.Failure(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
             }
             val valSrc = validatedRevision.sourceRecord
@@ -916,6 +1296,11 @@ public class InstalledPackageStore internal constructor(
                 valSrc.asset.assetId != revSrc.asset.assetId ||
                 valSrc.asset.name != revSrc.asset.name) {
                 return PackageOutcome.Failure(PackageFailure.Mutation(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, implId))
+            }
+            // Identity coherence: the stored manifest identity must agree with
+            // the stored source-record identity.
+            if (revision.manifest.repositoryId != revision.sourceRecord.repositoryId) {
+                return PackageOutcome.Failure(PackageFailure.Identity(PackageFailure.IdentityDetail.REPOSITORY_ID_MISMATCH, implId))
             }
             if (validatedRevision.digest != revision.digest) {
                 return PackageOutcome.Failure(PackageFailure.Integrity(PackageFailure.IntegrityDetail.DIGEST_MISMATCH, implId))
@@ -1104,6 +1489,7 @@ public class InstalledPackageStore internal constructor(
             is PackageFailure.Rollback -> this.copy(implementationId = implId)
             is PackageFailure.Loading -> this.copy(implementationId = implId)
             is PackageFailure.Shutdown -> this.copy(implementationId = implId)
+            is PackageFailure.Capability -> this.copy(implementationId = implId)
         }
     }
 

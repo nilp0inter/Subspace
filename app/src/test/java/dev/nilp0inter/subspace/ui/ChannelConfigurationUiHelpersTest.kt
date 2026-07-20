@@ -102,4 +102,46 @@ class ChannelConfigurationUiHelpersTest {
             )
         }
     }
+
+    @Test
+    fun `non dynamic choice fields are always visible regardless of values`() {
+        val fields: List<ChannelConfigurationField> = listOf(
+            ChannelConfigurationField.BooleanField("toggle", "Toggle"),
+            ChannelConfigurationField.TextField("text", "Text"),
+            ChannelConfigurationField.ChoiceField(
+                "choice",
+                "Choice",
+                choices = listOf(ChannelConfigurationField.ChoiceField.Choice("a", "A")),
+            ),
+            ChannelConfigurationField.NumberField("number", "Number"),
+            ChannelConfigurationField.DirectoryField("dir", "Directory"),
+        )
+
+        fields.forEach { field ->
+            assertTrue("${field::class.simpleName} should be visible with empty values", field.isVisible(emptyMap()))
+            assertTrue(
+                "${field::class.simpleName} should be visible with arbitrary values",
+                field.isVisible(mapOf("unrelated" to "x", field.id to "irrelevant")),
+            )
+        }
+    }
+
+    @Test
+    fun `payload contains exactly the declared fields when starting from empty payload`() {
+        val fields = listOf(
+            ChannelConfigurationField.BooleanField("enabled", "Enabled"),
+            ChannelConfigurationField.TextField("name", "Name", required = false),
+            ChannelConfigurationField.NumberField("count", "Count"),
+        )
+        val result = payloadWithFieldValues(
+            initialPayload = OpaqueJsonObject.parse("{}").getOrThrow(),
+            fields = fields,
+            values = mapOf("enabled" to "true", "name" to "test", "count" to "7"),
+        ).toJsonObject()
+
+        assertEquals(3, result.length())
+        assertTrue(result.getBoolean("enabled"))
+        assertEquals("test", result.getString("name"))
+        assertEquals(7L, result.getLong("count"))
+    }
 }
