@@ -420,6 +420,36 @@ class PlaybackRouteStrategyTest {
         )
     }
 
+    @Test
+    fun onTheRoadAcceptsBluetoothA2DPCarMediaOutput() = runTest {
+        val audioManager = mockk<AudioManager>()
+        val sco = mockk<ScoAudioController>()
+        val car = mockk<AudioDeviceInfo>()
+        val route = FakeAcquiredRoute()
+        val requests = mutableListOf<PlaybackRouteRequest>()
+        every { audioManager.mode } returns AudioManager.MODE_NORMAL
+        every { audioManager.communicationDevice } returns null
+        every { car.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+
+        val resolver = ModePlaybackRouteResolver(
+            audioManager = audioManager,
+            workSco = sco,
+            awaitTelecomCaptureRelease = { true },
+            carMediaDevice = { car },
+            carMediaFocus = mockk(relaxed = true),
+            routeFactory = { request -> requests += request; route },
+        )
+        val acquisition = resolver.strategyFor(InputMode.OnTheRoad).acquire()
+
+        assertTrue(acquisition is PlaybackRouteAcquisition.Acquired)
+        val request = requests.single()
+        assertEquals(InputMode.OnTheRoad, request.mode)
+        assertEquals(AudioRouteEndpoint.Car, request.endpoint)
+        assertSame(car, request.preferredDevice)
+        assertEquals(AudioAttributes.USAGE_MEDIA, request.usage)
+        assertEquals(AudioManager.MODE_NORMAL, request.audioMode)
+    }
+
 
     @Test
     fun strategyAcquiringAnAcquiredRouteReturnsThatRoute() = runTest {
@@ -537,6 +567,49 @@ class PlaybackRouteStrategyTest {
         acquired.route.release()
         assertTrue(innerRoute.released)
         assertTrue(releasedFlag.isCompleted)
+    }
+
+    @Test
+    fun mediaFocusRouteRequestsFocusBeforePlaybackAndAbandonsOnRelease() = runTest {
+        val events = mutableListOf<String>()
+        val inner = FakeAcquiredRoute()
+        val route = MediaFocusPlaybackRoute(
+            requestFocus = { events += "focus"; true },
+            abandonFocus = { events += "abandon" },
+            delegate = inner,
+        )
+
+        val playback = route.start(RecordedPcm(ShortArray(4), 16_000))
+        assertEquals(listOf("focus"), events)
+        assertTrue(playback is FakeActivePlayback)
+
+        route.release()
+        assertEquals(listOf("focus", "abandon"), events)
+        assertTrue(inner.released)
+    }
+
+    @Test
+    fun mediaFocusRouteFailsClosedWhenFocusDeniedAndDoesNotStartDelegate() = runTest {
+        val events = mutableListOf<String>()
+        val inner = FakeAcquiredRoute()
+        val route = MediaFocusPlaybackRoute(
+            requestFocus = { false },
+            abandonFocus = { events += "abandon" },
+            delegate = inner,
+        )
+
+        try {
+            route.start(RecordedPcm(ShortArray(4), 16_000))
+            throw AssertionError("expected focus denial to fail closed")
+        } catch (expected: IllegalStateException) {
+            // focus denial fails closed before the delegate starts
+        }
+        assertEquals(0, inner.releaseCount)
+
+        route.release()
+        // Focus was never held, so nothing is abandoned; delegate release still happens.
+        assertTrue(events.isEmpty())
+        assertTrue(inner.released)
     }
 
     // ------------------------------------------------------------------

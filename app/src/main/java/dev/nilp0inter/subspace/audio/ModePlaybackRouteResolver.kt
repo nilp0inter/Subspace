@@ -3,6 +3,7 @@ package dev.nilp0inter.subspace.audio
 import android.bluetooth.BluetoothDevice
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import dev.nilp0inter.subspace.model.InputMode
 
@@ -28,6 +29,10 @@ internal data class PlaybackRouteRequest(
  * address metadata is corroboration at most and never a veto, because some OEMs label the
  * SCO communication endpoint with the phone's own identity. [awaitTelecomCaptureRelease]
  * is called before any On-the-road mode/device query.
+ *
+ * On-the-road playback targets the car media path (Bluetooth A2DP or wired Android Auto
+ * output) after the Telecom SCO call has dropped, and holds transient media audio focus
+ * for the duration of playback so the head unit routes media audio to the speakers.
  */
 internal class ModePlaybackRouteResolver(
     private val audioManager: AudioManager,
@@ -40,6 +45,7 @@ internal class ModePlaybackRouteResolver(
         audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             .firstOrNull { it.type in CAR_OUTPUT_TYPES }
     },
+    private val carMediaFocus: CarMediaFocus = CarMediaFocus(audioManager),
     private val routeFactory: (PlaybackRouteRequest) -> AcquiredPlaybackRoute = { request ->
         StreamPlaybackRoute(
             preferredDevice = request.preferredDevice,
@@ -101,16 +107,17 @@ internal class ModePlaybackRouteResolver(
         }
         val device = carMediaDevice()?.takeIf { it.type in CAR_OUTPUT_TYPES }
             ?: return PlaybackRouteAcquisition.Unavailable("Validated car media output unavailable")
-        return PlaybackRouteAcquisition.Acquired(
-            routeFactory(
-                PlaybackRouteRequest(
-                    mode = InputMode.OnTheRoad,
-                    endpoint = AudioRouteEndpoint.Car,
-                    preferredDevice = device,
-                    usage = AudioAttributes.USAGE_MEDIA,
-                    audioMode = AudioManager.MODE_NORMAL,
-                ),
+        val route = routeFactory(
+            PlaybackRouteRequest(
+                mode = InputMode.OnTheRoad,
+                endpoint = AudioRouteEndpoint.Car,
+                preferredDevice = device,
+                usage = AudioAttributes.USAGE_MEDIA,
+                audioMode = AudioManager.MODE_NORMAL,
             ),
+        )
+        return PlaybackRouteAcquisition.Acquired(
+            MediaFocusPlaybackRoute(carMediaFocus::request, carMediaFocus::abandon, route),
         )
     }
 
@@ -167,10 +174,75 @@ internal class ModePlaybackRouteResolver(
     private companion object {
         val CAR_OUTPUT_TYPES = setOf(
             AudioDeviceInfo.TYPE_AUX_LINE,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
             AudioDeviceInfo.TYPE_BUS,
             AudioDeviceInfo.TYPE_HDMI,
             AudioDeviceInfo.TYPE_USB_DEVICE,
             AudioDeviceInfo.TYPE_USB_HEADSET,
         )
+    }
+}
+
+/**
+ * Transient `USAGE_MEDIA` audio focus for car (On-the-road) response playback.
+ *
+ * After the Telecom SCO call drops, response audio travels the car's media path (A2DP or
+ * wired Android Auto). The head unit routes media audio to the speakers only while the
+ * phone holds media audio focus, mirroring the proven [MediaResponsePlayer] behavior.
+ */
+internal class CarMediaFocus(private val audioManager: AudioManager) {
+    private var focusRequest: AudioFocusRequest? = null
+
+    fun request(): Boolean {
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            .build()
+        val granted = runCatching { audioManager.requestAudioFocus(request) }
+            .getOrDefault(AudioManager.AUDIOFOCUS_REQUEST_FAILED) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        focusRequest = if (granted) request else null
+        return granted
+    }
+
+    fun abandon() {
+        focusRequest?.let { runCatching { audioManager.abandonAudioFocusRequest(it) } }
+        focusRequest = null
+    }
+}
+
+/**
+ * Playback route decorator that holds media audio focus for the duration of one playback.
+ * Focus is requested before the delegate starts and abandoned on release. When focus is
+ * denied, [start] throws so the host fails closed and keeps the message pending for a
+ * later retry instead of playing silently.
+ */
+internal class MediaFocusPlaybackRoute(
+    private val requestFocus: () -> Boolean,
+    private val abandonFocus: () -> Unit,
+    private val delegate: AcquiredPlaybackRoute,
+) : AcquiredPlaybackRoute {
+    private var focusHeld = false
+
+    override val endpoint: AudioRouteEndpoint
+        get() = delegate.endpoint
+
+    override suspend fun start(recording: RecordedPcm): ActivePcmPlayback {
+        if (!requestFocus()) {
+            throw IllegalStateException("Car media audio focus unavailable")
+        }
+        focusHeld = true
+        return delegate.start(recording)
+    }
+
+    override suspend fun release() {
+        if (focusHeld) {
+            focusHeld = false
+            abandonFocus()
+        }
+        delegate.release()
     }
 }
