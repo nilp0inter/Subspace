@@ -25,6 +25,12 @@ The Debug Channel package SHALL request playback only through `subspace.playback
 - **AND** On-the-road playback SHALL wait for Telecom capture routing to be released, then resolve and use the validated car media output
 - **AND** none of these paths SHALL reuse a released PTT-session route or choose an ambient fallback output
 
+#### Scenario: On-a-pinch admission under owned Work SCO residue
+- **WHEN** a queued Debug entry becomes eligible in On-a-pinch mode while the app's own Work SCO lease or keep-warm residue still holds the communication route
+- **THEN** phone playback acquisition SHALL NOT treat that owned residue as a busy foreign route
+- **AND** it SHALL resolve the built-in speaker with media usage
+- **AND** only a communication route the app does not own SHALL make phone acquisition busy
+
 ## ADDED Requirements
 
 ### Requirement: Debug Channel is an external Lua package

@@ -152,26 +152,52 @@ class PlaybackRouteStrategyTest {
     }
 
     @Test
-    fun wrongScoIdentityIsRejectedAndReleasesScoOwnership() = runTest {
+    fun missingScoTransportRejectsAndReleasesOwnership() = runTest {
         val audioManager = mockk<AudioManager>()
         val sco = mockk<ScoAudioController>()
         val owner = mockk<BluetoothDevice>()
-        val selected = mockk<AudioDeviceInfo>()
-        every { owner.name } returns "RSM-Target"
-        every { selected.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        every { selected.productName } returns "Different Headset"
         coEvery { sco.acquire() } returns true
-        every { sco.selectedCommunicationDevice() } returns selected
+        every { sco.selectedCommunicationDevice() } returns null
         every { sco.release() } just runs
 
         val acquisition = ModePlaybackRouteResolver(audioManager, sco, targetRsmDevice = { owner })
             .strategyFor(InputMode.Work).acquire()
 
         assertEquals(
-            PlaybackRouteAcquisition.Unavailable("Target RSM SCO ownership unavailable"),
+            PlaybackRouteAcquisition.Unavailable("Target RSM SCO transport unavailable"),
             acquisition,
         )
         coVerify(exactly = 1) { sco.acquire() }
+        verify(exactly = 1) { sco.release() }
+    }
+
+    @Test
+    fun subsystemProvenScoTransportIsAcceptedDespiteForeignEndpointMetadata() = runTest {
+        val audioManager = mockk<AudioManager>()
+        val sco = mockk<ScoAudioController>()
+        val owner = mockk<BluetoothDevice>()
+        val selected = mockk<AudioDeviceInfo>()
+        val route = FakeAcquiredRoute()
+        // Some OEMs label the SCO communication endpoint with the phone's own
+        // product name and adapter address. The target-RSM SCO subsystem's proof
+        // (targeted voice recognition plus target HFP audio connection) is the
+        // authoritative ownership signal; endpoint metadata is never a veto.
+        every { selected.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        every { selected.productName } returns "CPH2653"
+        every { selected.address } returns "AA:BB:CC:DD:EE:99"
+        coEvery { sco.acquire() } returns true
+        every { sco.selectedCommunicationDevice() } returns selected
+        every { sco.release() } just runs
+
+        val acquisition = ModePlaybackRouteResolver(
+            audioManager = audioManager,
+            workSco = sco,
+            targetRsmDevice = { owner },
+            routeFactory = { route },
+        ).strategyFor(InputMode.Work).acquire()
+
+        assertTrue(acquisition is PlaybackRouteAcquisition.Acquired)
+        (acquisition as PlaybackRouteAcquisition.Acquired).route.release()
         verify(exactly = 1) { sco.release() }
     }
 
@@ -210,6 +236,7 @@ class PlaybackRouteStrategyTest {
         every { audioManager.communicationDevice } returns null
         every { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } returns arrayOf(speaker)
         every { speaker.type } returns AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        every { sco.isActive() } returns false
 
         val resolver = ModePlaybackRouteResolver(
             audioManager = audioManager,
@@ -234,6 +261,7 @@ class PlaybackRouteStrategyTest {
         val sco = mockk<ScoAudioController>()
         every { audioManager.mode } returns AudioManager.MODE_NORMAL
         every { audioManager.communicationDevice } returns null
+        every { sco.isActive() } returns false
         every { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } returns emptyArray()
 
         val acquisition = ModePlaybackRouteResolver(audioManager, sco)
@@ -243,6 +271,55 @@ class PlaybackRouteStrategyTest {
             PlaybackRouteAcquisition.Unavailable("Phone speaker output unavailable"),
             acquisition,
         )
+    }
+
+    @Test
+    fun onAPinchSpeakerAcquisitionIsNotBlockedByOwnedWorkScoState() = runTest {
+        val audioManager = mockk<AudioManager>()
+        val sco = mockk<ScoAudioController>()
+        val speaker = mockk<AudioDeviceInfo>()
+        val scoEndpoint = mockk<AudioDeviceInfo>()
+        val route = FakeAcquiredRoute()
+        val requests = mutableListOf<PlaybackRouteRequest>()
+        // The app's own Work SCO lease or keep-warm residue holds communication
+        // routing; phone speaker acquisition must not treat it as a foreign busy
+        // route, or delayed entries recorded in Work can never drain after a
+        // mode switch to On-a-pinch.
+        every { sco.isActive() } returns true
+        every { audioManager.mode } returns AudioManager.MODE_IN_COMMUNICATION
+        every { audioManager.communicationDevice } returns scoEndpoint
+        every { scoEndpoint.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        every { audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) } returns arrayOf(speaker)
+        every { speaker.type } returns AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
+        val resolver = ModePlaybackRouteResolver(
+            audioManager = audioManager,
+            workSco = sco,
+            routeFactory = { request -> requests += request; route },
+        )
+        val acquisition = resolver.strategyFor(InputMode.OnAPinch).acquire()
+
+        assertTrue(acquisition is PlaybackRouteAcquisition.Acquired)
+        val request = requests.single()
+        assertEquals(AudioRouteEndpoint.Local, request.endpoint)
+        assertSame(speaker, request.preferredDevice)
+        assertEquals(AudioAttributes.USAGE_MEDIA, request.usage)
+    }
+
+    @Test
+    fun onAPinchBusyUnderForeignCommunicationRoute() = runTest {
+        val audioManager = mockk<AudioManager>()
+        val sco = mockk<ScoAudioController>()
+        val scoEndpoint = mockk<AudioDeviceInfo>()
+        every { sco.isActive() } returns false
+        every { audioManager.mode } returns AudioManager.MODE_IN_COMMUNICATION
+        every { audioManager.communicationDevice } returns scoEndpoint
+        every { scoEndpoint.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+
+        val acquisition = ModePlaybackRouteResolver(audioManager, sco)
+            .strategyFor(InputMode.OnAPinch).acquire()
+
+        assertEquals(PlaybackRouteAcquisition.Busy, acquisition)
     }
 
     @Test

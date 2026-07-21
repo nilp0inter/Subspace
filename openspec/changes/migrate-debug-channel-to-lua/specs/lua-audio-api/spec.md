@@ -113,6 +113,8 @@ When an operation deadline expires, the host SHALL atomically win with `E_TIMEOU
 
 Explicit cancellation of a live input invocation SHALL resume its pending operation exactly once with `E_CANCELLED` when bounded terminal delivery remains possible. Cancelling a spawned-task owner SHALL cancel its pending operations, discard its suspended coroutine without re-entry, and dispose its unconsumed audio. Generation replacement or close SHALL cancel all pending operations, discard every suspended coroutine without re-entering Lua, invalidate audio tokens, revoke capability leases, remove generation-authorized queued playback, and suppress every late effect.
 
+When a resumed `handle_input` callback yields another authorized semantic operation before terminating (for example, synthesis followed by playback scheduling in TTS, or transcription then synthesis then playback scheduling in STT_TTS), the host SHALL dispatch each successive chained yield under the same input invocation owner until the callback terminates, fails, or is cancelled. Each chained yield SHALL be a distinct semantic operation carrying its own actor-operation token and atomic terminal gate; an earlier operation's claimed terminal gate SHALL NOT prevent a later chained operation from claiming its own gate, resuming Lua, or reaching its own terminal outcome.
+
 #### Scenario: Yielding operation releases execution slot
 - **WHEN** an authorized execution yields in a semantic audio operation
 - **THEN** the host SHALL release the actor execution gate while retaining the owning execution identity
@@ -137,4 +139,10 @@ Explicit cancellation of a live input invocation SHALL resume its pending operat
 - **WHEN** a generation retires or closes while any execution is yielded in a semantic audio operation
 - **THEN** the host SHALL discard the suspended execution, revoke related operation, capability, audio, and queue state, and SHALL NOT resume Lua
 - **AND** later completion SHALL be rejected as stale without audio creation, playback, status, or log publication
+
+#### Scenario: Chained semantic operations within one input invocation
+- **WHEN** a `handle_input` callback yields a semantic operation, is resumed with its result, and then yields a further authorized semantic operation before returning
+- **THEN** the host SHALL dispatch the further operation under the same input invocation owner without requiring a new PTT capture
+- **AND** the further operation SHALL claim and complete its own terminal gate independently of the earlier operation's gate
+- **AND** the callback SHALL terminate exactly once after the final chained operation resolves
 

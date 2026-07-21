@@ -321,11 +321,22 @@ internal class LuaAdapterRuntime(
                     LuaCoroutineId(outcome.coroutineId),
                     LuaOperationId(outcome.operationId),
                 )
+                // A chained yield (e.g. synthesize -> playback.schedule in TTS) is a
+                // distinct semantic operation: mint a fresh terminal gate so the next
+                // executor can claim it independently of the completed predecessor.
+                val nextSemantic = SemanticAudioOperation.create(
+                    next,
+                    (generationContext as ActorRuntimeHostContext).actorIdentity,
+                )
                 synchronized(inputLock) {
                     if (pendingInputExecution?.ownerToken != ownerToken ||
                         pendingInputExecution?.operation?.operationId?.value != operationId
                     ) return LuaInputResumeResult.Stale
-                    pendingInputExecution = pending.copy(operation = next, label = outcome.value ?: "")
+                    pendingInputExecution = pending.copy(
+                        operation = next,
+                        label = outcome.value ?: "",
+                        semantic = nextSemantic,
+                    )
                 }
                 return LuaInputResumeResult.Accepted
             }
@@ -1098,11 +1109,19 @@ internal class LuaAdapterRuntime(
                             }
                         }
                         if (cancellationRequested != null) {
-                            when {
-                                pending.label.startsWith("transcribe:") -> executeTranscription(pending)
-                                pending.label.startsWith("synthesize:") -> executeSynthesis(pending)
-                                pending.label.startsWith("playback:") -> executePlayback(pending)
-                                else -> Unit
+                            dispatchPendingByLabel(pending)
+                            // Chained yields: each resume may produce a new semantic
+                            // operation (e.g. synthesize -> playback.schedule in TTS,
+                            // or transcribe -> synthesize -> playback.schedule in
+                            // STT_TTS). Dispatch each successive yield until the
+                            // callback terminates or no further progress is made.
+                            var lastDispatchedOperationId = pending.operation.operationId.value
+                            while (true) {
+                                val current = synchronized(inputLock) { pendingInputExecution } ?: break
+                                if (current.ownerToken != pending.ownerToken) break
+                                if (current.operation.operationId.value == lastDispatchedOperationId) break
+                                lastDispatchedOperationId = current.operation.operationId.value
+                                dispatchPendingByLabel(current)
                             }
                         }
                         if (cancellationRequested == null) {
@@ -1205,6 +1224,16 @@ internal class LuaAdapterRuntime(
             else CallbackInvocationResult.Failure(value),
         )
         resumeInput(pending.ownerToken, pending.operation.operationId.value, success, value)
+    }
+
+    /** Dispatches one pending semantic operation by its yield-label prefix. */
+    private suspend fun dispatchPendingByLabel(pending: PendingInputExecution) {
+        when {
+            pending.label.startsWith("transcribe:") -> executeTranscription(pending)
+            pending.label.startsWith("synthesize:") -> executeSynthesis(pending)
+            pending.label.startsWith("playback:") -> executePlayback(pending)
+            else -> Unit
+        }
     }
 
     private suspend fun <T : Any> awaitSemanticBackend(

@@ -22,9 +22,12 @@ internal data class PlaybackRouteRequest(
  * Host-only output policy for channel content. This deliberately does not reuse
  * [ResolvedAudioRoute], which owns an input source and a PTT-session release policy.
  *
- * [targetRsmDevice] is mandatory for Work acquisition: an anonymous SCO endpoint is accepted only
- * after explicit target ownership proof. [awaitTelecomCaptureRelease] is called before any
- * On-the-road mode/device query.
+ * Work acquisition trusts the target-RSM SCO subsystem as the authoritative ownership
+ * proof: [workSco] performs the target-specific voice-recognition start, target HFP audio
+ * connection polling, and transport selection under that proof. Endpoint product-name or
+ * address metadata is corroboration at most and never a veto, because some OEMs label the
+ * SCO communication endpoint with the phone's own identity. [awaitTelecomCaptureRelease]
+ * is called before any On-the-road mode/device query.
  */
 internal class ModePlaybackRouteResolver(
     private val audioManager: AudioManager,
@@ -63,17 +66,16 @@ internal class ModePlaybackRouteResolver(
             return PlaybackRouteAcquisition.Unavailable("Target RSM Bluetooth ownership unavailable")
         }
         val device = workSco.selectedCommunicationDevice()
-        if (!isOwnedTargetSco(device, owner)) {
+        if (device == null || device.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
             workSco.release()
-            return PlaybackRouteAcquisition.Unavailable("Target RSM SCO ownership unavailable")
+            return PlaybackRouteAcquisition.Unavailable("Target RSM SCO transport unavailable")
         }
-        val ownedDevice = checkNotNull(device)
         val route = try {
             routeFactory(
                 PlaybackRouteRequest(
                     mode = InputMode.Work,
                     endpoint = AudioRouteEndpoint.Rsm,
-                    preferredDevice = ownedDevice,
+                    preferredDevice = device,
                     owner = owner,
                     usage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
                     audioMode = AudioManager.MODE_IN_COMMUNICATION,
@@ -113,8 +115,14 @@ internal class ModePlaybackRouteResolver(
     }
 
     private fun acquirePhone(): PlaybackRouteAcquisition {
-        if (audioManager.mode != AudioManager.MODE_NORMAL ||
-            audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        // The app's own target-RSM SCO lease or keep-warm residue never blocks phone
+        // speaker playback: host admission already serializes capture/playback, and the
+        // speaker track's preferred device keeps audio off the work route. Only a
+        // communication route this app does not own (e.g. an unrelated telecom call)
+        // makes phone acquisition busy.
+        if (!workSco.isActive() &&
+            (audioManager.mode != AudioManager.MODE_NORMAL ||
+                audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO)
         ) {
             return PlaybackRouteAcquisition.Busy
         }
@@ -132,25 +140,6 @@ internal class ModePlaybackRouteResolver(
                 ),
             ),
         )
-    }
-
-    private fun isOwnedTargetSco(device: AudioDeviceInfo?, owner: BluetoothDevice): Boolean {
-        if (device == null || device.type != AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return false
-        val expectedName = runCatching { owner.name }.getOrNull()?.trim().orEmpty()
-        val productName = device.productName?.toString()?.trim().orEmpty()
-        if (productName.isNotEmpty() &&
-            (expectedName.isEmpty() ||
-                (!productName.equals(expectedName, ignoreCase = true) &&
-                    !productName.contains(expectedName, ignoreCase = true)))
-        ) return false
-        val expectedAddress = runCatching { owner.address }.getOrNull()?.trim().orEmpty()
-        val endpointAddress = runCatching { device.address }.getOrNull()?.trim().orEmpty()
-        if (endpointAddress.isNotEmpty() &&
-            (expectedAddress.isEmpty() || !expectedAddress.equals(endpointAddress, ignoreCase = true))
-        ) return false
-        // An anonymous AudioDeviceInfo is valid only because explicit BluetoothDevice ownership
-        // was proven before SCO acquisition.
-        return true
     }
 
     private class ReleasingPlaybackRoute(
