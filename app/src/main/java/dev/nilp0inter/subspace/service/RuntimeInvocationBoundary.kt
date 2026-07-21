@@ -11,7 +11,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CompletableDeferred
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -538,27 +541,38 @@ class RuntimeGenerationInvocationGate internal constructor(
      * the FIFO admission queue. Used by actor runtime to resume a yielded Lua slice under the
      * same per-generation execution serialization as host-admitted callbacks, but never as a
      * new host-admitted callback. Returns [RuntimeInvocationOutcome.Closed] if the generation
-     * is no longer live; otherwise runs [action] on the worker dispatcher under [executionMutex].
+     * is no longer live; otherwise runs [action] on the worker dispatcher. Callers outside a
+     * serialized request take [executionMutex]; continuations resumed from inside a request
+     * callback are already covered by that lock and skip it to avoid self-deadlock.
      */
     internal suspend fun <T> invokeContinuation(action: suspend () -> T): RuntimeInvocationOutcome<T> {
         if (!isLive) return RuntimeInvocationOutcome.Closed
+        // A continuation resumed from inside a serialized request callback is already
+        // protected by the executionMutex held by process(); re-locking the
+        // non-reentrant mutex would deadlock the whole generation (the processor
+        // waits on the callback that waits on the lock it holds).
+        if (coroutineContext[InsideGateExecution] != null) {
+            return if (!isLive) RuntimeInvocationOutcome.Closed else runContinuationAction(action)
+        }
         return try {
             executionMutex.withLock {
                 if (!isLive) {
                     RuntimeInvocationOutcome.Closed
                 } else {
-                    try {
-                        RuntimeInvocationOutcome.Success(workers.run { action() })
-                    } catch (_: CancellationException) {
-                        RuntimeInvocationOutcome.Cancelled
-                    } catch (failure: Throwable) {
-                        failure.toOutcome(RuntimeInvocationPhase.CLOSE, RuntimeInvocationOrigin.RUNTIME)
-                    }
+                    runContinuationAction(action)
                 }
             }
         } catch (_: CancellationException) {
             RuntimeInvocationOutcome.Cancelled
         }
+    }
+
+    private suspend fun <T> runContinuationAction(action: suspend () -> T): RuntimeInvocationOutcome<T> = try {
+        RuntimeInvocationOutcome.Success(workers.run { action() })
+    } catch (_: CancellationException) {
+        RuntimeInvocationOutcome.Cancelled
+    } catch (failure: Throwable) {
+        failure.toOutcome(RuntimeInvocationPhase.CLOSE, RuntimeInvocationOrigin.RUNTIME)
     }
 
     private fun drainQueuedLocked(): List<Request<*>> {
@@ -610,7 +624,7 @@ class RuntimeGenerationInvocationGate internal constructor(
                         if (result.isCompleted) {
                             null
                         } else {
-                            childWork.scope.async(start = CoroutineStart.LAZY) {
+                            childWork.scope.async(start = CoroutineStart.LAZY, context = InsideGateExecution.element) {
                                 workers.run(callback)
                             }.also { execution = it }
                         }
@@ -659,5 +673,17 @@ class RuntimeGenerationInvocationGate internal constructor(
             RuntimeInvocationOrigin.PROVIDER -> RuntimeInvocationOutcome.ProviderFailure(failure)
             RuntimeInvocationOrigin.RUNTIME -> RuntimeInvocationOutcome.RuntimeFailure(failure)
         }
+    }
+}
+
+/**
+ * Marks a coroutine running inside one serialized gate request execution.
+ * Continuations resumed from that callback are already serialized by the
+ * outer executionMutex; [RuntimeGenerationInvocationGate.invokeContinuation]
+ * detects this marker and must not re-acquire the non-reentrant mutex.
+ */
+private class InsideGateExecution private constructor() : AbstractCoroutineContextElement(InsideGateExecution) {
+    companion object Key : CoroutineContext.Key<InsideGateExecution> {
+        val element: InsideGateExecution = InsideGateExecution()
     }
 }

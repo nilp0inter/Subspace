@@ -676,6 +676,38 @@ class RuntimeInvocationBoundaryTest {
         assertEquals(1, closeCalls.get())
     }
 
+    @Test(timeout = 5_000)
+    fun continuationResumedFromInsideACommittedCallbackDoesNotSelfDeadlockTheGeneration() = runTest {
+        val harness = harness()
+        val target = harness.gate.openCommittedTarget()
+            ?: throw AssertionError("Expected an open committed target")
+        var continuationResult: RuntimeInvocationOutcome<String>? = null
+
+        val invoke = async {
+            target.invoke(RuntimeInvocationPhase.INPUT_RELEASED) {
+                // Mirrors the production ECHO path: handle_input yields on playback.schedule
+                // and the host resumes the yielded slice inline (executePlayback ->
+                // resumeInput -> resumeProgramImageCoroutine -> invokeContinuation) while
+                // the INPUT_RELEASED callback still holds the gate's execution serialization.
+                continuationResult = harness.gate.invokeContinuation { "slice-resumed" }
+                "input-released"
+            }
+        }
+        runCurrent()
+
+        assertEquals("input-released", assertSuccess(invoke.await()))
+        assertEquals(
+            "slice-resumed",
+            assertSuccess(continuationResult ?: RuntimeInvocationOutcome.Closed),
+        )
+        // The generation must remain live: no timeout invalidation fired.
+        assertEquals(
+            "later",
+            assertSuccess(harness.gate.invoke(RuntimeInvocationPhase.HANDLE_SOS) { "later" }),
+        )
+        harness.close()
+    }
+
     private fun kotlinx.coroutines.test.TestScope.harness(
         instanceId: String = "channel",
         generation: Long = 0,
