@@ -435,7 +435,7 @@ The queue is channel-associated FIFO. It does not play a Debug entry while anoth
 
 - Work reacquires the target RSM Bluetooth SCO output with voice-communication usage;
 - On-a-pinch requires normal Android audio mode and uses the built-in speaker with media usage;
-- On-the-road waits until Telecom capture routing is released and mode is normal, then uses a validated car media output.
+- On-the-road releases any stale Work (RSM) route, waits until Telecom capture routing is released and mode is normal, then plays through the car media path — a validated car media output when one is enumerable, otherwise unpinned `USAGE_MEDIA` default media routing (which reaches the car A2DP sink) — requesting transient media audio focus best-effort.
 
 There is no ambient output, device choice, route handle, or local fallback visible to Lua. A route that is temporarily busy remains pending under host policy; a terminal route failure produces a typed host outcome and cleanup.
 

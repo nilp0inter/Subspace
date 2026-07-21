@@ -22,7 +22,7 @@ The Debug Channel package SHALL request playback only through `subspace.playback
 - **WHEN** capture has terminated and the queued playback becomes eligible under Work, On-a-pinch, or On-the-road
 - **THEN** Work playback SHALL use an acquired Bluetooth SCO communication route with voice-communication usage
 - **AND** On-a-pinch playback SHALL use normal audio mode and the built-in speaker with media usage
-- **AND** On-the-road playback SHALL wait for Telecom capture routing to be released, then resolve and use the validated car media output
+- **AND** On-the-road playback SHALL release any stale Work (RSM) route, wait for Telecom capture routing to be released and normal audio mode, then play through the car media path (a validated car media output when enumerable, otherwise unpinned `USAGE_MEDIA` default media routing to the A2DP sink), requesting transient media audio focus best-effort
 - **AND** none of these paths SHALL reuse a released PTT-session route or choose an ambient fallback output
 
 #### Scenario: On-a-pinch admission under owned Work SCO residue

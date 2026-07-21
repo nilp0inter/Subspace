@@ -6,12 +6,13 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import dev.nilp0inter.subspace.model.InputMode
+import dev.nilp0inter.subspace.service.SubspaceLogger as Log
 
 /** Observable host request used to construct one semantic playback route. */
 internal data class PlaybackRouteRequest(
     val mode: InputMode,
     val endpoint: AudioRouteEndpoint,
-    val preferredDevice: AudioDeviceInfo,
+    val preferredDevice: AudioDeviceInfo?,
     val owner: BluetoothDevice? = null,
     val usage: Int,
     val audioMode: Int,
@@ -97,16 +98,31 @@ internal class ModePlaybackRouteResolver(
     }
 
     private suspend fun acquireCar(): PlaybackRouteAcquisition {
+        // A stale Work (RSM) SCO lease or keep-warm holds MODE_IN_COMMUNICATION and an SCO
+        // communication device, which would block car media admission. Release it, mirroring
+        // the capture-path release-work-before-car gate.
+        if (workSco.isActive()) {
+            workSco.releaseImmediately("car-playback-acquire")
+        }
         if (!awaitTelecomCaptureRelease()) {
+            Log.d(ROUTE_LOG_TAG, "CAR_PLAYBACK_ACQUIRE result=telecom-not-released")
             return PlaybackRouteAcquisition.Unavailable("Telecom capture route unavailable")
         }
         if (audioManager.mode != AudioManager.MODE_NORMAL ||
             audioManager.communicationDevice?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
         ) {
+            Log.d(ROUTE_LOG_TAG,
+                "CAR_PLAYBACK_ACQUIRE result=busy mode=${audioManager.mode} " +
+                    "comm=${audioManager.communicationDevice?.type}",)
             return PlaybackRouteAcquisition.Busy
         }
+        // Prefer a validated car media output (A2DP / wired Android Auto) when one is
+        // enumerable; otherwise fall back to unpinned USAGE_MEDIA (default media routing,
+        // which reaches the car's A2DP sink) instead of failing closed — mirroring the
+        // proven pre-host-owned MediaResponsePlayer path. Some OEMs do not expose a
+        // routable car output device to getDevices(), and requiring one strands responses.
         val device = carMediaDevice()?.takeIf { it.type in CAR_OUTPUT_TYPES }
-            ?: return PlaybackRouteAcquisition.Unavailable("Validated car media output unavailable")
+        Log.d(ROUTE_LOG_TAG, "CAR_PLAYBACK_ACQUIRE result=acquired device=${device?.type ?: "unpinned"}")
         val route = routeFactory(
             PlaybackRouteRequest(
                 mode = InputMode.OnTheRoad,
@@ -205,6 +221,7 @@ internal class CarMediaFocus(private val audioManager: AudioManager) {
         val granted = runCatching { audioManager.requestAudioFocus(request) }
             .getOrDefault(AudioManager.AUDIOFOCUS_REQUEST_FAILED) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         focusRequest = if (granted) request else null
+        Log.d(ROUTE_LOG_TAG, "CAR_MEDIA_FOCUS granted=$granted")
         return granted
     }
 
@@ -216,9 +233,10 @@ internal class CarMediaFocus(private val audioManager: AudioManager) {
 
 /**
  * Playback route decorator that holds media audio focus for the duration of one playback.
- * Focus is requested before the delegate starts and abandoned on release. When focus is
- * denied, [start] throws so the host fails closed and keeps the message pending for a
- * later retry instead of playing silently.
+ * Focus is requested (best-effort) before the delegate starts and abandoned on release.
+ * Focus denial does not block playback: the on-the-road spec requires requesting focus
+ * AND playing the response, and a head unit still renders an unpinned USAGE_MEDIA A2DP
+ * stream when transient focus is unavailable.
  */
 internal class MediaFocusPlaybackRoute(
     private val requestFocus: () -> Boolean,
@@ -231,10 +249,7 @@ internal class MediaFocusPlaybackRoute(
         get() = delegate.endpoint
 
     override suspend fun start(recording: RecordedPcm): ActivePcmPlayback {
-        if (!requestFocus()) {
-            throw IllegalStateException("Car media audio focus unavailable")
-        }
-        focusHeld = true
+        focusHeld = requestFocus()
         return delegate.start(recording)
     }
 

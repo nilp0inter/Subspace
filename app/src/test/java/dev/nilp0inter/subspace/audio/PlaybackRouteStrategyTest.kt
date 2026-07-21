@@ -330,6 +330,7 @@ class PlaybackRouteStrategyTest {
         val events = mutableListOf<String>()
         every { audioManager.mode } answers { events += "mode"; AudioManager.MODE_NORMAL }
         every { audioManager.communicationDevice } answers { events += "communication"; null }
+        every { sco.isActive() } returns false
         val resolver = ModePlaybackRouteResolver(
             audioManager = audioManager,
             workSco = sco,
@@ -358,6 +359,7 @@ class PlaybackRouteStrategyTest {
         every { audioManager.mode } returns AudioManager.MODE_NORMAL
         every { audioManager.communicationDevice } returns null
         every { car.type } returns AudioDeviceInfo.TYPE_USB_DEVICE
+        every { sco.isActive() } returns false
 
         val resolver = ModePlaybackRouteResolver(
             audioManager = audioManager,
@@ -387,6 +389,7 @@ class PlaybackRouteStrategyTest {
         every { audioManager.mode } returns AudioManager.MODE_NORMAL
         every { audioManager.communicationDevice } returns activeSco
         every { activeSco.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        every { sco.isActive() } returns false
 
         val acquisition = ModePlaybackRouteResolver(
             audioManager = audioManager,
@@ -401,9 +404,12 @@ class PlaybackRouteStrategyTest {
     }
 
     @Test
-    fun onTheRoadWithoutValidatedCarMediaFailsWithoutAmbientFallback() = runTest {
+    fun onTheRoadWithoutEnumerableCarMediaFallsBackToUnpinnedMediaRouting() = runTest {
         val audioManager = mockk<AudioManager>()
         val sco = mockk<ScoAudioController>()
+        val route = FakeAcquiredRoute()
+        val requests = mutableListOf<PlaybackRouteRequest>()
+        every { sco.isActive() } returns false
         every { audioManager.mode } returns AudioManager.MODE_NORMAL
         every { audioManager.communicationDevice } returns null
 
@@ -412,12 +418,15 @@ class PlaybackRouteStrategyTest {
             workSco = sco,
             awaitTelecomCaptureRelease = { true },
             carMediaDevice = { null },
+            carMediaFocus = mockk(relaxed = true),
+            routeFactory = { request -> requests += request; route },
         ).strategyFor(InputMode.OnTheRoad).acquire()
 
-        assertEquals(
-            PlaybackRouteAcquisition.Unavailable("Validated car media output unavailable"),
-            acquisition,
-        )
+        assertTrue(acquisition is PlaybackRouteAcquisition.Acquired)
+        val request = requests.single()
+        assertEquals(AudioRouteEndpoint.Car, request.endpoint)
+        assertEquals(null, request.preferredDevice)
+        assertEquals(AudioAttributes.USAGE_MEDIA, request.usage)
     }
 
     @Test
@@ -430,6 +439,7 @@ class PlaybackRouteStrategyTest {
         every { audioManager.mode } returns AudioManager.MODE_NORMAL
         every { audioManager.communicationDevice } returns null
         every { car.type } returns AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        every { sco.isActive() } returns false
 
         val resolver = ModePlaybackRouteResolver(
             audioManager = audioManager,
@@ -448,6 +458,29 @@ class PlaybackRouteStrategyTest {
         assertSame(car, request.preferredDevice)
         assertEquals(AudioAttributes.USAGE_MEDIA, request.usage)
         assertEquals(AudioManager.MODE_NORMAL, request.audioMode)
+    }
+
+    @Test
+    fun onTheRoadReleasesStaleWorkRouteBeforeAcquiringCarMedia() = runTest {
+        val audioManager = mockk<AudioManager>()
+        val sco = mockk<ScoAudioController>()
+        val route = FakeAcquiredRoute()
+        every { sco.isActive() } returns true
+        coEvery { sco.releaseImmediately(any()) } returns RouteGateResult.Success("car-playback-acquire")
+        every { audioManager.mode } returns AudioManager.MODE_NORMAL
+        every { audioManager.communicationDevice } returns null
+
+        val acquisition = ModePlaybackRouteResolver(
+            audioManager = audioManager,
+            workSco = sco,
+            awaitTelecomCaptureRelease = { true },
+            carMediaDevice = { null },
+            carMediaFocus = mockk(relaxed = true),
+            routeFactory = { route },
+        ).strategyFor(InputMode.OnTheRoad).acquire()
+
+        assertTrue(acquisition is PlaybackRouteAcquisition.Acquired)
+        coVerify(exactly = 1) { sco.releaseImmediately("car-playback-acquire") }
     }
 
 
@@ -589,26 +622,23 @@ class PlaybackRouteStrategyTest {
     }
 
     @Test
-    fun mediaFocusRouteFailsClosedWhenFocusDeniedAndDoesNotStartDelegate() = runTest {
+    fun mediaFocusRoutePlaysThroughWhenFocusDeniedBestEffort() = runTest {
         val events = mutableListOf<String>()
         val inner = FakeAcquiredRoute()
         val route = MediaFocusPlaybackRoute(
-            requestFocus = { false },
+            requestFocus = { events += "focus"; false },
             abandonFocus = { events += "abandon" },
             delegate = inner,
         )
 
-        try {
-            route.start(RecordedPcm(ShortArray(4), 16_000))
-            throw AssertionError("expected focus denial to fail closed")
-        } catch (expected: IllegalStateException) {
-            // focus denial fails closed before the delegate starts
-        }
-        assertEquals(0, inner.releaseCount)
+        val playback = route.start(RecordedPcm(ShortArray(4), 16_000))
+        assertEquals(listOf("focus"), events)
+        assertTrue(playback is FakeActivePlayback)
 
         route.release()
-        // Focus was never held, so nothing is abandoned; delegate release still happens.
-        assertTrue(events.isEmpty())
+        // Focus was denied (never held), so nothing is abandoned; the delegate still
+        // played and is released — focus is best-effort, not a playback precondition.
+        assertEquals(listOf("focus"), events)
         assertTrue(inner.released)
     }
 
