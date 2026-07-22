@@ -1007,6 +1007,7 @@ class NavigationTtsEngineTest {
 
         val secondResult = engine.requestPcm(second, delivered::add)
         firstPlaybackCancelled.await()
+        firstRequest.join()
 
         assertTrue(firstRequest.isCancelled)
         assertTrue(secondResult is NavigationSynthesisResult.Success)

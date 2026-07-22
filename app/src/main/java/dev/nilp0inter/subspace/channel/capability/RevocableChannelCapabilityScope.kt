@@ -108,12 +108,12 @@ class RevocableChannelCapabilityScope(
      * already-terminal state.
      */
     suspend fun revoke(): CapabilityScopeTerminationResult {
-        // One atomic monotonic transition: either PENDING→REVOKED or OPEN→REVOKED.
-        // Linearizing to REVOKED first prevents any concurrent authorize (PENDING→OPEN)
-        // or acquire from observing OPEN state, before lease cleanup runs.
-        if (!state.compareAndSet(ScopeState.OPEN, ScopeState.REVOKED) &&
-            !state.compareAndSet(ScopeState.PENDING, ScopeState.REVOKED)
-        ) return CapabilityScopeTerminationResult.AlreadyClosed
+        // A single exchange linearizes either PENDING→REVOKED or OPEN→REVOKED.
+        // Using separate CAS attempts would allow authorize() to move PENDING→OPEN
+        // between them, causing revoke() to miss both states and leave the scope open.
+        if (state.getAndSet(ScopeState.REVOKED) === ScopeState.REVOKED) {
+            return CapabilityScopeTerminationResult.AlreadyClosed
+        }
         // Notify host-owned resources even when no lease is currently retained. Deferred
         // playback entries outlive the short capability lease used for scheduling, so lease
         // cleanup alone cannot revoke those queued entries. The host callback is idempotent and
