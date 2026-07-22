@@ -1,9 +1,15 @@
-## ADDED Requirements
+## Purpose
+
+Define deterministic, per-generation serialization and lifecycle-safe invocation boundaries for channel runtime callbacks and cooperative actor continuations.
+
+## Requirements
 
 ### Requirement: Runtime callbacks are serialized per instance
 The host SHALL invoke provider and runtime callbacks through a host-owned invocation boundary that permits at most one host-admitted callback to execute at a time for a runtime generation. Host-admitted callbacks SHALL be ordered deterministically in admission order, and each executing callback SHALL observe the effects of the preceding completed callback before it begins. Runtime callbacks SHALL NOT be invoked directly from arbitrary callers.
 
 Where the runtime is a cooperative actor runtime, the invocation boundary SHALL distinguish host-to-runtime adapter admission from in-actor scheduling. A host callback SHALL occupy the serialized adapter queue only while it admits an event and runs that event's current Lua slice. If the slice yields, the adapter callback SHALL return a normalized admitted or yielded result and release its invocation slot; the suspended coroutine remains actor-owned and does not keep the host callback active. Later host callbacks MAY then admit later events in FIFO order. Actor continuations resume through the bounded ready queue and do not constitute new host-admitted callbacks. At most one native Lua entry SHALL execute for the generation regardless of queued callbacks, ready continuations, or suspended coroutines. Separate runtime instances MAY execute independently.
+
+When a yielded actor continuation is resumed synchronously from inside an executing serialized callback, the boundary SHALL treat that continuation as already covered by the callback's execution serialization. The continuation resume SHALL NOT block on, or attempt to re-acquire, the non-reentrant execution lock already held by the enclosing callback in a way that deadlocks the runtime generation; liveness and closed-state checks for that generation SHALL still apply.
 
 #### Scenario: Concurrent events target one runtime
 - **WHEN** two runtime callbacks are admitted concurrently for the same runtime generation
@@ -30,6 +36,13 @@ Where the runtime is a cooperative actor runtime, the invocation boundary SHALL 
 - **WHEN** a suspended Lua entry's host-operation token completes while a different coroutine is running in the same actor
 - **THEN** the actor SHALL NOT resume the suspended entry concurrently with the running coroutine
 - **AND** it SHALL resume the suspended entry only when native Lua entry is again available for that generation
+
+#### Scenario: Continuation resumed from within a serialized callback does not self-deadlock
+- **WHEN** an executing host-admitted callback synchronously resumes a yielded actor continuation through the invocation boundary
+- **THEN** the boundary SHALL run that continuation under the enclosing callback's existing execution serialization
+- **AND** it SHALL NOT block waiting for a non-reentrant execution lock already held by that same callback
+- **AND** the generation SHALL complete both the callback and the continuation without a timeout-based invalidation
+- **AND** continuations resumed from outside any serialized callback SHALL still acquire the execution lock and remain serialized against host-admitted callbacks
 
 ### Requirement: Invocation admission and execution are bounded
 The host SHALL use a bounded queue and an explicit deadline or timeout policy for provider construction and runtime callback work. When the queue has no capacity, the host SHALL reject new work with a typed busy result rather than block an unbounded number of callers. When an invocation exceeds its deadline, the host SHALL cancel it and return a typed timeout result without waiting indefinitely for provider or runtime code.

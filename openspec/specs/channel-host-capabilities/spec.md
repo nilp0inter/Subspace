@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Modifies Channel Host Capabilities to adapt transcription, synthesis, and playback to language-neutral opaque interfaces, and support selection-aware host-routed deferred audio queues.
+
+## Requirements
 
 ### Requirement: Channels access effects only through semantic host capabilities
 The host SHALL expose Android- and product-native effects to channel runtimes only through semantic capability contracts. The host SHALL retain exclusive ownership of Android resources, audio routes and capture, Bluetooth and other hardware transports, connection and reconnection policy, concurrency, cleanup, and detailed platform diagnostics. Effects including audio capture, playback, text output, Sleepwalker transport, remote-agent completion, model discovery, synthesis, and tool execution SHALL continue to require semantic host capabilities, and capability contracts SHALL NOT expose Android, BLE, GATT, HID transport, Telecom, audio-route, recorder, file-descriptor, socket, or hardware objects to providers or runtimes. General runtime modules for future language adapters are a distinct mechanism: a runtime module SHALL yield opaque, lifecycle-bound operations and SHALL NOT expose platform objects, Android contexts, SDK clients, transport connections, or credential material. This change SHALL NOT introduce HTTP, filesystem, socket, package, or public API contracts for runtime modules.
@@ -72,11 +76,11 @@ Any host audio capability made available to a channel SHALL represent work throu
 - **THEN** the host SHALL return a typed result or opaque operation handle
 - **AND** the host SHALL choose and manage platform audio resources without revealing them to the channel
 
-#### Scenario: Runtime returns synthesized playback
-- **WHEN** a runtime creates an opaque playback operation from synthesized audio and returns it as its terminal input result
-- **THEN** capability creation SHALL NOT play audio through an ambient or process-wide output
-- **AND** the audio-input subsystem SHALL resolve the opaque operation and play its PCM exactly once through the active session's resolved output
-- **AND** it SHALL preserve the endpoint-specific playback and route-release ordering before completing terminal cleanup
+#### Scenario: Runtime schedules deferred playback
+- **WHEN** a runtime schedules a playback operation from synthesized or captured audio via `subspace.playback.schedule`
+- **THEN** the scheduling operation SHALL NOT play audio through an ambient or process-wide output
+- **AND** the playback capability SHALL accept the audio into the selection-aware deferred queue exactly once
+- **AND** it SHALL return a successful scheduled result to Lua without returning any underlying queue token, route, or platform object
 
 #### Scenario: PTT capture is prepared
 - **WHEN** the active runtime accepts a channel-level input target
@@ -168,23 +172,33 @@ The host SHALL expose asynchronous model discovery as a semantic operation scope
 - **AND** it SHALL NOT fabricate a model choice or silently select a different profile
 
 ### Requirement: Synthesis and playback are host-owned asynchronous effects
-The host SHALL expose semantic synthesis and playback capabilities that accept channel-domain text, channel instance identity, runtime generation, and run identity. Synthesis and playback SHALL be allowed to complete after the originating PTT session and SHALL be scheduled independently of the PTT audio route. The host SHALL own synthesis engines, PCM handling, output admission, playback routing, serialization, cancellation, pending/heard state, and cleanup; runtimes SHALL receive only typed outcomes or opaque lifecycle-bound handles.
+The host SHALL expose semantic synthesis and playback capabilities that accept channel-domain text or opaque audio handles, channel instance identity, and runtime generation. Synthesis and playback SHALL be allowed to complete after the originating PTT session and SHALL be scheduled independently of the PTT audio route. The host SHALL own synthesis engines, PCM handling, output admission, playback routing, serialization, cancellation, pending/heard state, and cleanup; runtimes SHALL receive only typed outcomes or opaque lifecycle-bound handles.
 
 #### Scenario: Accepted response is synthesized after PTT
 - **WHEN** a durable channel run produces final assistant text after its PTT target has released
 - **THEN** the host SHALL synthesize and schedule playback through the semantic capabilities without reopening or retaining the PTT route
 - **AND** the host SHALL associate the effect with the channel instance, runtime generation, and run identity
 
-#### Scenario: Response arrives while its channel is not selected
-- **WHEN** synthesis completes while another channel is active or playback cannot be admitted
-- **THEN** the host SHALL retain a typed pending playback result for the addressed channel
+#### Scenario: Admitted playback is temporarily ineligible for physical output
+- **WHEN** a playback entry has already passed bounded queue admission but another channel is selected or current selection/route policy temporarily prevents physical playback
+- **THEN** the host SHALL retain that authorized entry as pending for its addressed channel
 - **AND** it SHALL NOT play through an ambient or unrelated channel output
-- **AND** it SHALL admit playback only through the host's selection and audio policy when that channel is returned to
+- **AND** it SHALL re-evaluate physical admission only under the host's selection and audio policy while the entry and generation remain current
 
 #### Scenario: Synthesis or playback is revoked
 - **WHEN** the owning runtime generation is retired or the operation is cancelled before playback is admitted
 - **THEN** the host SHALL cancel or detach the operation according to its semantic contract
 - **AND** completion after cancellation SHALL NOT produce playback, publication, or another late effect
+
+#### Scenario: Semantic operation exceeds deadline
+- **WHEN** transcription, synthesis, or deferred-queue admission does not complete before its finite host-configured deadline
+- **THEN** the host SHALL atomically terminate the operation with the language-neutral timeout outcome
+- **AND** it SHALL cancel or detach backend work, clean operation-specific resources, and suppress every late completion or effect
+
+#### Scenario: Deferred queue capacity is exhausted
+- **WHEN** queue admission would exceed a finite per-instance, per-generation, or global entry-count or retained-audio-byte bound
+- **THEN** the host SHALL reject admission with a typed busy outcome before consuming the caller's opaque audio handle
+- **AND** it SHALL NOT create a partial queue entry, reroute existing audio, or evict another channel's entry implicitly
 
 ### Requirement: Host executes only declared semantic agent tools
 The host SHALL execute agent tool calls through semantic tool descriptors, requests, and normalized results. For this change the host SHALL expose only configured Keyboard `type_text` and `press_enter` operations, SHALL perform enabled calls automatically without per-call authorization, and SHALL own keyboard-profile resolution, text compilation, transport access, serialization, retries, and cleanup. Tool contracts SHALL NOT expose Android input, BLE/HID, filesystem, SDK, or transport objects to channel runtimes.
@@ -205,11 +219,11 @@ The host SHALL execute agent tool calls through semantic tool descriptors, reque
 - **AND** it SHALL NOT automatically replay the text-output or key-press effect
 
 ### Requirement: Asynchronous capability effects are generation-safe
-Every asynchronous capability operation SHALL carry the channel instance identifier, runtime generation, and durable run identity that authorized it. The host SHALL accept completion, publication, playback, synthesis, and tool results only while that authorization remains current, SHALL revoke it on generation retirement, and SHALL make revocation and terminal completion idempotent. A late completion SHALL be observable only as a normalized stale or cancelled outcome and SHALL NOT mutate current channel state.
+Every asynchronous capability operation and queued playback entry SHALL carry the channel instance identifier and runtime generation that authorized it. The host SHALL accept completion, publication, playback, synthesis, and tool results only while that authorization remains current, SHALL revoke it on generation retirement or close, and SHALL make revocation and terminal completion idempotent. A late completion SHALL be observable only as a normalized stale or cancelled outcome and SHALL NOT mutate current channel state or produce deferred playback.
 
 #### Scenario: Runtime generation is replaced
 - **WHEN** a channel definition change or runtime replacement retires generation G and creates generation H
-- **THEN** the host SHALL revoke outstanding capability effects owned by G
+- **THEN** the host SHALL revoke outstanding capability effects and queued playback entries owned by G
 - **AND** operations issued by H SHALL use separate authorization even when the channel instance ID is unchanged
 
 #### Scenario: Late completion arrives
@@ -291,7 +305,7 @@ Plugin-owned policy (protocol selection, retry and backoff, polling cadence, sta
 - **AND** the policy SHALL NOT retain authorization, capability leases, or effect delivery after the generation closes
 
 ### Requirement: No public runtime I/O modules or persistent plugin state ship in this change
-This change SHALL promote the internal Lua kernel and actor mechanisms required for lifecycle and scheduling, but SHALL NOT expose public runtime I/O modules (HTTP, filesystem, socket, general networking, or event-loop modules), a channel-accessible persistent key-value store, package filesystem, package installer, or package verifier. General runtime modules described by this change are a forward contract boundary and SHALL NOT be registered or exposed to plugin code. Existing capability contracts SHALL remain usable by built-in Kotlin runtimes without constructing a Lua actor.
+This change SHALL promote the internal Lua kernel and actor mechanisms required for lifecycle and scheduling, and the capability-gated public semantic audio modules (`subspace.transcription`, `subspace.synthesis`, `subspace.playback`), but SHALL NOT expose general public runtime I/O modules (HTTP, filesystem, socket, general networking, or event-loop modules), a channel-accessible persistent key-value store, package filesystem, package installer, or package verifier. General runtime modules described by this change are a forward contract boundary and SHALL NOT be registered or exposed to plugin code. Existing capability contracts SHALL remain usable by built-in Kotlin runtimes without constructing a Lua actor.
 
 #### Scenario: Change is applied without public runtime I/O modules
 - **WHEN** the internal Lua actor runtime and channel capability platform are initialized
