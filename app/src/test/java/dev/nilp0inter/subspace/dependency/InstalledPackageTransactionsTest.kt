@@ -468,7 +468,7 @@ class InstalledPackageTransactionsTest {
             // Package with non-empty configuration and capabilities (task 10.2)
             val source = sourceRecord("125", "751", "752")
             val provider = InstalledProviderId.derive(source.repositoryId)
-            val manifest = """{"manifestVersion":1,"repositoryId":"125","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
+            val manifest = """{"manifestVersion":1,"repositoryId":"125","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"resources":{"mounts":[]},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
             val luaSource = "-- evolved fixture\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
             val archive = strictUnixStoredZip(
                 listOf(
@@ -549,13 +549,13 @@ class InstalledPackageTransactionsTest {
                 asset = GitHubAssetIdentity("2", "subspace-channel.zip"),
             )
             val diagnosticsSource = historicalSource.copy(
-                release = GitHubReleaseIdentity("1", "v1.2.0", false),
-                asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
+                release = GitHubReleaseIdentity("358362176", "v1.3.0", false),
+                asset = GitHubAssetIdentity("486488343", "subspace-channel.zip"),
             )
-            val debugSource = sourceRecord("1306065111", "1", "1").copy(
+            val debugSource = sourceRecord("1306065111", "358361888", "486487786").copy(
                 coordinates = GitHubRepositoryCoordinates("nilp0inter", "debug-channel"),
-                release = GitHubReleaseIdentity("1", "v1.0.0", false),
-                asset = GitHubAssetIdentity("1", "subspace-channel.zip"),
+                release = GitHubReleaseIdentity("358361888", "v1.2.0", false),
+                asset = GitHubAssetIdentity("486487786", "subspace-channel.zip"),
             )
             val diagnosticsProvider = InstalledProviderId.derive(diagnosticsSource.repositoryId)
             val debugProvider = InstalledProviderId.derive(debugSource.repositoryId)
@@ -591,12 +591,12 @@ class InstalledPackageTransactionsTest {
             publications.assertLast(setOf(diagnosticsProvider, debugProvider), emptySet())
 
             val committed = index(root).providers
-            assertEquals("1.2.0", committed.getValue(diagnosticsSource.repositoryId).active.manifest.packageVersion)
+            assertEquals("1.3.0", committed.getValue(diagnosticsSource.repositoryId).active.manifest.packageVersion)
             assertEquals(
                 "1.1.0",
                 committed.getValue(diagnosticsSource.repositoryId).rollback?.manifest?.packageVersion,
             )
-            assertEquals("1.0.0", committed.getValue(debugSource.repositoryId).active.manifest.packageVersion)
+            assertEquals("1.2.0", committed.getValue(debugSource.repositoryId).active.manifest.packageVersion)
             assertContent(root, digest(historicalBytes), historicalBytes)
         }
     }
@@ -611,7 +611,7 @@ class InstalledPackageTransactionsTest {
             val providerB = InstalledProviderId.derive(sourceB.repositoryId)
 
             // Package A with non-trivial declarations
-            val manifestA = """{"manifestVersion":1,"repositoryId":"126","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Mutation Target","summary":"Target for manifest mutation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO"]}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"Echo"},{"value":"DELAYED_ECHO","label":"Delayed"}]}]}},"capabilities":["audio.playback"]}"""
+            val manifestA = """{"manifestVersion":1,"repositoryId":"126","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Mutation Target","summary":"Target for manifest mutation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO"]}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"Echo"},{"value":"DELAYED_ECHO","label":"Delayed"}]}]}},"resources":{"mounts":[]},"capabilities":["audio.playback"]}"""
             val luaA = "-- target\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
             val archiveA = strictUnixStoredZip(
                 listOf(
@@ -622,7 +622,7 @@ class InstalledPackageTransactionsTest {
             )
 
             // Package B (sibling) with different declarations
-            val manifestB = """{"manifestVersion":1,"repositoryId":"127","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Sibling Package","summary":"Sibling for mutation isolation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+            val manifestB = """{"manifestVersion":1,"repositoryId":"127","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Sibling Package","summary":"Sibling for mutation isolation test"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
             val luaB = "-- sibling\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
             val archiveB = strictUnixStoredZip(
                 listOf(
@@ -760,7 +760,7 @@ class InstalledPackageTransactionsTest {
 
     private fun packageArchive(repositoryId: String, version: String, marker: String): ByteArray {
         val source = "-- $marker\\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Transaction package","summary":"Transactional package fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Transaction package","summary":"Transactional package fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),

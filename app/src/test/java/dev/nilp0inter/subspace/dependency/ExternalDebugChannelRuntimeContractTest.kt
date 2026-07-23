@@ -137,15 +137,15 @@ class ExternalDebugChannelRuntimeContractTest {
             val registry = runtimeRegistry(providers, DebugCapabilityHost())
             val channel = definition("debug-compat", id, "ECHO")
 
-            // Create instance with v1.0.0
+            // Create instance with the exact v1.2.0 release
             registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
             advanceUntilIdle()
             val firstStateId = bridge.createdStates.single()
             assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(channel.id)?.preparation)
 
-            // Compatible update to v1.1.0 (same schema, different packageVersion)
+            // Compatible update to a successor revision (same schema, different packageVersion)
             val repo = repository(root, bridge, providers)
-            val updateResult = success(repo.installOrUpdate(ByteArrayInputStream(v110Fixture()), v110SourceRecord()))
+            val updateResult = success(repo.installOrUpdate(ByteArrayInputStream(successorFixture()), successorSourceRecord()))
             assertEquals(MutationResult.Updated(id), updateResult)
             assertTrue("Provider must remain available after compatible update",
                 providers.resolve(id) is ChannelProviderResolution.Available)
@@ -201,18 +201,22 @@ class ExternalDebugChannelRuntimeContractTest {
             val registry = runtimeRegistry(providers, DebugCapabilityHost())
             val channel = definition("debug-rollback", id, "ECHO")
 
+            // Create instance with the exact v1.2.0 release
             registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
             advanceUntilIdle()
             assertEquals(ChannelPreparationAvailability.Available, registry.getRuntimeSnapshot(channel.id)?.preparation)
 
-            // Compatible update to v1.1.0
+            // Compatible update to a successor revision
             val repo = repository(root, bridge, providers)
             assertEquals(MutationResult.Updated(id), success(
-                repo.installOrUpdate(ByteArrayInputStream(v110Fixture()), v110SourceRecord())))
+                repo.installOrUpdate(ByteArrayInputStream(successorFixture()), successorSourceRecord())))
 
-            // Explicit rollback to v1.0.0
-            val rollbackResult = success(repo.rollback(v110SourceRecord().repositoryId))
+            // Explicit rollback restores the exact v1.2.0 revision
+            val rollbackResult = success(repo.rollback(sourceRecord().repositoryId))
             assertEquals(MutationResult.RolledBack(id), rollbackResult)
+            val rolledBack = success(InstalledPackageStore(root).loadIndex()).index.providers.getValue(sourceRecord().repositoryId)
+            assertEquals("1.2.0", rolledBack.active.manifest.packageVersion)
+            assertEquals("1.2.1", rolledBack.rollback?.manifest?.packageVersion)
             assertTrue("Rollback must restore provider availability",
                 providers.resolve(id) is ChannelProviderResolution.Available)
 
@@ -415,7 +419,7 @@ class ExternalDebugChannelRuntimeContractTest {
             // Package update: predecessor must close before successor creates
             val repo = repository(root, bridge, providers)
             assertEquals(MutationResult.Updated(id), success(
-                repo.installOrUpdate(ByteArrayInputStream(v110Fixture()), v110SourceRecord())))
+                repo.installOrUpdate(ByteArrayInputStream(successorFixture()), successorSourceRecord())))
             registry.reconcile(ChannelCatalogueSnapshot(listOf(edited), edited.id))
             advanceUntilIdle()
             val updateState = bridge.createdStates.last()
@@ -491,19 +495,21 @@ class ExternalDebugChannelRuntimeContractTest {
     }
 
     private fun fixture() = requireNotNull(javaClass.classLoader?.getResourceAsStream("debug-channel/subspace-channel.zip")).use { it.readBytes() }
-    private fun v110Fixture() = requireNotNull(javaClass.classLoader?.getResourceAsStream("debug-channel/subspace-channel-v1.1.0.zip")).use { it.readBytes() }
+    private fun successorFixture() = requireNotNull(javaClass.classLoader?.getResourceAsStream("debug-channel/subspace-channel-v1.2.1.zip")).use { it.readBytes() }
     private fun incompatibleFixture() = requireNotNull(javaClass.classLoader?.getResourceAsStream("debug-channel/subspace-channel-incompatible.zip")).use { it.readBytes() }
-    private fun sourceRecord() = PackageSourceRecord(GitHubRepositoryIdentity(REPOSITORY_ID), GitHubRepositoryCoordinates("nilp0inter", "debug-channel"), GitHubReleaseIdentity(RELEASE_ID, "v1.0.0", false), GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"), OWNER)
-    private fun v110SourceRecord() = PackageSourceRecord(GitHubRepositoryIdentity(REPOSITORY_ID), GitHubRepositoryCoordinates("nilp0inter", "debug-channel"), GitHubReleaseIdentity("2", "v1.1.0", false), GitHubAssetIdentity("2", "subspace-channel-v1.1.0.zip"), OWNER)
+    private fun sourceRecord() = PackageSourceRecord(GitHubRepositoryIdentity(REPOSITORY_ID), GitHubRepositoryCoordinates("nilp0inter", "debug-channel"), GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false), GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"), OWNER)
+    // Test-only carrier: a schema-compatible successor revision for update/rollback traversal; not a published release.
+    private fun successorSourceRecord() = PackageSourceRecord(GitHubRepositoryIdentity(REPOSITORY_ID), GitHubRepositoryCoordinates("nilp0inter", "debug-channel"), GitHubReleaseIdentity("4", "v1.2.1", false), GitHubAssetIdentity("4", "subspace-channel-v1.2.1.zip"), OWNER)
     private fun incompatibleSourceRecord() = PackageSourceRecord(GitHubRepositoryIdentity(REPOSITORY_ID), GitHubRepositoryCoordinates("nilp0inter", "debug-channel"), GitHubReleaseIdentity("3", "v2.0.0", false), GitHubAssetIdentity("3", "subspace-channel-incompatible.zip"), OWNER)
     private suspend fun <T> withTemporaryDirectory(block: suspend (File) -> T): T { val root = createTempDirectory("debug-runtime-").toFile(); return try { block(root) } finally { root.deleteRecursively() } }
 
     private object FakeSession : ChannelAudioInputSession { override val sampleRate = 16_000; override val frames = emptyFlow<ShortArray>() }
 
     private class DebugKernelBridge : LuaKernelBridge {
-        private val nextState = AtomicLong(1); private val nextOperation = AtomicLong(1)
+        private val nextState = AtomicLong(1)
         private val modes = mutableMapOf<Long, String>(); private val stages = mutableMapOf<Long, String>()
         val createdStates = mutableListOf<Long>(); val closedStates = mutableListOf<Long>(); val startedModes = mutableListOf<String>(); val delays = mutableListOf<Double>(); val transcriptions = mutableListOf<String>(); val synthesisTexts = mutableListOf<String>()
+        private val claims = mutableMapOf<Long, HostOperationClaim>(); private var nextRequestId = 100L
         override fun create(config: LuaKernelConfig): LuaKernelOutcome { val id = nextState.getAndIncrement(); createdStates += id; modes[id] = "ECHO"; return LuaKernelOutcome.Created(id, id, LUA_VERSION, API_VERSION, "debug-fixture") }
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String) = complete(handle)
         override fun start(handle: LuaStateHandle) = complete(handle)
@@ -511,8 +517,8 @@ class ExternalDebugChannelRuntimeContractTest {
             val mode = modes[operation.stateHandle.stateId.value] ?: "ECHO"
             if (!success) return complete(operation.stateHandle, "{\"error\":{\"code\":\"E_HOST_FAILURE\",\"detail\":\"operation failed\"}}")
             return when (stages[operation.stateHandle.stateId.value]) {
-                "transcribe" -> if (mode == "STT") complete(operation.stateHandle, "{\"ok\":true}") else yield(operation, "synthesize:{\"text\":\"transcript\",\"language\":\"en\",\"voice\":\"default\",\"speed\":1.0}", spawnAdmission.admitSynthesis(nextOperation.getAndIncrement(), "{\"text\":\"transcript\",\"language\":\"en\",\"voice\":\"default\",\"speed\":1.0}"))
-                "synthesize" -> yield(operation, "playback:synthesized:0.0", spawnAdmission.admitPlayback(nextOperation.getAndIncrement(), "synthesized:0", 0.0))
+                "transcribe" -> if (mode == "STT") complete(operation.stateHandle, "{\"ok\":true}") else yield(operation, registerClaim(HostOperationKind.SYNTHESIZE, text = "transcript", language = "en", voice = "default", speed = 1.0))
+                "synthesize" -> yield(operation, registerClaim(HostOperationKind.PLAYBACK, audioToken = value, delaySeconds = 0.0))
                 "playback" -> complete(operation.stateHandle, "{\"ok\":true}")
                 else -> complete(operation.stateHandle, "{\"ok\":true}")
             }
@@ -526,8 +532,9 @@ class ExternalDebugChannelRuntimeContractTest {
         override fun invokeCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, arguments: LuaValue, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome { val mode = modes[handle.stateId.value] ?: "ECHO"; val caps = (arguments as? LuaValue.Map)?.pairs?.get("capabilities") as? LuaValue.Map; val required = when (mode) { "ECHO", "DELAYED_ECHO" -> listOf("audio.playback"); "STT" -> listOf("audio.transcription"); "TTS" -> listOf("audio.synthesis", "audio.playback"); else -> listOf("audio.transcription", "audio.synthesis", "audio.playback") }; val ready = required.all { (caps?.pairs?.get(it) as? LuaValue.StringValue)?.value == "available" }; return complete(handle, "{\"ready\":$ready,\"status\":\"$mode\"}") }
         override fun invokeInputCallback(handle: LuaStateHandle, callbackHandle: LuaCallbackHandle, arguments: LuaValue, capturedAudioToken: String, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome { val mode = modes[handle.stateId.value] ?: "ECHO"; when (mode) { "ECHO" -> delays += 0.0; "DELAYED_ECHO" -> delays += 5.0; "STT" -> transcriptions += capturedAudioToken; "TTS" -> synthesisTexts += "Debug synthesis test"; "STT_TTS" -> { transcriptions += capturedAudioToken; synthesisTexts += "transcript" } }; return complete(handle, "{\"ok\":true}") }
         override fun startCoroutine(handle: LuaStateHandle, coroutineId: LuaCoroutineId, spawnAdmission: LuaSpawnAdmission) = complete(handle)
-        private fun yield(operation: LuaOperationHandle, label: String, admission: Int) = if (admission == 0) LuaKernelOutcome.Yielded(operation.stateHandle.stateId.value, operation.stateHandle.generation.value, operation.coroutineId.value, operation.operationId.value, label) else LuaKernelOutcome.RuntimeFailure(operation.stateHandle.stateId.value, operation.stateHandle.generation.value, "admission rejected")
-        private fun yield(handle: LuaStateHandle, op: Long, label: String, admission: Int) = if (admission == 0) LuaKernelOutcome.Yielded(handle.stateId.value, handle.generation.value, 1, op, label) else LuaKernelOutcome.RuntimeFailure(handle.stateId.value, handle.generation.value, "admission rejected")
+        override fun claimHostOperation(handle: LuaStateHandle, requestId: Long): HostOperationClaim = claims[requestId] ?: HostOperationClaim.Rejected("E_STALE")
+        private fun registerClaim(kind: HostOperationKind, audioToken: String? = null, text: String? = null, language: String? = null, voice: String? = null, speed: Double = 1.0, delaySeconds: Double = 0.0): String { val id = nextRequestId++; claims[id] = HostOperationClaim.Admitted(id, kind, audioToken, text, language, voice, speed, delaySeconds); return id.toString() }
+        private fun yield(operation: LuaOperationHandle, claimId: String) = LuaKernelOutcome.Yielded(operation.stateHandle.stateId.value, operation.stateHandle.generation.value, operation.coroutineId.value, operation.operationId.value, claimId)
         private fun complete(handle: LuaStateHandle, value: String? = null) = LuaKernelOutcome.Completed(handle.stateId.value, handle.generation.value, null, value, null, null, null, null, null, LUA_VERSION, API_VERSION, "debug-fixture")
     }
 
@@ -566,8 +573,8 @@ class ExternalDebugChannelRuntimeContractTest {
 
     private companion object {
         const val REPOSITORY_ID = "1306065111"
-        const val RELEASE_ID = "356470937"
-        const val ASSET_ID = "482932674"
+        const val RELEASE_ID = "358361888"
+        const val ASSET_ID = "486487786"
         const val OWNER = "1224006"
     }
 }

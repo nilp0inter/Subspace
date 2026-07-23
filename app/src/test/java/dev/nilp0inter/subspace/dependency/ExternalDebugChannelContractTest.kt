@@ -18,6 +18,7 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.zip.ZipFile
 import kotlin.io.path.createTempDirectory
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -40,7 +41,7 @@ class ExternalDebugChannelContractTest {
             ByteArrayInputStream(artifact), sourceRecord(), File(root, "staging.zip"),
         ))
         assertEquals(GitHubRepositoryIdentity(REPOSITORY_ID), revision.manifest.repositoryId)
-        assertEquals("1.0.0", revision.manifest.packageVersion)
+        assertEquals("1.2.0", revision.manifest.packageVersion)
         assertEquals("plugin", revision.programImage.entryPoint)
         assertEquals(LUA_VERSION, revision.manifest.runtime.luaVersion)
         assertEquals(API_VERSION, revision.manifest.runtime.apiVersion)
@@ -84,6 +85,25 @@ class ExternalDebugChannelContractTest {
         }
     }
 
+    @Test
+    fun `historical pre-resources releases remain preserved byte-exact under explicit historical paths`() = withTemporaryDirectory { root ->
+        val cases = listOf(
+            Triple(HISTORICAL_V1_0_0_PATH, HISTORICAL_V1_0_0_SHA256, "1.0.0"),
+            Triple(HISTORICAL_V1_1_0_PATH, HISTORICAL_V1_1_0_SHA256, "1.1.0"),
+        )
+        cases.forEachIndexed { i, (path, expectedSha, expectedVersion) ->
+            val bytes = requireNotNull(javaClass.classLoader?.getResourceAsStream(path)) {
+                "Missing preserved historical debug fixture: $path"
+            }.use { it.readBytes() }
+            assertEquals(expectedSha, sha256(bytes))
+            ZipFile(File(root, "historical-$i.zip").also { it.writeBytes(bytes) }).use { zip ->
+                val manifest = JSONObject(String(zip.getInputStream(zip.getEntry("manifest.json")).readBytes()))
+                assertEquals(expectedVersion, manifest.getString("packageVersion"))
+                assertFalse("Pre-resources historical manifest must remain unrevised", manifest.has("resources"))
+            }
+        }
+    }
+
 
     private fun fixture(): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(RESOURCE_PATH))
         .use { it.readBytes() }
@@ -91,7 +111,7 @@ class ExternalDebugChannelContractTest {
     private fun sourceRecord() = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
         coordinates = GitHubRepositoryCoordinates("nilp0inter", "debug-channel"),
-        release = GitHubReleaseIdentity(RELEASE_ID, "v1.0.0", false),
+        release = GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false),
         asset = GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"),
         ownerId = OFFICIAL_OWNER_ID,
     )
@@ -138,10 +158,14 @@ class ExternalDebugChannelContractTest {
     private companion object {
         const val RESOURCE_PATH = "debug-channel/subspace-channel.zip"
         const val REPOSITORY_ID = "1306065111"
-        const val RELEASE_ID = "356470937"
-        const val ASSET_ID = "482932674"
+        const val RELEASE_ID = "358361888"
+        const val ASSET_ID = "486487786"
         const val OFFICIAL_OWNER_ID = "1224006"
-        const val ARTIFACT_SIZE = 7103
-        const val ARTIFACT_SHA256 = "f90c8c073378659acac1fbb63f100e1d1b180d69b05a154ecefc3cd17887b76a"
+        const val ARTIFACT_SIZE = 7129
+        const val ARTIFACT_SHA256 = "2ae022f3c5854a449ad7cbafd6fe8341a52e1bec29a991c9683f02add77aea74"
+        const val HISTORICAL_V1_0_0_PATH = "debug-channel/historical/v1.0.0/subspace-channel.zip"
+        const val HISTORICAL_V1_0_0_SHA256 = "f90c8c073378659acac1fbb63f100e1d1b180d69b05a154ecefc3cd17887b76a"
+        const val HISTORICAL_V1_1_0_PATH = "debug-channel/historical/v1.1.0/subspace-channel.zip"
+        const val HISTORICAL_V1_1_0_SHA256 = "464293ebdf2dade6a0577b4e99f52293faf80d3deebce84db7ae041143dd7342"
     }
 }

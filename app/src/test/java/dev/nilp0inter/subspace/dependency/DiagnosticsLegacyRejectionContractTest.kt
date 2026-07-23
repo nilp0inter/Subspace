@@ -33,9 +33,9 @@ import org.junit.Test
 
 /**
  * Task 1.9 contract: the evolved in-tree Diagnostics fixture is the only accepted immutable
- * package shape, while the byte-pinned historical v1.0.0/v1.1.0 releases — whose manifests
- * predate the mandatory `configuration`/`capabilities` declarations — are retained solely as
- * rejection fixtures.
+ * package shape, while the byte-pinned historical releases are retained solely as rejection
+ * fixtures: v1.0.0/v1.1.0 predate the mandatory `configuration`/`capabilities` declarations,
+ * and v1.2.0 predates the mandatory `resources` declaration.
  *
  * These tests prove the clean cutover by driving the real [PackageValidator] and the real
  * [InstalledPackageRepository] with the exact pinned bytes:
@@ -136,6 +136,42 @@ class DiagnosticsLegacyRejectionContractTest {
         )
 
         assertManifestMalformed(outcome, "historical v1.1.0")
+        assertFalse(
+            "Strict validator must not retain a staging file for a rejected historical artifact",
+            stagingFile.exists(),
+        )
+    }
+
+    @Test
+    fun `byte-pinned historical v1_2_0 release rejects at the strict manifest decoder before storage`() = withTemporaryDirectory { root ->
+        val historicalBytes = loadPinnedFixture("$HISTORICAL_RESOURCE_BASE/v1.2.0/subspace-channel.zip", HISTORICAL_V1_2_0_SHA256)
+        val manifest = readManifestJson(historicalBytes)
+        assertEquals(
+            "Historical fixture must retain its original packageVersion",
+            "1.2.0",
+            manifest.getString("packageVersion"),
+        )
+        assertTrue(
+            "v1.2.0 historical manifest must already carry the evolved configuration declaration",
+            manifest.has(CONFIGURATION_KEY),
+        )
+        assertTrue(
+            "v1.2.0 historical manifest must already carry the evolved capabilities declaration",
+            manifest.has(CAPABILITIES_KEY),
+        )
+        assertFalse(
+            "v1.2.0 historical manifest must omit the resources declaration (the resources cutover gap)",
+            manifest.has(RESOURCES_KEY),
+        )
+
+        val stagingFile = File(root, "historical-v1.2.0.zip")
+        val outcome = PackageValidator.validatePackage(
+            ByteArrayInputStream(historicalBytes),
+            diagnosticsSourceRecord(),
+            stagingFile,
+        )
+
+        assertManifestMalformed(outcome, "historical v1.2.0")
         assertFalse(
             "Strict validator must not retain a staging file for a rejected historical artifact",
             stagingFile.exists(),
@@ -249,7 +285,7 @@ class DiagnosticsLegacyRejectionContractTest {
     }
 
     @Test
-    fun `v1_2_0 update transaction commits without inferred defaults config migration or legacy callback`() = runTest {
+    fun `v1_3_0 update transaction commits without inferred defaults config migration or legacy callback`() = runTest {
         withTemporaryDirectoryAsync { root ->
             val bridge = RecordingUpdatesBridge()
             val providers = ChannelImplementationProviderRegistry()
@@ -272,11 +308,11 @@ class DiagnosticsLegacyRejectionContractTest {
             val implementationId = InstalledProviderId.derive(diagnosticsSourceRecord().repositoryId)
             val artifact = loadPinnedFixture(EVOLVED_RESOURCE_PATH, EVOLVED_ARTIFACT_SHA256)
 
-            // First install — the evolved v1.2.0 must commit.
+            // First install — the evolved v1.3.0 must commit.
             val installed = repository.installOrUpdate(ByteArrayInputStream(artifact), diagnosticsSourceRecord())
             runCurrent()
             assertEquals(
-                "v1.2.0 fixture must install through the generic repository path",
+                "v1.3.0 fixture must install through the generic repository path",
                 MutationResult.Installed(implementationId),
                 expectSuccess(installed),
             )
@@ -296,7 +332,7 @@ class DiagnosticsLegacyRejectionContractTest {
             val beforePublicationCount = publicationCount
             val reinstalled = repository.installOrUpdate(ByteArrayInputStream(artifact), diagnosticsSourceRecord())
             assertEquals(
-                "Reinstalling the same v1.2.0 artifact must produce Reinstalled",
+                "Reinstalling the same v1.3.0 artifact must produce Reinstalled",
                 MutationResult.Reinstalled(implementationId),
                 expectSuccess(reinstalled),
             )
@@ -620,14 +656,16 @@ class DiagnosticsLegacyRejectionContractTest {
         private const val EVOLVED_RESOURCE_PATH = "diagnostics-channel/subspace-channel.zip"
         private const val HISTORICAL_RESOURCE_BASE = "diagnostics-channel/historical"
         private const val REPOSITORY_ID = "1305223892"
-        private const val RELEASE_ID = "356470779"
-        private const val ASSET_ID = "482931807"
+        private const val RELEASE_ID = "358362176"
+        private const val ASSET_ID = "486488343"
         private const val OWNER_ID = "1224006"
-        private const val EVOLVED_PACKAGE_VERSION = "1.2.0"
-        private const val EVOLVED_ARTIFACT_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
+        private const val EVOLVED_PACKAGE_VERSION = "1.3.0"
+        private const val EVOLVED_ARTIFACT_SHA256 = "054e850fa901679a9bcc3f4df68d12fab247f0dce9c2f82de4d039cb7c8a9b12"
         private const val HISTORICAL_V1_0_0_SHA256 = "a1609ba59e3bac16dbcdf03532f9774848aaf18ec46137e6bda7cecc012c6b87"
         private const val HISTORICAL_V1_1_0_SHA256 = "87652e947664ffd49c6086b18733861cbf3060bda4c7952e957f94f3ed73fab7"
+        private const val HISTORICAL_V1_2_0_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
         private const val CONFIGURATION_KEY = "configuration"
         private const val CAPABILITIES_KEY = "capabilities"
+        private const val RESOURCES_KEY = "resources"
     }
 }

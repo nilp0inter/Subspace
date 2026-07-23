@@ -412,7 +412,7 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
                 bridge.createdStateIds.size,
             )
 
-            // Explicit update to v1.2.0 must succeed
+            // Explicit update to v1.3.0 must succeed
             assertEquals(
                 MutationResult.Installed(implementationId),
                 success(repository.installOrUpdate(ByteArrayInputStream(releasedArtifact()), sourceRecord())),
@@ -515,6 +515,68 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
         }
     }
 
+    @Test
+    fun `released diagnostics compatible update and explicit rollback traverse the exact and successor revisions`() = runTest {
+        withTemporaryDirectory { root ->
+            val bridge = RecordingDiagnosticsKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val implementationId = installReleasedArtifact(root, bridge, providers)
+            val registry = runtimeRegistry(providers)
+            val channel = definition("diagnostics-update-rollback", implementationId)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+
+            // Compatible update to a successor revision (test-only carrier, not a published release)
+            val repository = repository(root, bridge, providers)
+            assertEquals(
+                MutationResult.Updated(implementationId),
+                success(repository.installOrUpdate(ByteArrayInputStream(successorArtifact()), successorSourceRecord())),
+            )
+            assertTrue(
+                "Provider must remain available after compatible update",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+            val updated = activeRevision(root)
+            assertEquals("1.3.1", updated.active.manifest.packageVersion)
+            assertEquals("1.3.0", updated.rollback?.manifest?.packageVersion)
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(
+                "Instance must remain ready after compatible update",
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+
+            // Explicit rollback restores the exact v1.3.0 release revision
+            assertEquals(
+                MutationResult.RolledBack(implementationId),
+                success(repository.rollback(sourceRecord().repositoryId)),
+            )
+            val rolledBack = activeRevision(root)
+            assertEquals("1.3.0", rolledBack.active.manifest.packageVersion)
+            assertEquals("1.3.1", rolledBack.rollback?.manifest?.packageVersion)
+            assertTrue(
+                "Provider must remain available after explicit rollback",
+                providers.resolve(implementationId) is ChannelProviderResolution.Available,
+            )
+
+            registry.reconcile(ChannelCatalogueSnapshot(listOf(channel), channel.id))
+            runCurrent()
+            assertEquals(
+                "Instance must remain ready after explicit rollback",
+                ChannelPreparationAvailability.Available,
+                registry.getRuntimeSnapshot(channel.id)?.preparation,
+            )
+            assertEquals(ChannelRuntimeRegistryShutdownResult.Closed, shutdown(registry))
+        }
+    }
+
     private suspend fun TestScope.installReleasedArtifact(
         root: File,
         bridge: RecordingDiagnosticsKernelBridge,
@@ -588,8 +650,17 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
     private fun sourceRecord(): PackageSourceRecord = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
         coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
-        release = GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false),
+        release = GitHubReleaseIdentity(RELEASE_ID, "v1.3.0", false),
         asset = GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"),
+        ownerId = OFFICIAL_OWNER_ID,
+    )
+
+    // Test-only carrier: a schema-compatible successor revision for update/rollback traversal; not a published release.
+    private fun successorSourceRecord(): PackageSourceRecord = PackageSourceRecord(
+        repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
+        coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
+        release = GitHubReleaseIdentity("900311", "v1.3.1", false),
+        asset = GitHubAssetIdentity("900312", "subspace-channel-v1.3.1.zip"),
         ownerId = OFFICIAL_OWNER_ID,
     )
 
@@ -600,6 +671,13 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
             assertEquals("The runtime fixture must remain the exact reviewed release artifact.", ARTIFACT_SHA256, sha256(bytes))
         }
     }
+
+    private fun successorArtifact(): ByteArray = requireNotNull(javaClass.classLoader?.getResourceAsStream(SUCCESSOR_RESOURCE_PATH)) {
+        "Missing diagnostics successor carrier fixture $SUCCESSOR_RESOURCE_PATH"
+    }.use { it.readBytes() }
+
+    private fun activeRevision(root: File): StoredProviderRecord =
+        success(InstalledPackageStore(root).loadIndex()).index.providers.getValue(sourceRecord().repositoryId)
 
     private fun historicalArtifact(resourcePath: String, expectedSha256: String): ByteArray =
         requireNotNull(javaClass.classLoader?.getResourceAsStream(resourcePath)) {
@@ -817,11 +895,12 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
 
     private companion object {
         const val RESOURCE_PATH = "diagnostics-channel/subspace-channel.zip"
+        const val SUCCESSOR_RESOURCE_PATH = "diagnostics-channel/subspace-channel-v1.3.1.zip"
         const val REPOSITORY_ID = "1305223892"
-        const val RELEASE_ID = "356470779"
-        const val ASSET_ID = "482931807"
+        const val RELEASE_ID = "358362176"
+        const val ASSET_ID = "486488343"
         const val OFFICIAL_OWNER_ID = "1224006"
-        const val ARTIFACT_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
+        const val ARTIFACT_SHA256 = "054e850fa901679a9bcc3f4df68d12fab247f0dce9c2f82de4d039cb7c8a9b12"
         const val HISTORICAL_V1_0_0_PATH = "diagnostics-channel/historical/v1.0.0/subspace-channel.zip"
         const val HISTORICAL_V1_0_0_SHA256 = "a1609ba59e3bac16dbcdf03532f9774848aaf18ec46137e6bda7cecc012c6b87"
     }

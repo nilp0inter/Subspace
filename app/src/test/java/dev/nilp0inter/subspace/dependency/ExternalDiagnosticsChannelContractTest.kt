@@ -45,7 +45,7 @@ class ExternalDiagnosticsChannelContractTest {
         )
 
         assertEquals(GitHubRepositoryIdentity(REPOSITORY_ID), revision.manifest.repositoryId)
-        assertEquals("1.2.0", revision.manifest.packageVersion)
+        assertEquals("1.3.0", revision.manifest.packageVersion)
         assertEquals("plugin", revision.programImage.entryPoint)
         assertEquals(LUA_VERSION, revision.manifest.runtime.luaVersion)
         assertEquals(API_VERSION, revision.manifest.runtime.apiVersion)
@@ -75,7 +75,7 @@ class ExternalDiagnosticsChannelContractTest {
     private fun sourceRecord(): PackageSourceRecord = PackageSourceRecord(
         repositoryId = GitHubRepositoryIdentity(REPOSITORY_ID),
         coordinates = GitHubRepositoryCoordinates("nilp0inter", "diagnostics-channel"),
-        release = GitHubReleaseIdentity(RELEASE_ID, "v1.2.0", false),
+        release = GitHubReleaseIdentity(RELEASE_ID, "v1.3.0", false),
         asset = GitHubAssetIdentity(ASSET_ID, "subspace-channel.zip"),
         ownerId = OFFICIAL_OWNER_ID,
     )
@@ -151,10 +151,10 @@ class ExternalDiagnosticsChannelContractTest {
     private companion object {
         private const val RESOURCE_PATH = "diagnostics-channel/subspace-channel.zip"
         private const val REPOSITORY_ID = "1305223892"
-        private const val RELEASE_ID = "356470779"
-        private const val ASSET_ID = "482931807"
+        private const val RELEASE_ID = "358362176"
+        private const val ASSET_ID = "486488343"
         private const val OFFICIAL_OWNER_ID = "1224006"
-        private const val ARTIFACT_SIZE = 5153
-        private const val ARTIFACT_SHA256 = "13200ca3647a0ed56d48a38ac4c89d8ca7fcc106a3d81b11cf02a53986af7fe2"
+        private const val ARTIFACT_SIZE = 5179
+        private const val ARTIFACT_SHA256 = "054e850fa901679a9bcc3f4df68d12fab247f0dce9c2f82de4d039cb7c8a9b12"
     }
 }
