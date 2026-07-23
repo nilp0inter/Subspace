@@ -1351,6 +1351,59 @@ class ChannelRuntimeRegistryTest {
         assertEquals(0, quota.liveEntries())
     }
 
+    @Test
+    fun `reconcileResourceBinding forces one fresh generation for a single unchanged instance`() = runTest {
+        val provider = TestProvider(ChannelImplementationId("test:resource"))
+        val fixture = fixture(provider)
+        val definition = definition("resource-channel", "test:resource")
+        val snapshot = ChannelCatalogueSnapshot(listOf(definition), definition.id)
+
+        fixture.registry.reconcile(snapshot)
+        runCurrent()
+        assertEquals(1, provider.runtimes.size)
+        val firstGeneration = fixture.registry.capabilityScopeIdentity(definition.id)
+        assertTrue(firstGeneration != null)
+
+        // The catalogue definition is unchanged; a resource binding replacement must
+        // still spawn exactly one fresh generation and revoke the predecessor.
+        fixture.registry.reconcileResourceBinding(snapshot, definition.id)
+        runCurrent()
+
+        assertEquals(2, provider.runtimes.size)
+        assertEquals(1, provider.runtimes[0].closeCount.get())
+        assertEquals(0, provider.runtimes[1].closeCount.get())
+        val secondGeneration = fixture.registry.capabilityScopeIdentity(definition.id)
+        assertTrue(secondGeneration != null)
+        assertNotEquals(firstGeneration!!.runtimeGeneration, secondGeneration!!.runtimeGeneration)
+
+        fixture.registry.shutdownAndAwait()
+    }
+
+    @Test
+    fun `reconcileResourceBinding is a no-op for unknown or disabled instances`() = runTest {
+        val provider = TestProvider(ChannelImplementationId("test:resource"))
+        val fixture = fixture(provider)
+        val definition = definition("resource-channel", "test:resource")
+        val snapshot = ChannelCatalogueSnapshot(listOf(definition), definition.id)
+
+        fixture.registry.reconcile(snapshot)
+        runCurrent()
+        assertEquals(1, provider.runtimes.size)
+
+        // Unknown instance: no construction.
+        fixture.registry.reconcileResourceBinding(snapshot, "does-not-exist")
+        runCurrent()
+        assertEquals(1, provider.runtimes.size)
+
+        // Disabled instance: no construction.
+        val disabled = ChannelCatalogueSnapshot(listOf(definition.copy(enabled = false)), definition.id)
+        fixture.registry.reconcileResourceBinding(disabled, definition.id)
+        runCurrent()
+        assertEquals(1, provider.runtimes.size)
+
+        fixture.registry.shutdownAndAwait()
+    }
+
     private fun TestScope.fixture(
         vararg providers: TestProvider,
         callbackTimeoutMillis: Long = 1_000,

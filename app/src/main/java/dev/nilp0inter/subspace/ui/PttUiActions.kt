@@ -9,6 +9,13 @@ interface PttUiActions {
     fun requestPermissions()
     fun requestManageExternalStorage()
     fun pickDirectory(configurationOwnerId: String, fieldId: String)
+    /**
+     * 2.7: Launch the generic SAF directory-tree picker for one declared mount,
+     * keyed by configuration owner instance + provider implementation + mount
+     * declaration ID. Distinct from [pickDirectory], which addresses a scalar
+     * [dev.nilp0inter.subspace.model.ChannelConfigurationField.DirectoryField].
+     */
+    fun pickMount(request: MountSelectionRequest)
     fun openBluetoothSettings()
     fun scanForDevice()
     fun pairTarget()

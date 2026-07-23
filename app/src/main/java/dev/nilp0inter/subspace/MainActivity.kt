@@ -133,6 +133,8 @@ class MainActivity : ComponentActivity() {
                     selectedDirectoryPath?.let { path -> DirectorySelection(ownerId, fieldId, path) }
                 }
             }
+            var pendingMountRequest by remember { mutableStateOf<dev.nilp0inter.subspace.ui.MountSelectionRequest?>(null) }
+            var pendingMountDeclaration by remember { mutableStateOf<dev.nilp0inter.subspace.dependency.PackageMountDeclaration?>(null) }
 
             val rootSurface = bootstrapRootSurface(bootstrapState)
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
@@ -155,6 +157,15 @@ class MainActivity : ComponentActivity() {
                     selectedDirectoryPath = path
                 }
             }
+            val mountLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) { result ->
+                val service = currentServiceState ?: return@rememberLauncherForActivityResult
+                val outcome = service.mountTreePickerBridge.outcomeFrom(result.data)
+                service.completeMountSelection(outcome)
+                pendingMountRequest = null
+                pendingMountDeclaration = null
+            }
 
             val voiceSetupLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.StartActivityForResult(),
@@ -162,12 +173,24 @@ class MainActivity : ComponentActivity() {
                 currentServiceState?.refreshBootstrapPrerequisites()
             }
 
-            val actions = remember(currentService, permissionLauncher, directoryLauncher) {
+            val actions = remember(currentService, permissionLauncher, directoryLauncher, mountLauncher, providerDescriptors) {
                 object : PttUiActions {
                     override fun requestPermissions() {
                         permissionLauncher.launch(RequiredPermissions.runtimePermissions())
                     }
 
+                    override fun pickMount(request: dev.nilp0inter.subspace.ui.MountSelectionRequest) {
+                        val service = currentServiceState ?: return
+                        val descriptor = providerDescriptors.firstOrNull { it.implementationId == request.implementationId }
+                            ?: return
+                        val declaration = descriptor.resourceDeclarations.mounts.firstOrNull { it.id == request.declarationId }
+                            ?: return
+                        service.beginMountSelection(request, declaration)
+                        pendingMountRequest = request
+                        pendingMountDeclaration = declaration
+                        val intent = service.mountTreePickerBridge.launchIntent(declaration)
+                        mountLauncher.launch(intent)
+                    }
                     override fun requestManageExternalStorage() {
                         startActivity(RequiredPermissions.manageExternalStorageIntent(this@MainActivity))
                     }
@@ -440,6 +463,8 @@ class MainActivity : ComponentActivity() {
                                             choiceResolver = dynamicChoiceResolver,
                                             directorySelection = directorySelection,
                                             onPickDirectory = actions::pickDirectory,
+                                            mountEntries = currentService?.mountEditorEntries(definition.id, definition.implementationId) ?: emptyList(),
+                                            onPickMount = actions::pickMount,
                                             onBack = actions::navigateBack,
                                         )
                                     }
@@ -468,6 +493,8 @@ class MainActivity : ComponentActivity() {
                                             choiceResolver = dynamicChoiceResolver,
                                             directorySelection = directorySelection,
                                             onPickDirectory = actions::pickDirectory,
+                                            mountEntries = emptyList(),
+                                            onPickMount = actions::pickMount,
                                             onBack = actions::navigateBack,
                                         )
                                     }

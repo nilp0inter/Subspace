@@ -292,6 +292,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
     private lateinit var scanner: DeviceScanner
     private lateinit var channelRepository: ChannelRepository
     private lateinit var channelManager: ServiceChannelManager
+    private lateinit var mountBindingStore: dev.nilp0inter.subspace.resource.MountBindingStore
+    private lateinit var safMountAdapter: dev.nilp0inter.subspace.mount.saf.SafMountAdapter
+    private lateinit var mountSelectionController: dev.nilp0inter.subspace.ui.MountSelectionController
+    val mountTreePickerBridge = dev.nilp0inter.subspace.mount.saf.SafTreePickerBridge()
     private lateinit var audioManager: AudioManager
     private lateinit var sco: ScoAudioController
     private lateinit var pcmOutput: AndroidPcmOutput
@@ -586,6 +590,20 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                 )
             }
         )
+        // 2.7: Compose the generic SAF mount adapter and selection controller after
+        // the runtime registry is live. Successful mount binding replacements trigger
+        // a single-instance atomic reconcile through reconcileResourceBinding.
+        mountBindingStore = dev.nilp0inter.subspace.resource.MountBindingStore(
+            java.io.File(filesDir, "mount-bindings.json"),
+        )
+        mountBindingStore.load()
+        val safGrantController = dev.nilp0inter.subspace.mount.saf.AndroidSafGrantController(contentResolver)
+        safMountAdapter = dev.nilp0inter.subspace.mount.saf.SafMountAdapter(mountBindingStore, safGrantController)
+        mountSelectionController = dev.nilp0inter.subspace.ui.MountSelectionController(safMountAdapter) { request, _ ->
+            serviceScope.launch {
+                runtimeRegistry.reconcileResourceBinding(channelRepository.catalogueState.value, request.ownerInstanceId)
+            }
+        }
         // Compose the service-owned installed-package coordinator after synchronous
         // built-in registration and runtime-registry construction. Package loading runs
         // asynchronously on Dispatchers.IO; built-in providers and foreground-service
@@ -1095,6 +1113,40 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         payload: dev.nilp0inter.subspace.model.OpaqueJsonObject,
     ): dev.nilp0inter.subspace.model.ChannelRepositoryMutationResult =
         channelManager.updateChannelConfiguration(channelId, payload)
+
+    fun beginMountSelection(
+        request: dev.nilp0inter.subspace.ui.MountSelectionRequest,
+        declaration: dev.nilp0inter.subspace.dependency.PackageMountDeclaration,
+    ) {
+        mountSelectionController.begin(request, declaration)
+    }
+
+    fun completeMountSelection(
+        outcome: dev.nilp0inter.subspace.mount.saf.SafTreePickerOutcome,
+    ): dev.nilp0inter.subspace.ui.MountSelectionResult =
+        mountSelectionController.complete(outcome)
+
+    fun mountEditorEntries(
+        channelInstanceId: String,
+        implementationId: dev.nilp0inter.subspace.model.ChannelImplementationId,
+    ): List<dev.nilp0inter.subspace.ui.MountEditorEntry> {
+        val descriptor = providerRegistry.descriptors().firstOrNull { it.implementationId == implementationId }
+            ?: return emptyList()
+        return dev.nilp0inter.subspace.ui.MountEditorProjection.entries(
+            descriptor.resourceDeclarations.mounts,
+        ) { declarationId ->
+            val declaration = descriptor.resourceDeclarations.mounts.firstOrNull { it.id == declarationId }
+                ?: return@entries dev.nilp0inter.subspace.resource.MountAvailability.Unavailable(
+                    dev.nilp0inter.subspace.resource.MountUnavailableReason.Undeclared,
+                )
+            val binding = mountBindingStore.currentBinding(channelInstanceId, implementationId, declarationId)
+            dev.nilp0inter.subspace.resource.MountAvailabilityProjection.project(
+                implementationId,
+                declaration,
+                binding,
+            )
+        }
+    }
 
     fun selectChannel(id: String): Boolean = channelManager.selectChannel(id)
 

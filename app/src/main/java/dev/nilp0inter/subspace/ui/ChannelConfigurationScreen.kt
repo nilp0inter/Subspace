@@ -68,6 +68,8 @@ fun ChannelConfigurationScreen(
     },
     directorySelection: DirectorySelection?,
     onPickDirectory: (String, String) -> Unit,
+    mountEntries: List<MountEditorEntry> = emptyList(),
+    onPickMount: (MountSelectionRequest) -> Unit = {},
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -142,6 +144,23 @@ fun ChannelConfigurationScreen(
                             onPickDirectory = onPickDirectory,
                         )
                     }
+                }
+            }
+
+            if (mountEntries.isNotEmpty()) {
+                mountEntries.forEach { entry ->
+                    ResourceMountEditorRow(
+                        entry = entry,
+                        onPickMount = {
+                            onPickMount(
+                                MountSelectionRequest(
+                                    ownerInstanceId = configurationOwnerId,
+                                    implementationId = descriptor.implementationId,
+                                    declarationId = entry.declaration.declarationId,
+                                ),
+                            )
+                        },
+                    )
                 }
             }
 
@@ -400,4 +419,48 @@ internal fun payloadWithFieldValues(
         }
     }
     return OpaqueJsonObject.fromJsonObject(payload)
+}
+
+/**
+ * 2.6/2.7: Host-rendered editor row for one declared resource mount. Shows only
+ * package-provided label/help and the portable status; the pick button launches
+ * the generic SAF directory-tree selection keyed by owner instance, provider
+ * implementation, and declaration ID. Never renders a grant blob, URI, or path.
+ */
+@Composable
+private fun ResourceMountEditorRow(
+    entry: MountEditorEntry,
+    onPickMount: () -> Unit,
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = if (entry.declaration.required) entry.declaration.label else "${entry.declaration.label} (optional)",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        entry.declaration.help?.let { help ->
+            Text(
+                text = help,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(
+            text = "Status: ${entry.statusPortable}",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (entry.isBlocking) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedButton(
+            onClick = onPickMount,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                when (entry.availability) {
+                    is dev.nilp0inter.subspace.resource.MountAvailability.Available -> "Change directory"
+                    is dev.nilp0inter.subspace.resource.MountAvailability.Unavailable -> "Select directory"
+                },
+            )
+        }
+    }
 }

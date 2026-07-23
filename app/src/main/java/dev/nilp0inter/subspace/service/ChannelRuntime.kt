@@ -44,6 +44,18 @@ sealed interface ChannelPreparationReason {
     ) : ChannelPreparationReason {
         override val message: String = "Configuration is incompatible with the current provider"
     }
+
+    /**
+     * 2.6: A required declared resource mount has no usable binding. Scalar
+     * configuration remains valid and preserved; the instance is unavailable
+     * until the user binds a usable directory tree. Never carries a platform
+     * grant, URI, or path.
+     */
+    data class RequiredResourceUnavailable(
+        val blockingDeclarationIds: List<String>,
+    ) : ChannelPreparationReason {
+        override val message: String = "A required storage resource is not available"
+    }
     data object RuntimeBusy : ChannelPreparationReason { override val message = "Channel is busy" }
     data object RuntimeTimedOut : ChannelPreparationReason { override val message = "Channel operation timed out" }
     data object RuntimeCancelled : ChannelPreparationReason { override val message = "Channel operation was cancelled" }
