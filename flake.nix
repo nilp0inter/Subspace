@@ -49,6 +49,50 @@
           fenix.packages.${system}.targets.i686-linux-android.stable.rust-std
           fenix.packages.${system}.targets.x86_64-linux-android.stable.rust-std
         ];
+        kotlinDebugAdapter = pkgs.stdenvNoCC.mkDerivation {
+          pname = "kotlin-debug-adapter";
+          version = "0.4.4";
+          src = pkgs.fetchurl {
+            url = "https://github.com/fwcd/kotlin-debug-adapter/releases/download/0.4.4/adapter.zip";
+            hash = "sha256-OHTLre0P24Ipo4EWeJWwpsr4i3rf+rxpD89ab7ZdEbY=";
+          };
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.unzip ];
+          installPhase = ''
+            unzip -q "$src" -d "$TMPDIR"
+            mkdir -p "$out"
+            cp -R "$TMPDIR/adapter/." "$out"
+          '';
+        };
+
+        subspaceAndroidDebugAdapter = pkgs.writeShellApplication {
+          name = "subspace-android-debug-adapter";
+          runtimeInputs = [ androidSdk kotlinDebugAdapter pkgs.jdk17 pkgs.coreutils ];
+          text = ''
+            set -eu
+
+            readonly appId=dev.nilp0inter.subspace
+            readonly forwardPort=37099
+
+            devicePid="$(adb shell pidof "$appId" | tr -d '\r' || true)"
+            case "$devicePid" in
+              "" | *[!0-9]*)
+                echo "No debuggable $appId process found. Install and launch the debug app before attaching." >&2
+                exit 1
+                ;;
+            esac
+
+            adb forward --remove "tcp:$forwardPort" >/dev/null 2>&1 || true
+            adb forward "tcp:$forwardPort" "jdwp:$devicePid" >/dev/null
+
+            cleanup() {
+              adb forward --remove "tcp:$forwardPort" >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT HUP INT TERM
+
+            kotlin-debug-adapter
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -58,6 +102,9 @@
             pkgs.gradle
             pkgs.jdk17
             pkgs.kotlin
+            pkgs.kotlin-language-server
+            kotlinDebugAdapter
+            subspaceAndroidDebugAdapter
             rustToolchain
             pkgs.cargo-ndk
             pkgs.pkg-config

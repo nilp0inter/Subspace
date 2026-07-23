@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "kotlin-lsp": {
+      "command": "kotlin-language-server",
+      "args": [],
+      "fileTypes": [".kt", ".kts"],
+      "rootMarkers": ["settings.gradle.kts", "build.gradle.kts"]
+    }
+  }
+}

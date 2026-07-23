@@ -19,6 +19,9 @@ The default devshell provides:
 - JDK 17
 - Gradle
 - Kotlin compiler
+- Kotlin language server (`kotlin-language-server`)
+- Android Kotlin JDWP debug bridge (`subspace-android-debug-adapter`), provisioned by
+  `nix develop`; do not install it globally
 - Android SDK platforms API 31 and API 35
 - Android build tools 35.0.0
 - Android platform tools
@@ -111,6 +114,22 @@ Launch the app:
 ```sh
 adb shell am start -n dev.nilp0inter.subspace/.MainActivity
 ```
+
+### OMP Kotlin Debugging
+
+Start OMP through `nix develop` at the repository root. Install and launch the debug app with the
+commands above, then call the OMP Debug tool with `action: "attach"`,
+`adapter: "subspace-android-kotlin"`, `port: 37099`, and `cwd` set to the repository root.
+
+The wrapper finds `dev.nilp0inter.subspace`, forwards `tcp:37099` to its JDWP endpoint, and
+removes the forward when the debug session terminates.
+
+An unattached or unauthorized device, an absent app process, or a non-debuggable/release app
+causes the wrapper or adapter to fail instead of attaching elsewhere. Restore the required state
+with `adb devices`, `gradle installDebug`, and
+`adb shell am start -n dev.nilp0inter.subspace/.MainActivity` through `nix develop` as documented
+above. The bridge covers Kotlin, Java, and ART frames; ARM64 JNI/Rust frames require a native
+debugger.
 
 In-app test flow:
 
