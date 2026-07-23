@@ -30,7 +30,10 @@ pub struct StateHandle {
 
 impl StateHandle {
     pub fn new(state_id: StateId, generation: Generation) -> Self {
-        StateHandle { state_id, generation }
+        StateHandle {
+            state_id,
+            generation,
+        }
     }
 }
 

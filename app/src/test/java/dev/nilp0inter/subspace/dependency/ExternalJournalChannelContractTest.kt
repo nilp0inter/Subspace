@@ -348,11 +348,11 @@ class ExternalJournalChannelContractTest {
     private companion object {
         const val RESOURCE_PATH = "journal-channel/subspace-channel.zip"
         const val REPOSITORY_ID = "1309332087"
-        const val RELEASE_ID = "358395794"
-        const val ASSET_ID = "486586844"
+        const val RELEASE_ID = "358535259"
+        const val ASSET_ID = "486933457"
         const val OFFICIAL_OWNER_ID = "1224006"
-        const val PACKAGE_VERSION = "1.0.0"
-        const val ARTIFACT_SIZE = 71690
-        const val ARTIFACT_SHA256 = "6d4e86ed2f1a82c2c05c919350ec0aa039f92f0ebb682373bef836c6529fc9fa"
+        const val PACKAGE_VERSION = "1.0.1"
+        const val ARTIFACT_SIZE = 71799
+        const val ARTIFACT_SHA256 = "54b05b21089db5abb63e6a2dceb70aec36e64407a7e18f8438fe42da41ce506a"
     }
 }

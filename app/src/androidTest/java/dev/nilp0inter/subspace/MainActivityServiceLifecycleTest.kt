@@ -8,21 +8,23 @@ import android.os.IBinder
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
-import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.nilp0inter.subspace.service.PttForegroundService
 import dev.nilp0inter.subspace.service.RequiredPermissions
 import dev.nilp0inter.subspace.lua.LuaNativeKernel
 import dev.nilp0inter.subspace.lua.actor.ActorRuntimeFactory
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 import java.io.FileInputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -69,7 +71,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 @RunWith(AndroidJUnit4::class)
 class MainActivityServiceLifecycleTest {
-    private val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+    private val context = InstrumentationRegistry.getInstrumentation().targetContext
     private var scenario: ActivityScenario<MainActivity>? = null
 
     @Before
@@ -95,45 +97,38 @@ class MainActivityServiceLifecycleTest {
     }
 
     @Test
-    fun launchingActivityStartsForegroundServiceWhichSurvivesBackgrounding() {
+    fun launchingActivityBindsSuppressedServiceUntilBackgrounding() {
         scenario = ActivityScenario.launch(MainActivity::class.java)
 
-        // (1) The activity's onStart starts + binds the service. Poll until the
-        // system registry reports the service as started and in the foreground.
-        waitFor("service should be started and foreground after activity launch") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground
+        waitFor("activity launch should bind a service without requesting monitoring") {
+            val snapshot = serviceSnapshot()
+            snapshot.exists &&
+                snapshot.hasBound &&
+                !snapshot.startRequested &&
+                !snapshot.foreground
         }
 
-        // (2) Move the activity to CREATED (home/back → stopped). The production
-        // onStop unbinds; the service must remain started + foreground and the
-        // bind must be released (`hasBound=false`).
         scenario!!.moveToState(Lifecycle.State.CREATED)
-
-        waitFor("service should remain started + foreground after the activity stops") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground && !s.hasBound
+        waitFor("suppressed service should stop after the activity unbinds") {
+            !serviceSnapshot().exists
         }
-
-        // Re-assert the invariants once more after the background state has
-        // settled, so a delayed stopForeground/stopSelf is caught rather than
-        // racing past the assertion.
-        val s = serviceSnapshot()
-        assertTrue("PttForegroundService must still be registered after backgrounding", s.exists)
-        assertTrue("PttForegroundService must remain started after the activity unbinds", s.startRequested)
-        assertTrue("PttForegroundService must remain in the foreground after the activity unbinds", s.foreground)
-        assertFalse("PttForegroundService must be unbound after the activity stops", s.hasBound)
     }
     @Test
-    fun ordinaryForegroundLifecycleDoesNotCreateOrLoadLuaActorRuntime() {
+    fun ordinaryBoundLifecycleDoesNotCreateOrLoadLuaActorRuntime() {
+        assumeFalse(
+            "Lua dormancy requires a built-in-only persisted catalogue",
+            hasEnabledExternalChannel(),
+        )
         ActorRuntimeFactory.resetForTest()
         LuaNativeKernel.resetForTest()
         try {
             scenario = ActivityScenario.launch(MainActivity::class.java)
-
-            waitFor("service should be started and foreground during the Lua-dormancy witness") {
+            waitFor("ordinary activity launch should bind the suppressed service") {
                 val snapshot = serviceSnapshot()
-                snapshot.exists && snapshot.startRequested && snapshot.foreground
+                snapshot.exists &&
+                    snapshot.hasBound &&
+                    !snapshot.startRequested &&
+                    !snapshot.foreground
             }
             assertFalse(
                 "ordinary activity/service startup with Kotlin providers must not construct a Lua actor",
@@ -145,9 +140,8 @@ class MainActivityServiceLifecycleTest {
             )
 
             scenario!!.moveToState(Lifecycle.State.CREATED)
-            waitFor("foreground service must survive backgrounding during the Lua-dormancy witness") {
-                val snapshot = serviceSnapshot()
-                snapshot.exists && snapshot.startRequested && snapshot.foreground && !snapshot.hasBound
+            waitFor("suppressed service should stop after the Lua-dormancy witness unbinds") {
+                !serviceSnapshot().exists
             }
             assertFalse(
                 "background lifecycle must not retroactively construct a Lua actor",
@@ -164,131 +158,64 @@ class MainActivityServiceLifecycleTest {
     }
 
     @Test
-    fun repeatedActivityStartStopDoesNotRestartTheForegroundService() {
+    fun repeatedActivityStartStopRecreatesOnlyBoundSuppressedService() {
         scenario = ActivityScenario.launch(MainActivity::class.java)
-
-        waitFor("service should be started and foreground after activity launch") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground
+        waitFor("initial activity launch should bind the suppressed service") {
+            val snapshot = serviceSnapshot()
+            snapshot.exists &&
+                snapshot.hasBound &&
+                !snapshot.startRequested &&
+                !snapshot.foreground
         }
+        val initialIdentity = requireNotNull(serviceSnapshot().serviceRecordId)
 
-        // Capture the ServiceRecord instance identity that the initial launch
-        // established. The `ServiceRecord{<hex> ...}` hex is per-instance; a
-        // restart would produce a new ServiceRecord with a different identity.
-        val initial = serviceSnapshot()
-        assertNotNull("PttForegroundService must be registered after launch", initial.serviceRecordId)
-        val initialIdentity = initial.serviceRecordId!!
-
-        // Cycle the Activity RESUMED → CREATED → RESUMED → CREATED. The
-        // launch above leaves the Activity at RESUMED, so the first explicit
-        // moveToState(CREATED) drives an onStop/unbind before the return to
-        // the foreground. Each onStart re-issues
-        // startForegroundService(ACTION_START_MONITORING) and bindService;
-        // each onStop unbinds. Because the service is already started+foreground
-        // and START_NOT_STICKY, the whole cycle must be a no-op on the service's
-        // identity: same ServiceRecord, still started+foreground at every
-        // state, `hasBound=false` in each CREATED state.
         scenario!!.moveToState(Lifecycle.State.CREATED)
-        waitFor("service should remain started + foreground after the first backgrounding") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground && !s.hasBound
+        waitFor("initial suppressed service should stop after unbind") {
+            !serviceSnapshot().exists
         }
 
         scenario!!.moveToState(Lifecycle.State.RESUMED)
-        waitFor("service should remain started + foreground after the activity returns to the foreground") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground
+        waitFor("resumed activity should bind a fresh suppressed service") {
+            val snapshot = serviceSnapshot()
+            snapshot.exists &&
+                snapshot.hasBound &&
+                !snapshot.startRequested &&
+                !snapshot.foreground
         }
-
-        scenario!!.moveToState(Lifecycle.State.CREATED)
-        waitFor("service should remain started + foreground after the second backgrounding") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground && !s.hasBound
-        }
-
-        val after = serviceSnapshot()
-        assertTrue("PttForegroundService must still be registered after the cycle", after.exists)
-        assertTrue("PttForegroundService must remain started across start/stop cycles", after.startRequested)
-        assertTrue("PttForegroundService must remain in the foreground across start/stop cycles", after.foreground)
-        assertFalse("PttForegroundService must be unbound in the CREATED state", after.hasBound)
-        assertEquals(
-            "PttForegroundService must keep the same ServiceRecord identity across repeated Activity start/stop",
-            initialIdentity,
-            after.serviceRecordId,
+        assertFalse(
+            "a resumed activity must bind a new service instance after terminal suppression",
+            initialIdentity == serviceSnapshot().serviceRecordId,
         )
     }
 
     @Test
-    fun disconnectSerialSuppressesRepeatedStartIntentUntilActivityUnbind() {
+    fun repeatedStartIntentRemainsSuppressedWithoutMonitoringRequest() {
         scenario = ActivityScenario.launch(MainActivity::class.java)
-
-        waitFor("service should be started and foreground after activity launch") {
-            val s = serviceSnapshot()
-            s.exists && s.startRequested && s.foreground
+        waitFor("activity launch should bind the suppressed service") {
+            val snapshot = serviceSnapshot()
+            snapshot.exists &&
+                snapshot.hasBound &&
+                !snapshot.startRequested &&
+                !snapshot.foreground
         }
+        val identity = requireNotNull(serviceSnapshot().serviceRecordId)
 
-        // Obtain the actual same-process service instance through a temporary
-        // BIND_AUTO_CREATE connection, then release only the temporary
-        // connection. The Activity's own binding (established in onStart)
-        // keeps the same instance alive so it can be observed before it is
-        // later unbound.
-        val service = obtainServiceViaTempBind()
-
-        // disconnectSerial() clears monitoringRequested, drops foreground,
-        // and calls stopSelf. Because the Activity is still bound, the
-        // service instance survives with startRequested=false and
-        // foreground=false.
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            service.disconnectSerial()
-        }
-
-        waitFor("service should exist with startRequested=false and foreground=false after disconnect") {
-            val s = serviceSnapshot()
-            s.exists && !s.startRequested && !s.foreground
-        }
-
-        val disconnected = serviceSnapshot()
-        assertNotNull(
-            "PttForegroundService must remain registered after disconnect (Activity still bound)",
-            disconnected.serviceRecordId,
-        )
-        val identity = disconnected.serviceRecordId!!
-
-        // Re-issue the production start intent exactly as MainActivity.onStart
-        // does. The repeated start must be suppressed in this instance:
-        // onStartCommand gates ensureForeground on monitoringRequested, which
-        // disconnectSerial cleared, so it calls stopSelf(startId) instead.
         ContextCompat.startForegroundService(
             context,
             Intent(context, PttForegroundService::class.java)
                 .setAction(PttForegroundService.ACTION_START_MONITORING),
         )
-
-        waitFor("repeated start intent must not restore started+foreground ownership") {
-            val s = serviceSnapshot()
-            s.exists && !s.startRequested && !s.foreground
+        waitFor("repeated start intent must remain suppressed while monitoring is false") {
+            val snapshot = serviceSnapshot()
+            snapshot.exists &&
+                snapshot.hasBound &&
+                !snapshot.startRequested &&
+                !snapshot.foreground
         }
+        assertEquals(identity, serviceSnapshot().serviceRecordId)
 
-        val afterRestart = serviceSnapshot()
-        assertEquals(
-            "PttForegroundService must keep the same ServiceRecord identity after the repeated start intent",
-            identity,
-            afterRestart.serviceRecordId,
-        )
-        assertFalse(
-            "repeated ACTION_START_MONITORING must not restore started ownership",
-            afterRestart.startRequested,
-        )
-        assertFalse(
-            "repeated ACTION_START_MONITORING must not restore foreground ownership",
-            afterRestart.foreground,
-        )
-
-        // Moving the Activity to CREATED triggers the production onStop
-        // unbind. With no remaining bindings and stopSelf already called,
-        // the service is terminally destroyed.
         scenario!!.moveToState(Lifecycle.State.CREATED)
-        waitFor("service must be absent after the Activity unbinds (terminal destruction)") {
+        waitFor("suppressed service should stop after the activity unbinds") {
             !serviceSnapshot().exists
         }
     }
@@ -391,6 +318,7 @@ class MainActivityServiceLifecycleTest {
             !serviceSnapshot().exists
         }
     }
+
 
     /**
      * Binds to the same-process [PttForegroundService] with a temporary
@@ -512,4 +440,16 @@ class MainActivityServiceLifecycleTest {
         // startsWith and stays immune to leading whitespace or field order.
         val HAS_BOUND = Regex("""\bhasBound=(true|false)\b""")
     }
+    private fun hasEnabledExternalChannel(): Boolean {
+        val catalogue = File(context.filesDir, "channels_catalogue.json")
+        if (!catalogue.isFile) return false
+        val definitions = JSONObject(catalogue.readText()).getJSONArray("definitions")
+        return (0 until definitions.length())
+            .map(definitions::getJSONObject)
+            .any { definition ->
+                definition.optBoolean("enabled", true) &&
+                    !definition.getString("implementationId").startsWith("builtin:")
+            }
+    }
+
 }

@@ -413,4 +413,96 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
         }
         return LuaKernelOutcomeCodec.decode(json)
     }
+
+    override fun claimHostOperation(handle: LuaStateHandle, requestId: Long): HostOperationClaim {
+        if (!LuaNativeKernel.ensureLoaded()) return HostOperationClaim.Rejected("E_HOST_FAILURE")
+        val json = try {
+            LuaNativeKernel.nativeClaimHostOperation(
+                handle.stateId.value,
+                handle.generation.value,
+                requestId,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return HostOperationClaim.Rejected("E_HOST_FAILURE")
+        }
+        return decodeClaim(json)
+    }
+
+    override fun setResourceContext(
+        handle: LuaStateHandle,
+        resourceContextJson: String,
+    ): LuaKernelOutcome {
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val json = try {
+            LuaNativeKernel.nativeSetResourceContext(
+                handle.stateId.value,
+                handle.generation.value,
+                resourceContextJson,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeSetResourceContext link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
+    }
+
+    /** Decode the typed claim result JSON into a [HostOperationClaim]. */
+    private fun decodeClaim(json: String): HostOperationClaim {
+        val root = try {
+            org.json.JSONObject(json)
+        } catch (_: Exception) {
+            return HostOperationClaim.Rejected("E_HOST_FAILURE")
+        }
+        return when (root.optString("kind")) {
+            "completed" -> {
+                val kind = when (root.optString("hostOperationKind")) {
+                    "TRANSCRIBE" -> HostOperationKind.TRANSCRIBE
+                    "SYNTHESIZE" -> HostOperationKind.SYNTHESIZE
+                    "PLAYBACK" -> HostOperationKind.PLAYBACK
+                    "AUDIO_OPEN" -> HostOperationKind.AUDIO_OPEN
+                    "AUDIO_EXPORT" -> HostOperationKind.AUDIO_EXPORT
+                    "FS_MKDIR" -> HostOperationKind.FS_MKDIR
+                    "FS_STAT" -> HostOperationKind.FS_STAT
+                    "FS_LIST" -> HostOperationKind.FS_LIST
+                    "FS_READ_TEXT" -> HostOperationKind.FS_READ_TEXT
+                    "FS_WRITE_TEXT" -> HostOperationKind.FS_WRITE_TEXT
+                    "FS_REMOVE" -> HostOperationKind.FS_REMOVE
+                    else -> return HostOperationClaim.Rejected("E_HOST_FAILURE")
+                }
+                HostOperationClaim.Admitted(
+                    requestId = root.optLong("requestId"),
+                    kind = kind,
+                    audioToken = if (root.has("audioToken")) root.optString("audioToken") else null,
+                    text = if (root.has("text")) root.optString("text") else null,
+                    language = if (root.has("language")) root.optString("language") else null,
+                    voice = if (root.has("voice")) root.optString("voice") else null,
+                    speed = root.optDouble("speed", 1.0),
+                    delaySeconds = root.optDouble("delaySeconds", 0.0),
+                    declarationId = if (root.has("declarationId")) root.optString("declarationId") else null,
+                    mountToken = if (root.has("mountToken")) root.optString("mountToken") else null,
+                    path = if (root.has("path")) root.optString("path") else null,
+                    parents = root.optBoolean("parents", false),
+                    limit = root.optLong("limit", 0),
+                    cursor = if (root.has("cursor")) root.optString("cursor") else null,
+                    maxBytes = root.optLong("maxBytes", 0),
+                    mode = if (root.has("mode")) root.optString("mode") else null,
+                    missingOk = root.optBoolean("missingOk", false),
+                    format = if (root.has("format")) root.optString("format") else null,
+                )
+            }
+            "closed" -> HostOperationClaim.Rejected("E_CLOSED")
+            "stale" -> HostOperationClaim.Rejected("E_STALE")
+            "invalid_ownership" -> HostOperationClaim.Rejected("E_STALE")
+            else -> HostOperationClaim.Rejected("E_HOST_FAILURE")
+        }
+    }
 }

@@ -139,21 +139,81 @@ internal interface LuaKernelBridge {
         coroutineId: LuaCoroutineId,
         spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
     ): LuaKernelOutcome
+    /**
+     * Claim one yielded host-operation request exactly once, returning its typed
+     * kind and payload. The [requestId] is the opaque identity the kernel yielded.
+     * Unknown, duplicate, stale, cancelled, and closed claims are
+     * [HostOperationClaim.Rejected] before any host effect. Lightweight bridges
+     * default to rejecting; the native bridge decodes the typed claim result.
+     */
+    fun claimHostOperation(
+        handle: LuaStateHandle,
+        requestId: Long,
+    ): HostOperationClaim = HostOperationClaim.Rejected("E_HOST_FAILURE")
+
+    /**
+     * Install the package resource context: declared `storage.files` capability
+     * eligibility and declared mount authority with resolved live status. Called
+     * once after construction, before any filesystem operation. Replacing the
+     * context invalidates outstanding mount leases in the native kernel.
+     * Resource-capable bridges must implement this operation; the default fails
+     * closed. The native bridge forwards the JSON to the kernel.
+     */
+    fun setResourceContext(
+        handle: LuaStateHandle,
+        resourceContextJson: String,
+    ): LuaKernelOutcome = LuaKernelOutcome.RuntimeFailure(
+        stateId = handle.stateId.value,
+        generation = handle.generation.value,
+        diagnostic = "resource context requires a native kernel bridge",
+    )
 }
 
 /** Native callback port: 0 accepted, 1 closed, 2 capacity exhausted. */
 internal interface LuaSpawnAdmission {
     fun admitTask(coroutineId: Long): Int
-    fun admitTranscription(operationId: Long, token: String): Int
-    fun admitSynthesis(operationId: Long, paramsJson: String): Int
-    fun admitPlayback(operationId: Long, token: String, delaySeconds: Double): Int
 
     companion object {
         fun rejecting(): LuaSpawnAdmission = object : LuaSpawnAdmission {
             override fun admitTask(coroutineId: Long): Int = 1
-            override fun admitTranscription(operationId: Long, token: String): Int = 1
-            override fun admitSynthesis(operationId: Long, paramsJson: String): Int = 1
-            override fun admitPlayback(operationId: Long, token: String, delaySeconds: Double): Int = 1
         }
     }
+}
+
+/** Generic logical host-operation request kinds claimed from the kernel. */
+internal enum class HostOperationKind {
+    TRANSCRIBE, SYNTHESIZE, PLAYBACK, AUDIO_OPEN, AUDIO_EXPORT,
+    FS_MKDIR, FS_STAT, FS_LIST, FS_READ_TEXT, FS_WRITE_TEXT, FS_REMOVE,
+}
+
+/**
+ * Typed result of claiming one yielded host-operation request. The claim is
+ * exactly-once: a request identity that is unknown, duplicate, stale, cancelled,
+ * or closed is [Rejected] before any host effect. Admitted claims carry the
+ * bounded typed payload fields (never a concatenated label) for the kind.
+ */
+internal sealed interface HostOperationClaim {
+    data class Admitted(
+        val requestId: Long,
+        val kind: HostOperationKind,
+        val audioToken: String?,
+        val text: String?,
+        val language: String?,
+        val voice: String?,
+        val speed: Double,
+        val delaySeconds: Double,
+        // Filesystem payload fields (present only for FS_* kinds).
+        val declarationId: String? = null,
+        val mountToken: String? = null,
+        val path: String? = null,
+        val parents: Boolean = false,
+        val limit: Long = 0,
+        val cursor: String? = null,
+        val maxBytes: Long = 0,
+        val mode: String? = null,
+        val missingOk: Boolean = false,
+        val format: String? = null,
+    ) : HostOperationClaim
+
+    data class Rejected(val errorCode: String) : HostOperationClaim
 }

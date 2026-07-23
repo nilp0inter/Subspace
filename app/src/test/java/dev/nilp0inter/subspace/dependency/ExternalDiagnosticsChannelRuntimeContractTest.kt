@@ -200,12 +200,19 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
 
             val event = bridge.inputEvents.single() as LuaValue.Map
             (target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
-            assertEquals(setOf("event", "session", "metadata"), event.pairs.keys)
+            assertEquals(
+                setOf("event", "session", "timestamp", "metadata"),
+                event.pairs.keys,
+            )
             assertEquals(LuaValue.StringValue("capture"), event.pairs["event"])
             val metadata = event.pairs["metadata"] as? LuaValue.Map
                 ?: throw AssertionError("PTT callback must receive a metadata object")
-            assertEquals(setOf("duration_ms", "sample_rate", "channels"), metadata.pairs.keys)
+            assertEquals(
+                setOf("duration_ms", "sample_rate", "channels", "pcm_bytes"),
+                metadata.pairs.keys,
+            )
             assertEquals(LuaValue.Number(500.0), metadata.pairs["duration_ms"])
+            assertEquals(LuaValue.Number(16_000.0), metadata.pairs["pcm_bytes"])
             assertEquals(LuaValue.Number(16_000.0), metadata.pairs["sample_rate"])
             assertEquals(LuaValue.Number(1.0), metadata.pairs["channels"])
             assertFalse("PCM content must never cross the Lua callback boundary.", "payload" in event.pairs)
@@ -344,15 +351,22 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
             (target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
 
             val event = bridge.inputEvents.single() as LuaValue.Map
-            assertEquals(setOf("event", "session", "metadata"), event.pairs.keys)
+            assertEquals(
+                setOf("event", "session", "timestamp", "metadata"),
+                event.pairs.keys,
+            )
             assertEquals(LuaValue.StringValue("capture"), event.pairs["event"])
 
             val metadata = event.pairs["metadata"] as? LuaValue.Map
                 ?: throw AssertionError("PTT callback must receive a metadata object")
-            assertEquals(setOf("duration_ms", "sample_rate", "channels"), metadata.pairs.keys)
+            assertEquals(
+                setOf("duration_ms", "sample_rate", "channels", "pcm_bytes"),
+                metadata.pairs.keys,
+            )
             assertEquals(LuaValue.Number(500.0), metadata.pairs["duration_ms"])
             assertEquals(LuaValue.Number(44_100.0), metadata.pairs["sample_rate"])
             assertEquals(LuaValue.Number(1.0), metadata.pairs["channels"])
+            assertEquals(LuaValue.Number(44_100.0), metadata.pairs["pcm_bytes"])
 
             // Opaque audio userdata must never cross the Lua boundary
             assertFalse("Audio payload must never reach the Lua callback", "payload" in event.pairs)
@@ -743,6 +757,10 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
         }
 
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome = completed(handle)
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ): LuaKernelOutcome = completed(handle)
 
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = completed(handle)
 

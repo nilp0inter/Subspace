@@ -385,6 +385,7 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
         serviceScope.launch(Dispatchers.IO) { openAiProfileFacade.refresh(id) }
     }
 
+    @SuppressLint("MissingPermission")
     override fun onCreate() {
         super.onCreate()
         SubspaceLogger.initialize(cacheDir)
@@ -614,6 +615,13 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             providerRegistry = providerRegistry,
             bridge = dev.nilp0inter.subspace.lua.LuaNativeKernelBridge(),
             logSink = pluginLogSink,
+            runtimeResourcesFactory =
+                dev.nilp0inter.subspace.lua.AndroidLuaRuntimeResourcesFactory(
+                    contentResolver = contentResolver,
+                    bindings = mountBindingStore,
+                    grants = safGrantController,
+                    stagingRoot = java.io.File(cacheDir, "lua-audio-staging"),
+                ),
             onCatalogueReconcile = {
                 _channelDescriptors.value = providerRegistry.descriptors()
                 runtimeRegistry.reconcile(channelRepository.catalogueState.value)

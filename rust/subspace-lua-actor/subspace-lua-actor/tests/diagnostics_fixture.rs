@@ -15,12 +15,14 @@ fn source_from_exact_archive() -> String {
             offset += 1;
             continue;
         }
-        let name_len =
-            u16::from_le_bytes([DIAGNOSTICS_ARCHIVE[offset + 26], DIAGNOSTICS_ARCHIVE[offset + 27]])
-                as usize;
-        let extra_len =
-            u16::from_le_bytes([DIAGNOSTICS_ARCHIVE[offset + 28], DIAGNOSTICS_ARCHIVE[offset + 29]])
-                as usize;
+        let name_len = u16::from_le_bytes([
+            DIAGNOSTICS_ARCHIVE[offset + 26],
+            DIAGNOSTICS_ARCHIVE[offset + 27],
+        ]) as usize;
+        let extra_len = u16::from_le_bytes([
+            DIAGNOSTICS_ARCHIVE[offset + 28],
+            DIAGNOSTICS_ARCHIVE[offset + 29],
+        ]) as usize;
         let size = u32::from_le_bytes([
             DIAGNOSTICS_ARCHIVE[offset + 18],
             DIAGNOSTICS_ARCHIVE[offset + 19],
@@ -170,11 +172,7 @@ fn diagnostics_startup_spawns_heartbeat() {
         &json!({"schema_version": 1, "values": {}}),
     );
     let v = value(&out);
-    assert!(
-        v.get("error").is_none(),
-        "startup must not error: {:?}",
-        v
-    );
+    assert!(v.get("error").is_none(), "startup must not error: {:?}", v);
     // The heartbeat coroutine is spawned; it immediately yields on runtime.sleep(30.0)
     assert_eq!(kind(&state.close(generation)), OutcomeKind::Closed);
 }
@@ -195,7 +193,8 @@ fn diagnostics_readiness_returns_ready() {
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["ready"], json!(true),
+        v["ready"],
+        json!(true),
         "readiness must return ready=true: {:?}",
         v
     );
@@ -227,7 +226,8 @@ fn diagnostics_input_valid_capture_accepted() {
     );
     let v = value(&out);
     assert_eq!(
-        v, json!({"ok": true}),
+        v,
+        json!({"ok": true}),
         "valid capture must return ok: {:?}",
         v
     );
@@ -302,8 +302,10 @@ fn diagnostics_input_excessive_values_are_bounded() {
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["error"]["code"], json!("E_INPUT_MALFORMED"),
-        "excessive duration: {:?}", v
+        v["error"]["code"],
+        json!("E_INPUT_MALFORMED"),
+        "excessive duration: {:?}",
+        v
     );
 
     // Sample rate exceeds 384000
@@ -315,8 +317,10 @@ fn diagnostics_input_excessive_values_are_bounded() {
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["error"]["code"], json!("E_INPUT_MALFORMED"),
-        "excessive sample rate: {:?}", v
+        v["error"]["code"],
+        json!("E_INPUT_MALFORMED"),
+        "excessive sample rate: {:?}",
+        v
     );
 
     // Channel count exceeds 32
@@ -328,8 +332,10 @@ fn diagnostics_input_excessive_values_are_bounded() {
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["error"]["code"], json!("E_INPUT_MALFORMED"),
-        "excessive channels: {:?}", v
+        v["error"]["code"],
+        json!("E_INPUT_MALFORMED"),
+        "excessive channels: {:?}",
+        v
     );
 
     assert_eq!(kind(&state.close(generation)), OutcomeKind::Closed);
@@ -395,16 +401,14 @@ fn diagnostics_sos_unexpected_event_rejected() {
         generation,
         &json!({"schema_version": 1, "values": {}}),
     );
-    let out = state.invoke_callback(
-        generation,
-        "handle_sos",
-        r#"{"event":"something_else"}"#,
-    );
+    let out = state.invoke_callback(generation, "handle_sos", r#"{"event":"something_else"}"#);
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["error"]["code"], json!("E_SOS"),
-        "unexpected SOS event: {:?}", v
+        v["error"]["code"],
+        json!("E_SOS"),
+        "unexpected SOS event: {:?}",
+        v
     );
     assert_eq!(kind(&state.close(generation)), OutcomeKind::Closed);
 }
@@ -445,16 +449,14 @@ fn diagnostics_lifecycle_unexpected_event_rejected() {
         generation,
         &json!({"schema_version": 1, "values": {}}),
     );
-    let out = state.invoke_callback(
-        generation,
-        "handle_lifecycle",
-        r#"{"event":"invalid"}"#,
-    );
+    let out = state.invoke_callback(generation, "handle_lifecycle", r#"{"event":"invalid"}"#);
     assert_eq!(kind(&out), OutcomeKind::Completed);
     let v = value(&out);
     assert_eq!(
-        v["error"]["code"], json!("E_LIFECYCLE"),
-        "unexpected lifecycle: {:?}", v
+        v["error"]["code"],
+        json!("E_LIFECYCLE"),
+        "unexpected lifecycle: {:?}",
+        v
     );
     assert_eq!(kind(&state.close(generation)), OutcomeKind::Closed);
 }
@@ -482,11 +484,7 @@ fn diagnostics_independent_states_isolate_modules_and_close_independently() {
     );
 
     // Startup both with valid config — each state is independent
-    let left_out = startup(
-        &left,
-        gen_left,
-        &json!({"schema_version": 1, "values": {}}),
-    );
+    let left_out = startup(&left, gen_left, &json!({"schema_version": 1, "values": {}}));
     let right_out = startup(
         &right,
         gen_right,

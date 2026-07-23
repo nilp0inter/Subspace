@@ -8,8 +8,12 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
 import dev.nilp0inter.subspace.dependency.ConfigurationDataDeclaration
+import dev.nilp0inter.subspace.dependency.ConfigurationFieldDeclaration
 import dev.nilp0inter.subspace.dependency.ConfigurationUiDeclaration
 import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
+import dev.nilp0inter.subspace.dependency.UiChoice
+import dev.nilp0inter.subspace.dependency.UiControl
+import dev.nilp0inter.subspace.dependency.UiFieldDeclaration
 import dev.nilp0inter.subspace.channel.capability.RuntimeGeneration
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
 import dev.nilp0inter.subspace.audio.ChannelInputResult
@@ -82,6 +86,30 @@ private fun emptyConfigurationDeclaration(): PackageConfigurationDeclaration = P
     ConfigurationUiDeclaration(emptyList()),
 )
 
+private fun configuredConfigurationDeclaration(): PackageConfigurationDeclaration =
+    PackageConfigurationDeclaration(
+        ConfigurationDataDeclaration(
+            listOf(
+                ConfigurationFieldDeclaration.StringField(
+                    id = "mode",
+                    default = "ECHO",
+                    allowedValues = listOf("ECHO"),
+                ),
+            ),
+        ),
+        ConfigurationUiDeclaration(
+            listOf(
+                UiFieldDeclaration(
+                    field = "mode",
+                    control = UiControl.CHOICE,
+                    label = "Mode",
+                    help = null,
+                    choices = listOf(UiChoice("ECHO", "Echo")),
+                ),
+            ),
+        ),
+    )
+
 /**
  * Constructs a test Lua provider with fixed identity and presentation.
  * Tests that need custom identity/presentation should use LuaChannelImplementationProvider.create.
@@ -90,6 +118,7 @@ private fun testLuaProvider(
     image: ImmutableProgramImage,
     bridge: LuaKernelBridge,
     policy: ActorPolicy = ActorPolicy.startingEvidence(),
+    configuration: PackageConfigurationDeclaration = emptyConfigurationDeclaration(),
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -104,7 +133,7 @@ private fun testLuaProvider(
     },
     bridge = bridge,
     actorPolicy = policy,
-    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
+    configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, configuration),
 )
 
 /**
@@ -890,23 +919,36 @@ class LuaActorInstrumentationTest {
         }
 
         private fun configuredStartupThroughProviderPath() = case("provider_configured_startup") {
-            fixture(image(
-                entry = "plugin.configured",
-                sources = mapOf("plugin.configured" to """
-                    local mode = nil
-                    return {
-                      startup = function(config)
-                        if type(config) ~= "table" or config.schema_version ~= 1 or type(config.values) ~= "table" or config.values.mode ~= "ECHO" then
-                          return { error = { code = "E_INVALID_ARGUMENT", detail = "expected mode=ECHO" } }
-                        end
-                        mode = config.values.mode
-                      end,
-                      handle_readiness = function()
-                        return { ready = mode == "ECHO", status = mode or "" }
-                      end,
-                    }
-                """.trimIndent()),
-            )).use { fixture ->
+            fixture(
+                testLuaProvider(
+                    image = image(
+                        entry = "plugin.configured",
+                        sources = mapOf("plugin.configured" to """
+                            local mode = nil
+                            return {
+                              startup = function(config)
+                                if type(config) ~= "table" or config.schema_version ~= 1 or type(config.values) ~= "table" or config.values.mode ~= "ECHO" then
+                                  return { error = { code = "E_INVALID_ARGUMENT", detail = "expected mode=ECHO" } }
+                                end
+                                mode = config.values.mode
+                              end,
+                              handle_readiness = function()
+                                return { ready = mode == "ECHO", status = mode or "" }
+                              end,
+                              handle_input = function(event)
+                                if type(event) ~= "table" or event.event ~= "capture" then
+                                  return { error = { code = "E_INVALID_ARGUMENT", detail = "expected capture" } }
+                                end
+                                return { ok = true }
+                              end,
+                            }
+                        """.trimIndent()),
+                    ),
+                    bridge = LuaNativeKernelBridge(),
+                    policy = policy(),
+                    configuration = configuredConfigurationDeclaration(),
+                ),
+            ).use { fixture ->
                 val definition = ChannelDefinition(
                     id = "configured",
                     name = "Configured startup",

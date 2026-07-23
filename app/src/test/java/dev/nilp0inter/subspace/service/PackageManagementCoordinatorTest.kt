@@ -431,7 +431,7 @@ class PackageManagementCoordinatorTest {
     private data class Download(val coordinates: GitHubRepositoryCoordinates, val asset: GitHubReleaseAsset)
 
     private fun packageArchive(repositoryId: String, version: String, marker: String, luaVersion: String = LUA_VERSION): ByteArray {
-        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Coordinator package","summary":"Coordinator transaction fixture"},"runtime":{"luaVersion":"$luaVersion","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Coordinator package","summary":"Coordinator transaction fixture"},"runtime":{"luaVersion":"$luaVersion","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),

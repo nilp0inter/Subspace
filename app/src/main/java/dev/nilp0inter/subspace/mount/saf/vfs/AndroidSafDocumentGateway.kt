@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import android.system.ErrnoException
 import android.system.OsConstants
+import android.util.Log
 import java.io.FileNotFoundException
 import java.io.InputStream
 import java.io.OutputStream
@@ -62,7 +63,8 @@ class AndroidSafDocumentGateway(
             SafGatewayResult.Failed(SafGatewayFailure.REVOKED)
         } catch (_: IllegalArgumentException) {
             SafGatewayResult.Failed(SafGatewayFailure.NOT_FOUND)
-        } catch (_: UnsupportedOperationException) {
+        } catch (failure: UnsupportedOperationException) {
+            Log.w(DIAGNOSTIC_TAG, "query_document_unsupported type=${failure.javaClass.simpleName}")
             SafGatewayResult.Failed(SafGatewayFailure.UNSUPPORTED)
         } catch (_: NullPointerException) {
             SafGatewayResult.Failed(SafGatewayFailure.UNAVAILABLE)
@@ -77,7 +79,7 @@ class AndroidSafDocumentGateway(
         val uri = childrenUri(documentId) ?: return SafGatewayResult.Failed(SafGatewayFailure.NOT_FOUND)
         var cursor: Cursor? = null
         return try {
-            cursor = contentResolver.query(uri, QUERY_COLUMNS, null, null, null)
+            cursor = contentResolver.query(uri, CHILD_QUERY_COLUMNS, null, null, null)
                 ?: return SafGatewayResult.Failed(SafGatewayFailure.UNAVAILABLE)
             val rows = ArrayList<SafDocumentRow>()
             while (cursor.moveToNext()) {
@@ -99,10 +101,11 @@ class AndroidSafDocumentGateway(
             SafGatewayResult.Failed(SafGatewayFailure.UNSUPPORTED)
         } catch (_: NullPointerException) {
             SafGatewayResult.Failed(SafGatewayFailure.UNAVAILABLE)
-        } catch (_: RuntimeException) {
+        } catch (failure: RuntimeException) {
+            Log.w(DIAGNOSTIC_TAG, "query_children_runtime type=${failure.javaClass.simpleName}")
             SafGatewayResult.Failed(SafGatewayFailure.IO)
         } finally {
-            cursor?.close()
+            closeCursorQuietly(cursor, "query_children")
         }
     }
 
@@ -210,7 +213,8 @@ class AndroidSafDocumentGateway(
             SafGatewayResult.Failed(SafGatewayFailure.REVOKED)
         } catch (_: IllegalArgumentException) {
             SafGatewayResult.Failed(SafGatewayFailure.NOT_FOUND)
-        } catch (_: UnsupportedOperationException) {
+        } catch (failure: UnsupportedOperationException) {
+            Log.w(DIAGNOSTIC_TAG, "open_read_unsupported type=${failure.javaClass.simpleName}")
             SafGatewayResult.Failed(SafGatewayFailure.UNSUPPORTED)
         } catch (_: NullPointerException) {
             SafGatewayResult.Failed(SafGatewayFailure.UNAVAILABLE)
@@ -291,7 +295,20 @@ class AndroidSafDocumentGateway(
         return if (parsed.scheme == ContentResolver.SCHEME_CONTENT) parsed else null
     }
 
+    private fun closeCursorQuietly(cursor: Cursor?, operation: String) {
+        try {
+            cursor?.close()
+        } catch (failure: RuntimeException) {
+            Log.w(DIAGNOSTIC_TAG, "${operation}_close_runtime type=${failure.javaClass.simpleName}")
+        }
+    }
+
     private companion object {
+        val CHILD_QUERY_COLUMNS = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+        )
         val QUERY_COLUMNS = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -299,6 +316,7 @@ class AndroidSafDocumentGateway(
             DocumentsContract.Document.COLUMN_SIZE,
             DocumentsContract.Document.COLUMN_LAST_MODIFIED,
         )
+        const val DIAGNOSTIC_TAG = "SubspaceStorage"
         const val FILE_MIME_TYPE = "application/octet-stream"
         const val MODE_TRUNCATE = "wt"
         const val MODE_WRITE = "w"

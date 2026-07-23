@@ -1,17 +1,24 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use serde_json::{json, Value};
-use subspace_lua_actor::{Outcome, OutcomeKind, SpawnAdmission, SpawnAdmitter, StateEngine};
+use subspace_lua_actor::{
+    Generation, Outcome, OutcomeKind, SpawnAdmission, SpawnAdmitter, StateEngine,
+};
 
 const MEMORY_LIMIT: u64 = 4 * 1024 * 1024;
 const HOOK_INTERVAL: u32 = 100;
 const INSTRUCTION_BUDGET: u64 = 50_000;
 
 fn engine(tasks: usize, timers: usize) -> StateEngine {
-    StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, INSTRUCTION_BUDGET, tasks, timers)
-        .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()))
+    StateEngine::new(
+        MEMORY_LIMIT,
+        HOOK_INTERVAL,
+        INSTRUCTION_BUDGET,
+        tasks,
+        timers,
+    )
+    .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()))
 }
 
 fn assert_kind(outcome: &Outcome, expected: OutcomeKind) {
@@ -35,7 +42,6 @@ fn value(outcome: &Outcome) -> Value {
         .clone()
 }
 
-
 fn load_image(state: &StateEngine, sources: Value, entrypoint: &str) {
     let generation = state.handle().generation;
     let source_map = serde_json::to_string(&sources).expect("fixture source map must serialize");
@@ -47,6 +53,35 @@ fn load_image(state: &StateEngine, sources: Value, entrypoint: &str) {
 
 fn invoke(state: &StateEngine, callback: &str) -> Outcome {
     state.invoke_callback(state.handle().generation, callback, "null")
+}
+
+fn invoke_input(
+    state: &StateEngine,
+    generation: Generation,
+    arguments_json: &str,
+    token: &str,
+    admitter: Arc<dyn SpawnAdmitter>,
+) -> Outcome {
+    let mut arguments: Value =
+        serde_json::from_str(arguments_json).expect("input fixture must be valid JSON");
+    arguments
+        .as_object_mut()
+        .expect("input fixture must be an object")
+        .entry("metadata")
+        .or_insert_with(|| {
+            json!({
+                "sample_rate": 16_000,
+                "channels": 1,
+                "duration_ms": 1,
+                "pcm_bytes": 32,
+            })
+        });
+    state.invoke_input_callback_with_spawn_admitter(
+        generation,
+        &arguments.to_string(),
+        token,
+        admitter,
+    )
 }
 
 fn assert_invalid_value(outcome: &Outcome) {
@@ -149,7 +184,10 @@ fn failed_images_cannot_mutate_host_modules_and_roll_back_before_valid_reload() 
     for (name, mutation) in [
         ("root field", "subspace.leaked = 'forbidden'"),
         ("runtime module", "subspace.runtime = {}"),
-        ("runtime constant", "subspace.runtime.LUA_VERSION = 'forged'"),
+        (
+            "runtime constant",
+            "subspace.runtime.LUA_VERSION = 'forged'",
+        ),
         ("runtime field", "subspace.runtime.leaked = 'forbidden'"),
     ] {
         let state = engine(4, 4);
@@ -190,7 +228,10 @@ fn early_image_staging_allocator_denial_rolls_back_bridge_accounting_and_closes(
     let before = state.snapshot(generation);
     assert_kind(&before, OutcomeKind::Completed);
     assert_eq!(before.to_json()["bridgeBytes"], json!(0));
-    assert_kind(&state.lower_memory_limit(generation, 1), OutcomeKind::Completed);
+    assert_kind(
+        &state.lower_memory_limit(generation, 1),
+        OutcomeKind::Completed,
+    );
 
     let source_map = serde_json::to_string(&json!({
         "entry": "return { startup = function() end }",
@@ -376,15 +417,24 @@ fn namespace_enumeration_has_only_allowed_modules_and_missing_require_is_side_ef
     let probe = invoke(&state, "probe");
     assert_kind(&probe, OutcomeKind::Completed);
     let result = value(&probe);
-    assert_eq!(result["preloaded"], json!([
-        "subspace.channel",
-        "subspace.log",
-        "subspace.playback",
-        "subspace.runtime",
-        "subspace.synthesis",
-        "subspace.transcription",
-    ]));
-    assert_eq!(result["forbidden"], json!([]), "forbidden namespace entries: {result}");
+    assert_eq!(
+        result["preloaded"],
+        json!([
+            "subspace.audio",
+            "subspace.channel",
+            "subspace.fs",
+            "subspace.log",
+            "subspace.playback",
+            "subspace.runtime",
+            "subspace.synthesis",
+            "subspace.transcription",
+        ])
+    );
+    assert_eq!(
+        result["forbidden"],
+        json!([]),
+        "forbidden namespace entries: {result}"
+    );
     assert_eq!(result["loaded_before"], result["loaded_after"]);
     assert_eq!(result["missing_ok"], json!(false));
     assert!(
@@ -450,7 +500,10 @@ fn reserved_semantic_module_names_are_rejected_from_program_images() {
         .expect("fixture source map must serialize");
         let outcome = rejected.load_program_image(rejected.handle().generation, &sources, "entry");
         assert_kind(&outcome, OutcomeKind::ValidationFailure);
-        assert_kind(&rejected.close(rejected.handle().generation), OutcomeKind::Closed);
+        assert_kind(
+            &rejected.close(rejected.handle().generation),
+            OutcomeKind::Closed,
+        );
     }
 }
 
@@ -593,7 +646,13 @@ fn module_resolver_returns_typed_errors_and_rejects_reserved_source_shadowing() 
     }
     assert_kind(&state.close(state.handle().generation), OutcomeKind::Closed);
 
-    for invalid_name in ["subspace", "subspace.runtime", "Plugin.upper", "plugin..empty", "plugin."] {
+    for invalid_name in [
+        "subspace",
+        "subspace.runtime",
+        "Plugin.upper",
+        "plugin..empty",
+        "plugin.",
+    ] {
         let rejected = engine(4, 4);
         let sources = serde_json::to_string(&json!({
             "entry": "return { startup = function() end }",
@@ -602,7 +661,10 @@ fn module_resolver_returns_typed_errors_and_rejects_reserved_source_shadowing() 
         .expect("fixture source map must serialize");
         let outcome = rejected.load_program_image(rejected.handle().generation, &sources, "entry");
         assert_kind(&outcome, OutcomeKind::ValidationFailure);
-        assert_kind(&rejected.close(rejected.handle().generation), OutcomeKind::Closed);
+        assert_kind(
+            &rejected.close(rejected.handle().generation),
+            OutcomeKind::Closed,
+        );
     }
 }
 
@@ -641,10 +703,17 @@ fn recursive_and_effectful_module_loads_fail_without_partial_cache_entries() {
     for (name, effect) in [
         ("spawn", "api.spawn(function() end)"),
         ("sleep", "api.sleep(1)"),
-        ("log", "api.info({message = 'not allowed during module load'})"),
+        (
+            "log",
+            "api.info({message = 'not allowed during module load'})",
+        ),
     ] {
         let state = engine(4, 4);
-        let module = if name == "log" { "subspace.log" } else { "subspace.runtime" };
+        let module = if name == "log" {
+            "subspace.log"
+        } else {
+            "subspace.runtime"
+        };
         let source = format!(
             "attempts = (attempts or 0) + 1; local api = require('{module}'); {effect}; return {{ cached = true }}"
         );
@@ -675,7 +744,11 @@ fn recursive_and_effectful_module_loads_fail_without_partial_cache_entries() {
         assert_kind(&outcome, OutcomeKind::Completed);
         let result = value(&outcome);
         for key in ["first_ok", "second_ok"] {
-            assert_eq!(result[key], json!(false), "{name} load unexpectedly succeeded: {result}");
+            assert_eq!(
+                result[key],
+                json!(false),
+                "{name} load unexpectedly succeeded: {result}"
+            );
         }
         for key in ["first_error", "second_error"] {
             assert!(
@@ -998,7 +1071,11 @@ fn callback_normalization_preserves_allowed_values_and_rejects_each_invalid_valu
     ] {
         let outcome = invoke(&state, callback);
         assert_kind(&outcome, OutcomeKind::Completed);
-        assert_eq!(value(&outcome), expected, "{callback} was normalized incorrectly");
+        assert_eq!(
+            value(&outcome),
+            expected,
+            "{callback} was normalized incorrectly"
+        );
     }
 
     for callback in [
@@ -1021,7 +1098,10 @@ fn callback_normalization_preserves_allowed_values_and_rejects_each_invalid_valu
 
     let recovery = invoke(&state, "map_value");
     assert_kind(&recovery, OutcomeKind::Completed);
-    assert_eq!(value(&recovery), json!({"alpha": 1, "nested": {"beta": "two"}}));
+    assert_eq!(
+        value(&recovery),
+        json!({"alpha": 1, "nested": {"beta": "two"}})
+    );
     assert_kind(&state.close(state.handle().generation), OutcomeKind::Closed);
 }
 
@@ -1042,7 +1122,10 @@ fn program_image_callbacks_interrupt_and_allocator_denial_without_stranding_clos
         "entry",
     );
     assert_kind(&invoke(&interrupted, "loop"), OutcomeKind::Interrupted);
-    assert_kind(&interrupted.close(interrupted.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &interrupted.close(interrupted.handle().generation),
+        OutcomeKind::Closed,
+    );
 
     let denied = engine(4, 4);
     load_image(
@@ -1072,7 +1155,10 @@ fn program_image_callbacks_interrupt_and_allocator_denial_without_stranding_clos
         "allocator denial was not surfaced in bridge telemetry: {:?}",
         allocation.to_json()
     );
-    assert_kind(&denied.close(denied.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &denied.close(denied.handle().generation),
+        OutcomeKind::Closed,
+    );
 }
 
 #[test]
@@ -1207,8 +1293,10 @@ fn runtime_spawn_sleep_context_bounds_and_raw_yield_boundary_are_observable_thro
     let raw_yield = invoke(&context, "raw_yield");
     assert_kind(&raw_yield, OutcomeKind::RuntimeFailure);
     assert!(diagnostic(&raw_yield).contains("E_INVALID_YIELD"));
-    assert_kind(&context.close(context.handle().generation), OutcomeKind::Closed);
-
+    assert_kind(
+        &context.close(context.handle().generation),
+        OutcomeKind::Closed,
+    );
 }
 
 #[test]
@@ -1259,7 +1347,11 @@ fn admitted_startup_spawn_capacity_releases_after_completion_and_cancellation() 
         let ids = json["spawnedCoroutines"]
             .as_array()
             .unwrap_or_else(|| panic!("accepted spawn omitted coroutine identity: {json:?}"));
-        assert_eq!(ids.len(), 1, "capacity rejection retained an extra task: {json:?}");
+        assert_eq!(
+            ids.len(),
+            1,
+            "capacity rejection retained an extra task: {json:?}"
+        );
         ids[0]
             .as_i64()
             .unwrap_or_else(|| panic!("spawned coroutine id was not an integer: {json:?}"))
@@ -1282,26 +1374,25 @@ fn admitted_startup_spawn_capacity_releases_after_completion_and_cancellation() 
     let first = invoke_startup();
     assert_capacity(&first, 1);
     let first_id = admitted_id(&first);
-    let completed = state.start_coroutine_with_spawn_admitter(
-        generation,
-        first_id,
-        Arc::clone(&admit_all),
-    );
+    let completed =
+        state.start_coroutine_with_spawn_admitter(generation, first_id, Arc::clone(&admit_all));
     assert_kind(&completed, OutcomeKind::Completed);
     assert_eq!(value(&completed), json!("completed task"));
 
     let sleeping = invoke_startup();
     assert_capacity(&sleeping, 2);
     let sleeping_id = admitted_id(&sleeping);
-    let yielded = state.start_coroutine_with_spawn_admitter(
-        generation,
-        sleeping_id,
-        Arc::clone(&admit_all),
-    );
+    let yielded =
+        state.start_coroutine_with_spawn_admitter(generation, sleeping_id, Arc::clone(&admit_all));
     assert_kind(&yielded, OutcomeKind::Yielded);
     let operation_id = yielded.to_json()["operationId"]
         .as_i64()
-        .unwrap_or_else(|| panic!("sleeping task omitted operation identity: {:?}", yielded.to_json()));
+        .unwrap_or_else(|| {
+            panic!(
+                "sleeping task omitted operation identity: {:?}",
+                yielded.to_json()
+            )
+        });
     let cancelled = state.cancel_coroutine(generation, sleeping_id, operation_id);
     assert_kind(&cancelled, OutcomeKind::Cancelled);
 
@@ -1453,29 +1544,19 @@ fn managed_sleep_uses_timer_capacity_and_live_cancellation_delivery() {
     assert_kind(&second, OutcomeKind::Completed);
     assert_eq!(value(&second), json!("E_BUSY"));
 
-    let cancelled = state.resume_coroutine(
-        generation,
-        first_id,
-        first_operation,
-        false,
-        "E_CANCELLED",
-    );
+    let cancelled =
+        state.resume_coroutine(generation, first_id, first_operation, false, "E_CANCELLED");
     assert_kind(&cancelled, OutcomeKind::Completed);
     assert_eq!(value(&cancelled), json!("E_CANCELLED"));
-    let duplicate = state.resume_coroutine(
-        generation,
-        first_id,
-        first_operation,
-        true,
-        "",
-    );
+    let duplicate = state.resume_coroutine(generation, first_id, first_operation, true, "");
     assert_kind(&duplicate, OutcomeKind::Completed);
     assert_eq!(value(&duplicate), json!("E_CANCELLED"));
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
 #[test]
-fn repeated_operation_specific_sleeps_survive_without_generic_task_expiry_and_close_blocks_resume() {
+fn repeated_operation_specific_sleeps_survive_without_generic_task_expiry_and_close_blocks_resume()
+{
     let state = engine(1, 1);
     let generation = state.handle().generation;
     load_image(
@@ -1526,7 +1607,9 @@ fn repeated_operation_specific_sleeps_survive_without_generic_task_expiry_and_cl
         "null",
         Arc::new(|_| SpawnAdmission::Accepted),
     );
-    let second_id = second_start.to_json()["spawnedCoroutines"][0].as_i64().unwrap();
+    let second_id = second_start.to_json()["spawnedCoroutines"][0]
+        .as_i64()
+        .unwrap();
     let second = state.start_coroutine_with_spawn_admitter(
         generation,
         second_id,
@@ -1668,7 +1751,8 @@ fn captured_audio_userdata_input_callback_behavior() {
     let admit_all: Arc<dyn SpawnAdmitter> = Arc::new(|_: i64| SpawnAdmission::Accepted);
 
     // 1. Invoke input callback, passing arguments and a token.
-    let outcome = state.invoke_input_callback_with_spawn_admitter(
+    let outcome = invoke_input(
+        &state,
         generation,
         r#"{"foo": "bar"}"#,
         "secret_token_12345",
@@ -1738,7 +1822,8 @@ fn opaque_audio_userdata_is_rejected_atomically_across_callback_config_errors_an
     );
 
     let admit_all: Arc<dyn SpawnAdmitter> = Arc::new(|_: i64| SpawnAdmission::Accepted);
-    let input = state.invoke_input_callback_with_spawn_admitter(
+    let input = invoke_input(
+        &state,
         generation,
         r#"{"source":"captured"}"#,
         "opaque-token-for-rejection-test",
@@ -1873,7 +1958,8 @@ fn native_input_userdata_boundary_consults_admission_only_at_runtime_spawn_and_n
             admission
         });
 
-        let outcome = state.invoke_input_callback_with_spawn_admitter(
+        let outcome = invoke_input(
+            &state,
             generation,
             &format!(r#"{{"source":"{label}"}}"#),
             secret_token,
@@ -1986,7 +2072,8 @@ fn native_input_userdata_boundary_consults_admission_only_at_runtime_spawn_and_n
         "entry",
     );
     let admit_all: Arc<dyn SpawnAdmitter> = Arc::new(|_| SpawnAdmission::Accepted);
-    let accepted = escape_state.invoke_input_callback_with_spawn_admitter(
+    let accepted = invoke_input(
+        &escape_state,
         escape_generation,
         r#"{"source":"captured"}"#,
         secret_token,
@@ -2015,21 +2102,19 @@ fn native_input_userdata_boundary_consults_admission_only_at_runtime_spawn_and_n
     assert_kind(&escape_state.close(escape_generation), OutcomeKind::Closed);
 }
 
-
 #[test]
 fn transcription_input_borrows_userdata_and_normalizes_validation_and_failures() {
-    struct TranscriptionAdmitter { probes: AtomicUsize }
+    struct TranscriptionAdmitter;
     impl SpawnAdmitter for TranscriptionAdmitter {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_transcription(&self, operation_id: i64, token: String) -> i32 {
-            assert_eq!(token, "captured-token");
-            if operation_id == 0 { self.probes.fetch_add(1, Ordering::SeqCst); }
-            0
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
         }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local t = require("subspace.transcription")
         return {
           startup = function() end,
@@ -2041,38 +2126,90 @@ fn transcription_input_borrows_userdata_and_normalizes_validation_and_failures()
             return {first=x,first_error=e,second=y,second_error=f}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
     let outside = invoke(&state, "outside");
     assert_kind(&outside, OutcomeKind::Completed);
     assert_eq!(value(&outside), json!({"error": "E_INVALID_CONTEXT"}));
-    let host = Arc::new(TranscriptionAdmitter { probes: AtomicUsize::new(0) });
-    let input = state.invoke_input_callback_with_spawn_admitter(generation, "{}", "captured-token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    let host = Arc::new(TranscriptionAdmitter);
+    let input = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&input, OutcomeKind::Yielded);
     let coroutine = input.to_json()["coroutineId"].as_i64().unwrap();
     let operation = input.to_json()["operationId"].as_i64().unwrap();
-    let first = state.resume_coroutine_with_spawn_admitter(generation, coroutine, operation, true, "héllo", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    // The first transcribe yields an opaque request id; claiming it returns the
+    // typed TRANSCRIBE payload carrying the captured token verbatim.
+    let request_id = input.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("TRANSCRIBE"));
+    assert_eq!(claim.to_json()["audioToken"], json!("captured-token"));
+    let first = state.resume_coroutine_with_spawn_admitter(
+        generation,
+        coroutine,
+        operation,
+        true,
+        "héllo",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&first, OutcomeKind::Yielded);
-    let second = state.resume_coroutine_with_spawn_admitter(generation, coroutine, first.to_json()["operationId"].as_i64().unwrap(), true, "world", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    let second = state.resume_coroutine_with_spawn_admitter(
+        generation,
+        coroutine,
+        first.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "world",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&second, OutcomeKind::Completed);
-    assert_eq!(value(&second), json!({"first":{"text":"héllo"},"second":{"text":"world"}}));
-    assert_eq!(host.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        value(&second),
+        json!({"first":{"text":"héllo"},"second":{"text":"world"}})
+    );
 
-    let invalid = state.invoke_input_callback_with_spawn_admitter(generation, r#"{"invalid":true}"#, "captured-token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    let invalid = invoke_input(
+        &state,
+        generation,
+        r#"{"invalid":true}"#,
+        "captured-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&invalid, OutcomeKind::Completed);
     assert_eq!(value(&invalid), json!({"error":"E_INVALID_ARGUMENT"}));
-    assert_eq!(host.probes.load(Ordering::SeqCst), 2);
 
     let allowed = [
-        "E_INVALID_ARGUMENT", "E_INVALID_VALUE", "E_INVALID_CONTEXT",
-        "E_CAPABILITY_UNDECLARED", "E_UNAVAILABLE", "E_BUSY", "E_TIMEOUT",
-        "E_CANCELLED", "E_CLOSED", "E_STALE", "E_HOST_FAILURE",
+        "E_INVALID_ARGUMENT",
+        "E_INVALID_VALUE",
+        "E_INVALID_CONTEXT",
+        "E_CAPABILITY_UNDECLARED",
+        "E_UNAVAILABLE",
+        "E_BUSY",
+        "E_TIMEOUT",
+        "E_CANCELLED",
+        "E_CLOSED",
+        "E_STALE",
+        "E_HOST_FAILURE",
     ];
     for injected in allowed.into_iter().chain([
         "panic: /endpoint=https://secret.example credential=top-secret transport reset",
         "unknown backend detail",
     ]) {
-        let failed = state.invoke_input_callback_with_spawn_admitter(
-            generation, "{\"fail\":true}", "captured-token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+        let failed = invoke_input(
+            &state,
+            generation,
+            "{\"fail\":true}",
+            "captured-token",
+            Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
         assert_kind(&failed, OutcomeKind::Yielded);
         let failed_result = state.resume_coroutine(
@@ -2083,69 +2220,122 @@ fn transcription_input_borrows_userdata_and_normalizes_validation_and_failures()
             injected,
         );
         assert_kind(&failed_result, OutcomeKind::Completed);
-        let expected = if injected.starts_with("E_") { injected } else { "E_HOST_FAILURE" };
-        assert_eq!(value(&failed_result), json!({"error": expected}), "injected={injected}");
-        assert!(!failed_result.to_json().to_string().contains("secret.example"));
+        let expected = if injected.starts_with("E_") {
+            injected
+        } else {
+            "E_HOST_FAILURE"
+        };
+        assert_eq!(
+            value(&failed_result),
+            json!({"error": expected}),
+            "injected={injected}"
+        );
+        assert!(!failed_result
+            .to_json()
+            .to_string()
+            .contains("secret.example"));
         assert!(!failed_result.to_json().to_string().contains("top-secret"));
-        assert!(!failed_result.to_json().to_string().contains("transport reset"));
+        assert!(!failed_result
+            .to_json()
+            .to_string()
+            .contains("transport reset"));
     }
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
 #[test]
 fn transcription_non_userdata_in_input_is_invalid_argument_without_host_admission() {
-    struct RejectingAdmitter(AtomicUsize);
+    struct RejectingAdmitter;
     impl SpawnAdmitter for RejectingAdmitter {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_transcription(&self, _: i64, _: String) -> i32 { self.0.fetch_add(1, Ordering::SeqCst); 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local t = require("subspace.transcription")
         return { startup = function() end, handle_input = function(event) local x,e=t.transcribe("bad") return {x=x,error=e and e.error} end }
-    "#}), "entry");
-    let host = Arc::new(RejectingAdmitter(AtomicUsize::new(0)));
-    let outcome = state.invoke_input_callback_with_spawn_admitter(generation, "{}", "token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    "#}),
+        "entry",
+    );
+    let host = Arc::new(RejectingAdmitter);
+    let outcome = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&outcome, OutcomeKind::Completed);
     assert_eq!(value(&outcome), json!({"error":"E_INVALID_ARGUMENT"}));
-    assert_eq!(host.0.load(Ordering::SeqCst), 0);
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
 #[test]
-fn opaque_audio_invalid_ownership_status_maps_to_invalid_argument_without_backend_admission() {
-    struct Rejecting { probes: AtomicUsize }
-    impl SpawnAdmitter for Rejecting {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_transcription(&self, _: i64, _: String) -> i32 { self.probes.fetch_add(1, Ordering::SeqCst); 3 }
-        fn admit_playback(&self, _: i64, _: String, _: f64) -> i32 { self.probes.fetch_add(1, Ordering::SeqCst); 3 }
+fn transcribe_claim_carries_foreign_token_verbatim_without_ownership_check() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local _,e=t.transcribe(event.audio); return {error=e and e.error} end}"#}), "entry");
-    let host = Arc::new(Rejecting { probes: AtomicUsize::new(0) });
-    let out = state.invoke_input_callback_with_spawn_admitter(generation, "{}", "foreign-owner", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
-    assert_kind(&out, OutcomeKind::Completed);
-    assert_eq!(value(&out), json!({"error":"E_INVALID_ARGUMENT"}));
-    assert_eq!(host.probes.load(Ordering::SeqCst), 1);
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    // A captured-kind userdata is valid regardless of the token's registry
+    // ownership: Rust validates the userdata KIND synchronously, while token
+    // ownership is a host-registry concern resolved at claim time. The opaque
+    // token must therefore be carried verbatim into the typed claim.
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "foreign-owner",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let request_id = out.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("TRANSCRIBE"));
+    assert_eq!(claim.to_json()["audioToken"], json!("foreign-owner"));
+    let resumed = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "verbatim",
+    );
+    assert_kind(&resumed, OutcomeKind::Completed);
+    assert_eq!(value(&resumed), json!({"text":"verbatim"}));
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
 #[test]
 fn synthesis_operation_validates_parameters_and_resumes_opaque_userdata() {
-    struct SynthesisAdmitter { admissions: AtomicUsize, params: Mutex<Vec<String>> }
+    struct SynthesisAdmitter;
     impl SpawnAdmitter for SynthesisAdmitter {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, params: String) -> i32 {
-            self.admissions.fetch_add(1, Ordering::SeqCst);
-            self.params.lock().push(params);
-            0
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
         }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local s = require("subspace.synthesis")
         return {
           startup = function() end,
@@ -2171,24 +2361,72 @@ fn synthesis_operation_validates_parameters_and_resumes_opaque_userdata() {
             return {text=tostring(x), meta=getmetatable(x)}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
     let outside = invoke(&state, "outside");
     assert_kind(&outside, OutcomeKind::Completed);
     assert_eq!(value(&outside), json!("E_INVALID_CONTEXT"));
-    let host = Arc::new(SynthesisAdmitter { admissions: AtomicUsize::new(0), params: Mutex::new(Vec::new()) });
-    for k in ["missing_text","extra","blank_text","long_text","bad_language","missing_voice","blank_voice","long_voice","nan","infinite","zero","negative"] {
-        let out = state.invoke_input_callback_with_spawn_admitter(generation, &format!(r#"{{"k":"{k}"}}"#), "token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    let host = Arc::new(SynthesisAdmitter);
+    for k in [
+        "missing_text",
+        "extra",
+        "blank_text",
+        "long_text",
+        "bad_language",
+        "missing_voice",
+        "blank_voice",
+        "long_voice",
+        "nan",
+        "infinite",
+        "zero",
+        "negative",
+    ] {
+        let out = invoke_input(
+            &state,
+            generation,
+            &format!(r#"{{"k":"{k}"}}"#),
+            "token",
+            Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+        );
         assert_kind(&out, OutcomeKind::Completed);
-        assert_eq!(value(&out), json!({"error":"E_INVALID_ARGUMENT"}), "case {k}");
+        assert_eq!(
+            value(&out),
+            json!({"error":"E_INVALID_ARGUMENT"}),
+            "case {k}"
+        );
     }
-    assert_eq!(host.admissions.load(Ordering::SeqCst), 0);
-    let valid = state.invoke_input_callback_with_spawn_admitter(generation, r#"{"k":"valid"}"#, "token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    let valid = invoke_input(
+        &state,
+        generation,
+        r#"{"k":"valid"}"#,
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&valid, OutcomeKind::Yielded);
-    assert_eq!(host.admissions.load(Ordering::SeqCst), 1);
-    let params: Value = serde_json::from_str(&host.params.lock()[0]).unwrap();
-    assert_eq!(params["speed"], json!(1.0));
-    assert_eq!(params["text"], json!("hello"));
-    let resumed = state.resume_coroutine_with_spawn_admitter(generation, valid.to_json()["coroutineId"].as_i64().unwrap(), valid.to_json()["operationId"].as_i64().unwrap(), true, "synthesized:result", Arc::clone(&host) as Arc<dyn SpawnAdmitter>);
+    // The valid synthesis yields an opaque request id; the typed claim returns
+    // the exact synthesis parameters (speed defaults to 1.0).
+    let request_id = valid.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    let claim_json = claim.to_json();
+    assert_eq!(claim_json["hostOperationKind"], json!("SYNTHESIZE"));
+    assert_eq!(claim_json["text"], json!("hello"));
+    assert_eq!(claim_json["language"], json!("en-US"));
+    assert_eq!(claim_json["voice"], json!("v"));
+    assert_eq!(claim_json["speed"].as_f64(), Some(1.0));
+    let resumed = state.resume_coroutine_with_spawn_admitter(
+        generation,
+        valid.to_json()["coroutineId"].as_i64().unwrap(),
+        valid.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "result",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
     assert_kind(&resumed, OutcomeKind::Completed);
     assert_eq!(value(&resumed), json!({"text":"opaque_audio","meta":false}));
     assert_kind(&state.close(generation), OutcomeKind::Closed);
@@ -2198,24 +2436,41 @@ fn synthesis_operation_validates_parameters_and_resumes_opaque_userdata() {
 fn synthesis_host_failure_resumes_normalized_error() {
     struct Failing;
     impl SpawnAdmitter for Failing {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"local s=require("subspace.synthesis"); return {startup=function()end,handle_input=function() local x,e=s.synthesize({text="x",language="en-US",voice="v"}); return {error=e and e.error} end}"#}), "entry");
+    load_image(
+        &state,
+        json!({"entry": r#"local s=require("subspace.synthesis"); return {startup=function()end,handle_input=function() local x,e=s.synthesize({text="x",language="en-US",voice="v"}); return {error=e and e.error} end}"#}),
+        "entry",
+    );
     let host = Arc::new(Failing);
     let allowed = [
-        "E_INVALID_ARGUMENT", "E_INVALID_VALUE", "E_INVALID_CONTEXT",
-        "E_CAPABILITY_UNDECLARED", "E_UNAVAILABLE", "E_BUSY", "E_TIMEOUT",
-        "E_CANCELLED", "E_CLOSED", "E_STALE", "E_HOST_FAILURE",
+        "E_INVALID_ARGUMENT",
+        "E_INVALID_VALUE",
+        "E_INVALID_CONTEXT",
+        "E_CAPABILITY_UNDECLARED",
+        "E_UNAVAILABLE",
+        "E_BUSY",
+        "E_TIMEOUT",
+        "E_CANCELLED",
+        "E_CLOSED",
+        "E_STALE",
+        "E_HOST_FAILURE",
     ];
     for injected in allowed.into_iter().chain([
         "exception-like: /endpoint=https://secret.example credential=top-secret transport reset",
         "provider failure detail",
     ]) {
-        let yielded = state.invoke_input_callback_with_spawn_admitter(
-            generation, "{}", "token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+        let yielded = invoke_input(
+            &state,
+            generation,
+            "{}",
+            "token",
+            Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
         assert_kind(&yielded, OutcomeKind::Yielded);
         let failed = state.resume_coroutine(
@@ -2226,8 +2481,16 @@ fn synthesis_host_failure_resumes_normalized_error() {
             injected,
         );
         assert_kind(&failed, OutcomeKind::Completed);
-        let expected = if injected.starts_with("E_") { injected } else { "E_HOST_FAILURE" };
-        assert_eq!(value(&failed), json!({"error": expected}), "injected={injected}");
+        let expected = if injected.starts_with("E_") {
+            injected
+        } else {
+            "E_HOST_FAILURE"
+        };
+        assert_eq!(
+            value(&failed),
+            json!({"error": expected}),
+            "injected={injected}"
+        );
         assert!(!failed.to_json().to_string().contains("secret.example"));
         assert!(!failed.to_json().to_string().contains("top-secret"));
         assert!(!failed.to_json().to_string().contains("transport reset"));
@@ -2237,18 +2500,18 @@ fn synthesis_host_failure_resumes_normalized_error() {
 
 #[test]
 fn playback_schedule_validates_options_before_admission_and_returns_exact_status() {
-    struct PlaybackAdmitter { admissions: AtomicUsize }
+    struct PlaybackAdmitter;
     impl SpawnAdmitter for PlaybackAdmitter {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_playback(&self, _: i64, _: String, _: f64) -> i32 {
-            self.admissions.fetch_add(1, Ordering::SeqCst);
-            0
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
         }
     }
 
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local p = require("subspace.playback")
         return {
           startup = function() end,
@@ -2270,24 +2533,56 @@ fn playback_schedule_validates_options_before_admission_and_returns_exact_status
           end,
           raw_yield = function() return coroutine.yield("untagged") end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
-    let host = Arc::new(PlaybackAdmitter { admissions: AtomicUsize::new(0) });
-    for case in ["missing", "extra", "non_table", "nan", "infinite", "negative", "oversize"] {
-        let out = state.invoke_input_callback_with_spawn_admitter(
-            generation, &format!(r#"{{"case":"{case}"}}"#), "captured-token",
+    let host = Arc::new(PlaybackAdmitter);
+    for case in [
+        "missing",
+        "extra",
+        "non_table",
+        "nan",
+        "infinite",
+        "negative",
+        "oversize",
+    ] {
+        let out = invoke_input(
+            &state,
+            generation,
+            &format!(r#"{{"case":"{case}"}}"#),
+            "captured-token",
             Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
         assert_kind(&out, OutcomeKind::Completed);
-        assert_eq!(value(&out), json!({"error": if case == "negative" || case == "oversize" { "E_INVALID_VALUE" } else { "E_INVALID_ARGUMENT" }}), "case {case}");
+        assert_eq!(
+            value(&out),
+            json!({"error": if case == "negative" || case == "oversize" { "E_INVALID_VALUE" } else { "E_INVALID_ARGUMENT" }}),
+            "case {case}"
+        );
     }
-    assert_eq!(host.admissions.load(Ordering::SeqCst), 0);
 
-    let valid = state.invoke_input_callback_with_spawn_admitter(
-        generation, "{}", "captured-token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    let valid = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&valid, OutcomeKind::Yielded);
-    assert_eq!(host.admissions.load(Ordering::SeqCst), 1);
+    // The valid playback yields an opaque request id; the typed claim returns
+    // the captured token and the requested delay (1s here).
+    let request_id = valid.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    let claim_json = claim.to_json();
+    assert_eq!(claim_json["hostOperationKind"], json!("PLAYBACK"));
+    assert_eq!(claim_json["audioToken"], json!("captured-token"));
+    assert_eq!(claim_json["delaySeconds"].as_f64(), Some(1.0));
     let resumed = state.resume_coroutine_with_spawn_admitter(
         generation,
         valid.to_json()["coroutineId"].as_i64().unwrap(),
@@ -2299,16 +2594,28 @@ fn playback_schedule_validates_options_before_admission_and_returns_exact_status
     assert_kind(&resumed, OutcomeKind::Completed);
     assert_eq!(value(&resumed), json!({"status":"scheduled"}));
     let allowed = [
-        "E_INVALID_ARGUMENT", "E_INVALID_VALUE", "E_INVALID_CONTEXT",
-        "E_CAPABILITY_UNDECLARED", "E_UNAVAILABLE", "E_BUSY", "E_TIMEOUT",
-        "E_CANCELLED", "E_CLOSED", "E_STALE", "E_HOST_FAILURE",
+        "E_INVALID_ARGUMENT",
+        "E_INVALID_VALUE",
+        "E_INVALID_CONTEXT",
+        "E_CAPABILITY_UNDECLARED",
+        "E_UNAVAILABLE",
+        "E_BUSY",
+        "E_TIMEOUT",
+        "E_CANCELLED",
+        "E_CLOSED",
+        "E_STALE",
+        "E_HOST_FAILURE",
     ];
     for injected in allowed.into_iter().chain([
         "exception-like: /endpoint=https://secret.example credential=top-secret transport reset",
         "playback backend detail",
     ]) {
-        let yielded = state.invoke_input_callback_with_spawn_admitter(
-            generation, "{}", "captured-token", Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+        let yielded = invoke_input(
+            &state,
+            generation,
+            "{}",
+            "captured-token",
+            Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
         assert_kind(&yielded, OutcomeKind::Yielded);
         let failed = state.resume_coroutine(
@@ -2319,18 +2626,24 @@ fn playback_schedule_validates_options_before_admission_and_returns_exact_status
             injected,
         );
         assert_kind(&failed, OutcomeKind::Completed);
-        let expected = if injected.starts_with("E_") { injected } else { "E_HOST_FAILURE" };
-        assert_eq!(value(&failed), json!({"error": expected}), "injected={injected}");
+        let expected = if injected.starts_with("E_") {
+            injected
+        } else {
+            "E_HOST_FAILURE"
+        };
+        assert_eq!(
+            value(&failed),
+            json!({"error": expected}),
+            "injected={injected}"
+        );
         assert!(!failed.to_json().to_string().contains("secret.example"));
         assert!(!failed.to_json().to_string().contains("top-secret"));
         assert!(!failed.to_json().to_string().contains("transport reset"));
     }
- 
 
     let untagged = state.invoke_callback(generation, "raw_yield", "null");
     assert_kind(&untagged, OutcomeKind::RuntimeFailure);
     assert!(diagnostic(&untagged).contains("E_INVALID_YIELD"));
-    assert_eq!(host.admissions.load(Ordering::SeqCst), 14);
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
@@ -2376,13 +2689,16 @@ fn detached_snapshots_reflect_lifecycle_and_reject_foreign_generations() {
 fn audio_wrong_kind_is_rejected_before_host_admission() {
     struct WrongKindGuard;
     impl SpawnAdmitter for WrongKindGuard {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
 
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local s = require("subspace.synthesis")
         local t = require("subspace.transcription")
         return {
@@ -2394,11 +2710,16 @@ fn audio_wrong_kind_is_rejected_before_host_admission() {
             return {error = e and e.error}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
     let host = Arc::new(WrongKindGuard);
-    let outcome = state.invoke_input_callback_with_spawn_admitter(
-        generation, "{}", "captured-token",
+    let outcome = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     // First yield from synthesis.synthesize
@@ -2408,13 +2729,16 @@ fn audio_wrong_kind_is_rejected_before_host_admission() {
 
     // Resume synthesis: creates synthesized audio userdata
     let resumed = state.resume_coroutine_with_spawn_admitter(
-        generation, coroutine_id, operation_id, true,
+        generation,
+        coroutine_id,
+        operation_id,
+        true,
         "synthesized:wrong-kind-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
-    // The transcribe call with synthesized (wrong-kind) userdata must fail
-    // before host admission, returning E_INVALID_VALUE from the kind check
-    // without invoking admit_transcription.
+    // The transcribe call with synthesized (wrong-kind) userdata must fail the
+    // synchronous kind check as E_INVALID_VALUE without yielding a host
+    // operation.
     assert_kind(&resumed, OutcomeKind::Completed);
     assert_eq!(
         value(&resumed),
@@ -2426,95 +2750,136 @@ fn audio_wrong_kind_is_rejected_before_host_admission() {
 }
 
 #[test]
-fn audio_admission_quota_stale_closed_mapped_before_yield() {
-    let state = engine(4, 4);
-    let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+fn host_operation_claim_rejects_busy_stale_closed() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let image = json!({"entry": r#"
         local t = require("subspace.transcription")
-        local s = require("subspace.synthesis")
-        local p = require("subspace.playback")
         return {
           startup = function() end,
           handle_input = function(event)
-            local args = event or {}
-            if args.op == "quota" then
-              local x, e = t.transcribe(event.audio)
-              return {error = e and e.error}
-            elseif args.op == "stale" then
-              local x, e = t.transcribe(event.audio)
-              return {error = e and e.error}
-            elseif args.op == "closed" then
-              local result, e = p.schedule(event.audio, {delay_seconds=0})
-              if e then return {error = e and e.error} end
-              return result
-            else
-              return {error = "unknown-op"}
-            end
+            local x, e = t.transcribe(event.audio)
+            if e then return {error = e.error} end
+            return {text = x.text}
           end,
         }
-    "#}), "entry");
+    "#});
 
-    // E_BUSY from transcription admitter (status 2)
+    // Busy / host-work failure: a valid op yields; the host completes it as a
+    // failure and Lua observes the normalized code (no synchronous pre-yield map).
     {
-        struct BusyAdmitter;
-        impl SpawnAdmitter for BusyAdmitter {
-            fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-            fn admit_transcription(&self, _: i64, _: String) -> i32 { 2 }
-        }
-        let host = Arc::new(BusyAdmitter);
-        let out = state.invoke_input_callback_with_spawn_admitter(
-            generation, r#"{"op":"quota"}"#, "busy-token",
+        let state = engine(4, 4);
+        let generation = state.handle().generation;
+        load_image(&state, image.clone(), "entry");
+        let host = Arc::new(Accepting);
+        let out = invoke_input(
+            &state,
+            generation,
+            "{}",
+            "busy-token",
             Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
-        assert_kind(&out, OutcomeKind::Completed);
-        assert_eq!(value(&out), json!({"error":"E_BUSY"}));
+        assert_kind(&out, OutcomeKind::Yielded);
+        let failed = state.resume_coroutine(
+            generation,
+            out.to_json()["coroutineId"].as_i64().unwrap(),
+            out.to_json()["operationId"].as_i64().unwrap(),
+            false,
+            "E_BUSY",
+        );
+        assert_kind(&failed, OutcomeKind::Completed);
+        assert_eq!(value(&failed), json!({"error":"E_BUSY"}));
+        assert_kind(&state.close(generation), OutcomeKind::Closed);
     }
 
-    // E_STALE from transcription admitter (status 5)
+    // Stale: once the owning coroutine is cancelled, its typed request is
+    // dropped, so a late claim is rejected (never Completed) and a late resume
+    // is suppressed.
     {
-        struct StaleAdmitter;
-        impl SpawnAdmitter for StaleAdmitter {
-            fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-            fn admit_transcription(&self, _: i64, _: String) -> i32 { 5 }
-        }
-        let host = Arc::new(StaleAdmitter);
-        let out = state.invoke_input_callback_with_spawn_admitter(
-            generation, r#"{"op":"stale"}"#, "stale-token",
+        let state = engine(4, 4);
+        let generation = state.handle().generation;
+        load_image(&state, image.clone(), "entry");
+        let host = Arc::new(Accepting);
+        let out = invoke_input(
+            &state,
+            generation,
+            "{}",
+            "stale-token",
             Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
-        assert_kind(&out, OutcomeKind::Completed);
-        assert_eq!(value(&out), json!({"error":"E_STALE"}));
+        assert_kind(&out, OutcomeKind::Yielded);
+        let coroutine_id = out.to_json()["coroutineId"].as_i64().unwrap();
+        let operation_id = out.to_json()["operationId"].as_i64().unwrap();
+        let request_id = out.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert_kind(
+            &state.cancel_coroutine(generation, coroutine_id, operation_id),
+            OutcomeKind::Cancelled,
+        );
+        let claim = state.claim_host_operation(generation, request_id);
+        assert_ne!(
+            claim.kind(),
+            OutcomeKind::Completed,
+            "claim after cancel must be rejected: {:?}",
+            claim.to_json()
+        );
+        let late = state.resume_coroutine(generation, coroutine_id, operation_id, true, "late");
+        assert_ne!(
+            late.kind(),
+            OutcomeKind::Completed,
+            "late resume after cancel must be suppressed: {:?}",
+            late.to_json()
+        );
+        assert_kind(&state.close(generation), OutcomeKind::Closed);
     }
 
-    // E_CLOSED from playback admitter (status 6)
+    // Closed: after the generation is closed, a claim against the closed
+    // generation is rejected as Closed.
     {
-        struct ClosedAdmitter;
-        impl SpawnAdmitter for ClosedAdmitter {
-            fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-            fn admit_playback(&self, _: i64, _: String, _: f64) -> i32 { 6 }
-        }
-        let host = Arc::new(ClosedAdmitter);
-        let out = state.invoke_input_callback_with_spawn_admitter(
-            generation, r#"{"op":"closed"}"#, "closed-token",
+        let state = engine(4, 4);
+        let generation = state.handle().generation;
+        load_image(&state, image.clone(), "entry");
+        let host = Arc::new(Accepting);
+        let out = invoke_input(
+            &state,
+            generation,
+            "{}",
+            "closed-token",
             Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
         );
-        assert_kind(&out, OutcomeKind::Completed);
-        assert_eq!(value(&out), json!({"error":"E_CLOSED"}));
+        assert_kind(&out, OutcomeKind::Yielded);
+        let request_id = out.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+        assert_kind(&state.close(generation), OutcomeKind::Closed);
+        let closed_generation = state.handle().generation;
+        let claim = state.claim_host_operation(closed_generation, request_id);
+        assert_kind(&claim, OutcomeKind::Closed);
     }
-
-    assert_kind(&state.close(generation), OutcomeKind::Closed);
 }
 
 #[test]
 fn yielded_audio_operation_releases_execution_slot() {
     struct AcceptSynthesisForSlot;
     impl SpawnAdmitter for AcceptSynthesisForSlot {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local s = require("subspace.synthesis")
         return {
           startup = function() return {ready = true} end,
@@ -2524,11 +2889,16 @@ fn yielded_audio_operation_releases_execution_slot() {
             return {synthesized = tostring(syn)}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
     let host = Arc::new(AcceptSynthesisForSlot);
-    let yield_out = state.invoke_input_callback_with_spawn_admitter(
-        generation, "{}", "captured-token",
+    let yield_out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&yield_out, OutcomeKind::Yielded);
@@ -2543,7 +2913,10 @@ fn yielded_audio_operation_releases_execution_slot() {
 
     // Resume the suspended audio operation
     let resumed = state.resume_coroutine_with_spawn_admitter(
-        generation, coroutine_id, operation_id, true,
+        generation,
+        coroutine_id,
+        operation_id,
+        true,
         "synthesized:slot-release-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
@@ -2556,12 +2929,15 @@ fn yielded_audio_operation_releases_execution_slot() {
 fn spawned_task_audio_operation_cancellation_discards_coroutine() {
     struct AcceptSynthesis;
     impl SpawnAdmitter for AcceptSynthesis {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(2, 1);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local runtime = require("subspace.runtime")
         local s = require("subspace.synthesis")
         return {
@@ -2573,11 +2949,15 @@ fn spawned_task_audio_operation_cancellation_discards_coroutine() {
             end)
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
     let host = Arc::new(AcceptSynthesis);
     let startup = state.invoke_callback_with_spawn_admitter(
-        generation, "startup", "null",
+        generation,
+        "startup",
+        "null",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&startup, OutcomeKind::Completed);
@@ -2587,7 +2967,8 @@ fn spawned_task_audio_operation_cancellation_discards_coroutine() {
 
     // Start the spawned task: it calls synthesis.synthesize and yields
     let yielded = state.start_coroutine_with_spawn_admitter(
-        generation, task_id,
+        generation,
+        task_id,
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&yielded, OutcomeKind::Yielded);
@@ -2602,7 +2983,10 @@ fn spawned_task_audio_operation_cancellation_discards_coroutine() {
     // Late resume echoes the Cancelled terminal without re-entering Lua
     // (the coroutine was released, so the cached terminal outcome is echoed).
     let late = state.resume_coroutine_with_spawn_admitter(
-        generation, task_id, operation_id, true,
+        generation,
+        task_id,
+        operation_id,
+        true,
         "synthesized:late-after-cancel",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
@@ -2615,12 +2999,15 @@ fn spawned_task_audio_operation_cancellation_discards_coroutine() {
 fn generation_close_during_audio_operation_suppresses_late_completion() {
     struct AcceptSynthesisForClose;
     impl SpawnAdmitter for AcceptSynthesisForClose {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_synthesis(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local s = require("subspace.synthesis")
         return {
           startup = function() end,
@@ -2630,11 +3017,16 @@ fn generation_close_during_audio_operation_suppresses_late_completion() {
             return {synthesized = tostring(syn)}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
     let host = Arc::new(AcceptSynthesisForClose);
-    let yield_out = state.invoke_input_callback_with_spawn_admitter(
-        generation, "{}", "captured-token",
+    let yield_out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&yield_out, OutcomeKind::Yielded);
@@ -2646,7 +3038,10 @@ fn generation_close_during_audio_operation_suppresses_late_completion() {
 
     // Late completion must be rejected as stale
     let late = state.resume_coroutine_with_spawn_admitter(
-        generation, coroutine_id, operation_id, true,
+        generation,
+        coroutine_id,
+        operation_id,
+        true,
         "synthesized:late-after-close",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
@@ -2660,13 +3055,16 @@ fn generation_close_during_audio_operation_suppresses_late_completion() {
 fn audio_operation_duplicate_terminal_echoes_without_reentry() {
     struct AcceptTranscription;
     impl SpawnAdmitter for AcceptTranscription {
-        fn admit(&self, _: i64) -> SpawnAdmission { SpawnAdmission::Accepted }
-        fn admit_transcription(&self, _: i64, _: String) -> i32 { 0 }
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
     }
 
     let state = engine(4, 4);
     let generation = state.handle().generation;
-    load_image(&state, json!({"entry": r#"
+    load_image(
+        &state,
+        json!({"entry": r#"
         local t = require("subspace.transcription")
         return {
           startup = function() end,
@@ -2676,11 +3074,16 @@ fn audio_operation_duplicate_terminal_echoes_without_reentry() {
             return {text = x.text}
           end,
         }
-    "#}), "entry");
+    "#}),
+        "entry",
+    );
 
     let host = Arc::new(AcceptTranscription);
-    let yield_out = state.invoke_input_callback_with_spawn_admitter(
-        generation, "{}", "captured-token",
+    let yield_out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&yield_out, OutcomeKind::Yielded);
@@ -2689,7 +3092,11 @@ fn audio_operation_duplicate_terminal_echoes_without_reentry() {
 
     // First resume completes the transcription operation
     let first = state.resume_coroutine_with_spawn_admitter(
-        generation, coroutine_id, operation_id, true, "hello world",
+        generation,
+        coroutine_id,
+        operation_id,
+        true,
+        "hello world",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&first, OutcomeKind::Completed);
@@ -2698,7 +3105,11 @@ fn audio_operation_duplicate_terminal_echoes_without_reentry() {
     // Duplicate resume echoes the exact same terminal outcome
     // without re-entering Lua (the "must not execute" string never reaches Lua).
     let duplicate = state.resume_coroutine_with_spawn_admitter(
-        generation, coroutine_id, operation_id, true, "must not execute",
+        generation,
+        coroutine_id,
+        operation_id,
+        true,
+        "must not execute",
         Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
     );
     assert_kind(&duplicate, OutcomeKind::Completed);
@@ -2708,5 +3119,991 @@ fn audio_operation_duplicate_terminal_echoes_without_reentry() {
         "duplicate resume must echo the exact terminal outcome without re-entry",
     );
 
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_yield_is_opaque_and_typed_claim_returns_payload() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"
+        local t = require("subspace.transcription")
+        local s = require("subspace.synthesis")
+        local p = require("subspace.playback")
+        return {
+          startup = function() end,
+          handle_input = function(event)
+            local a = event or {}
+            if a.op == "transcribe" then
+              local x, e = t.transcribe(event.audio)
+              if e then return {error = e.error} end
+              return {text = x.text}
+            elseif a.op == "synthesize" then
+              local x, e = s.synthesize({text="hello", language="en-US", voice="v", speed=1.0})
+              if e then return {error = e.error} end
+              return {text = tostring(x), meta = getmetatable(x)}
+            elseif a.op == "playback" then
+              local r, e = p.schedule(event.audio, {delay_seconds=2})
+              if e then return {error = e.error} end
+              return r
+            end
+            return {error = "unknown-op"}
+          end,
+        }
+    "#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+
+    // TRANSCRIBE: opaque yield, typed claim carries the captured token.
+    let out = invoke_input(
+        &state,
+        generation,
+        r#"{"op":"transcribe"}"#,
+        "cap-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let label = out.to_json()["value"].as_str().unwrap().to_string();
+    let request_id = label
+        .parse::<i64>()
+        .expect("yielded value must be a bare integer request id");
+    assert!(
+        !label.contains('{'),
+        "opaque label leaked structure: {label}"
+    );
+    assert!(
+        !label.contains("synthesized"),
+        "opaque label leaked synth marker: {label}"
+    );
+    assert!(
+        !label.contains("cap-token"),
+        "opaque label leaked the audio token: {label}"
+    );
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    let cj = claim.to_json();
+    assert_eq!(cj["hostOperationKind"], json!("TRANSCRIBE"));
+    assert_eq!(cj["audioToken"], json!("cap-token"));
+    let _ = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "ok",
+    );
+
+    // SYNTHESIZE: opaque yield, typed claim carries exact parameters.
+    let out = invoke_input(
+        &state,
+        generation,
+        r#"{"op":"synthesize"}"#,
+        "cap-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let label = out.to_json()["value"].as_str().unwrap().to_string();
+    let request_id = label.parse::<i64>().expect("bare integer request id");
+    assert!(
+        !label.contains("hello"),
+        "opaque label leaked synthesis text: {label}"
+    );
+    assert!(
+        !label.contains('{'),
+        "opaque label leaked structure: {label}"
+    );
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    let cj = claim.to_json();
+    assert_eq!(cj["hostOperationKind"], json!("SYNTHESIZE"));
+    assert_eq!(cj["text"], json!("hello"));
+    assert_eq!(cj["language"], json!("en-US"));
+    assert_eq!(cj["voice"], json!("v"));
+    assert_eq!(cj["speed"].as_f64(), Some(1.0));
+    let _ = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "tok",
+    );
+
+    // PLAYBACK: opaque yield, typed claim carries token + delay.
+    let out = invoke_input(
+        &state,
+        generation,
+        r#"{"op":"playback"}"#,
+        "cap-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let label = out.to_json()["value"].as_str().unwrap().to_string();
+    let request_id = label.parse::<i64>().expect("bare integer request id");
+    assert!(
+        !label.contains('{'),
+        "opaque label leaked structure: {label}"
+    );
+    assert!(
+        !label.contains("cap-token"),
+        "opaque label leaked the audio token: {label}"
+    );
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    let cj = claim.to_json();
+    assert_eq!(cj["hostOperationKind"], json!("PLAYBACK"));
+    assert_eq!(cj["audioToken"], json!("cap-token"));
+    assert_eq!(cj["delaySeconds"].as_f64(), Some(2.0));
+    let resumed = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "ignored",
+    );
+    assert_kind(&resumed, OutcomeKind::Completed);
+    assert_eq!(value(&resumed), json!({"status":"scheduled"}));
+
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_duplicate_claim_is_rejected() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "dup-token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let request_id = out.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let first = state.claim_host_operation(generation, request_id);
+    assert_kind(&first, OutcomeKind::Completed);
+    let second = state.claim_host_operation(generation, request_id);
+    assert_kind(&second, OutcomeKind::InvalidOwnership);
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_foreign_claim_is_rejected() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    // A request id that was never yielded has no owner.
+    let foreign = state.claim_host_operation(generation, 999_999);
+    assert_kind(&foreign, OutcomeKind::InvalidOwnership);
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_stale_claim_after_cancel() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let coroutine_id = out.to_json()["coroutineId"].as_i64().unwrap();
+    let operation_id = out.to_json()["operationId"].as_i64().unwrap();
+    let request_id = out.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert_kind(
+        &state.cancel_coroutine(generation, coroutine_id, operation_id),
+        OutcomeKind::Cancelled,
+    );
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_ne!(
+        claim.kind(),
+        OutcomeKind::Completed,
+        "claim after cancel must be rejected: {:?}",
+        claim.to_json()
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_closed_claim_after_close() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let request_id = out.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+    let closed_generation = state.handle().generation;
+    let claim = state.claim_host_operation(closed_generation, request_id);
+    assert_kind(&claim, OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_synthesis_completion_publishes_opaque_audio() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local s=require("subspace.synthesis"); return {startup=function()end,handle_input=function(event) local x,e=s.synthesize({text="hello",language="en-US",voice="v"}); if e then return {error=e.error} end; return {text=tostring(x), meta=getmetatable(x)} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let resumed = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "tok",
+    );
+    assert_kind(&resumed, OutcomeKind::Completed);
+    assert_eq!(value(&resumed), json!({"text":"opaque_audio","meta":false}));
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn host_operation_failure_normalizes_unknown_to_host_failure() {
+    struct Accepting;
+    impl SpawnAdmitter for Accepting {
+        fn admit(&self, _: i64) -> SpawnAdmission {
+            SpawnAdmission::Accepted
+        }
+    }
+    let state = engine(4, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({"entry": r#"local t=require("subspace.transcription"); return {startup=function()end,handle_input=function(event) local x,e=t.transcribe(event.audio); if e then return {error=e.error} end; return {text=x.text} end}"#}),
+        "entry",
+    );
+    let host = Arc::new(Accepting);
+    let out = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "token",
+        Arc::clone(&host) as Arc<dyn SpawnAdmitter>,
+    );
+    assert_kind(&out, OutcomeKind::Yielded);
+    let failed = state.resume_coroutine(
+        generation,
+        out.to_json()["coroutineId"].as_i64().unwrap(),
+        out.to_json()["operationId"].as_i64().unwrap(),
+        false,
+        "provider exploded https://secret.example",
+    );
+    assert_kind(&failed, OutcomeKind::Completed);
+    assert_eq!(value(&failed), json!({"error":"E_HOST_FAILURE"}));
+    let rendered = failed.to_json().to_string();
+    assert!(
+        !rendered.contains("secret.example"),
+        "raw failure detail leaked: {rendered}"
+    );
+    assert!(
+        !rendered.contains("provider exploded"),
+        "raw failure detail leaked: {rendered}"
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn input_defer_commits_only_after_terminal_success_and_releases_every_failure_path() {
+    let state = engine(1, 4);
+    let generation = state.handle().generation;
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local runtime = require("subspace.runtime")
+                local transcription = require("subspace.transcription")
+                local ran = 0
+                local busy = ""
+                return {
+                  startup = function() end,
+                  outside = function()
+                    local _, context_error = runtime.defer(function() end)
+                    local _, argument_error = runtime.defer("not-a-function")
+                    return {
+                      context = context_error.error,
+                      argument = argument_error.error,
+                    }
+                  end,
+                  probe = function()
+                    return { ran = ran, busy = busy }
+                  end,
+                  handle_input = function(event)
+                    local ok, defer_error = runtime.defer(function()
+                      ran = ran + 1
+                    end)
+                    if not ok then
+                      return { error = { code = defer_error.error, detail = "defer" } }
+                    end
+                    if event.mode == "two" then
+                      local _, second_error = runtime.defer(function()
+                        ran = ran + 100
+                      end)
+                      busy = second_error.error
+                    end
+                    if event.mode == "yield" then
+                      local _, transcription_error =
+                        transcription.transcribe(event.audio)
+                      if transcription_error then
+                        return {
+                          error = {
+                            code = transcription_error.error,
+                            detail = "transcription",
+                          },
+                        }
+                      end
+                    end
+                    if event.mode == "fail" then
+                      return { error = { code = "E_IO", detail = "failed" } }
+                    end
+                    return { ok = true }
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+
+    assert_eq!(
+        value(&invoke(&state, "outside")),
+        json!({
+            "context": "E_INVALID_CONTEXT",
+            "argument": "E_INVALID_ARGUMENT",
+        }),
+    );
+
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let admitter: Arc<dyn SpawnAdmitter> = {
+        let admissions = Arc::clone(&admissions);
+        Arc::new(move |_| {
+            admissions.fetch_add(1, Ordering::SeqCst);
+            SpawnAdmission::Accepted
+        })
+    };
+
+    let failed = invoke_input(
+        &state,
+        generation,
+        r#"{"mode":"fail"}"#,
+        "captured",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&failed, OutcomeKind::Completed);
+    assert!(failed.to_json().get("spawnedCoroutines").is_none());
+    assert_eq!(admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(value(&invoke(&state, "probe")), json!({"ran":0,"busy":""}));
+
+    let yielded = invoke_input(
+        &state,
+        generation,
+        r#"{"mode":"yield"}"#,
+        "captured",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&yielded, OutcomeKind::Yielded);
+    assert!(yielded.to_json().get("spawnedCoroutines").is_none());
+    assert_eq!(admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(value(&invoke(&state, "probe")), json!({"ran":0,"busy":""}));
+    let committed = state.resume_coroutine_with_spawn_admitter(
+        generation,
+        yielded.to_json()["coroutineId"].as_i64().unwrap(),
+        yielded.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&committed, OutcomeKind::Completed);
+    let deferred_id = committed.to_json()["spawnedCoroutines"][0]
+        .as_i64()
+        .unwrap();
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(value(&invoke(&state, "probe")), json!({"ran":0,"busy":""}));
+    assert_kind(
+        &state.start_coroutine_with_spawn_admitter(generation, deferred_id, Arc::clone(&admitter)),
+        OutcomeKind::Completed,
+    );
+    assert_eq!(value(&invoke(&state, "probe")), json!({"ran":1,"busy":""}));
+
+    let bounded = invoke_input(
+        &state,
+        generation,
+        r#"{"mode":"two"}"#,
+        "captured",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&bounded, OutcomeKind::Completed);
+    let bounded_id = bounded.to_json()["spawnedCoroutines"][0].as_i64().unwrap();
+    assert_eq!(
+        value(&invoke(&state, "probe")),
+        json!({"ran":1,"busy":"E_BUSY"})
+    );
+    assert_kind(
+        &state.start_coroutine_with_spawn_admitter(generation, bounded_id, Arc::clone(&admitter)),
+        OutcomeKind::Completed,
+    );
+    assert_eq!(
+        value(&invoke(&state, "probe")),
+        json!({"ran":2,"busy":"E_BUSY"})
+    );
+
+    let cancelled = invoke_input(
+        &state,
+        generation,
+        r#"{"mode":"yield"}"#,
+        "captured",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&cancelled, OutcomeKind::Yielded);
+    assert_kind(
+        &state.cancel_coroutine(
+            generation,
+            cancelled.to_json()["coroutineId"].as_i64().unwrap(),
+            cancelled.to_json()["operationId"].as_i64().unwrap(),
+        ),
+        OutcomeKind::Cancelled,
+    );
+    let after_cancel = invoke_input(&state, generation, "{}", "captured", Arc::clone(&admitter));
+    assert_kind(&after_cancel, OutcomeKind::Completed);
+    assert_eq!(
+        after_cancel.to_json()["spawnedCoroutines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn defer_is_rejected_during_module_evaluation_before_reserving_work() {
+    let state = engine(1, 1);
+    let generation = state.handle().generation;
+    let outcome = state.load_program_image(
+        generation,
+        &json!({
+            "entry": r#"
+                local runtime = require("subspace.runtime")
+                runtime.defer(function() end)
+                return { startup = function() end }
+            "#,
+        })
+        .to_string(),
+        "entry",
+    );
+    assert_kind(&outcome, OutcomeKind::RuntimeFailure);
+    assert!(diagnostic(&outcome).contains("effect-call-during-load"));
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn runtime_instance_id_is_host_owned_and_excludes_generation_identity() {
+    let state = engine(1, 1);
+    let generation = state.handle().generation;
+    assert_kind(
+        &state.set_resource_context(
+            generation,
+            r#"{"instanceId":"journal-instance","storageFiles":false,"mounts":{}}"#,
+        ),
+        OutcomeKind::Completed,
+    );
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local runtime = require("subspace.runtime")
+                return {
+                  startup = function() end,
+                  probe = function()
+                    local changed = pcall(function()
+                      runtime.INSTANCE_ID = "forged"
+                    end)
+                    return {
+                      instance_id = runtime.INSTANCE_ID,
+                      mutation_succeeded = changed,
+                    }
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+    assert_eq!(
+        value(&invoke(&state, "probe")),
+        json!({
+            "instance_id": "journal-instance",
+            "mutation_succeeded": false,
+        }),
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn audio_open_yields_typed_request_and_resumes_as_opaque_recording() {
+    let state = engine(2, 1);
+    let generation = state.handle().generation;
+    assert_kind(
+        &state.set_resource_context(
+            generation,
+            r#"{"instanceId":"journal","storageFiles":true,"audioFiles":true,"mounts":{"output":{"access":"read-write","status":"available"}}}"#,
+        ),
+        OutcomeKind::Completed,
+    );
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local audio = require("subspace.audio")
+                local fs = require("subspace.fs")
+                return {
+                  startup = function() end,
+                  handle_input = function(event)
+                    local mount = assert(fs.mount("output"))
+                    local recording, open_error = audio.open(
+                      mount,
+                      "stored/input.wav",
+                      { format = "wav-pcm-s16le" }
+                    )
+                    if not recording then return { error = open_error } end
+                    return audio.describe(recording)
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+
+    let admitter: Arc<dyn SpawnAdmitter> = Arc::new(|_: i64| SpawnAdmission::Accepted);
+    let yielded = invoke_input(&state, generation, "{}", "captured-token", admitter);
+    assert_kind(&yielded, OutcomeKind::Yielded);
+    let request_id = yielded.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("AUDIO_OPEN"));
+    assert_eq!(claim.to_json()["declarationId"], json!("output"));
+    assert_eq!(claim.to_json()["path"], json!("stored/input.wav"));
+    assert_eq!(claim.to_json()["format"], json!("wav-pcm-s16le"));
+
+    let completed = state.resume_coroutine(
+        generation,
+        yielded.to_json()["coroutineId"].as_i64().unwrap(),
+        yielded.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"token":"opened-token","metadata":{"sample_rate":16000,"channels":1,"duration_ms":250,"pcm_bytes":8000}}"#,
+    );
+    assert_kind(&completed, OutcomeKind::Completed);
+    assert_eq!(
+        value(&completed),
+        json!({
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_ms": 250,
+            "pcm_bytes": 8000,
+        }),
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn audio_export_claim_preserves_recording_identity_and_portable_options() {
+    let state = engine(2, 1);
+    let generation = state.handle().generation;
+    assert_kind(
+        &state.set_resource_context(
+            generation,
+            r#"{"instanceId":"journal","storageFiles":true,"audioFiles":true,"mounts":{"output":{"access":"read-write","status":"available"}}}"#,
+        ),
+        OutcomeKind::Completed,
+    );
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local audio = require("subspace.audio")
+                local fs = require("subspace.fs")
+                return {
+                  startup = function() end,
+                  handle_input = function(event)
+                    local mount = assert(fs.mount("output"))
+                    return audio.export(
+                      event.audio,
+                      mount,
+                      "daily/capture.ogg",
+                      { format = "ogg-vorbis", mode = "replace" }
+                    )
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+
+    let admitter: Arc<dyn SpawnAdmitter> = Arc::new(|_: i64| SpawnAdmission::Accepted);
+    let yielded = invoke_input(&state, generation, "{}", "captured-token", admitter);
+    assert_kind(&yielded, OutcomeKind::Yielded);
+    let request_id = yielded.to_json()["value"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let claim = state.claim_host_operation(generation, request_id);
+    assert_kind(&claim, OutcomeKind::Completed);
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("AUDIO_EXPORT"));
+    assert_eq!(claim.to_json()["audioToken"], json!("captured-token"));
+    assert_eq!(claim.to_json()["declarationId"], json!("output"));
+    assert_eq!(claim.to_json()["path"], json!("daily/capture.ogg"));
+    assert_eq!(claim.to_json()["format"], json!("ogg-vorbis"));
+    assert_eq!(claim.to_json()["mode"], json!("replace"));
+
+    let completed = state.resume_coroutine(
+        generation,
+        yielded.to_json()["coroutineId"].as_i64().unwrap(),
+        yielded.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"status":"written","format":"ogg-vorbis","sample_rate":16000,"channels":1,"duration_ms":250,"bytes":1234}"#,
+    );
+    assert_kind(&completed, OutcomeKind::Completed);
+    assert_eq!(
+        value(&completed),
+        json!({
+            "status": "written",
+            "format": "ogg-vorbis",
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_ms": 250,
+            "bytes": 1234,
+        }),
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn captured_recording_round_trips_through_export_open_transcription_and_export() {
+    let state = engine(2, 1);
+    let generation = state.handle().generation;
+    assert_kind(
+        &state.set_resource_context(
+            generation,
+            r#"{"instanceId":"journal","storageFiles":true,"audioFiles":true,"mounts":{"output":{"access":"read-write","status":"available"}}}"#,
+        ),
+        OutcomeKind::Completed,
+    );
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local audio = require("subspace.audio")
+                local fs = require("subspace.fs")
+                local transcription = require("subspace.transcription")
+                return {
+                  startup = function() end,
+                  handle_input = function(event)
+                    local mount = assert(fs.mount("output"))
+                    local captured = assert(audio.describe(event.audio))
+                    assert(captured.pcm_bytes == 16000)
+                    assert(audio.export(
+                      event.audio,
+                      mount,
+                      "daily/capture.wav",
+                      { format = "wav-pcm-s16le", mode = "create-new" }
+                    ))
+                    local reopened = assert(audio.open(
+                      mount,
+                      "daily/capture.wav",
+                      { format = "wav-pcm-s16le" }
+                    ))
+                    local transcript = assert(transcription.transcribe(reopened))
+                    assert(audio.export(
+                      reopened,
+                      mount,
+                      "daily/capture.ogg",
+                      { format = "ogg-vorbis", mode = "replace" }
+                    ))
+                    return { ok = true, text = transcript.text }
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+    let admitter: Arc<dyn SpawnAdmitter> = Arc::new(|_: i64| SpawnAdmission::Accepted);
+    let mut outcome = invoke_input(
+        &state,
+        generation,
+        r#"{"metadata":{"sample_rate":16000,"channels":1,"duration_ms":500,"pcm_bytes":16000}}"#,
+        "captured-token",
+        admitter,
+    );
+
+    assert_kind(&outcome, OutcomeKind::Yielded);
+    let mut claim = state.claim_host_operation(
+        generation,
+        outcome.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("AUDIO_EXPORT"));
+    assert_eq!(claim.to_json()["audioToken"], json!("captured-token"));
+    outcome = state.resume_coroutine(
+        generation,
+        outcome.to_json()["coroutineId"].as_i64().unwrap(),
+        outcome.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"status":"written","format":"wav-pcm-s16le","sample_rate":16000,"channels":1,"duration_ms":500,"bytes":16044}"#,
+    );
+
+    assert_kind(&outcome, OutcomeKind::Yielded);
+    claim = state.claim_host_operation(
+        generation,
+        outcome.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("AUDIO_OPEN"));
+    outcome = state.resume_coroutine(
+        generation,
+        outcome.to_json()["coroutineId"].as_i64().unwrap(),
+        outcome.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"token":"reopened-token","metadata":{"sample_rate":16000,"channels":1,"duration_ms":500,"pcm_bytes":16000}}"#,
+    );
+
+    assert_kind(&outcome, OutcomeKind::Yielded);
+    claim = state.claim_host_operation(
+        generation,
+        outcome.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("TRANSCRIBE"));
+    assert_eq!(claim.to_json()["audioToken"], json!("reopened-token"));
+    outcome = state.resume_coroutine(
+        generation,
+        outcome.to_json()["coroutineId"].as_i64().unwrap(),
+        outcome.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        "portable transcript",
+    );
+
+    assert_kind(&outcome, OutcomeKind::Yielded);
+    claim = state.claim_host_operation(
+        generation,
+        outcome.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(claim.to_json()["hostOperationKind"], json!("AUDIO_EXPORT"));
+    assert_eq!(claim.to_json()["audioToken"], json!("reopened-token"));
+    let completed = state.resume_coroutine(
+        generation,
+        outcome.to_json()["coroutineId"].as_i64().unwrap(),
+        outcome.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"status":"written","format":"ogg-vorbis","sample_rate":16000,"channels":1,"duration_ms":500,"bytes":1234}"#,
+    );
+    assert_kind(&completed, OutcomeKind::Completed);
+    assert_eq!(
+        value(&completed),
+        json!({"ok": true, "text": "portable transcript"}),
+    );
+    assert_kind(&state.close(generation), OutcomeKind::Closed);
+}
+
+#[test]
+fn durable_input_write_precedes_deferred_mount_work() {
+    let state = engine(2, 1);
+    let generation = state.handle().generation;
+    assert_kind(
+        &state.set_resource_context(
+            generation,
+            r#"{"instanceId":"journal","storageFiles":true,"audioFiles":false,"mounts":{"output":{"access":"read-write","status":"available"}}}"#,
+        ),
+        OutcomeKind::Completed,
+    );
+    load_image(
+        &state,
+        json!({
+            "entry": r#"
+                local fs = require("subspace.fs")
+                local runtime = require("subspace.runtime")
+                return {
+                  startup = function() end,
+                  handle_input = function()
+                    local mount = assert(fs.mount("output"))
+                    assert(fs.write_text(
+                      mount, "pending.json", "{}", { mode = "replace" }
+                    ))
+                    assert(runtime.defer(function()
+                      assert(fs.stat(mount, "pending.json"))
+                    end))
+                    return { ok = true }
+                  end,
+                }
+            "#,
+        }),
+        "entry",
+    );
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let admitter: Arc<dyn SpawnAdmitter> = {
+        let admissions = Arc::clone(&admissions);
+        Arc::new(move |_| {
+            admissions.fetch_add(1, Ordering::SeqCst);
+            SpawnAdmission::Accepted
+        })
+    };
+    let write = invoke_input(
+        &state,
+        generation,
+        "{}",
+        "captured-token",
+        Arc::clone(&admitter),
+    );
+    assert_kind(&write, OutcomeKind::Yielded);
+    let write_claim = state.claim_host_operation(
+        generation,
+        write.to_json()["value"].as_str().unwrap().parse().unwrap(),
+    );
+    assert_eq!(
+        write_claim.to_json()["hostOperationKind"],
+        json!("FS_WRITE_TEXT")
+    );
+    assert_eq!(admissions.load(Ordering::SeqCst), 0);
+
+    let committed = state.resume_coroutine_with_spawn_admitter(
+        generation,
+        write.to_json()["coroutineId"].as_i64().unwrap(),
+        write.to_json()["operationId"].as_i64().unwrap(),
+        true,
+        r#"{"status":"written","bytes":2}"#,
+        Arc::clone(&admitter),
+    );
+    assert_kind(&committed, OutcomeKind::Completed);
+    assert_eq!(value(&committed), json!({"ok": true}));
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    let deferred_id = committed.to_json()["spawnedCoroutines"][0]
+        .as_i64()
+        .unwrap();
+
+    let deferred =
+        state.start_coroutine_with_spawn_admitter(generation, deferred_id, Arc::clone(&admitter));
+    assert_kind(&deferred, OutcomeKind::Yielded);
+    let stat_claim = state.claim_host_operation(
+        generation,
+        deferred.to_json()["value"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(stat_claim.to_json()["hostOperationKind"], json!("FS_STAT"));
     assert_kind(&state.close(generation), OutcomeKind::Closed);
 }

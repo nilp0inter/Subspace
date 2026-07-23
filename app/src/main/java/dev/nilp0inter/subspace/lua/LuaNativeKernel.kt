@@ -147,4 +147,18 @@ internal object LuaNativeKernel {
         coroutineId: Long,
         spawnAdmission: LuaSpawnAdmission,
     ): String
+
+    /** Claim one yielded host-operation request exactly once; returns typed claim JSON. */
+    external fun nativeClaimHostOperation(
+        stateId: Long,
+        generation: Long,
+        requestId: Long,
+    ): String
+
+    /** Install the package resource context (declared storage capability + mounts). */
+    external fun nativeSetResourceContext(
+        stateId: Long,
+        generation: Long,
+        resourceContextJson: String,
+    ): String
 }

@@ -68,31 +68,26 @@ struct HostAdmitter {
 
 impl SpawnAdmitter for HostAdmitter {
     fn admit(&self, coroutine_id: i64) -> SpawnAdmission {
-        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return SpawnAdmission::Closed };
-        match env.call_method(&self.host, "admitTask", "(J)I", &[JValue::Long(coroutine_id)]).and_then(|v| v.i()) {
+        let mut env = match self.vm.attach_current_thread() {
+            Ok(e) => e,
+            Err(_) => return SpawnAdmission::Closed,
+        };
+        match env
+            .call_method(
+                &self.host,
+                "admitTask",
+                "(J)I",
+                &[JValue::Long(coroutine_id)],
+            )
+            .and_then(|v| v.i())
+        {
             Ok(0) => SpawnAdmission::Accepted,
             Ok(2) => SpawnAdmission::Capacity,
-            _ => { let _ = env.exception_clear(); SpawnAdmission::Closed }
+            _ => {
+                let _ = env.exception_clear();
+                SpawnAdmission::Closed
+            }
         }
-    }
-
-    fn admit_transcription(&self, operation_id: i64, token: String) -> i32 {
-        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
-        let token = match env.new_string(token) { Ok(s) => s, Err(_) => return 1 };
-        let result = env.call_method(&self.host, "admitTranscription", "(JLjava/lang/String;)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(token))]).and_then(|v| v.i());
-        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
-    }
-    fn admit_synthesis(&self, operation_id: i64, params_json: String) -> i32 {
-        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
-        let params = match env.new_string(params_json) { Ok(s) => s, Err(_) => return 1 };
-        let result = env.call_method(&self.host, "admitSynthesis", "(JLjava/lang/String;)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(params))]).and_then(|v| v.i());
-        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
-    }
-    fn admit_playback(&self, operation_id: i64, token: String, delay_seconds: f64) -> i32 {
-        let mut env = match self.vm.attach_current_thread() { Ok(e) => e, Err(_) => return 1 };
-        let token = match env.new_string(token) { Ok(s) => s, Err(_) => return 1 };
-        let result = env.call_method(&self.host, "admitPlayback", "(JLjava/lang/String;D)I", &[JValue::Long(operation_id), JValue::Object(&JObject::from(token)), JValue::Double(delay_seconds)]).and_then(|v| v.i());
-        match result { Ok(value) => value, Err(_) => { let _ = env.exception_clear(); 1 } }
     }
 }
 
@@ -100,8 +95,12 @@ fn spawn_admitter(
     env: &mut JNIEnv,
     host_admitter: JObject,
 ) -> Result<Arc<dyn SpawnAdmitter>, Outcome> {
-    let vm = env.get_java_vm().map_err(|_| Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"))?;
-    let host = env.new_global_ref(host_admitter).map_err(|_| Outcome::runtime_failure("unable to retain host spawn admission"))?;
+    let vm = env
+        .get_java_vm()
+        .map_err(|_| Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"))?;
+    let host = env
+        .new_global_ref(host_admitter)
+        .map_err(|_| Outcome::runtime_failure("unable to retain host spawn admission"))?;
     Ok(Arc::new(HostAdmitter { vm, host }))
 }
 
@@ -576,7 +575,9 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeIn
         };
         let vm = match env.get_java_vm() {
             Ok(vm) => vm,
-            Err(_) => return Outcome::runtime_failure("unable to acquire JavaVM for spawn admission"),
+            Err(_) => {
+                return Outcome::runtime_failure("unable to acquire JavaVM for spawn admission")
+            }
         };
         let host: GlobalRef = match env.new_global_ref(host_admitter) {
             Ok(host) => host,
@@ -664,6 +665,42 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSt
         })
     })
 }
+
+/// `nativeClaimHostOperation(stateId: Long, generation: Long, requestId: Long): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeClaimHostOperation(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    request_id: jlong,
+) -> jstring {
+    jni_body(&mut env, |_env| {
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.claim_host_operation(generation as Generation, request_id as i64)
+        })
+    })
+}
+
+/// `nativeSetResourceContext(stateId: Long, generation: Long, resourceContextJson: String): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSetResourceContext(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    resource_context_json: JString,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let sid = state_id as StateId;
+        let gen = generation as Generation;
+        let json = match jstring_to_rust(env, &resource_context_json) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("resourceContextJson string is invalid"),
+        };
+        with_state(sid, gen, |engine| engine.set_resource_context(gen, &json))
+    })
+}
 // Prevent LLVM from stripping the JNI symbols in release builds.
 #[used]
 static JNI_SYMBOLS: &[&str] = &[
@@ -679,6 +716,8 @@ static JNI_SYMBOLS: &[&str] = &[
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeCallback",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeInputCallback",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeClaimHostOperation",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSetResourceContext",
 ];
 
 // ---------------------------------------------------------------------------

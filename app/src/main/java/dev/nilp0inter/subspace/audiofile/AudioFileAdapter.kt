@@ -1,5 +1,7 @@
 package dev.nilp0inter.subspace.audiofile
 
+import android.util.Log
+
 import dev.nilp0inter.subspace.audio.AudioEncoder
 import dev.nilp0inter.subspace.storage.BackendFailure
 import dev.nilp0inter.subspace.storage.BackendNodeInfo
@@ -125,16 +127,16 @@ public class AudioFileAdapter(
             is PathParseResult.Invalid -> return AudioFileOutcome.Failure(mapFilesystem(parsed.error))
         }
         val target = resolveTarget(resolved, components)
-        if (target is AudioFileOutcome.Failure) return AudioFileOutcome.Failure(target.error)
+        if (target is AudioFileOutcome.Failure) return openFailure("resolve", target.error)
         val node = (target as AudioFileOutcome.Success).value
         when (val kind = backendKind(resolved, node)) {
             KindProbe.File -> Unit
             KindProbe.Directory -> return fail(AudioFileErrorCode.E_INVALID_VALUE, "source is a directory")
-            is KindProbe.Failed -> return AudioFileOutcome.Failure(kind.error)
+            is KindProbe.Failed -> return openFailure("kind", kind.error)
         }
         val bytes = when (val read = backendRead(resolved, node, bounds.maxArtifactBytes)) {
             is AudioFileOutcome.Success -> read.value
-            is AudioFileOutcome.Failure -> return AudioFileOutcome.Failure(read.error)
+            is AudioFileOutcome.Failure -> return openFailure("read", read.error)
         }
         val pcm = when (val decoded = WavPcm16.decode(bytes, bounds)) {
             is WavPcm16.DecodeResult.Decoded -> decoded.pcm
@@ -525,6 +527,11 @@ public class AudioFileAdapter(
         return AudioFileError(code, sanitizer.sanitize(reason))
     }
 
+    private fun openFailure(stage: String, error: AudioFileError): AudioFileOutcome.Failure {
+        Log.w(DIAGNOSTIC_TAG, "audio_open_failure stage=$stage code=${error.code}")
+        return AudioFileOutcome.Failure(error)
+    }
+
     private fun mapFilesystem(error: FilesystemError): AudioFileError =
         AudioFileError(fromFilesystemCode(error.code), sanitizer.sanitize(error.reason))
 
@@ -576,4 +583,8 @@ public class AudioFileAdapter(
     override fun close() {
         staging.close()
     }
+    private companion object {
+        const val DIAGNOSTIC_TAG = "SubspaceStorage"
+    }
+
 }

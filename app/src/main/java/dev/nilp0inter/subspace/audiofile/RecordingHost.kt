@@ -55,6 +55,10 @@ public class RecordingHandle internal constructor(
     override fun toString(): String = "RecordingHandle"
 }
 
+internal fun recordingHandle(token: String): RecordingHandle = RecordingHandle(token)
+
+internal fun RecordingHandle.hostToken(): String = token
+
 /**
  * 6.4/6.10: The result of borrowing a Recording for describe/export/transcription. Borrowing never
  * consumes: a [Borrowed] Recording stays live and usable by its owner after the borrow.

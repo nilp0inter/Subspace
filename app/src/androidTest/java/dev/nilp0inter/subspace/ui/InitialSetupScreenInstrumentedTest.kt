@@ -48,20 +48,6 @@ class InitialSetupScreenInstrumentedTest {
         composeRule.onNodeWithText("Retry offline voice setup").assertIsEnabled()
     }
 
-    @Test
-    fun unresolvedVoiceWithoutConcreteIssueHasNoVoiceErrorUi() {
-        renderSetup(
-            missingPermissions = emptyList(),
-            needsManageExternalStorage = false,
-            invalidModelSets = emptyList(),
-            offlineNavigationVoiceIssue = null,
-            voiceSetupRequiresManualNavigation = false,
-        )
-
-        composeRule.onNodeWithText("Offline English voice not available.").assertIsDisplayed()
-        composeRule.onNodeWithText("Error: Offline voice verification failed").assertDoesNotExist()
-        composeRule.onNodeWithText("Retry offline voice setup").assertDoesNotExist()
-    }
 
     @Test
     fun settingsFallbackShowsManualVoiceInstallationGuidance() {

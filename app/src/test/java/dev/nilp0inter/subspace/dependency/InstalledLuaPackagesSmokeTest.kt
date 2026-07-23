@@ -606,6 +606,10 @@ class InstalledLuaPackagesSmokeTest {
         }
 
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome = completed(handle)
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ): LuaKernelOutcome = completed(handle)
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = completed(handle)
         override fun resume(operation: LuaOperationHandle, success: Boolean, value: String, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(operation.stateHandle)
         override fun cancel(operation: LuaOperationHandle): LuaKernelOutcome = completed(operation.stateHandle)

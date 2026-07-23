@@ -235,6 +235,20 @@ internal class LuaOpaqueAudioRegistry(
     }
 
     /**
+     * Disposes one token without requiring its execution owner. Used only by
+     * the host-side RecordingHost adapter after an audio-file result loses its
+     * terminal race; Lua cannot invoke this path or name a token.
+     */
+    @Synchronized
+    internal fun dispose(token: Token, kind: Kind) {
+        val entry = entries[token.value] ?: return
+        if (entry.kind != kind) return
+        entries.remove(token.value)
+        releaseAccounting(entry)
+        disposeEntry(entry)
+    }
+
+    /**
      * Transfer an entry out of the registry on successful deferred-queue
      * admission. Releases its owner, generation, and process accounting.
      */

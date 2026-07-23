@@ -31,6 +31,18 @@ class MountedFilesystemPaginationTest {
     }
 
     @Test
+    fun emptyPathListsTheMountRoot() = runTest {
+        val vfs = Vfs()
+        vfs.backend.seedDir(listOf("2026"))
+        vfs.backend.seedFile(listOf("note.txt"), "x".toByteArray(StandardCharsets.UTF_8))
+
+        val page = vfs.fs.list(vfs.handle(), "", ListOptions(limit = 10)).success()
+
+        assertEquals(setOf("2026", "note.txt"), page.entries.map { it.name }.toSet())
+        assertNull(page.nextCursor)
+    }
+
+    @Test
     fun paginationReturnsEveryEntryExactlyOnceAcrossPages() = runTest {
         val vfs = Vfs()
         seedEntries(vfs, "d", 10)

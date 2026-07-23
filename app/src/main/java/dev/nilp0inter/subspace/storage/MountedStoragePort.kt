@@ -103,12 +103,17 @@ public data class ListEntry(val name: String, val kind: NodeKind)
 
 /**
  * An opaque, unforgeable listing continuation token. Callers receive it from
- * [ListPage.nextCursor] and present it back in [ListOptions.cursor]; they cannot construct or
- * inspect it. A cursor is bound to one mount, directory, generation, and listing session and is
- * invalidated after completion, terminal pagination failure, replacement, or close.
+ * [ListPage.nextCursor] and present it back in [ListOptions.cursor]; they cannot inspect it. A
+ * cursor is bound to one mount, directory, generation, and listing session and is invalidated
+ * after completion, terminal pagination failure, replacement, or close.
+ *
+ * The host operation bridge round-trips the token across the kernel boundary as an opaque string:
+ * the constructor and [token] are public to the host so it can present a cursor the kernel
+ * yielded back to [ListOptions] verbatim. The token carries no meaning to a package, which only
+ * ever passes the value it received; the registry revalidates the binding on every use.
  */
 @JvmInline
-public value class ListCursor internal constructor(internal val token: String)
+public value class ListCursor public constructor(public val token: String)
 
 /** One bounded list page: at most the accepted limit of [entries] plus optional [nextCursor]. */
 public data class ListPage(

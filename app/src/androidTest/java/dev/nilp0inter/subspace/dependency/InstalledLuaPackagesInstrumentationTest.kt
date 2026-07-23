@@ -302,7 +302,7 @@ class InstalledLuaPackagesInstrumentationTest {
     fun configuredStartupWithModeFieldReachesReadinessThroughProductionJni() = runBlocking {
         withPrivateStore { root ->
             ProductionFixture(root).useSuspending { fixture ->
-                val id = ChannelImplementationId("instrumentation:configured-mode-startup")
+                val id = fixture.debugImplementationId
                 val definition = ChannelDefinition(
                     id = "configured-mode-startup",
                     name = "Mode startup ECHO",
@@ -468,19 +468,35 @@ class InstalledLuaPackagesInstrumentationTest {
                 )
                 val acceptance = fixture.runtimeRegistry.prepareInput(definition.id) as? ChannelInputAcceptance.Accepted
                     ?: throw AssertionError("must accept input for cancellation test")
-                acceptance.target.onInputStarted(FakeSession)
-                assertEquals(
-                    "must be RECORDING after input start",
-                    ChannelExecutionStatus.RECORDING,
-                    fixture.runtimeRegistry.getRuntimeSnapshot(definition.id)?.executionStatus,
-                )
-                acceptance.target.onInputCancelled("instrumentation cancellation probe")
-                assertEquals(
-                    "input cancellation must return the runtime to IDLE",
-                    ChannelExecutionStatus.IDLE,
-                    fixture.runtimeRegistry.getRuntimeSnapshot(definition.id)?.executionStatus,
-                )
-                (acceptance.target as? CommittedTargetLeaseOwner)?.releaseCommittedTargetLease()
+                val lease = acceptance.target as? CommittedTargetLeaseOwner
+                    ?: throw AssertionError("accepted target must own a committed lease")
+                try {
+                    acceptance.target.onInputStarted(FakeSession)
+                    assertTrue(
+                        "must become RECORDING after input start",
+                        withTimeoutOrNull(WAIT_MILLIS) {
+                            while (
+                                fixture.runtimeRegistry
+                                    .getRuntimeSnapshot(definition.id)
+                                    ?.executionStatus != ChannelExecutionStatus.RECORDING
+                            ) {
+                                delay(POLL_MILLIS)
+                            }
+                            true
+                        } == true,
+                    )
+                    acceptance.target.onInputCancelled("instrumentation cancellation probe")
+                    lease.releaseCommittedTargetLease()
+                    assertEquals(
+                        "input cancellation must return the runtime to IDLE",
+                        ChannelExecutionStatus.IDLE,
+                        fixture.runtimeRegistry
+                            .getRuntimeSnapshot(definition.id)
+                            ?.executionStatus,
+                    )
+                } finally {
+                    lease.releaseCommittedTargetLease()
+                }
             }
         }
     }
@@ -729,8 +745,13 @@ class InstalledLuaPackagesInstrumentationTest {
             dispatcher = Dispatchers.IO,
         )
 
-        fun catalogue(vararg definitions: ChannelDefinition) {
-            catalogue.set(ChannelCatalogueSnapshot(definitions.toList(), definitions.firstOrNull()?.id.orEmpty()))
+        suspend fun catalogue(vararg definitions: ChannelDefinition) {
+            val snapshot = ChannelCatalogueSnapshot(
+                definitions.toList(),
+                definitions.firstOrNull()?.id.orEmpty(),
+            )
+            catalogue.set(snapshot)
+            runtimeRegistry.reconcile(snapshot)
         }
 
         suspend fun close() {
@@ -790,6 +811,11 @@ class InstalledLuaPackagesInstrumentationTest {
 
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome =
             delegate.load(handle, source, entrypoint)
+
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ): LuaKernelOutcome = delegate.setResourceContext(handle, resourceContextJson)
 
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = delegate.start(handle)
 
@@ -1064,7 +1090,7 @@ class InstalledLuaPackagesInstrumentationTest {
             write(((value ushr 24) and 0xff).toInt())
         }
         private fun packageArchive(repositoryId: String, version: String, source: String): ByteArray {
-            val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Device package","summary":"Immutable device fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"additionalProperties":false,"fields":[]},"ui":{"fields":[]}},"capabilities":[]}"""
+            val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Device package","summary":"Immutable device fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"additionalProperties":false,"fields":[]},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
             return strictUnixStoredZip(
                 listOf(
                     ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), REGULAR_FILE_0644),
@@ -1081,7 +1107,7 @@ class InstalledLuaPackagesInstrumentationTest {
             capabilitiesJson: String,
             source: String,
         ): ByteArray {
-            val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Device package","summary":"Immutable device fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":$configJson,"capabilities":$capabilitiesJson}"""
+            val manifest = """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Device package","summary":"Immutable device fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":$configJson,"resources":{"mounts":[]},"capabilities":$capabilitiesJson}"""
             return strictUnixStoredZip(
                 listOf(
                     ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), REGULAR_FILE_0644),

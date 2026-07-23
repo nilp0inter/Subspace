@@ -66,6 +66,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -89,6 +90,11 @@ private fun testLuaProvider(
     image: ImmutableProgramImage,
     bridge: LuaKernelBridge,
     logSink: PluginLogSink = NoOpPluginLogSink,
+    storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+    resourceDeclarations: dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration =
+        dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
+    audioFilePortFactory: LuaAudioFilePortFactory? = null,
+    mountReadinessStatus: LuaMountReadinessStatus? = null,
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -104,6 +110,10 @@ private fun testLuaProvider(
     bridge = bridge,
     logSink = logSink,
     configurationProvider = CompiledConfigurationProvider(TEST_LUA_IMPLEMENTATION_ID, emptyConfigurationDeclaration()),
+    resourceDeclarations = resourceDeclarations,
+    storagePort = storagePort,
+    audioFilePortFactory = audioFilePortFactory,
+    mountReadinessStatus = mountReadinessStatus,
 )
 
 /**
@@ -562,6 +572,7 @@ class LuaAdapterRuntimeTest {
                 ChannelCapability.Synthesis,
                 ChannelCapability.AudioOperation,
                 ChannelCapability.DeferredAudioPlayback,
+                ChannelCapability.StorageFiles,
             ),
             capabilityAvailability = mapOf(
                 ChannelCapability.Transcription to CapabilityAvailability.Available,
@@ -570,6 +581,9 @@ class LuaAdapterRuntimeTest {
                     dev.nilp0inter.subspace.channel.capability.CapabilityUnavailableReason.HOST_NOT_READY,
                 ),
             ),
+            storagePort = dev.nilp0inter.subspace.storage.Vfs().fs,
+            resourceDeclarations = fsResourceDeclarations(),
+            mountReadinessStatus = LuaMountReadinessStatus { "read-only" },
         )
         try {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
@@ -577,10 +591,18 @@ class LuaAdapterRuntimeTest {
 
             val context = bridge.callbackCalls.last { it.name == "handle_readiness" }.arguments as? LuaValue.Map
                 ?: throw AssertionError("Readiness callback must receive a context map")
-            assertEquals(setOf("capabilities"), context.pairs.keys)
+            assertEquals(setOf("capabilities", "resources"), context.pairs.keys)
             val capabilities = context.pairs["capabilities"] as? LuaValue.Map
                 ?: throw AssertionError("Readiness context must contain a capabilities map")
-            assertEquals(PackageCapability.ALL, capabilities.pairs.keys)
+            assertEquals(
+                setOf(
+                    PackageCapability.AUDIO_TRANSCRIPTION,
+                    PackageCapability.AUDIO_SYNTHESIS,
+                    PackageCapability.AUDIO_PLAYBACK,
+                    PackageCapability.STORAGE_FILES,
+                ),
+                capabilities.pairs.keys,
+            )
             assertEquals(
                 LuaValue.StringValue("available"),
                 capabilities.pairs[PackageCapability.AUDIO_TRANSCRIPTION],
@@ -592,6 +614,18 @@ class LuaAdapterRuntimeTest {
             assertEquals(
                 LuaValue.StringValue("unavailable"),
                 capabilities.pairs[PackageCapability.AUDIO_PLAYBACK],
+            )
+            assertEquals(
+                LuaValue.StringValue("available"),
+                capabilities.pairs[PackageCapability.STORAGE_FILES],
+            )
+            val resources = context.pairs["resources"] as? LuaValue.Map
+                ?: throw AssertionError("Readiness context must contain resources")
+            val mounts = resources.pairs["mounts"] as? LuaValue.Map
+                ?: throw AssertionError("Readiness resources must contain mounts")
+            assertEquals(
+                mapOf("output" to LuaValue.StringValue("read-only")),
+                mounts.pairs,
             )
             assertEquals("STT", harness.runtime.snapshot.value.summary)
             assertTrue(harness.runtime.prepareInput() is ChannelInputAcceptance.Accepted)
@@ -703,18 +737,53 @@ class LuaAdapterRuntimeTest {
 
                 val inputEvent = bridge.callbackCalls.last { it.name == "handle_input" }.arguments as LuaValue.Map
                 assertEquals(
-                    "Only host-domain event identity, per-capture session, and metadata may cross into Lua.",
-                    setOf("event", "session", "metadata"),
+                    "Only host-domain event identity, per-capture session, timestamp, and metadata may cross into Lua.",
+                    setOf("event", "session", "timestamp", "metadata"),
                     inputEvent.pairs.keys,
                 )
                 assertEquals(LuaValue.StringValue("capture"), inputEvent.pairs["event"])
                 assertTrue(inputEvent.pairs["session"] is LuaValue.StringValue)
+                val timestamp = inputEvent.pairs["timestamp"] as? LuaValue.Map
+                    ?: throw AssertionError("${case.name}: timestamp must be a map")
+                assertEquals(setOf("unix_ms", "local_time"), timestamp.pairs.keys)
+                val localTime = timestamp.pairs["local_time"] as? LuaValue.Map
+                    ?: throw AssertionError("${case.name}: local_time must be a map")
+                assertEquals(
+                    setOf(
+                        "year", "month", "day", "hour", "minute", "second",
+                        "millisecond", "utc_offset_minutes",
+                    ),
+                    localTime.pairs.keys,
+                )
+                fun number(name: String): Int =
+                    ((localTime.pairs[name] as? LuaValue.Number)?.value
+                        ?: throw AssertionError("${case.name}: $name must be numeric")).toInt()
+                val offset = java.time.ZoneOffset.ofTotalSeconds(number("utc_offset_minutes") * 60)
+                val reconstructed = java.time.OffsetDateTime.of(
+                    number("year"),
+                    number("month"),
+                    number("day"),
+                    number("hour"),
+                    number("minute"),
+                    number("second"),
+                    number("millisecond") * 1_000_000,
+                    offset,
+                ).toInstant().toEpochMilli()
+                assertEquals(
+                    reconstructed.toDouble(),
+                    (timestamp.pairs["unix_ms"] as LuaValue.Number).value,
+                    0.0,
+                )
                 val metadata = inputEvent.pairs["metadata"] as? LuaValue.Map
                     ?: throw AssertionError("${case.name}: metadata must be a map")
-                assertEquals(setOf("duration_ms", "sample_rate", "channels"), metadata.pairs.keys)
+                assertEquals(
+                    setOf("duration_ms", "sample_rate", "channels", "pcm_bytes"),
+                    metadata.pairs.keys,
+                )
                 assertEquals(LuaValue.Number(500.0), metadata.pairs["duration_ms"])
                 assertEquals(LuaValue.Number(16_000.0), metadata.pairs["sample_rate"])
                 assertEquals(LuaValue.Number(1.0), metadata.pairs["channels"])
+                assertEquals(LuaValue.Number(16_000.0), metadata.pairs["pcm_bytes"])
             } finally {
                 harness.close()
             }
@@ -819,7 +888,7 @@ class LuaAdapterRuntimeTest {
         }
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0)))
         }
         val harness = harness(
             bridge,
@@ -904,13 +973,25 @@ class LuaAdapterRuntimeTest {
 
     @Test
     fun `input coroutine releases slot and resumes only current owner with exact terminal`() = runTest {
+        val playback = ControlledDeferredPlayback()
+        val operation = AudioOperationArtifact(RecordedPcm(shortArrayOf(2), 16_000), operationId = "owner-terminal", generation = RuntimeGeneration(7))
+        val audio = object : AudioOperationCapability {
+            override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+            override suspend fun createPlaybackResult(audio: OpaqueAudioRecording) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
+        }
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(coroutineId = 51, operationId = 601))
-            resumeOutcomes += yielded(coroutineId = 52, operationId = 602)
+            enqueue("handle_input", yielded(coroutineId = 51, operationId = 601, value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0)))
+            resumeOutcomes += yielded(coroutineId = 52, operationId = 602, value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0))
             resumeOutcomes += completed("""{"ok":true}""")
         }
-        val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"))
+        val harness = harness(
+            bridge,
+            setOf("startup", "handle_readiness", "handle_input"),
+            audioOperation = audio,
+            deferredAudioPlayback = playback,
+            declaredCapabilities = setOf(ChannelCapability.AudioOperation, ChannelCapability.DeferredAudioPlayback),
+        )
         try {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
             harness.runtime.refreshReadiness()
@@ -944,6 +1025,8 @@ class LuaAdapterRuntimeTest {
                 harness.runtime.resumeInput(chainedPending.ownerToken, chainedPending.operationId, true, "{}"),
             )
 
+            playback.release(DelayedPlaybackOutcome.Pending(DelayedPlaybackOperationId("queued")))
+            runCurrent()
             assertEquals(ChannelInputResult.None, release.await())
             assertNull(harness.runtime.pendingInput())
             assertEquals(ChannelExecutionStatus.SUCCESS, harness.runtime.snapshot.value.executionStatus)
@@ -963,7 +1046,7 @@ class LuaAdapterRuntimeTest {
         }
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0)))
         }
         val harness = harness(
             bridge,
@@ -977,7 +1060,6 @@ class LuaAdapterRuntimeTest {
             val target = acceptedTarget(harness.runtime); target.onInputStarted(session(16_000))
             val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }; runCurrent()
             val pending = checkNotNull(harness.runtime.pendingInput())
-            bridge.playbackLabel = "playback:${bridge.lastCapturedToken}:0"
             playback.release(DelayedPlaybackOutcome.Pending(DelayedPlaybackOperationId("queued")))
             assertEquals(ChannelInputResult.None, release.await()); assertEquals(1, playback.calls); assertEquals(1, bridge.resumeCalls.size)
             assertEquals(LuaInputResumeResult.Stale, harness.runtime.resumeInput(pending.ownerToken, pending.operationId, false, "E_HOST_FAILURE"))
@@ -1632,6 +1714,119 @@ class LuaAdapterRuntimeTest {
     }
 
     @Test
+    fun `authorized background filesystem operation resumes through generic storage`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        val bridge = RecordingBridge().apply {
+            val listId = registerFsClaim(HostOperationKind.FS_LIST, path = "", limit = 10)
+            enqueue("startup", completed(spawnedCoroutines = listOf(130)))
+            startCoroutineOutcomes += yielded(
+                coroutineId = 130,
+                operationId = 40,
+                value = listId,
+            )
+            resumeOutcomes += completed()
+        }
+        val harness = harness(
+            bridge,
+            setOf("startup"),
+            declaredCapabilities = setOf(ChannelCapability.StorageFiles),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
+            runCurrent()
+
+            val (success, value) = bridge.resumeCalls.single()
+            assertTrue(success)
+            assertEquals(0, org.json.JSONObject(value).getJSONArray("entries").length())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `authorized background audio open resumes through generic port`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        lateinit var audioFiles: FakeAudioFilePort
+        val bridge = RecordingBridge().apply {
+            val openId = registerAudioFileClaim(
+                kind = HostOperationKind.AUDIO_OPEN,
+                path = "stored/capture.wav",
+                format = "wav-pcm-s16le",
+            )
+            enqueue("startup", completed(spawnedCoroutines = listOf(131)))
+            startCoroutineOutcomes += yielded(
+                coroutineId = 131,
+                operationId = 41,
+                value = openId,
+            )
+            resumeOutcomes += completed()
+        }
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup"),
+            declaredCapabilities = setOf(
+                ChannelCapability.StorageFiles,
+                ChannelCapability.AudioFiles,
+            ),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+            audioFilePortFactory = LuaAudioFilePortFactory { recordings ->
+                FakeAudioFilePort(recordings).also { audioFiles = it }
+            },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
+            runCurrent()
+
+            val (success, value) = bridge.resumeCalls.single()
+            assertTrue(success)
+            assertEquals(
+                16_000,
+                org.json.JSONObject(value)
+                    .getJSONObject("metadata")
+                    .getInt("sample_rate"),
+            )
+            assertEquals(0, audioFiles.exportCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `background task interruption is isolated from the program image`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("startup", completed(spawnedCoroutines = listOf(132)))
+            startCoroutineOutcomes += LuaKernelOutcome.Interrupted(
+                stateId = 41,
+                generation = 7,
+                diagnostic = "instruction budget exceeded",
+                elapsedNanos = 1,
+            )
+        }
+        val harness = harness(bridge, setOf("startup"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
+            runCurrent()
+
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                harness.runtime.snapshot.value.preparation,
+            )
+            assertEquals(
+                ChannelExecutionStatus.IDLE,
+                harness.runtime.snapshot.value.executionStatus,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `close before a background timer fires suppresses its coroutine resume`() = runTest {
         val bridge = RecordingBridge().apply {
             enqueue("startup", completed(spawnedCoroutines = listOf(94)))
@@ -1788,7 +1983,7 @@ class LuaAdapterRuntimeTest {
         val backend = CountingTranscription()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.TRANSCRIBE)))
         }
         val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), transcription = backend)
         try {
@@ -1814,7 +2009,7 @@ class LuaAdapterRuntimeTest {
         val backend = CountingSynthesis()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.SYNTHESIZE, text = "hi", language = "en", voice = "v", speed = 1.0)))
         }
         val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), synthesis = backend)
         try {
@@ -1847,7 +2042,7 @@ class LuaAdapterRuntimeTest {
             val playback = ControlledDeferredPlayback()
             val bridge = RecordingBridge().apply {
                 enqueue("handle_readiness", completed("""{"ready":true}"""))
-                enqueue("handle_input", yielded(coroutineId = 710L + index, operationId = 810L + index, value = "playback:{token}:0"))
+                enqueue("handle_input", yielded(coroutineId = 710L + index, operationId = 810L + index, value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0)))
             }
             val harness = harness(
                 bridge,
@@ -1881,7 +2076,7 @@ class LuaAdapterRuntimeTest {
         val backend = CountingTranscription()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.TRANSCRIBE)))
         }
         val harness = harness(
             bridge,
@@ -1912,7 +2107,7 @@ class LuaAdapterRuntimeTest {
         val backend = CountingSynthesis()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.SYNTHESIZE, text = "hi", language = "en", voice = "v", speed = 1.0)))
         }
         val harness = harness(
             bridge,
@@ -1944,7 +2139,7 @@ class LuaAdapterRuntimeTest {
         val playback = ControlledDeferredPlayback()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(value = "playback:{token}:0"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0)))
         }
         val harness = harness(
             bridge,
@@ -1981,7 +2176,7 @@ class LuaAdapterRuntimeTest {
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
             enqueue("handle_readiness", completed("""{"ready":false}"""))
-            enqueue("handle_input", yielded(value = "transcribe:{token}"))
+            enqueue("handle_input", yielded(value = registerClaim(HostOperationKind.TRANSCRIBE)))
         }
         val harness = harness(
             bridge,
@@ -2023,7 +2218,7 @@ class LuaAdapterRuntimeTest {
             val backend = CountingTranscription()
             val bridge = RecordingBridge().apply {
                 enqueue("handle_readiness", completed("""{"ready":true}"""))
-                enqueue("handle_input", yielded(coroutineId = 900L + index, operationId = 901L + index, value = "transcribe:{token}"))
+                enqueue("handle_input", yielded(coroutineId = 900L + index, operationId = 901L + index, value = registerClaim(HostOperationKind.TRANSCRIBE)))
             }
             val harness = harness(
                 bridge,
@@ -2054,7 +2249,7 @@ class LuaAdapterRuntimeTest {
         val backend = LateTranscription()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(coroutineId = 601, operationId = 701, value = "transcribe:{token}"))
+            enqueue("handle_input", yielded(coroutineId = 601, operationId = 701, value = registerClaim(HostOperationKind.TRANSCRIBE)))
         }
         val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), transcription = backend,
             declaredCapabilities = setOf(ChannelCapability.Transcription),
@@ -2080,7 +2275,7 @@ class LuaAdapterRuntimeTest {
         val backend = LateSynthesis()
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true}"""))
-            enqueue("handle_input", yielded(coroutineId = 602, operationId = 702, value = "synthesize:{\"text\":\"hi\",\"language\":\"en\",\"voice\":\"v\",\"speed\":1}"))
+            enqueue("handle_input", yielded(coroutineId = 602, operationId = 702, value = registerClaim(HostOperationKind.SYNTHESIZE, text = "hi", language = "en", voice = "v", speed = 1.0)))
         }
         val harness = harness(bridge, setOf("startup", "handle_readiness", "handle_input"), synthesis = backend,
             declaredCapabilities = setOf(ChannelCapability.Synthesis),
@@ -2103,7 +2298,7 @@ class LuaAdapterRuntimeTest {
             override suspend fun createPlaybackResult(audio: OpaqueSynthesizedAudio) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
             override suspend fun createPlaybackResult(audio: OpaqueAudioRecording) = CapabilityOperationResult.Success<OpaqueAudioOperation>(operation)
         }
-        val bridge = RecordingBridge().apply { enqueue("handle_readiness", completed("""{"ready":true}""")); enqueue("handle_input", yielded(coroutineId = 603, operationId = 703, value = "playback:{token}:0")) }
+        val bridge = RecordingBridge().apply { enqueue("handle_readiness", completed("""{"ready":true}""")); enqueue("handle_input", yielded(coroutineId = 603, operationId = 703, value = registerClaim(HostOperationKind.PLAYBACK, audioToken = "{token}", delaySeconds = 0.0))) }
         val harness = harness(
             bridge,
             setOf("startup", "handle_readiness", "handle_input"),
@@ -2166,6 +2361,360 @@ class LuaAdapterRuntimeTest {
         fun complete() { continuation?.resume(CapabilityOperationResult.Success(artifact)) }
     }
 
+
+    // ── subspace.fs generic mounted-storage dispatch (non-Journal fixture) ──
+
+    private fun fsResourceDeclarations() = dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(
+        listOf(
+            dev.nilp0inter.subspace.dependency.PackageMountDeclaration(
+                id = "output",
+                kind = dev.nilp0inter.subspace.dependency.PackageMountKind.DIRECTORY_TREE,
+                access = dev.nilp0inter.subspace.dependency.PackageMountAccess.READ_WRITE,
+                required = true,
+                label = "Output",
+                help = null,
+            ),
+        ),
+    )
+
+    private class FakeAudioFilePort(
+        private val recordings: dev.nilp0inter.subspace.audiofile.RecordingHost,
+    ) : dev.nilp0inter.subspace.audiofile.AudioFilePort {
+        var exportCalls: Int = 0
+            private set
+
+        override fun describe(
+            handle: dev.nilp0inter.subspace.audiofile.RecordingHandle,
+            owner: dev.nilp0inter.subspace.audiofile.ExecutionOwner,
+        ): dev.nilp0inter.subspace.audiofile.AudioFileOutcome<
+            dev.nilp0inter.subspace.audiofile.AudioMediaMetadata,
+        > = when (val borrowed = recordings.borrow(handle, owner)) {
+            is dev.nilp0inter.subspace.audiofile.RecordingBorrow.Borrowed ->
+                dev.nilp0inter.subspace.audiofile.AudioFileOutcome.Success(
+                    dev.nilp0inter.subspace.audiofile.AudioMediaMetadata(
+                        sampleRate = borrowed.pcm.sampleRate,
+                        channels = 1,
+                        durationMs = borrowed.pcm.durationMs,
+                        pcmBytes = borrowed.pcm.pcmBytes,
+                    ),
+                )
+            else -> audioFileFailure(
+                dev.nilp0inter.subspace.audiofile.AudioFileErrorCode.E_INVALID_ARGUMENT,
+            )
+        }
+
+        override suspend fun open(
+            owner: dev.nilp0inter.subspace.audiofile.ExecutionOwner,
+            mount: dev.nilp0inter.subspace.storage.MountHandle,
+            path: String,
+            options: dev.nilp0inter.subspace.audiofile.AudioOpenOptions,
+        ): dev.nilp0inter.subspace.audiofile.AudioFileOutcome<
+            dev.nilp0inter.subspace.audiofile.RecordingHandle,
+        > {
+            val handle = recordings.admit(
+                dev.nilp0inter.subspace.audiofile.PcmMonoS16Le(
+                    ShortArray(16) { it.toShort() },
+                    16_000,
+                ),
+                owner,
+            ) ?: return audioFileFailure(
+                dev.nilp0inter.subspace.audiofile.AudioFileErrorCode.E_BUSY,
+            )
+            return dev.nilp0inter.subspace.audiofile.AudioFileOutcome.Success(handle)
+        }
+
+        override suspend fun export(
+            owner: dev.nilp0inter.subspace.audiofile.ExecutionOwner,
+            recording: dev.nilp0inter.subspace.audiofile.RecordingHandle,
+            mount: dev.nilp0inter.subspace.storage.MountHandle,
+            path: String,
+            options: dev.nilp0inter.subspace.audiofile.AudioExportOptions,
+        ): dev.nilp0inter.subspace.audiofile.AudioFileOutcome<
+            dev.nilp0inter.subspace.audiofile.AudioExportResult,
+        > {
+            val pcm = when (val borrowed = recordings.borrow(recording, owner)) {
+                is dev.nilp0inter.subspace.audiofile.RecordingBorrow.Borrowed -> borrowed.pcm
+                else -> return audioFileFailure(
+                    dev.nilp0inter.subspace.audiofile.AudioFileErrorCode.E_INVALID_ARGUMENT,
+                )
+            }
+            exportCalls += 1
+            return dev.nilp0inter.subspace.audiofile.AudioFileOutcome.Success(
+                dev.nilp0inter.subspace.audiofile.AudioExportResult(
+                    status = dev.nilp0inter.subspace.audiofile.AudioExportStatus.WRITTEN,
+                    format = options.format,
+                    sampleRate = pcm.sampleRate,
+                    channels = pcm.channels,
+                    durationMs = pcm.durationMs,
+                    bytes = 23,
+                ),
+            )
+        }
+
+        override fun advanceGeneration(newGeneration: Long) = Unit
+
+        override fun close() = Unit
+
+        private fun <T> audioFileFailure(
+            code: dev.nilp0inter.subspace.audiofile.AudioFileErrorCode,
+        ): dev.nilp0inter.subspace.audiofile.AudioFileOutcome<T> =
+            dev.nilp0inter.subspace.audiofile.AudioFileOutcome.Failure(
+                dev.nilp0inter.subspace.audiofile.AudioFileError(code, "test failure"),
+            )
+    }
+
+    @Test
+    fun `audio file claims dispatch through generic ports with opaque recording ownership`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        lateinit var audioFiles: FakeAudioFilePort
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+        }
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(
+                ChannelCapability.StorageFiles,
+                ChannelCapability.AudioFiles,
+            ),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+            audioFilePortFactory = LuaAudioFilePortFactory { recordings ->
+                FakeAudioFilePort(recordings).also { audioFiles = it }
+            },
+            mountReadinessStatus = LuaMountReadinessStatus { "available" },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val resourceContext = org.json.JSONObject(bridge.lastResourceContextJson!!)
+            assertTrue(resourceContext.getBoolean("storageFiles"))
+            assertTrue(resourceContext.getBoolean("audioFiles"))
+
+            val openId = bridge.registerAudioFileClaim(
+                kind = HostOperationKind.AUDIO_OPEN,
+                path = "stored/input.wav",
+                format = "wav-pcm-s16le",
+            )
+            bridge.resumeOutcomes.add(completed("""{"opened":true}"""))
+            driveFsInput(bridge, harness, openId)
+            val openResume = org.json.JSONObject(bridge.resumeCalls.single().second)
+            assertTrue(bridge.resumeCalls.single().first)
+            assertTrue(openResume.getString("token").isNotBlank())
+            assertEquals(
+                16_000,
+                openResume.getJSONObject("metadata").getInt("sample_rate"),
+            )
+
+            bridge.resumeCalls.clear()
+            val exportId = bridge.registerAudioFileClaim(
+                kind = HostOperationKind.AUDIO_EXPORT,
+                audioToken = "{token}",
+                path = "daily/capture.ogg",
+                format = "ogg-vorbis",
+                mode = "replace",
+            )
+            bridge.resumeOutcomes.add(completed("""{"exported":true}"""))
+            driveFsInput(bridge, harness, exportId)
+            val exportResume = org.json.JSONObject(bridge.resumeCalls.single().second)
+            assertTrue(bridge.resumeCalls.single().first)
+            assertEquals("written", exportResume.getString("status"))
+            assertEquals("ogg-vorbis", exportResume.getString("format"))
+            assertEquals(1, audioFiles.exportCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    /** Drive one handle_input that yields a single FS claim and runs it to completion. */
+    private suspend fun TestScope.driveFsInput(
+        bridge: RecordingBridge,
+        harness: AdapterHarness,
+        claimLabel: String,
+    ) {
+        bridge.enqueue("handle_input", yielded(value = claimLabel))
+        val target = acceptedTarget(harness.runtime)
+        target.onInputStarted(session(16_000))
+        val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+        runCurrent()
+        assertEquals(ChannelInputResult.None, release.await())
+    }
+
+    private fun lastResumeJson(bridge: RecordingBridge): org.json.JSONObject {
+        val (success, value) = bridge.resumeCalls.last()
+        assertTrue("FS operation must resume successfully, got ($success, $value)", success)
+        return org.json.JSONObject(value)
+    }
+
+    @Test
+    fun `fs operations dispatch through the generic storage port and resume with portable json`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.StorageFiles),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+
+            // The resource context installed into the kernel must carry the
+            // declared storage capability and the declared mount — generically,
+            // with no Journal-specific branch.
+            val rc = org.json.JSONObject(bridge.lastResourceContextJson!!)
+            assertEquals("lua-adapter", rc.getString("instanceId"))
+            assertTrue(rc.getBoolean("storageFiles"))
+            assertEquals("read-write", rc.getJSONObject("mounts").getJSONObject("output").getString("access"))
+
+            // Chain all six operations through one input: each resume yields the
+            // next FS request until the callback terminates.
+            val mkdirId = bridge.registerFsClaim(HostOperationKind.FS_MKDIR, path = "a/b", parents = true)
+            val writeId = bridge.registerFsClaim(HostOperationKind.FS_WRITE_TEXT, path = "a/b/f.txt", text = "hello", mode = "create-new")
+            val statId = bridge.registerFsClaim(HostOperationKind.FS_STAT, path = "a/b/f.txt")
+            val readId = bridge.registerFsClaim(HostOperationKind.FS_READ_TEXT, path = "a/b/f.txt", maxBytes = 1024)
+            val listId = bridge.registerFsClaim(HostOperationKind.FS_LIST, path = "a/b", limit = 10)
+            val removeId = bridge.registerFsClaim(HostOperationKind.FS_REMOVE, path = "a/b/f.txt")
+            bridge.enqueue("handle_input", yielded(value = mkdirId))
+            bridge.resumeOutcomes.add(yielded(operationId = 11, value = writeId))
+            bridge.resumeOutcomes.add(yielded(operationId = 12, value = statId))
+            bridge.resumeOutcomes.add(yielded(operationId = 13, value = readId))
+            bridge.resumeOutcomes.add(yielded(operationId = 14, value = listId))
+            bridge.resumeOutcomes.add(yielded(operationId = 15, value = removeId))
+            bridge.resumeOutcomes.add(completed("""{"ok":true}"""))
+
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+
+            assertEquals(6, bridge.resumeCalls.size)
+            assertEquals("created", org.json.JSONObject(bridge.resumeCalls[0].second).getString("status"))
+            val write = org.json.JSONObject(bridge.resumeCalls[1].second)
+            assertEquals("written", write.getString("status"))
+            assertEquals(5L, write.getLong("bytes"))
+            val stat = org.json.JSONObject(bridge.resumeCalls[2].second)
+            assertEquals("file", stat.getString("kind"))
+            assertEquals(5L, stat.getLong("size"))
+            val read = org.json.JSONObject(bridge.resumeCalls[3].second)
+            assertEquals("hello", read.getString("text"))
+            assertEquals(5L, read.getLong("bytes"))
+            val list = org.json.JSONObject(bridge.resumeCalls[4].second)
+            assertEquals("f.txt", list.getJSONArray("entries").getJSONObject(0).getString("name"))
+            assertEquals("file", list.getJSONArray("entries").getJSONObject(0).getString("kind"))
+            assertEquals("removed", org.json.JSONObject(bridge.resumeCalls[5].second).getString("status"))
+            assertTrue(bridge.resumeCalls.all { it.first })
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `fs mount resolution failure resumes with the portable error code verbatim`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        vfs.resolver.mount = null // no live binding for the declaration
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = registerFsClaim(HostOperationKind.FS_STAT, path = "a/b")))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.StorageFiles),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            driveFsInput(bridge, harness, bridge.claims.keys.last().toString())
+            assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `fs operation failure resumes with the portable error code without audio normalization`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            // read_text on a missing file: the port reports E_NOT_FOUND, which is
+            // NOT in the audio vocabulary and must pass through verbatim (audio
+            // normalization would collapse it to E_HOST_FAILURE).
+            enqueue("handle_input", yielded(value = registerFsClaim(HostOperationKind.FS_READ_TEXT, path = "missing.txt", maxBytes = 64)))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.StorageFiles),
+            storagePort = vfs.fs,
+            resourceDeclarations = fsResourceDeclarations(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            driveFsInput(bridge, harness, bridge.claims.keys.last().toString())
+            assertEquals(listOf(false to "E_NOT_FOUND"), bridge.resumeCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `fs operation in flight is suppressed when the runtime closes`() = runTest {
+        val vfs = dev.nilp0inter.subspace.storage.Vfs()
+        val gate = CompletableDeferred<Unit>()
+        val port = GatedMkdirPort(vfs.fs, gate)
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+            enqueue("handle_input", yielded(value = registerFsClaim(HostOperationKind.FS_MKDIR, path = "a/b", parents = true)))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.StorageFiles),
+            storagePort = port,
+            resourceDeclarations = fsResourceDeclarations(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val target = acceptedTarget(harness.runtime)
+            target.onInputStarted(session(16_000))
+            val release = async { target.onInputReleased(RecordedPcm(shortArrayOf(1), 16_000)) }
+            runCurrent()
+            // The mkdir is suspended behind the gate; the input is pending.
+            assertTrue(harness.runtime.pendingInput() != null)
+
+            // Close terminalizes the pending input and claims the exactly-once gate.
+            harness.runtime.close()
+            // Release the backend; the late FS result must be suppressed.
+            gate.complete(Unit)
+            runCurrent()
+            assertEquals(ChannelInputResult.None, release.await())
+            assertTrue("late FS completion must not resume Lua after close", bridge.resumeCalls.isEmpty())
+            assertEquals(1, bridge.closeCalls.get())
+        } finally {
+            harness.close()
+        }
+    }
+
+    /** A storage port whose mkdir suspends on a gate so a close race can be staged. */
+    private class GatedMkdirPort(
+        private val delegate: dev.nilp0inter.subspace.storage.MountedStoragePort,
+        private val gate: CompletableDeferred<Unit>,
+    ) : dev.nilp0inter.subspace.storage.MountedStoragePort by delegate {
+        override suspend fun mkdir(
+            mount: dev.nilp0inter.subspace.storage.MountHandle,
+            path: String,
+            options: dev.nilp0inter.subspace.storage.MkdirOptions,
+        ): dev.nilp0inter.subspace.storage.FilesystemOutcome<dev.nilp0inter.subspace.storage.MkdirResult> {
+            gate.await()
+            return delegate.mkdir(mount, path, options)
+        }
+    }
 
     /** Replicates [harness] setup but returns the raw result instead of asserting success. */
     private suspend fun constructRuntimeResult(
@@ -2236,6 +2785,11 @@ class LuaAdapterRuntimeTest {
         declaredCapabilities: Set<ChannelCapability> = emptySet(),
         capabilityAvailability: Map<ChannelCapability, CapabilityAvailability> = emptyMap(),
         unavailableCapabilities: Map<ChannelCapability, CapabilityUnavailableReason> = emptyMap(),
+        storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+        resourceDeclarations: dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration =
+            dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
+        audioFilePortFactory: LuaAudioFilePortFactory? = null,
+        mountReadinessStatus: LuaMountReadinessStatus? = null,
     ): AdapterHarness {
         val instanceId = "lua-adapter"
         val generation = hostRuntimeGeneration
@@ -2277,6 +2831,10 @@ class LuaAdapterRuntimeTest {
             image,
             bridge,
             logSink,
+            storagePort = storagePort,
+            resourceDeclarations = resourceDeclarations,
+            audioFilePortFactory = audioFilePortFactory,
+            mountReadinessStatus = mountReadinessStatus,
         ).constructRuntime(
             ChannelRuntimeConstructionRequest(
                 definition = definition,
@@ -2517,8 +3075,10 @@ class LuaAdapterRuntimeTest {
     )
     private class RecordingBridge : LuaKernelBridge {
         val callbackCalls = mutableListOf<CallbackCall>()
-        var playbackLabel: String? = null
+        val claims = mutableMapOf<Long, HostOperationClaim>()
+        private var nextRequestId = 100L
         var lastCapturedToken: String? = null
+        var lastResourceContextJson: String? = null
         val closeCalls = AtomicInteger()
         val startedCoroutines = mutableListOf<Long>()
         val resumeCalls = mutableListOf<Pair<Boolean, String>>()
@@ -2538,6 +3098,99 @@ class LuaAdapterRuntimeTest {
 
         fun enqueue(name: String, outcome: LuaKernelOutcome) {
             scriptedCallbacks.getOrPut(name) { ArrayDeque() }.addLast(outcome)
+        }
+
+        override fun claimHostOperation(handle: LuaStateHandle, requestId: Long): HostOperationClaim {
+            val claim = claims[requestId] ?: return HostOperationClaim.Rejected("E_STALE")
+            // Preserve the old {token} substitution: resolve a placeholder audioToken
+            // to the token captured by the most recent input callback.
+            if (claim !is HostOperationClaim.Admitted) return claim
+            val audioToken = claim.audioToken ?: return claim
+            if (!audioToken.contains("{token}")) return claim
+            return claim.copy(audioToken = audioToken.replace("{token}", lastCapturedToken.orEmpty()))
+        }
+
+        /** Registers a claim; returns its opaque request-id string for use as the yielded value. */
+        fun registerClaim(
+            kind: HostOperationKind,
+            audioToken: String? = null,
+            text: String? = null,
+            language: String? = null,
+            voice: String? = null,
+            speed: Double = 1.0,
+            delaySeconds: Double = 0.0,
+        ): String {
+            val id = nextRequestId++
+            claims[id] = HostOperationClaim.Admitted(id, kind, audioToken, text, language, voice, speed, delaySeconds)
+            return id.toString()
+        }
+
+        /** Registers a filesystem claim; returns its opaque request-id string for the yielded value. */
+        fun registerFsClaim(
+            kind: HostOperationKind,
+            declarationId: String = "output",
+            mountToken: String = "fs-mount-1",
+            path: String = "a/b",
+            parents: Boolean = false,
+            limit: Long = 0,
+            cursor: String? = null,
+            maxBytes: Long = 0,
+            text: String? = null,
+            mode: String? = null,
+            missingOk: Boolean = false,
+        ): String {
+            val id = nextRequestId++
+            claims[id] = HostOperationClaim.Admitted(
+                requestId = id,
+                kind = kind,
+                audioToken = null,
+                text = text,
+                language = null,
+                voice = null,
+                speed = 1.0,
+                delaySeconds = 0.0,
+                declarationId = declarationId,
+                mountToken = mountToken,
+                path = path,
+                parents = parents,
+                limit = limit,
+                cursor = cursor,
+                maxBytes = maxBytes,
+                mode = mode,
+                missingOk = missingOk,
+            )
+            return id.toString()
+        }
+
+        fun registerAudioFileClaim(
+            kind: HostOperationKind,
+            audioToken: String? = null,
+            path: String,
+            format: String,
+            mode: String? = null,
+        ): String {
+            val id = nextRequestId++
+            claims[id] = HostOperationClaim.Admitted(
+                requestId = id,
+                kind = kind,
+                audioToken = audioToken,
+                text = null,
+                language = null,
+                voice = null,
+                speed = 1.0,
+                delaySeconds = 0.0,
+                declarationId = "output",
+                mountToken = "audio-mount-1",
+                path = path,
+                mode = mode,
+                format = format,
+            )
+            return id.toString()
+        }
+
+        override fun setResourceContext(handle: LuaStateHandle, resourceContextJson: String): LuaKernelOutcome {
+            lastResourceContextJson = resourceContextJson
+            return completed()
         }
 
         override fun create(config: LuaKernelConfig): LuaKernelOutcome = LuaKernelOutcome.Created(

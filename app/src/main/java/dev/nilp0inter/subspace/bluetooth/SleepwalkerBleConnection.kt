@@ -435,6 +435,7 @@ open class SleepwalkerBleConnection {
             }
         }
 
+        @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             Log.d(TAG, "BLE_MTU_CHANGED mtu=$mtu status=$status")
             if (synchronized(gattLock) { this@SleepwalkerBleConnection.gatt !== gatt }) {

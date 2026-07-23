@@ -512,6 +512,10 @@ class ExternalDebugChannelRuntimeContractTest {
         private val claims = mutableMapOf<Long, HostOperationClaim>(); private var nextRequestId = 100L
         override fun create(config: LuaKernelConfig): LuaKernelOutcome { val id = nextState.getAndIncrement(); createdStates += id; modes[id] = "ECHO"; return LuaKernelOutcome.Created(id, id, LUA_VERSION, API_VERSION, "debug-fixture") }
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String) = complete(handle)
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ) = complete(handle)
         override fun start(handle: LuaStateHandle) = complete(handle)
         override fun resume(operation: LuaOperationHandle, success: Boolean, value: String, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome {
             val mode = modes[operation.stateHandle.stateId.value] ?: "ECHO"

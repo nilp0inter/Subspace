@@ -233,7 +233,7 @@ private fun ChannelConfigurationFieldEditor(
 
         is ChannelConfigurationField.DynamicChoiceField -> DynamicChoiceEditor(
             field = field,
-            value = value,
+            selectedValue = value,
             dependencyValue = dependencyValue,
             choiceResolver = choiceResolver,
             onValueChange = onValueChange,
@@ -297,19 +297,23 @@ internal fun ChannelConfigurationField.isVisible(values: Map<String, String?>): 
 @Composable
 private fun DynamicChoiceEditor(
     field: ChannelConfigurationField.DynamicChoiceField,
-    value: String?,
+    selectedValue: String?,
     dependencyValue: String?,
     choiceResolver: DynamicConfigurationChoiceResolver,
     onValueChange: (String?) -> Unit,
 ) {
     var expanded by remember(field.id) { mutableStateOf(false) }
-    val resolution by androidx.compose.runtime.produceState<DynamicConfigurationChoiceResolution>(
-        initialValue = DynamicConfigurationChoiceResolution.Loading,
+    var resolution by remember(
         field.source,
         dependencyValue,
         choiceResolver,
     ) {
-        this.value = try {
+        mutableStateOf<DynamicConfigurationChoiceResolution>(
+            DynamicConfigurationChoiceResolution.Loading,
+        )
+    }
+    LaunchedEffect(field.source, dependencyValue, choiceResolver) {
+        resolution = try {
             choiceResolver.resolve(DynamicConfigurationChoiceRequest(field.source, dependencyValue))
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
@@ -320,8 +324,8 @@ private fun DynamicChoiceEditor(
         }
     }
     val choices = (resolution as? DynamicConfigurationChoiceResolution.Available)?.choices.orEmpty()
-    val selected = choices.firstOrNull { it.id == value }
-    val selectedLabel = selected?.label ?: value?.let { "Unavailable: $it" }
+    val selected = choices.firstOrNull { it.id == selectedValue }
+    val selectedLabel = selected?.label ?: selectedValue?.let { "Unavailable: $it" }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(requiredLabel(field), style = MaterialTheme.typography.bodyLarge)

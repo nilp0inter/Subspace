@@ -130,13 +130,17 @@ The host SHALL translate platform exceptions and transport-specific failures at 
 - **THEN** diagnostics SHALL identify the semantic capability, channel instance, operation phase, and normalized outcome
 - **AND** they SHALL NOT expose audio payloads, channel text content, secrets, or hardware addresses
 
-### Requirement: No persistent script state capability is introduced
-This change SHALL NOT provide a channel-accessible persistent key-value store, package filesystem, package installer, package verifier, Lua engine, or other script-runtime service. Capability contracts added by this change SHALL remain usable by built-in Kotlin runtimes without requiring a package or scripting subsystem.
+### Requirement: Persistent script state is exposed only through declared mounted storage
+The host SHALL NOT provide ambient filesystem access, unrestricted paths, a persistent key-value/database service, package-writable source tree, package installer/verifier capability, or platform storage object. It SHALL provide only the language-neutral mounted-storage capability explicitly declared by a package and bound by a user-selected instance resource. The capability SHALL remain usable through generic host-domain requests without requiring Journal semantics and SHALL enforce mount authority, generation revocation, path confinement, bounds, and typed outcomes. Built-in Kotlin runtimes SHALL remain usable without constructing Lua or acquiring a package mount.
 
-#### Scenario: Hardened capability boundary is initialized
-- **WHEN** the host initializes the channel capability platform delivered by this change
-- **THEN** it SHALL expose only capabilities implemented and authorized by the Kotlin host
-- **AND** it SHALL NOT initialize persistent script state or Lua/package infrastructure
+#### Scenario: Mounted storage platform is initialized
+- **WHEN** the host initializes generic package storage
+- **THEN** only declared and instance-bound mounts SHALL authorize persistent package writes
+- **AND** no runtime SHALL gain ambient host or package-source filesystem access
+
+#### Scenario: Built-in runtime operates normally
+- **WHEN** a built-in Kotlin runtime uses existing capabilities
+- **THEN** it SHALL function without a Lua actor, mount binding, or filesystem module
 
 ### Requirement: Host owns language-neutral asynchronous agent operations
 The host SHALL expose remote-agent operations through semantic, language-neutral capability contracts that accept host-domain profile identifiers, model identifiers, messages, and tool envelopes. The host SHALL resolve the global profile endpoint and credential, own the protocol client, request serialization, networking, retries, cancellation, and durable run correlation, and return typed asynchronous operation results. Provider and runtime code SHALL NOT receive credentials, HTTP clients, SDK request or response types, JSON transport models, Android objects, or connection policy.
@@ -304,15 +308,38 @@ Plugin-owned policy (protocol selection, retry and backoff, polling cadence, sta
 - **THEN** the host-owned mechanism SHALL cancel or drain that work on generation retirement
 - **AND** the policy SHALL NOT retain authorization, capability leases, or effect delivery after the generation closes
 
-### Requirement: No public runtime I/O modules or persistent plugin state ship in this change
-This change SHALL promote the internal Lua kernel and actor mechanisms required for lifecycle and scheduling, and the capability-gated public semantic audio modules (`subspace.transcription`, `subspace.synthesis`, `subspace.playback`), but SHALL NOT expose general public runtime I/O modules (HTTP, filesystem, socket, general networking, or event-loop modules), a channel-accessible persistent key-value store, package filesystem, package installer, or package verifier. General runtime modules described by this change are a forward contract boundary and SHALL NOT be registered or exposed to plugin code. Existing capability contracts SHALL remain usable by built-in Kotlin runtimes without constructing a Lua actor.
+### Requirement: Public runtime I/O is restricted to capability-mounted files in this change
+This change SHALL expose the capability-gated `subspace.fs` and `subspace.audio` file operations defined by their public specs while retaining existing semantic audio modules. It SHALL NOT expose HTTP, sockets, general networking, arbitrary event-loop integration, unrestricted Lua `io`/`os`, a generic key-value/database API, package source mutation, installer, verifier, or binary-string file API. Filesystem operations SHALL require declared `storage.files` eligibility and a live bound mount; audio-file operations SHALL additionally require `audio.files`. Existing built-in capabilities SHALL remain usable without Lua.
 
-#### Scenario: Change is applied without public runtime I/O modules
-- **WHEN** the internal Lua actor runtime and channel capability platform are initialized
-- **THEN** no HTTP, filesystem, socket, general networking, event-loop, or persistent plugin-state module SHALL be exposed to channel code
-- **AND** no package installation or verification path SHALL be introduced
+#### Scenario: Revised runtime modules are initialized
+- **WHEN** a revised Lua provider starts with declared file capabilities and a live mount
+- **THEN** only the bounded documented storage/audio-file operations SHALL be available
+- **AND** no ambient networking, raw platform filesystem, or package-management operation SHALL appear
 
-#### Scenario: Built-in runtime does not require Lua
-- **WHEN** a built-in Kotlin runtime operates through the existing channel and capability boundaries
-- **THEN** it SHALL function without constructing a Lua actor or Lua state
-- **AND** no public runtime I/O module or persistent plugin-state capability SHALL be present
+#### Scenario: Built-in runtime does not require public modules
+- **WHEN** `builtin:journal` or another built-in runtime operates
+- **THEN** it SHALL retain its current host capability path without constructing a Lua state
+- **AND** the generic file APIs SHALL not replace or intercept its behavior
+
+### Requirement: Mounted-storage capability uses language-neutral requests
+The host SHALL expose generic operations for mount lookup/status, directory creation, stat, paginated listing, bounded UTF-8 read/write, and nonrecursive removal using host-domain mount identity, logical relative paths, bounded options, and typed outcomes. Contracts SHALL not contain Android URI/path/document/provider classes, Kotlin coroutine/UI types, iOS URL/bookmark types, file descriptors, or Journal values. Every operation SHALL be associated with instance and generation authorization and a revocable lease/binding.
+
+#### Scenario: Lua adapter requests directory listing
+- **WHEN** the language adapter submits a valid bounded listing request
+- **THEN** the capability SHALL return a portable page or typed failure
+- **AND** adapter code SHALL receive no platform provider object
+
+### Requirement: Audio-file capability composes recording and mounted-storage authority
+The host SHALL expose generic Recording describe/open/export operations using opaque Recording handles, mount authority, logical paths, exact format tokens, and typed outcomes. It SHALL own WAV decoding/writing, OGG/Vorbis encoding, app-private staging, provider streaming, quotas, cancellation, and cleanup. The capability SHALL not contain Journal entry, metadata, output-mode, Markdown, recovery, or path-layout logic.
+
+#### Scenario: Package exports OGG to mount
+- **WHEN** an authorized adapter requests OGG/Vorbis export of a live Recording
+- **THEN** the capability SHALL encode and publish through the mounted-storage boundary or return one typed failure
+- **AND** it SHALL not infer why the package requested the file
+
+### Requirement: Public file capabilities remain portable to future language and platform adapters
+Mounted-storage and audio-file ports SHALL use portable host-domain values, opaque handles, explicit lifecycle, and normalized outcomes. Android implementation SHALL use persisted SAF authority behind the port. A future non-Android adapter SHALL be able to implement the same contracts without Android classes or changes to package source. Platform-specific grant acquisition/release and document coordination SHALL remain adapter-owned.
+
+#### Scenario: Future platform implements tree backend
+- **WHEN** another platform maps a user-selected document tree to the host mount contract
+- **THEN** existing Lua packages SHALL continue using the same mount IDs, relative paths, operations, results, and errors

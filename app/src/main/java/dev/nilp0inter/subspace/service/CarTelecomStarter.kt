@@ -306,6 +306,7 @@ internal class CarTelecomStarter(
         }
     }
 
+    @SuppressLint("MissingPermission")
     private suspend fun primeCarHfpForTelecom(endpoint: ResolvedCarHfpEndpoint): BluetoothDevice? {
         val proxy = endpoint.proxy
         val car = endpoint.device

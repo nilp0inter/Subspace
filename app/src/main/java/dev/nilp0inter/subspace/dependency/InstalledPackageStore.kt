@@ -2,6 +2,7 @@ package dev.nilp0inter.subspace.dependency
 
 import dev.nilp0inter.subspace.lua.LuaPackageMaterializer
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
+import dev.nilp0inter.subspace.lua.LuaRuntimeResourcesFactory
 import dev.nilp0inter.subspace.lua.PluginLogSink
 import dev.nilp0inter.subspace.lua.NoOpPluginLogSink
 import dev.nilp0inter.subspace.lua.actor.ActorPolicy
@@ -904,10 +905,16 @@ internal fun interface FaultInjector {
 public class InstalledPackageStore internal constructor(
     private val storeRoot: File,
     private val faultInjector: FaultInjector,
-    private val logSink: PluginLogSink = NoOpPluginLogSink
+    private val logSink: PluginLogSink = NoOpPluginLogSink,
+    private val runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
 ) {
     public constructor(storeRoot: File) : this(storeRoot, FaultInjector.NOOP)
     internal constructor(storeRoot: File, logSink: PluginLogSink) : this(storeRoot, FaultInjector.NOOP, logSink)
+    internal constructor(
+        storeRoot: File,
+        logSink: PluginLogSink,
+        runtimeResourcesFactory: LuaRuntimeResourcesFactory,
+    ) : this(storeRoot, FaultInjector.NOOP, logSink, runtimeResourcesFactory)
     internal val stagingDir = File(storeRoot, "staging")
     internal val contentDir = File(storeRoot, "content/sha256")
     private val currentFile = File(storeRoot, "index.json")
@@ -1253,7 +1260,13 @@ public class InstalledPackageStore internal constructor(
                 }
 
 
-                val binding = LuaPackageMaterializer.materialize(validatedRevision, bridge, ActorPolicy.startingEvidence(), logSink = logSink)
+                val binding = LuaPackageMaterializer.materialize(
+                    validatedRevision,
+                    bridge,
+                    ActorPolicy.startingEvidence(),
+                    logSink = logSink,
+                    runtimeResourcesFactory = runtimeResourcesFactory,
+                )
                 // Binding coherence: every descriptor value (implementation ID,
                 // configuration-provider ID, snapshot key, repository-derived ID,
                 // fingerprint, fields, defaults, capability eligibility) derives from

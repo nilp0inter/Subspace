@@ -92,12 +92,17 @@ internal class InstalledPackagesCoordinator(
     private val providerRegistry: ChannelImplementationProviderRegistry,
     bridge: LuaKernelBridge,
     logSink: PluginLogSink,
+    runtimeResourcesFactory: dev.nilp0inter.subspace.lua.LuaRuntimeResourcesFactory? = null,
     private val onCatalogueReconcile: suspend () -> Unit,
     private val serviceScope: CoroutineScope,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     bounds: PackageValidationBounds = PackageValidationBounds.DEFAULT,
 ) {
-    private val store = InstalledPackageStore(storeRoot, logSink)
+    private val store = if (runtimeResourcesFactory == null) {
+        InstalledPackageStore(storeRoot, logSink)
+    } else {
+        InstalledPackageStore(storeRoot, logSink, runtimeResourcesFactory)
+    }
     private val closed = AtomicBoolean(false)
 
     private val operationMutex = Mutex()

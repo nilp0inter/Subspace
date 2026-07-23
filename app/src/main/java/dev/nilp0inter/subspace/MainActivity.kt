@@ -15,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -133,8 +134,36 @@ class MainActivity : ComponentActivity() {
                     selectedDirectoryPath?.let { path -> DirectorySelection(ownerId, fieldId, path) }
                 }
             }
+            val mountTreePickerBridge = remember {
+                dev.nilp0inter.subspace.mount.saf.SafTreePickerBridge()
+            }
             var pendingMountRequest by remember { mutableStateOf<dev.nilp0inter.subspace.ui.MountSelectionRequest?>(null) }
             var pendingMountDeclaration by remember { mutableStateOf<dev.nilp0inter.subspace.dependency.PackageMountDeclaration?>(null) }
+            var pendingMountOutcome by remember {
+                mutableStateOf<dev.nilp0inter.subspace.mount.saf.SafTreePickerOutcome?>(null)
+            }
+
+            LaunchedEffect(
+                currentService,
+                pendingMountRequest,
+                pendingMountDeclaration,
+                pendingMountOutcome,
+            ) {
+                val connectedService = currentService ?: return@LaunchedEffect
+                val request = pendingMountRequest ?: return@LaunchedEffect
+                val declaration = pendingMountDeclaration ?: return@LaunchedEffect
+                val outcome = pendingMountOutcome ?: return@LaunchedEffect
+
+                // Opening the document picker stops this Activity, which
+                // temporarily unbinds the service. Re-establish the pending
+                // request on the connected service before consuming the
+                // picker result.
+                connectedService.beginMountSelection(request, declaration)
+                connectedService.completeMountSelection(outcome)
+                pendingMountRequest = null
+                pendingMountDeclaration = null
+                pendingMountOutcome = null
+            }
 
             val rootSurface = bootstrapRootSurface(bootstrapState)
             val currentReadyForMonitor by rememberUpdatedState(state.readyForMonitor)
@@ -160,11 +189,7 @@ class MainActivity : ComponentActivity() {
             val mountLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.StartActivityForResult(),
             ) { result ->
-                val service = currentServiceState ?: return@rememberLauncherForActivityResult
-                val outcome = service.mountTreePickerBridge.outcomeFrom(result.data)
-                service.completeMountSelection(outcome)
-                pendingMountRequest = null
-                pendingMountDeclaration = null
+                pendingMountOutcome = mountTreePickerBridge.outcomeFrom(result.data)
             }
 
             val voiceSetupLauncher = rememberLauncherForActivityResult(
@@ -188,7 +213,7 @@ class MainActivity : ComponentActivity() {
                         service.beginMountSelection(request, declaration)
                         pendingMountRequest = request
                         pendingMountDeclaration = declaration
-                        val intent = service.mountTreePickerBridge.launchIntent(declaration)
+                        val intent = mountTreePickerBridge.launchIntent(declaration)
                         mountLauncher.launch(intent)
                     }
                     override fun requestManageExternalStorage() {
@@ -222,12 +247,12 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun connectSerial() {
+                        currentServiceState?.connectSerial()
                         ContextCompat.startForegroundService(
                             this@MainActivity,
                             Intent(this@MainActivity, PttForegroundService::class.java)
                                 .setAction(PttForegroundService.ACTION_START_MONITORING),
                         )
-                        currentServiceState?.connectSerial()
                     }
 
                     override fun retry() {
@@ -403,7 +428,7 @@ class MainActivity : ComponentActivity() {
                             BackHandler(enabled = false) { }
                             val voiceIssue = setup.offlineNavigationVoiceIssue
                             val voiceSetupIntent = remember(voiceIssue) {
-                                resolveVoiceSetupIntent(voiceIssue)
+                                resolveVoiceSetupIntent(this, voiceIssue)
                             }
                             InitialSetupScreen(
                                 missingPermissions = setup.missingPermissions,
@@ -584,18 +609,25 @@ class MainActivity : ComponentActivity() {
         PackageManagement,
     }
 
-    private fun resolveVoiceSetupIntent(issue: OfflineNavigationVoiceIssue?): Intent {
-        val enginePackage = issue?.enginePackage
-        if (enginePackage != null) {
-            val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
-                .setPackage(enginePackage)
-            val handlers = packageManager.queryIntentActivities(installIntent, PackageManager.MATCH_DEFAULT_ONLY)
-            if (handlers.isNotEmpty()) {
-                return installIntent
-            }
+}
+
+internal fun resolveVoiceSetupIntent(
+    context: Context,
+    issue: OfflineNavigationVoiceIssue?,
+): Intent {
+    val enginePackage = issue?.enginePackage
+    if (enginePackage != null) {
+        val installIntent = Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)
+            .setPackage(enginePackage)
+        val handlers = context.packageManager.queryIntentActivities(
+            installIntent,
+            PackageManager.MATCH_DEFAULT_ONLY,
+        )
+        if (handlers.isNotEmpty()) {
+            return installIntent
         }
-        return Intent(Settings.ACTION_SETTINGS)
     }
+    return Intent(Settings.ACTION_SETTINGS)
 }
 
 internal fun ChannelRepositoryMutationResult?.failureMessage(): String? = when (this) {

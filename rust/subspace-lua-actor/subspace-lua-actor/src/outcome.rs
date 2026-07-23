@@ -89,7 +89,10 @@ impl Outcome {
     /// Serialize to a flat JSON object: `{"kind": "...", ...}`.
     pub fn to_json(&self) -> Value {
         let mut obj = Map::new();
-        obj.insert("kind".to_string(), Value::String(self.kind.as_str().to_string()));
+        obj.insert(
+            "kind".to_string(),
+            Value::String(self.kind.as_str().to_string()),
+        );
         for (k, v) in &self.fields {
             obj.insert(k.clone(), v.clone());
         }

@@ -241,7 +241,7 @@ public class MountedFilesystem(
         if (options.limit <= 0) {
             return fail(FilesystemErrorCode.E_INVALID_ARGUMENT, "list limit must be positive")
         }
-        val parsed = parsePathOrFailure(path)
+        val parsed = parsePathOrFailure(path, allowMountRoot = true)
         if (parsed is PathParse.Fail) return parsed.result
         val components = (parsed as PathParse.Ok).components
 
@@ -496,11 +496,16 @@ public class MountedFilesystem(
         data class Fail(val result: FilesystemOutcome<Nothing>) : PathParse
     }
 
-    private fun parsePathOrFailure(path: String): PathParse =
-        when (val result = MountRelativePath.parse(path, policy.pathBounds)) {
+    private fun parsePathOrFailure(
+        path: String,
+        allowMountRoot: Boolean = false,
+    ): PathParse {
+        if (allowMountRoot && path.isEmpty()) return PathParse.Ok(emptyList())
+        return when (val result = MountRelativePath.parse(path, policy.pathBounds)) {
             is PathParseResult.Valid -> PathParse.Ok(result.path.components)
             is PathParseResult.Invalid -> PathParse.Fail(FilesystemOutcome.Failure(result.error))
         }
+    }
 
     // -----------------------------------------------------------------------
     // Resolution helpers (always confined beneath the mount root)
@@ -535,6 +540,7 @@ public class MountedFilesystem(
         resolved: ResolvedMount,
         components: List<String>,
     ): FilesystemOutcome<NodeRef> {
+        if (components.isEmpty()) return FilesystemOutcome.Success(resolved.root)
         val parent = descend(resolved, components, components.size - 1)
         if (parent !is FilesystemOutcome.Success) return parent
         return when (val lookup = backendChild(resolved, parent.value, components.last())) {

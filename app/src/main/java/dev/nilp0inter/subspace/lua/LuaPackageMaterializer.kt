@@ -33,7 +33,8 @@ internal object LuaPackageMaterializer {
         bridge: LuaKernelBridge,
         actorPolicy: ActorPolicy = ActorPolicy.startingEvidence(),
         validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
-        logSink: PluginLogSink = NoOpPluginLogSink
+        logSink: PluginLogSink = NoOpPluginLogSink,
+        runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
     ): InstalledProviderBinding {
         val implementationId = InstalledProviderId.derive(revision.manifest.repositoryId)
         val presentation = ChannelPresentationMetadata(
@@ -64,6 +65,7 @@ internal object LuaPackageMaterializer {
             configurationFields = fields,
             requiredCapabilities = capabilities,
             resourceDeclarations = revision.manifest.resources,
+            runtimeResourcesFactory = runtimeResourcesFactory,
         )
         return InstalledProviderBinding(
             repositoryId = revision.manifest.repositoryId,

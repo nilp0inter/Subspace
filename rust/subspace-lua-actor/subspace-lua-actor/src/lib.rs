@@ -44,6 +44,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod accounting;
+mod hostop;
 mod jni_bridge;
 mod outcome;
 mod ownership;
@@ -56,6 +57,7 @@ pub const LUA_VERSION: &str = "5.4.8";
 pub const BINDING_VERSION: &str = "0.1.0";
 
 pub use accounting::MemoryReport;
+pub use hostop::{HostOperationKind, HostOperationPayload};
 pub use outcome::{Outcome, OutcomeKind};
 pub use ownership::{Generation, Lifecycle, OperationId, StateHandle, StateId};
 #[doc(hidden)]

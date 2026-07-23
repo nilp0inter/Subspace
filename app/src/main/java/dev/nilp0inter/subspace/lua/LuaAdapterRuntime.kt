@@ -1,6 +1,32 @@
 package dev.nilp0inter.subspace.lua
 import dev.nilp0inter.subspace.channel.capability.*
 import dev.nilp0inter.subspace.dependency.PackageCapability
+import dev.nilp0inter.subspace.storage.FilesystemOutcome
+import dev.nilp0inter.subspace.storage.ListCursor
+import dev.nilp0inter.subspace.storage.ListOptions
+import dev.nilp0inter.subspace.storage.ListPage
+import dev.nilp0inter.subspace.storage.MkdirOptions
+import dev.nilp0inter.subspace.storage.MkdirResult
+import dev.nilp0inter.subspace.storage.MkdirStatus
+import dev.nilp0inter.subspace.storage.NodeKind
+import dev.nilp0inter.subspace.storage.ReadTextOptions
+import dev.nilp0inter.subspace.storage.ReadTextResult
+import dev.nilp0inter.subspace.storage.RemoveOptions
+import dev.nilp0inter.subspace.storage.RemoveResult
+import dev.nilp0inter.subspace.storage.RemoveStatus
+import dev.nilp0inter.subspace.storage.StatResult
+import dev.nilp0inter.subspace.storage.WriteMode
+import dev.nilp0inter.subspace.storage.WriteResult
+import dev.nilp0inter.subspace.storage.WriteTextOptions
+import dev.nilp0inter.subspace.audiofile.AudioExportMode
+import dev.nilp0inter.subspace.audiofile.AudioExportOptions
+import dev.nilp0inter.subspace.audiofile.AudioFileFormat
+import dev.nilp0inter.subspace.audiofile.AudioFileOutcome
+import dev.nilp0inter.subspace.audiofile.AudioFilePort
+import dev.nilp0inter.subspace.audiofile.AudioOpenOptions
+import dev.nilp0inter.subspace.audiofile.ExecutionOwner
+import dev.nilp0inter.subspace.audiofile.ExecutionOwnerKind
+import dev.nilp0inter.subspace.audiofile.RecordingHost
 
 import dev.nilp0inter.subspace.audio.ChannelAudioInputSession
 import dev.nilp0inter.subspace.audio.ChannelInputAcceptance
@@ -22,10 +48,12 @@ import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
 import dev.nilp0inter.subspace.service.ChannelPreparationReason
 import dev.nilp0inter.subspace.service.ChannelRuntime
 import dev.nilp0inter.subspace.service.ChannelRuntimeSnapshot
+import dev.nilp0inter.subspace.service.SubspaceLogger
 import kotlinx.coroutines.flow.MutableStateFlow
 import dev.nilp0inter.subspace.lua.actor.ActorGateResult
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -38,6 +66,8 @@ import dev.nilp0inter.subspace.lua.actor.ActorTaskId
 import dev.nilp0inter.subspace.lua.actor.ActorOperationId
 import dev.nilp0inter.subspace.lua.actor.ActorTerminal
 import java.util.UUID
+import java.time.Clock
+import java.time.Instant
 
 private fun normalizeSemanticAudioError(value: String): String = when (value) {
     "E_INVALID_ARGUMENT", "E_INVALID_VALUE", "E_INVALID_CONTEXT",
@@ -50,6 +80,8 @@ private fun ChannelCapabilityScope.isPublicCapabilityDeclared(id: String): Boole
     PackageCapability.AUDIO_SYNTHESIS -> ChannelCapability.Synthesis in declaredCapabilities
     PackageCapability.AUDIO_PLAYBACK -> ChannelCapability.AudioOperation in declaredCapabilities &&
         ChannelCapability.DeferredAudioPlayback in declaredCapabilities
+    PackageCapability.STORAGE_FILES -> ChannelCapability.StorageFiles in declaredCapabilities
+    PackageCapability.AUDIO_FILES -> ChannelCapability.AudioFiles in declaredCapabilities
     else -> false
 }
 
@@ -70,6 +102,14 @@ private fun CapabilityOperationResult<*>.normalizedSemanticError(): String = whe
     is CapabilityOperationResult.Failed -> "E_HOST_FAILURE"
     is CapabilityOperationResult.Success -> "E_HOST_FAILURE"
 }
+
+internal fun interface LuaAudioFilePortFactory {
+    fun create(recordings: RecordingHost): AudioFilePort
+}
+internal fun interface LuaMountReadinessStatus {
+    fun status(declarationId: String): String
+}
+
 
 /**
  * A [ChannelRuntime] backed by one Lua actor instance.
@@ -94,9 +134,26 @@ internal class LuaAdapterRuntime(
     private val configuration: ValidatedChannelConfiguration,
     private val capabilities: ChannelCapabilityScope,
     private val initialSummary: String? = null,
+    private val storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+    private val clock: Clock = Clock.systemDefaultZone(),
+    private val audioFilePortFactory: LuaAudioFilePortFactory? = null,
+    private val resourceDeclarations:
+        dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration =
+        dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
+    private val mountReadinessStatus: LuaMountReadinessStatus? = null,
+    private val resourceClose: (() -> Unit)? = null,
 ) : ChannelRuntime {
     @Volatile
     private var audioRegistry: LuaOpaqueAudioRegistry? = null
+    @Volatile
+    private var recordingHost: LuaRecordingHost? = null
+    @Volatile
+    private var audioFilePort: AudioFilePort? = null
+
+    // Cached platform mount handles keyed by declaration id, revalidated by the
+    // port per operation; cleared on close. The Rust-side mount token is the
+    // validation authority — this cache only avoids re-resolving the grant.
+    private val mountHandleCache = java.util.concurrent.ConcurrentHashMap<String, dev.nilp0inter.subspace.storage.MountHandle>()
 
     private val closed = AtomicBoolean(false)
     private val hostGeneration = requireNotNull(generationContext as? ActorRuntimeHostContext) {
@@ -159,6 +216,9 @@ internal class LuaAdapterRuntime(
         const val READINESS_MALFORMED_DIAGNOSTIC = "invalid readiness result"
         // Matches the actor's operation-specific yielded-operation deadline.
         const val SEMANTIC_AUDIO_DEADLINE_MILLIS = 30_000L
+        // Default page size for fs.list when the package omits a bounded limit.
+        const val FS_DEFAULT_LIST_LIMIT = 100
+        const val FS_DIAGNOSTIC_TAG = "SubspaceStorage"
     }
 
     // ── Activate ──────────────────────────────────────────────────────────
@@ -201,8 +261,20 @@ internal class LuaAdapterRuntime(
             ).asGeneralCallbackOutcome()
             if (lifecycleOutcome !is CallbackInvocationResult.Success) {
                 discardStagedAndClose()
-                return ChannelActivationResult.Failed("handle_lifecycle failed: ${lifecycleOutcome.diagnostic()}")
+                return ChannelActivationResult.Failed(
+                    "handle_lifecycle failed: ${lifecycleOutcome.diagnostic()}",
+                )
             }
+        }
+
+        val registry = LuaOpaqueAudioRegistry(stateHandle)
+        val recordings = LuaRecordingHost(registry)
+        val filePort = try {
+            audioFilePortFactory?.create(recordings)
+        } catch (_: Throwable) {
+            registry.close()
+            discardStagedAndClose()
+            return ChannelActivationResult.Failed("audio-file port creation failed")
         }
 
         // Publish the actor before returning Ready. The registry separately
@@ -210,11 +282,14 @@ internal class LuaAdapterRuntime(
         if (closed.get() || !generationContext.isActive() || !activated.compareAndSet(false, true) ||
             !actor.publishProgramImageLive()
         ) {
+            filePort?.close()
+            registry.close()
             discardStagedAndClose()
             return ChannelActivationResult.Failed("Lua runtime closed during activation")
         }
-        audioRegistry = LuaOpaqueAudioRegistry(stateHandle)
-
+        audioRegistry = registry
+        recordingHost = recordings
+        audioFilePort = filePort
         updateSnapshot(
             preparation = ChannelPreparationAvailability.Available,
             executionStatus = ChannelExecutionStatus.IDLE,
@@ -270,6 +345,7 @@ internal class LuaAdapterRuntime(
         operationId: Long,
         success: Boolean,
         value: String,
+        normalizeAudioError: Boolean = true,
     ): LuaInputResumeResult {
         if (closed.get() || !generationContext.isActive()) {
             synchronized(inputLock) { pendingInputExecution?.takeIf { it.ownerToken == ownerToken } }
@@ -288,11 +364,7 @@ internal class LuaAdapterRuntime(
             }
         }.let { return it }
 
-        val deliveredValue = if (!success && (pending.label.startsWith("transcribe:") || pending.label.startsWith("synthesize:") || pending.label.startsWith("playback:"))) {
-            normalizeSemanticAudioError(value)
-        } else {
-            value
-        }
+        val deliveredValue = if (!success && normalizeAudioError) normalizeSemanticAudioError(value) else value
 
         val admission = ScopedSpawnAdmission(pending.audioOwner)
         val gateOutcome = try {
@@ -390,7 +462,7 @@ internal class LuaAdapterRuntime(
         val context = readinessContext()
         val outcome = invokeCallbackHandle(
             readinessHandle,
-            LuaValue.Map(mapOf("capabilities" to LuaValue.Map(context))),
+            LuaValue.Map(context),
         )
         when (val projection = outcome.readinessProjection()) {
             is ReadinessProjection.Valid -> {
@@ -440,8 +512,13 @@ internal class LuaAdapterRuntime(
      */
     override suspend fun close() {
         if (!closed.compareAndSet(false, true)) return
+        audioFilePort?.close()
+        audioFilePort = null
+        recordingHost = null
         audioRegistry?.close()
         audioRegistry = null
+        mountHandleCache.clear()
+        resourceClose?.invoke()
         cachedReadiness.set(false)
         synchronized(logLock) {
             logs.clear()
@@ -640,49 +717,6 @@ internal class LuaAdapterRuntime(
             }
         }
 
-        override fun admitTranscription(operationId: Long, token: String): Int {
-            if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_TRANSCRIPTION)) return 3
-            val owner = audioOwner ?: return 1
-            val registry = audioRegistry ?: return 1
-            if (operationId == 0L) {
-                return when (registry.resolve(LuaOpaqueAudioRegistry.Token(token), owner, LuaOpaqueAudioRegistry.Kind.Captured)) {
-                    is LuaOpaqueAudioRegistry.Resolution.Captured -> 0
-                    LuaOpaqueAudioRegistry.Resolution.Foreign -> 3
-                    LuaOpaqueAudioRegistry.Resolution.WrongKind -> 4
-                    LuaOpaqueAudioRegistry.Resolution.Stale -> 5
-                    LuaOpaqueAudioRegistry.Resolution.Closed -> 6
-                    is LuaOpaqueAudioRegistry.Resolution.Synthesized -> 4
-                }
-            }
-            return if (closed.get() || !generationContext.isActive()) 1 else 0
-        }
-
-        override fun admitSynthesis(operationId: Long, paramsJson: String): Int {
-            audioOwner ?: return 1
-            audioRegistry ?: return 1
-            if (operationId == 0L) {
-                if (closed.get() || !generationContext.isActive()) return 1
-                if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_SYNTHESIS)) return 3
-                return 0
-            }
-            return if (closed.get() || !generationContext.isActive()) 1 else 0
-        }
-        override fun admitPlayback(operationId: Long, token: String, delaySeconds: Double): Int {
-            val owner = audioOwner ?: return 1
-            val registry = audioRegistry ?: return 1
-            if (operationId != 0L) return if (closed.get() || !generationContext.isActive()) 1 else 0
-            if (closed.get() || !generationContext.isActive()) return 1
-            if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_PLAYBACK)) return 3
-            if (!delaySeconds.isFinite() || delaySeconds < 0.0 || delaySeconds > 86_400.0) return 4
-            return when {
-                registry.resolve(LuaOpaqueAudioRegistry.Token(token), owner, LuaOpaqueAudioRegistry.Kind.Captured) is LuaOpaqueAudioRegistry.Resolution.Captured -> 0
-                registry.resolve(LuaOpaqueAudioRegistry.Token(token), owner, LuaOpaqueAudioRegistry.Kind.Synthesized) is LuaOpaqueAudioRegistry.Resolution.Synthesized -> 0
-                registry.resolve(LuaOpaqueAudioRegistry.Token(token), owner, LuaOpaqueAudioRegistry.Kind.Captured) is LuaOpaqueAudioRegistry.Resolution.Foreign -> 3
-                registry.resolve(LuaOpaqueAudioRegistry.Token(token), owner, LuaOpaqueAudioRegistry.Kind.Captured) is LuaOpaqueAudioRegistry.Resolution.Stale -> 5
-                else -> 4
-            }
-        }
-
         fun releaseFor(outcome: LuaKernelOutcome): SpawnAdmissionRelease {
             val accepted = pending.map { it.first }
             val matched = when (outcome) {
@@ -723,8 +757,27 @@ internal class LuaAdapterRuntime(
         val timer: Disposable,
         val deadline: Disposable,
     )
-    /** Runs one native coroutine without recursion, retaining task capacity while asleep. */
+
+    private data class HostOperationCompletion(
+        val success: Boolean,
+        val value: String,
+    )
     private suspend fun runBackgroundCoroutine(initialCoroutineId: LuaCoroutineId) {
+        val audioOwner = LuaOpaqueAudioRegistry.Owner.Task(
+            "coroutine-${initialCoroutineId.value}",
+        )
+        try {
+            runBackgroundCoroutineOwned(initialCoroutineId, audioOwner)
+        } finally {
+            audioRegistry?.invalidateOwner(audioOwner)
+        }
+    }
+
+    /** Runs one native coroutine without recursion, retaining task capacity while asleep. */
+    private suspend fun runBackgroundCoroutineOwned(
+        initialCoroutineId: LuaCoroutineId,
+        audioOwner: LuaOpaqueAudioRegistry.Owner.Task,
+    ) {
         suspend fun resumeSlice(operation: LuaOperationHandle, success: Boolean, value: String): ActorGateResult<LuaKernelOutcome>? {
             val admission = ScopedSpawnAdmission()
             val result = actor.resumeProgramImageCoroutine(operation, success, value, admission)
@@ -755,7 +808,7 @@ internal class LuaAdapterRuntime(
                 is LuaKernelOutcome.Completed -> {
                     val completion = consumeCompletedOutcome(outcome)
                     if (completion !is CallbackInvocationResult.Success) {
-                        failProgramImage("malformed background completion: ${completion.diagnostic()}")
+                        recordDiagnostic("malformed background completion: ${completion.diagnostic()}")
                     }
                     return
                 }
@@ -766,6 +819,30 @@ internal class LuaAdapterRuntime(
                     } catch (_: IllegalArgumentException) {
                         failProgramImage("invalid background operation handle")
                         return
+                    }
+                    val requestId = outcome.value?.toLongOrNull()
+                    val claim = requestId?.let { bridge.claimHostOperation(stateHandle, it) }
+                    if (claim is HostOperationClaim.Admitted) {
+                        val completion = when (claim.kind) {
+                            HostOperationKind.TRANSCRIBE ->
+                                performBackgroundTranscription(audioOwner, claim)
+                            HostOperationKind.AUDIO_OPEN,
+                            HostOperationKind.AUDIO_EXPORT ->
+                                performBackgroundAudioFileOperation(audioOwner, claim)
+                            HostOperationKind.FS_MKDIR,
+                            HostOperationKind.FS_STAT,
+                            HostOperationKind.FS_LIST,
+                            HostOperationKind.FS_READ_TEXT,
+                            HostOperationKind.FS_WRITE_TEXT,
+                            HostOperationKind.FS_REMOVE -> performFsOperation(claim)
+                            else -> HostOperationCompletion(false, "E_UNSUPPORTED")
+                        }
+                        gateOutcome = resumeSlice(
+                            operation,
+                            completion.success,
+                            completion.value,
+                        ) ?: return
+                        continue
                     }
                     val seconds = parseSleepSeconds(outcome.value)
                     if (seconds == null) {
@@ -816,10 +893,181 @@ internal class LuaAdapterRuntime(
                     gateOutcome = resumeSlice(operation, timerFirst, if (timerFirst) "" else "E_TIMEOUT") ?: return
                 }
                 else -> {
-                    failProgramImage("background coroutine terminated: ${outcome::class.simpleName}")
+                    recordDiagnostic("background coroutine terminated: ${outcome::class.simpleName}")
                     return
                 }
             }
+        }
+    }
+
+    private suspend fun performBackgroundTranscription(
+        audioOwner: LuaOpaqueAudioRegistry.Owner.Task,
+        claim: HostOperationClaim.Admitted,
+    ): HostOperationCompletion {
+        if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_TRANSCRIPTION)) {
+            return HostOperationCompletion(false, "E_CAPABILITY_UNDECLARED")
+        }
+        val token = claim.audioToken
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val registry = audioRegistry
+            ?: return HostOperationCompletion(false, "E_CLOSED")
+        val recording = registry.resolve(
+            LuaOpaqueAudioRegistry.Token(token),
+            audioOwner,
+            LuaOpaqueAudioRegistry.Kind.Captured,
+        ) as? LuaOpaqueAudioRegistry.Resolution.Captured
+            ?: return HostOperationCompletion(false, "E_STALE")
+        val result = when (val acquisition = capabilities.acquire(CapabilityKey.Transcription)) {
+            is CapabilityAcquisition.Available -> {
+                awaitSemanticBackend(
+                    operation = {
+                        acquisition.lease.use { it.transcribe(recording.recording) }
+                    },
+                ) ?: return HostOperationCompletion(false, "E_TIMEOUT")
+            }
+            is CapabilityAcquisition.Recoverable,
+            is CapabilityAcquisition.Unavailable ->
+                CapabilityOperationResult.Unavailable(CapabilityUnavailableReason.NOT_CONFIGURED)
+            is CapabilityAcquisition.Denied ->
+                CapabilityOperationResult.Denied(acquisition.reason)
+            CapabilityAcquisition.Closed -> CapabilityOperationResult.Closed
+            CapabilityAcquisition.Cancelled -> CapabilityOperationResult.Cancelled
+            is CapabilityAcquisition.Failed ->
+                CapabilityOperationResult.Failed(CapabilityFailureReason.HOST_FAILURE)
+        }
+        return when (result) {
+            is CapabilityOperationResult.Success -> {
+                val text = result.value.text
+                if (text.toByteArray(Charsets.UTF_8).size <= 16 * 1024) {
+                    HostOperationCompletion(true, text)
+                } else {
+                    HostOperationCompletion(false, "E_HOST_FAILURE")
+                }
+            }
+            is CapabilityOperationResult.Unavailable ->
+                HostOperationCompletion(false, "E_UNAVAILABLE")
+            is CapabilityOperationResult.Denied ->
+                HostOperationCompletion(false, "E_CAPABILITY_UNDECLARED")
+            CapabilityOperationResult.Closed ->
+                HostOperationCompletion(false, "E_CLOSED")
+            CapabilityOperationResult.Cancelled ->
+                HostOperationCompletion(false, "E_CANCELLED")
+            is CapabilityOperationResult.Failed ->
+                HostOperationCompletion(false, "E_HOST_FAILURE")
+        }
+    }
+
+    private suspend fun performBackgroundAudioFileOperation(
+        audioOwner: LuaOpaqueAudioRegistry.Owner.Task,
+        claim: HostOperationClaim.Admitted,
+    ): HostOperationCompletion {
+        val port = audioFilePort
+            ?: return HostOperationCompletion(false, "E_UNAVAILABLE")
+        val recordings = recordingHost
+            ?: return HostOperationCompletion(false, "E_UNAVAILABLE")
+        val declarationId = claim.declarationId
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val path = claim.path
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val format = claim.format?.let(AudioFileFormat::fromToken)
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val storage = storagePort
+            ?: return HostOperationCompletion(false, "E_MOUNT_UNAVAILABLE")
+        val mount = when (val resolved = resolveMountHandle(storage, declarationId)) {
+            is FilesystemOutcome.Success -> resolved.value
+            is FilesystemOutcome.Failure ->
+                return HostOperationCompletion(false, resolved.error.code.name)
+        }
+        val owner = ExecutionOwner(
+            id = audioOwner.id,
+            kind = ExecutionOwnerKind.TASK,
+            generation = hostGeneration,
+        )
+        return when (claim.kind) {
+            HostOperationKind.AUDIO_OPEN -> {
+                if (format != AudioFileFormat.WAV_PCM_S16LE) {
+                    return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+                }
+                val outcome = awaitSemanticBackend(
+                    operation = {
+                        port.open(owner, mount, path, AudioOpenOptions(format))
+                    },
+                    onLateResult = { late ->
+                        if (late is AudioFileOutcome.Success) recordings.dispose(late.value)
+                    },
+                ) ?: return HostOperationCompletion(false, "E_TIMEOUT")
+                when (outcome) {
+                    is AudioFileOutcome.Failure ->
+                        HostOperationCompletion(false, outcome.error.code.name)
+                    is AudioFileOutcome.Success -> {
+                        val handle = outcome.value
+                        when (val described = port.describe(handle, owner)) {
+                            is AudioFileOutcome.Failure -> {
+                                recordings.dispose(handle)
+                                HostOperationCompletion(false, described.error.code.name)
+                            }
+                            is AudioFileOutcome.Success -> {
+                                val metadata = described.value
+                                HostOperationCompletion(
+                                    true,
+                                    org.json.JSONObject()
+                                        .put("token", recordings.tokenFor(handle))
+                                        .put(
+                                            "metadata",
+                                            org.json.JSONObject()
+                                                .put("sample_rate", metadata.sampleRate)
+                                                .put("channels", metadata.channels)
+                                                .put("duration_ms", metadata.durationMs)
+                                                .put("pcm_bytes", metadata.pcmBytes),
+                                        )
+                                        .toString(),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            HostOperationKind.AUDIO_EXPORT -> {
+                val token = claim.audioToken
+                    ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+                val mode = when (claim.mode) {
+                    "create-new" -> AudioExportMode.CREATE_NEW
+                    "replace" -> AudioExportMode.REPLACE
+                    else -> return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+                }
+                val outcome = awaitSemanticBackend(
+                    operation = {
+                        port.export(
+                            owner = owner,
+                            recording = recordings.handleFor(
+                                LuaOpaqueAudioRegistry.Token(token),
+                            ),
+                            mount = mount,
+                            path = path,
+                            options = AudioExportOptions(format, mode),
+                        )
+                    },
+                ) ?: return HostOperationCompletion(false, "E_TIMEOUT")
+                when (outcome) {
+                    is AudioFileOutcome.Failure ->
+                        HostOperationCompletion(false, outcome.error.code.name)
+                    is AudioFileOutcome.Success -> {
+                        val result = outcome.value
+                        HostOperationCompletion(
+                            true,
+                            org.json.JSONObject()
+                                .put("status", "written")
+                                .put("format", result.format.token)
+                                .put("sample_rate", result.sampleRate)
+                                .put("channels", result.channels)
+                                .put("duration_ms", result.durationMs)
+                                .put("bytes", result.bytes)
+                                .toString(),
+                        )
+                    }
+                }
+            }
+            else -> HostOperationCompletion(false, "E_UNSUPPORTED")
         }
     }
 
@@ -898,22 +1146,43 @@ internal class LuaAdapterRuntime(
      * Per spec: only `{ready = true}` is ready; all malformed or absent values are not ready.
      */
     private suspend fun readinessContext(): Map<String, LuaValue> {
-        val context = linkedMapOf<String, LuaValue>()
+        val capabilityContext = linkedMapOf<String, LuaValue>()
         PackageCapability.ALL.forEach { capabilityId ->
             if (!capabilities.isPublicCapabilityDeclared(capabilityId)) return@forEach
             val availability = when (capabilityId) {
-                PackageCapability.AUDIO_TRANSCRIPTION -> availabilityFor(CapabilityKey.Transcription)
-                PackageCapability.AUDIO_SYNTHESIS -> availabilityFor(CapabilityKey.Synthesis)
+                PackageCapability.AUDIO_TRANSCRIPTION ->
+                    availabilityFor(CapabilityKey.Transcription)
+                PackageCapability.AUDIO_SYNTHESIS ->
+                    availabilityFor(CapabilityKey.Synthesis)
                 PackageCapability.AUDIO_PLAYBACK -> {
                     val audio = availabilityFor(CapabilityKey.AudioOperation)
                     val playback = availabilityFor(CapabilityKey.DeferredAudioPlayback)
                     combineAvailability(audio, playback)
                 }
+                PackageCapability.STORAGE_FILES ->
+                    if (storagePort != null) "available" else "unavailable"
+                PackageCapability.AUDIO_FILES ->
+                    if (audioFilePort != null) "available" else "unavailable"
                 else -> return@forEach
             }
-            context[capabilityId] = LuaValue.StringValue(availability)
+            capabilityContext[capabilityId] = LuaValue.StringValue(availability)
         }
-        return context
+        val mounts = resourceDeclarations.mounts.associate { declaration ->
+            val status = mountReadinessStatus
+                ?.status(declaration.id)
+                ?.takeIf {
+                    it == "available" || it == "read-only" ||
+                        it == "needs-reauthorization" || it == "unavailable"
+                }
+                ?: "unavailable"
+            declaration.id to LuaValue.StringValue(status)
+        }
+        return mapOf(
+            "capabilities" to LuaValue.Map(capabilityContext),
+            "resources" to LuaValue.Map(
+                mapOf("mounts" to LuaValue.Map(mounts)),
+            ),
+        )
     }
 
     private suspend fun availabilityFor(key: CapabilityKey<*>): String = try {
@@ -1000,11 +1269,16 @@ internal class LuaAdapterRuntime(
      * Close and discard everything on activation failure.
      */
     private suspend fun discardStagedAndClose() {
+        audioFilePort?.close()
+        audioFilePort = null
+        recordingHost = null
         actor.latchProgramImageFailure()
         discardStagedTasks()
         actor.close()
         audioRegistry?.close()
         audioRegistry = null
+        mountHandleCache.clear()
+        resourceClose?.invoke()
         updateSnapshot(
             preparation = ChannelPreparationAvailability.Unavailable(
                 ChannelPreparationReason.RuntimeFailed("activation failed"),
@@ -1067,19 +1341,45 @@ internal class LuaAdapterRuntime(
             val outcome = try {
                 val effectiveSampleRate = if (sampleRate > 0) sampleRate else recording.sampleRate
                 val durationMillis = if (effectiveSampleRate > 0) {
-                    recording.samples.size.toDouble() * 1_000.0 / effectiveSampleRate.toDouble()
+                    recording.samples.size * 1_000L / effectiveSampleRate
                 } else {
-                    0.0
+                    0L
                 }
+                val capturedAt = Instant.now(clock)
+                val localTime = capturedAt.atZone(clock.zone)
                 val event = LuaValue.Map(
                     mapOf(
                         "event" to LuaValue.StringValue("capture"),
                         "session" to LuaValue.StringValue(sessionId),
+                        "timestamp" to LuaValue.Map(
+                            mapOf(
+                                "unix_ms" to LuaValue.Number(capturedAt.toEpochMilli().toDouble()),
+                                "local_time" to LuaValue.Map(
+                                    mapOf(
+                                        "year" to LuaValue.Number(localTime.year.toDouble()),
+                                        "month" to LuaValue.Number(localTime.monthValue.toDouble()),
+                                        "day" to LuaValue.Number(localTime.dayOfMonth.toDouble()),
+                                        "hour" to LuaValue.Number(localTime.hour.toDouble()),
+                                        "minute" to LuaValue.Number(localTime.minute.toDouble()),
+                                        "second" to LuaValue.Number(localTime.second.toDouble()),
+                                        "millisecond" to LuaValue.Number(
+                                            (localTime.nano / 1_000_000).toDouble(),
+                                        ),
+                                        "utc_offset_minutes" to LuaValue.Number(
+                                            (localTime.offset.totalSeconds / 60).toDouble(),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
                         "metadata" to LuaValue.Map(
                             mapOf(
-                                "duration_ms" to LuaValue.Number(durationMillis),
+                                "duration_ms" to LuaValue.Number(durationMillis.toDouble()),
                                 "sample_rate" to LuaValue.Number(effectiveSampleRate.toDouble()),
                                 "channels" to LuaValue.Number(1.0),
+                                "pcm_bytes" to LuaValue.Number(
+                                    recording.samples.size.toDouble() * 2.0,
+                                ),
                             ),
                         ),
                     ),
@@ -1109,7 +1409,7 @@ internal class LuaAdapterRuntime(
                             }
                         }
                         if (cancellationRequested != null) {
-                            dispatchPendingByLabel(pending)
+                            dispatchPending(pending)
                             // Chained yields: each resume may produce a new semantic
                             // operation (e.g. synthesize -> playback.schedule in TTS,
                             // or transcribe -> synthesize -> playback.schedule in
@@ -1121,7 +1421,7 @@ internal class LuaAdapterRuntime(
                                 if (current.ownerToken != pending.ownerToken) break
                                 if (current.operation.operationId.value == lastDispatchedOperationId) break
                                 lastDispatchedOperationId = current.operation.operationId.value
-                                dispatchPendingByLabel(current)
+                                dispatchPending(current)
                             }
                         }
                         if (cancellationRequested == null) {
@@ -1146,11 +1446,23 @@ internal class LuaAdapterRuntime(
             }
             when (outcome) {
                 is CallbackInvocationResult.Success -> {
-                    if (outcome.value.strictInputStatus() != null) {
-                        updateSnapshot(
-                            executionStatus = outcome.value.strictInputStatus()!!,
-                        )
+                    val status = outcome.value.strictInputStatus()
+                    if (status != null) {
+                        if (status == ChannelExecutionStatus.FAILED) {
+                            val error = (outcome.value as? LuaValue.Map)
+                                ?.pairs?.get("error") as? LuaValue.Map
+                            val code = (error?.pairs?.get("code") as? LuaValue.StringValue)
+                                ?.value?.take(MAX_READINESS_STATUS_BYTES)
+                            val detail = (error?.pairs?.get("detail") as? LuaValue.StringValue)
+                                ?.value?.take(MAX_READINESS_STATUS_BYTES)
+                            SubspaceLogger.w(
+                                "LuaChannel",
+                                "input_application_failure code=$code detail=$detail",
+                            )
+                        }
+                        updateSnapshot(executionStatus = status)
                     } else {
+                        SubspaceLogger.w("LuaChannel", "input_invalid_terminal")
                         updateSnapshot(executionStatus = ChannelExecutionStatus.FAILED)
                     }
                 }
@@ -1158,6 +1470,11 @@ internal class LuaAdapterRuntime(
                 is CallbackInvocationResult.YieldViolation,
                 is CallbackInvocationResult.InvalidOutcome,
                 is CallbackInvocationResult.Pending -> {
+                    SubspaceLogger.w(
+                        "LuaChannel",
+                        "input_runtime_failure type=${outcome::class.simpleName} " +
+                            "detail=${outcome.diagnostic().take(MAX_READINESS_STATUS_BYTES)}",
+                    )
                     updateSnapshot(executionStatus = ChannelExecutionStatus.FAILED)
                 }
             }
@@ -1217,23 +1534,385 @@ internal class LuaAdapterRuntime(
         resumeSemantic(pending, success, value)
     }
 
-    private suspend fun resumeSemantic(pending: PendingInputExecution, success: Boolean, value: String) {
+    private suspend fun resumeSemantic(
+        pending: PendingInputExecution,
+        success: Boolean,
+        value: String,
+        normalizeAudioError: Boolean = true,
+    ) {
         if (!pending.semantic.claimTerminal()) return
         pending.semantic.completeClaimed(
             if (success) CallbackInvocationResult.Success(LuaValue.StringValue(value))
             else CallbackInvocationResult.Failure(value),
         )
-        resumeInput(pending.ownerToken, pending.operation.operationId.value, success, value)
+        resumeInput(pending.ownerToken, pending.operation.operationId.value, success, value, normalizeAudioError)
     }
 
-    /** Dispatches one pending semantic operation by its yield-label prefix. */
-    private suspend fun dispatchPendingByLabel(pending: PendingInputExecution) {
-        when {
-            pending.label.startsWith("transcribe:") -> executeTranscription(pending)
-            pending.label.startsWith("synthesize:") -> executeSynthesis(pending)
-            pending.label.startsWith("playback:") -> executePlayback(pending)
+    /** Claims one pending semantic operation and dispatches it by its typed kind. */
+    private suspend fun dispatchPending(pending: PendingInputExecution) {
+        val requestId = pending.label.toLongOrNull()
+        if (requestId == null) {
+            resumeInput(
+                pending.ownerToken,
+                pending.operation.operationId.value,
+                false,
+                "E_HOST_FAILURE",
+            )
+            return
+        }
+        when (val claim = bridge.claimHostOperation(stateHandle, requestId)) {
+            is HostOperationClaim.Rejected ->
+                resumeInput(
+                    pending.ownerToken,
+                    pending.operation.operationId.value,
+                    false,
+                    claim.errorCode,
+                )
+            is HostOperationClaim.Admitted -> when (claim.kind) {
+                HostOperationKind.TRANSCRIBE -> executeTranscription(pending)
+                HostOperationKind.SYNTHESIZE -> executeSynthesis(pending, claim)
+                HostOperationKind.PLAYBACK -> executePlayback(pending, claim)
+                HostOperationKind.AUDIO_OPEN,
+                HostOperationKind.AUDIO_EXPORT -> executeAudioFileOperation(pending, claim)
+                HostOperationKind.FS_MKDIR,
+                HostOperationKind.FS_STAT,
+                HostOperationKind.FS_LIST,
+                HostOperationKind.FS_READ_TEXT,
+                HostOperationKind.FS_WRITE_TEXT,
+                HostOperationKind.FS_REMOVE -> executeFsOperation(pending, claim)
+            }
+        }
+    }
+
+    /**
+     * Dispatches one claimed portable recording-file operation. The native
+     * broker has already validated Lua shape, capability declaration, mount
+     * access, and execution ownership; the generic ports revalidate the live
+     * mount and Recording handles before any provider or codec effect.
+     */
+    private suspend fun executeAudioFileOperation(
+        pending: PendingInputExecution,
+        claim: HostOperationClaim.Admitted,
+    ) {
+        val port = audioFilePort
+        val recordings = recordingHost
+        if (port == null || recordings == null) {
+            resumeSemantic(pending, false, "E_UNAVAILABLE", normalizeAudioError = false)
+            return
+        }
+        val declarationId = claim.declarationId
+        val path = claim.path
+        val format = claim.format?.let(AudioFileFormat::fromToken)
+        if (declarationId == null || path == null || format == null) {
+            resumeSemantic(pending, false, "E_INVALID_ARGUMENT", normalizeAudioError = false)
+            return
+        }
+        val storage = storagePort
+        if (storage == null) {
+            resumeSemantic(pending, false, "E_MOUNT_UNAVAILABLE", normalizeAudioError = false)
+            return
+        }
+        val mount = when (val resolved = resolveMountHandle(storage, declarationId)) {
+            is FilesystemOutcome.Success -> resolved.value
+            is FilesystemOutcome.Failure -> {
+                resumeSemantic(pending, false, resolved.error.code.name, normalizeAudioError = false)
+                return
+            }
+        }
+        val owner = ExecutionOwner(
+            id = pending.audioOwner.id,
+            kind = when (pending.audioOwner) {
+                is LuaOpaqueAudioRegistry.Owner.Input -> ExecutionOwnerKind.INPUT
+                is LuaOpaqueAudioRegistry.Owner.Task -> ExecutionOwnerKind.TASK
+            },
+            generation = hostGeneration,
+        )
+        when (claim.kind) {
+            HostOperationKind.AUDIO_OPEN -> {
+                if (format != AudioFileFormat.WAV_PCM_S16LE) {
+                    resumeSemantic(pending, false, "E_INVALID_ARGUMENT", normalizeAudioError = false)
+                    return
+                }
+                val outcome = awaitSemanticBackend(
+                    operation = { port.open(owner, mount, path, AudioOpenOptions(format)) },
+                    onLateResult = { late ->
+                        if (late is AudioFileOutcome.Success) recordings.dispose(late.value)
+                    },
+                )
+                if (outcome == null) {
+                    resumeSemantic(pending, false, "E_TIMEOUT", normalizeAudioError = false)
+                    return
+                }
+                when (outcome) {
+                    is AudioFileOutcome.Failure ->
+                        resumeSemantic(
+                            pending,
+                            false,
+                            outcome.error.code.name,
+                            normalizeAudioError = false,
+                        )
+                    is AudioFileOutcome.Success -> {
+                        val handle = outcome.value
+                        when (val described = port.describe(handle, owner)) {
+                            is AudioFileOutcome.Failure -> {
+                                recordings.dispose(handle)
+                                resumeSemantic(
+                                    pending,
+                                    false,
+                                    described.error.code.name,
+                                    normalizeAudioError = false,
+                                )
+                            }
+                            is AudioFileOutcome.Success -> {
+                                val metadata = described.value
+                                val result = org.json.JSONObject()
+                                    .put("token", recordings.tokenFor(handle))
+                                    .put(
+                                        "metadata",
+                                        org.json.JSONObject()
+                                            .put("sample_rate", metadata.sampleRate)
+                                            .put("channels", metadata.channels)
+                                            .put("duration_ms", metadata.durationMs)
+                                            .put("pcm_bytes", metadata.pcmBytes),
+                                    )
+                                    .toString()
+                                resumeSemantic(
+                                    pending,
+                                    true,
+                                    result,
+                                    normalizeAudioError = false,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            HostOperationKind.AUDIO_EXPORT -> {
+                val token = claim.audioToken
+                if (token == null) {
+                    resumeSemantic(
+                        pending,
+                        false,
+                        "E_INVALID_ARGUMENT",
+                        normalizeAudioError = false,
+                    )
+                    return
+                }
+                val mode = when (claim.mode) {
+                    "create-new" -> AudioExportMode.CREATE_NEW
+                    "replace" -> AudioExportMode.REPLACE
+                    else -> {
+                        resumeSemantic(
+                            pending,
+                            false,
+                            "E_INVALID_ARGUMENT",
+                            normalizeAudioError = false,
+                        )
+                        return
+                    }
+                }
+                val outcome = awaitSemanticBackend(
+                    operation = {
+                        port.export(
+                            owner = owner,
+                            recording = recordings.handleFor(
+                                LuaOpaqueAudioRegistry.Token(token),
+                            ),
+                            mount = mount,
+                            path = path,
+                            options = AudioExportOptions(format, mode),
+                        )
+                    },
+                )
+                if (outcome == null) {
+                    resumeSemantic(pending, false, "E_TIMEOUT", normalizeAudioError = false)
+                    return
+                }
+                when (outcome) {
+                    is AudioFileOutcome.Failure ->
+                        resumeSemantic(
+                            pending,
+                            false,
+                            outcome.error.code.name,
+                            normalizeAudioError = false,
+                        )
+                    is AudioFileOutcome.Success -> {
+                        val result = outcome.value
+                        val value = org.json.JSONObject()
+                            .put("status", "written")
+                            .put("format", result.format.token)
+                            .put("sample_rate", result.sampleRate)
+                            .put("channels", result.channels)
+                            .put("duration_ms", result.durationMs)
+                            .put("bytes", result.bytes)
+                            .toString()
+                        resumeSemantic(pending, true, value, normalizeAudioError = false)
+                    }
+                }
+            }
             else -> Unit
         }
+    }
+
+
+    /**
+     * Dispatch one claimed filesystem operation to the generic [storagePort].
+     *
+     * Generic only: no semantic labels and no Journal branches. The claim
+     * carries the declaration id and validated logical path/arguments; this
+     * resolves the platform [dev.nilp0inter.subspace.storage.MountHandle]
+     * (revalidated per operation), performs exactly one bounded port call, and
+     * resumes with a normalized JSON result on success or a portable error code
+     * on failure. Success, provider failure, cancellation, revocation,
+     * generation close, and process teardown all race through the same
+     * exactly-once terminal gate as the audio operations via [resumeSemantic].
+     */
+    private suspend fun executeFsOperation(
+        pending: PendingInputExecution,
+        claim: HostOperationClaim.Admitted,
+    ) {
+        val completion = performFsOperation(claim)
+        resumeSemantic(
+            pending,
+            completion.success,
+            completion.value,
+            normalizeAudioError = false,
+        )
+    }
+
+    private suspend fun performFsOperation(
+        claim: HostOperationClaim.Admitted,
+    ): HostOperationCompletion {
+        val port = storagePort ?: return HostOperationCompletion(false, "E_CLOSED")
+        val declarationId = claim.declarationId
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val path = claim.path
+            ?: return HostOperationCompletion(false, "E_INVALID_ARGUMENT")
+        val handle = when (val resolved = resolveMountHandle(port, declarationId)) {
+            is FilesystemOutcome.Success -> resolved.value
+            is FilesystemOutcome.Failure ->
+                return HostOperationCompletion(false, resolved.error.code.name)
+        }
+        val outcome: FilesystemOutcome<Any> = try {
+            when (claim.kind) {
+                HostOperationKind.FS_MKDIR ->
+                    port.mkdir(handle, path, MkdirOptions(claim.parents))
+                HostOperationKind.FS_STAT -> port.stat(handle, path)
+                HostOperationKind.FS_LIST -> port.list(
+                    handle,
+                    path,
+                    ListOptions(
+                        limit = if (claim.limit > 0) {
+                            claim.limit.toInt()
+                        } else {
+                            FS_DEFAULT_LIST_LIMIT
+                        },
+                        cursor = claim.cursor?.let { ListCursor(it) },
+                    ),
+                )
+                HostOperationKind.FS_READ_TEXT ->
+                    port.readText(handle, path, ReadTextOptions(claim.maxBytes))
+                HostOperationKind.FS_WRITE_TEXT -> {
+                    val mode = when (claim.mode) {
+                        "replace" -> WriteMode.REPLACE
+                        else -> WriteMode.CREATE_NEW
+                    }
+                    port.writeText(
+                        handle,
+                        path,
+                        claim.text.orEmpty(),
+                        WriteTextOptions(mode),
+                    )
+                }
+                HostOperationKind.FS_REMOVE ->
+                    port.remove(handle, path, RemoveOptions(claim.missingOk))
+                else -> return HostOperationCompletion(false, "E_UNSUPPORTED")
+            }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Throwable) {
+            SubspaceLogger.w(
+                FS_DIAGNOSTIC_TAG,
+                "port_throw kind=${claim.kind} type=${failure.javaClass.simpleName}",
+            )
+            return HostOperationCompletion(false, "E_IO")
+        }
+        return when (outcome) {
+            is FilesystemOutcome.Success ->
+                HostOperationCompletion(true, fsResultJson(claim.kind, outcome.value))
+            is FilesystemOutcome.Failure -> {
+                SubspaceLogger.w(
+                    FS_DIAGNOSTIC_TAG,
+                    "port_failure kind=${claim.kind} code=${outcome.error.code}",
+                )
+                HostOperationCompletion(false, outcome.error.code.name)
+            }
+        }
+    }
+
+    /** Resolve (and cache) the platform mount handle for a declaration id. */
+    private fun resolveMountHandle(
+        port: dev.nilp0inter.subspace.storage.MountedStoragePort,
+        declarationId: String,
+    ): FilesystemOutcome<dev.nilp0inter.subspace.storage.MountHandle> {
+        mountHandleCache[declarationId]?.let { return FilesystemOutcome.Success(it) }
+        return when (val result = port.mount(declarationId)) {
+            is FilesystemOutcome.Success -> {
+                mountHandleCache[declarationId] = result.value
+                result
+            }
+            is FilesystemOutcome.Failure -> result
+        }
+    }
+
+    /** Serialize one portable filesystem result to the exact JSON the Lua module returns. */
+    private fun fsResultJson(kind: HostOperationKind, value: Any): String = when (kind) {
+        HostOperationKind.FS_MKDIR -> {
+            val status = when ((value as MkdirResult).status) {
+                MkdirStatus.CREATED -> "created"
+                MkdirStatus.EXISTING -> "existing"
+            }
+            org.json.JSONObject().put("status", status).toString()
+        }
+        HostOperationKind.FS_STAT -> {
+            val stat = value as StatResult
+            val obj = org.json.JSONObject()
+                .put("name", stat.name)
+                .put("kind", if (stat.kind == NodeKind.FILE) "file" else "directory")
+                .put("size", stat.sizeBytes)
+            stat.modifiedAtUnixMs?.let { obj.put("modified_at_unix_ms", it) }
+            obj.toString()
+        }
+        HostOperationKind.FS_LIST -> {
+            val page = value as ListPage
+            val entries = org.json.JSONArray()
+            for (entry in page.entries) {
+                entries.put(
+                    org.json.JSONObject()
+                        .put("name", entry.name)
+                        .put("kind", if (entry.kind == NodeKind.FILE) "file" else "directory"),
+                )
+            }
+            val obj = org.json.JSONObject().put("entries", entries)
+            page.nextCursor?.let { obj.put("next_cursor", it.token) }
+            obj.toString()
+        }
+        HostOperationKind.FS_READ_TEXT -> {
+            val read = value as ReadTextResult
+            org.json.JSONObject().put("text", read.text).put("bytes", read.bytes).toString()
+        }
+        HostOperationKind.FS_WRITE_TEXT -> {
+            val write = value as WriteResult
+            org.json.JSONObject().put("status", "written").put("bytes", write.bytes).toString()
+        }
+        HostOperationKind.FS_REMOVE -> {
+            val status = when ((value as RemoveResult).status) {
+                RemoveStatus.REMOVED -> "removed"
+                RemoveStatus.MISSING -> "missing"
+            }
+            org.json.JSONObject().put("status", status).toString()
+        }
+        else -> "{}"
     }
 
     private suspend fun <T : Any> awaitSemanticBackend(
@@ -1251,10 +1930,9 @@ internal class LuaAdapterRuntime(
         }
         return result
     }
-    private suspend fun executeSynthesis(pending: PendingInputExecution) {
+    private suspend fun executeSynthesis(pending: PendingInputExecution, claim: HostOperationClaim.Admitted) {
         if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_SYNTHESIS)) { resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_CAPABILITY_UNDECLARED"); return }
-        val params = try { org.json.JSONObject(pending.label.removePrefix("synthesize:")) } catch (_: Exception) { resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_INVALID_ARGUMENT"); return }
-        val text = params.optString("text", ""); val language = params.optString("language", ""); val voice = params.optString("voice", ""); val speed = params.optDouble("speed", Double.NaN)
+        val text = claim.text.orEmpty(); val language = claim.language.orEmpty(); val voice = claim.voice.orEmpty(); val speed = claim.speed
         if (text.isBlank() || language.isBlank() || voice.isBlank() || !speed.isFinite() || speed <= 0.0) { resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_INVALID_ARGUMENT"); return }
         val result = when (val acquisition = capabilities.acquire(CapabilityKey.Synthesis)) {
             is CapabilityAcquisition.Available -> {
@@ -1288,8 +1966,8 @@ internal class LuaAdapterRuntime(
                     pending.semantic.completeClaimed(CallbackInvocationResult.Failure("E_BUSY"))
                     resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_BUSY")
                 } else {
-                    pending.semantic.completeClaimed(CallbackInvocationResult.Success(LuaValue.StringValue("synthesized:${token.value}")))
-                    resumeInput(pending.ownerToken, pending.operation.operationId.value, true, "synthesized:${token.value}")
+                    pending.semantic.completeClaimed(CallbackInvocationResult.Success(LuaValue.StringValue(token.value)))
+                    resumeInput(pending.ownerToken, pending.operation.operationId.value, true, token.value)
                 }
             }
             is CapabilityOperationResult.Unavailable -> resumeSemantic(pending, false, "E_UNAVAILABLE")
@@ -1300,15 +1978,14 @@ internal class LuaAdapterRuntime(
         }
     }
 
-    private suspend fun executePlayback(pending: PendingInputExecution) {
+    private suspend fun executePlayback(pending: PendingInputExecution, claim: HostOperationClaim.Admitted) {
         if (!capabilities.isPublicCapabilityDeclared(PackageCapability.AUDIO_PLAYBACK)) {
             resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_CAPABILITY_UNDECLARED")
             return
         }
-        val parts = pending.label.split(":")
-        val token = parts.getOrNull(1)
-        val delay = parts.getOrNull(2)?.toDoubleOrNull()
-        if (parts.size != 3 || token == null || delay == null || !delay.isFinite() || delay < 0.0 || delay > 86_400.0) {
+        val token = claim.audioToken
+        val delay = claim.delaySeconds
+        if (token == null || !delay.isFinite() || delay < 0.0 || delay > 86_400.0) {
             resumeInput(pending.ownerToken, pending.operation.operationId.value, false, "E_INVALID_VALUE")
             return
         }

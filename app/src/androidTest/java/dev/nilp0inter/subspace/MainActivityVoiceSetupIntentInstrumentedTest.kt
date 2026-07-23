@@ -1,7 +1,6 @@
 package dev.nilp0inter.subspace
 
 import android.content.Context
-import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.Settings
@@ -81,17 +80,8 @@ class MainActivityVoiceSetupIntentInstrumentedTest {
                 ).isNotEmpty()
             }
 
-    private fun resolveVoiceSetupIntent(issue: OfflineNavigationVoiceIssue?): Intent {
-        val activity = MainActivity()
-        ContextWrapper::class.java
-            .getDeclaredMethod("attachBaseContext", Context::class.java)
-            .apply { isAccessible = true }
-            .invoke(activity, context)
-        return MainActivity::class.java
-            .getDeclaredMethod("resolveVoiceSetupIntent", OfflineNavigationVoiceIssue::class.java)
-            .apply { isAccessible = true }
-            .invoke(activity, issue) as Intent
-    }
+    private fun resolveVoiceSetupIntent(issue: OfflineNavigationVoiceIssue?): Intent =
+        dev.nilp0inter.subspace.resolveVoiceSetupIntent(context, issue)
 
     private fun assertNoProhibitedVoiceSettingsIntent(intent: Intent) {
         assertFalse(intent.action == "com.android.settings.TTS_SETTINGS")

@@ -26,6 +26,20 @@ import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import org.json.JSONArray
 import org.json.JSONObject
 
+internal data class LuaRuntimeResources(
+    val storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort,
+    val audioFilePortFactory: LuaAudioFilePortFactory,
+    val mountReadinessStatus: LuaMountReadinessStatus,
+    val close: () -> Unit,
+)
+
+internal fun interface LuaRuntimeResourcesFactory {
+    fun create(
+        request: ChannelRuntimeConstructionRequest,
+        declarations: PackageResourcesDeclaration,
+    ): LuaRuntimeResources
+}
+
 /**
  * Host-supplied Lua implementation provider.
  *
@@ -47,6 +61,10 @@ internal class LuaChannelImplementationProvider private constructor(
     private val configurationProviderFields: List<ChannelConfigurationField> = emptyList(),
     private val configurationRequiredCapabilities: Set<ChannelCapability> = emptySet(),
     private val resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
+    private val storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+    private val audioFilePortFactory: LuaAudioFilePortFactory? = null,
+    private val mountReadinessStatus: LuaMountReadinessStatus? = null,
+    private val runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
 ) : ChannelImplementationProvider {
 
     companion object {
@@ -68,6 +86,10 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationFields: List<ChannelConfigurationField> = emptyList(),
             requiredCapabilities: Set<ChannelCapability> = emptySet(),
             resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
+            storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+            audioFilePortFactory: LuaAudioFilePortFactory? = null,
+            mountReadinessStatus: LuaMountReadinessStatus? = null,
+            runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -82,6 +104,10 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProviderFields = configurationFields,
             configurationRequiredCapabilities = requiredCapabilities,
             resourceDeclarations = resourceDeclarations,
+            storagePort = storagePort,
+            audioFilePortFactory = audioFilePortFactory,
+            mountReadinessStatus = mountReadinessStatus,
+            runtimeResourcesFactory = runtimeResourcesFactory,
         )
 
         /**
@@ -102,6 +128,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationFields: List<ChannelConfigurationField> = emptyList(),
             requiredCapabilities: Set<ChannelCapability> = emptySet(),
             resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
+            storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -116,6 +143,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProviderFields = configurationFields,
             configurationRequiredCapabilities = requiredCapabilities,
             resourceDeclarations = resourceDeclarations,
+            storagePort = storagePort,
         )
     }
 
@@ -182,6 +210,23 @@ internal class LuaChannelImplementationProvider private constructor(
             }
         }
 
+        // Install the immutable instance identity and declared resource
+        // authority before any package source is evaluated.
+        when (val rc = bridge.setResourceContext(stateHandle, buildResourceContextJson(request))) {
+            is LuaKernelOutcome.Completed -> Unit
+            is LuaKernelOutcome.ValidationFailure -> {
+                actor.close()
+                return ChannelRuntimeConstructionResult.Failure(constructionFailure(rc.diagnostic))
+            }
+            else -> {
+                actor.close()
+                return ChannelRuntimeConstructionResult.Failure(
+                    constructionFailure("resource context installation failed"),
+                )
+            }
+        }
+
+
         val imageLoad = try {
             bridge.loadProgramImage(
                 handle = stateHandle,
@@ -235,6 +280,7 @@ internal class LuaChannelImplementationProvider private constructor(
             }
         }
 
+        val runtimeResources = runtimeResourcesFactory?.create(request, resourceDeclarations)
         return ChannelRuntimeConstructionResult.Success(
             LuaAdapterRuntime(
                 definition = request.definition,
@@ -247,8 +293,43 @@ internal class LuaChannelImplementationProvider private constructor(
                 logSink = logSink,
                 capabilities = request.capabilities,
                 initialSummary = presentation.summary,
+                storagePort = runtimeResources?.storagePort ?: storagePort,
+                audioFilePortFactory =
+                    runtimeResources?.audioFilePortFactory ?: audioFilePortFactory,
+                resourceDeclarations = resourceDeclarations,
+                mountReadinessStatus =
+                    runtimeResources?.mountReadinessStatus ?: mountReadinessStatus,
+                resourceClose = runtimeResources?.close,
             ),
         )
+    }
+
+    /**
+     * Build the kernel resource-context JSON from the declared capabilities and
+     * `resources.mounts`. Mount `status` reflects the resolved live binding; the
+     * generic binding layer supplies it per generation — declared mounts default
+     * to `available` here and fail closed at operation time via the storage port
+     * when no live grant backs them.
+     */
+    private fun buildResourceContextJson(request: ChannelRuntimeConstructionRequest): String {
+        val storageDeclared = ChannelCapability.StorageFiles in request.capabilities.declaredCapabilities
+        val audioFilesDeclared =
+            ChannelCapability.AudioFiles in request.capabilities.declaredCapabilities
+        val mounts = JSONObject()
+        for (mount in resourceDeclarations.mounts) {
+            mounts.put(
+                mount.id,
+                JSONObject()
+                    .put("access", mount.access.value)
+                    .put("status", "available"),
+            )
+        }
+        return JSONObject()
+            .put("instanceId", request.definition.id)
+            .put("storageFiles", storageDeclared)
+            .put("audioFiles", audioFilesDeclared)
+            .put("mounts", mounts)
+            .toString()
     }
 
     /** Exact version mapping happens before all actor/state work. */

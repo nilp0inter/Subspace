@@ -36,40 +36,45 @@ A Lua channel provider SHALL receive its program logic as an immutable program i
 - **AND** no mutation of source text SHALL be possible because the source map is immutable for the image's lifetime
 
 ### Requirement: Lua provider implements the ChannelImplementationProvider contract
-The Lua provider SHALL implement the `ChannelImplementationProvider` contract used by the existing provider registry. A production installed-package provider SHALL expose a stable package-specific implementation identifier derived by the host from its resolved durable repository identity, validated package presentation metadata, a schema-version-1 configuration provider compiled from the package-declared configuration schema, a configuration-field list, a required-capability set compiled from the package-declared capabilities, one immutable program image, and an opaque provider-revision fingerprint equal to the active artifact digest. The provider SHALL NOT trust a package-selected built-in or internal identifier, register an alternative provider registry, add a special-case path in core dispatch, modify catalogue persistence, or create a Lua actor or Lua state at package materialization or provider registration time. Runtime construction SHALL create one Lua state and actor only for the addressed channel instance through standard registry reconciliation.
+The Lua provider SHALL implement the `ChannelImplementationProvider` contract used by the existing provider registry. A production installed-package provider SHALL expose a stable package-specific implementation identifier derived by the host from its resolved durable repository identity, validated package presentation metadata, a schema-version-1 configuration provider compiled from the package-declared scalar schema, a configuration-field list, validated resource-mount declarations, a required-capability set compiled from package capabilities, one immutable program image, and an opaque provider-revision fingerprint equal to the active artifact digest. Resource declarations SHALL compile into generic editor/runtime metadata and SHALL NOT contain live platform grants or create platform access during validation, materialization, or registration. The provider SHALL NOT trust a package-selected built-in/internal identifier, register an alternative registry, add a package- or Journal-specific core dispatch path, modify catalogue persistence, or create a Lua actor/state during materialization or registration. Runtime construction SHALL create one Lua state and actor only for the addressed channel instance through standard registry reconciliation and SHALL resolve that instance's compatible host-owned resource bindings.
 
 #### Scenario: Installed Lua provider is registered
 - **WHEN** the host materializes and publishes a validated active installed package provider
 - **THEN** it SHALL appear alongside built-in Kotlin providers through the same descriptor contract
-- **AND** its descriptor, configuration-provider ID, installed snapshot key, and host-derived repository provider ID SHALL agree
-- **AND** registration SHALL NOT create a Lua actor or Lua state
+- **AND** its descriptor, configuration-provider ID, resource declarations, installed snapshot key, and host-derived repository provider ID SHALL agree
+- **AND** registration SHALL NOT create a Lua actor, Lua state, mount handle, or platform access
 
 #### Scenario: Multiple instances reference one installed provider
 - **WHEN** two catalogue definitions reference one installed Lua provider implementation ID
 - **THEN** both SHALL resolve the same immutable active provider revision
-- **AND** the registry SHALL construct independent runtime generations keyed by their distinct instance IDs
-- **AND** each generation SHALL receive its own actor, state, cache, timers, tasks, logs, generation context, and capability scope
+- **AND** the registry SHALL construct independent runtime generations keyed by distinct instance IDs
+- **AND** each generation SHALL receive its own actor, state, cache, timers, tasks, logs, generation context, capability scope, and instance-bound mount handles
 
 #### Scenario: Installed Lua provider constructs a runtime
-- **WHEN** the registry invokes the provider's runtime constructor for a validated configuration definition
+- **WHEN** the registry invokes the provider constructor for a definition with validated scalar configuration and compatible resource bindings
 - **THEN** the provider SHALL validate and load its host-resolved immutable program image
-- **AND** it SHALL create one Lua state and one actor for that definition's instance ID
-- **AND** it SHALL validate the entry callback table through the existing Lua Runtime v1 contract
+- **AND** it SHALL create one Lua state and actor for that definition's instance ID
+- **AND** it SHALL validate the entry callback table through revised Lua Runtime v1
 
-#### Scenario: Package declares configuration and capabilities
-- **WHEN** a package-format-v1 manifest contains valid configuration schema fields and required capability declarations
-- **THEN** package validation SHALL accept the artifact and compile the declarations into the provider snapshot
-- **AND** the provider SHALL expose the compiled configuration provider and capability eligibility set to the host registry
+#### Scenario: Package declares configuration, resources, and capabilities
+- **WHEN** a revised package-format-v1 manifest contains valid scalar configuration, resource mounts, and capability declarations
+- **THEN** package validation SHALL compile the declarations into the provider snapshot without executing Lua
+- **AND** the provider SHALL expose scalar fields, generic mount metadata, and capability eligibility to standard host surfaces
+
+#### Scenario: Required resource binding is missing
+- **WHEN** a catalogue definition references a valid provider but lacks a usable binding for one required mount
+- **THEN** the host SHALL preserve and project the instance with typed resource unavailability
+- **AND** it SHALL not grant ambient storage, inject a default path, or call Lua to invent a binding
 
 #### Scenario: Lua provider is unavailable
-- **WHEN** a catalogue definition references an installed Lua provider that is absent, loading, removed, corrupt, incompatible, or failed materialization
+- **WHEN** a definition references an installed Lua provider that is absent, loading, removed, corrupt, incompatible, or failed materialization
 - **THEN** the host SHALL preserve and project the instance with a typed unavailability reason
-- **AND** it SHALL NOT silently construct a generic Lua provider, default program image, retained old revision, or alternative runtime
+- **AND** it SHALL NOT silently construct a generic provider, default image, retained old revision, or alternative runtime
 
-#### Scenario: Configuration replacement spawns fresh generation
-- **WHEN** an active channel's configuration is modified in the catalogue
-- **THEN** the host SHALL stop predecessor admission, complete any committed terminal callback, drain and cancel descendants, revoke all capability leases, close the predecessor generation, and start a fresh generation with a new configuration snapshot
-- **AND** it SHALL NOT modify the running predecessor actor in place
+#### Scenario: Configuration or resource replacement spawns fresh generation
+- **WHEN** an active channel's scalar configuration or mount binding is modified
+- **THEN** the host SHALL stop predecessor admission, complete any committed terminal callback, drain/cancel descendants, revoke capabilities and mount handles, close the predecessor, and start a fresh generation with the new immutable inputs
+- **AND** it SHALL NOT modify the predecessor actor or its authority in place
 
 ### Requirement: Lua provider/runtime adapter uses generation-safe execution context
 The provider SHALL construct a runtime that receives an opaque host-owned generation execution context. This context SHALL supply typed, generation-bound timer scheduling, background-task admission, and a liveness query without exposing the registry gate, owning actor, Kotlin `CoroutineScope`, `RuntimeGenerationInvocationGate`, `RuntimeGeneration`, `CapabilityScopeIdentity`, or any Android or platform object. The context SHALL be bound to one generation. Timer or task admission after close or replacement SHALL return typed `CLOSED`; resource exhaustion SHALL return distinct typed `CAPACITY_EXHAUSTED`. Accepted timer callbacks SHALL be suppressed after close. The provider SHALL NOT construct a runtime outside standard registry reconciliation or bypass invocation, registry, capability, or generation gates. The host SHALL NOT deliver operation tokens, coroutine references, userdata, or Kotlin platform objects to plugin code.

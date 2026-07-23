@@ -63,17 +63,17 @@ impl Accountant {
         self.memory_limit_bytes.store(new_limit, Ordering::Relaxed);
     }
 
-
-
     /// Record the current Lua-byte reading (from `Lua::used_memory`) and
     /// update the sampled peak. Returns the updated current value.
     pub fn record_lua_current(&self, current: u64) {
         let mut prev_peak = self.peak_bytes.load(Ordering::Relaxed);
         while current > prev_peak {
-            match self
-                .peak_bytes
-                .compare_exchange(prev_peak, current, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.peak_bytes.compare_exchange(
+                prev_peak,
+                current,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(actual) => prev_peak = actual,
             }

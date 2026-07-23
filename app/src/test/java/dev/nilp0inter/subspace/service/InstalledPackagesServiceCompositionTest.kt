@@ -626,7 +626,7 @@ class InstalledPackagesServiceCompositionTest {
 
     private fun packageArchive(): ByteArray {
         val source = "return { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Service test package","summary":"Installed Lua service composition package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Service test package","summary":"Installed Lua service composition package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
@@ -792,6 +792,10 @@ class InstalledPackagesServiceCompositionTest {
         }
 
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome = completed(handle)
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ): LuaKernelOutcome = completed(handle)
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = completed(handle)
         override fun resume(operation: LuaOperationHandle, success: Boolean, value: String, spawnAdmission: LuaSpawnAdmission): LuaKernelOutcome = completed(operation.stateHandle)
         override fun cancel(operation: LuaOperationHandle): LuaKernelOutcome = completed(operation.stateHandle)

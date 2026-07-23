@@ -2,8 +2,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use subspace_lua_actor::{
-    Generation, OperationId, Outcome, OutcomeKind, StateEngine,
-    BINDING_VERSION, LUA_VERSION,
+    Generation, OperationId, Outcome, OutcomeKind, StateEngine, BINDING_VERSION, LUA_VERSION,
 };
 
 const MEMORY_LIMIT: u64 = 4 * 1024 * 1024;
@@ -30,7 +29,10 @@ fn string_field(outcome: &Outcome, field: &str) -> String {
         serde_json::Value::String(s) => s,
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
-        other => panic!("expected string, number or bool for field {field}, got {:?}", other),
+        other => panic!(
+            "expected string, number or bool for field {field}, got {:?}",
+            other
+        ),
     }
 }
 
@@ -139,7 +141,10 @@ fn states_isolate_globals_accounting_and_close_effects() {
     assert_kind(&closed, OutcomeKind::Closed);
     let rejected_left = left.snapshot(left_handle.generation);
     assert!(
-        matches!(rejected_left.kind(), OutcomeKind::Stale | OutcomeKind::Closed),
+        matches!(
+            rejected_left.kind(),
+            OutcomeKind::Stale | OutcomeKind::Closed
+        ),
         "closed state accepted a snapshot: {:?}",
         rejected_left.to_json()
     );
@@ -238,18 +243,41 @@ fn snapshots_publish_identity_versions_and_memory_invariants() {
         u64_field(&snapshot, "currentBytes") <= u64_field(&snapshot, "peakBytes"),
         "live Lua bytes cannot exceed sampled peak"
     );
-    let elapsed = snapshot.to_json().get("elapsedNanos").and_then(|value| value.as_u64());
-    assert!(elapsed.is_some(), "snapshot omitted elapsedNanos evidence: {:?}", snapshot.to_json());
+    let elapsed = snapshot
+        .to_json()
+        .get("elapsedNanos")
+        .and_then(|value| value.as_u64());
+    assert!(
+        elapsed.is_some(),
+        "snapshot omitted elapsedNanos evidence: {:?}",
+        snapshot.to_json()
+    );
     assert_kind(&state.close(handle.generation), OutcomeKind::Closed);
 }
 
 #[test]
 fn malformed_source_and_invalid_entrypoint_are_normalized_and_closable() {
     for (source, entrypoint, expected) in [
-        ("function main( return 1 end", "main", OutcomeKind::SyntaxFailure),
-        ("\u{1b}Lua\0binary-chunk", "main", OutcomeKind::SyntaxFailure),
-        ("not_an_entrypoint = 3", "not_an_entrypoint", OutcomeKind::ValidationFailure),
-        ("function other() return 'ok' end", "missing", OutcomeKind::ValidationFailure),
+        (
+            "function main( return 1 end",
+            "main",
+            OutcomeKind::SyntaxFailure,
+        ),
+        (
+            "\u{1b}Lua\0binary-chunk",
+            "main",
+            OutcomeKind::SyntaxFailure,
+        ),
+        (
+            "not_an_entrypoint = 3",
+            "not_an_entrypoint",
+            OutcomeKind::ValidationFailure,
+        ),
+        (
+            "function other() return 'ok' end",
+            "missing",
+            OutcomeKind::ValidationFailure,
+        ),
     ] {
         let state = engine();
         let handle = state.handle();
@@ -362,7 +390,10 @@ fn string_nonstrings_and_nested_lua_errors_are_normalized_and_recoverable() {
     ] {
         let state = engine();
         let handle = state.handle();
-        assert_kind(&state.load(handle.generation, source, "main"), OutcomeKind::Completed);
+        assert_kind(
+            &state.load(handle.generation, source, "main"),
+            OutcomeKind::Completed,
+        );
         let failed = state.start(handle.generation);
         assert_kind(&failed, OutcomeKind::RuntimeFailure);
 
@@ -375,7 +406,11 @@ fn string_nonstrings_and_nested_lua_errors_are_normalized_and_recoverable() {
         }
 
         assert_kind(
-            &state.load(handle.generation, "function healthy() return 'recovered' end", "healthy"),
+            &state.load(
+                handle.generation,
+                "function healthy() return 'recovered' end",
+                "healthy",
+            ),
             OutcomeKind::Completed,
         );
         let recovered = state.start(handle.generation);
@@ -422,7 +457,10 @@ fn protected_ordinary_lua_errors_leave_peer_state_usable() {
         "a protected error in one state changed a peer state's execution",
     );
 
-    assert_kind(&failing.close(failing_handle.generation), OutcomeKind::Closed);
+    assert_kind(
+        &failing.close(failing_handle.generation),
+        OutcomeKind::Closed,
+    );
     assert_kind(&peer.close(peer_handle.generation), OutcomeKind::Closed);
 }
 
@@ -483,14 +521,20 @@ fn success_failure_and_cancel_resumption_have_exactly_once_effects() {
     let success = success_state.resume(generation, operation, true, "payload");
     assert_kind(&success, OutcomeKind::Completed);
     assert_eq!(string_field(&success, "value"), "success:payload");
-    assert_kind(&success_state.close(success_state.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &success_state.close(success_state.handle().generation),
+        OutcomeKind::Closed,
+    );
 
     let failure_state = engine();
     let (generation, operation) = yielded_operation(&failure_state, YIELDING_COUNTER);
     let failure = failure_state.resume(generation, operation, false, "denied");
     assert_kind(&failure, OutcomeKind::Completed);
     assert_eq!(string_field(&failure, "value"), "failure:denied");
-    assert_kind(&failure_state.close(failure_state.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &failure_state.close(failure_state.handle().generation),
+        OutcomeKind::Closed,
+    );
 
     let cancelled_state = engine();
     let (generation, operation) = yielded_operation(&cancelled_state, YIELDING_COUNTER);
@@ -499,13 +543,20 @@ fn success_failure_and_cancel_resumption_have_exactly_once_effects() {
     let duplicate_cancel = cancelled_state.cancel(generation, operation);
     assert_kind(&duplicate_cancel, OutcomeKind::Cancelled);
     assert_kind(
-        &cancelled_state.load(generation, "function observe() return tostring(hits) end", "observe"),
+        &cancelled_state.load(
+            generation,
+            "function observe() return tostring(hits) end",
+            "observe",
+        ),
         OutcomeKind::Completed,
     );
     let observed = cancelled_state.start(generation);
     assert_kind(&observed, OutcomeKind::Completed);
     assert_eq!(string_field(&observed, "value"), "0");
-    assert_kind(&cancelled_state.close(cancelled_state.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &cancelled_state.close(cancelled_state.handle().generation),
+        OutcomeKind::Closed,
+    );
 }
 
 #[test]
@@ -530,7 +581,9 @@ fn cancellation_and_close_races_admit_one_terminal_result() {
     let cancellation = cancellation.join().expect("cancellation caller panicked");
     let outcomes = [completion.kind(), cancellation.kind()];
     assert!(
-        outcomes.iter().all(|kind| matches!(kind, OutcomeKind::Completed | OutcomeKind::Cancelled)),
+        outcomes
+            .iter()
+            .all(|kind| matches!(kind, OutcomeKind::Completed | OutcomeKind::Cancelled)),
         "race returned a non-terminal outcome: {outcomes:?}"
     );
     assert!(
@@ -539,12 +592,20 @@ fn cancellation_and_close_races_admit_one_terminal_result() {
     );
 
     assert_kind(
-        &state.load(generation, "function observe() return tostring(hits) end", "observe"),
+        &state.load(
+            generation,
+            "function observe() return tostring(hits) end",
+            "observe",
+        ),
         OutcomeKind::Completed,
     );
     let observed = state.start(generation);
     assert_kind(&observed, OutcomeKind::Completed);
-    let expected_hits = if outcomes[0] == OutcomeKind::Completed { "1" } else { "0" };
+    let expected_hits = if outcomes[0] == OutcomeKind::Completed {
+        "1"
+    } else {
+        "0"
+    };
     assert_eq!(string_field(&observed, "value"), expected_hits);
     assert_kind(&state.close(state.handle().generation), OutcomeKind::Closed);
 
@@ -569,7 +630,10 @@ fn cancellation_and_close_races_admit_one_terminal_result() {
     let close = close.join().expect("close caller panicked");
     assert_kind(&close, OutcomeKind::Closed);
     assert!(
-        matches!(completion.kind(), OutcomeKind::Completed | OutcomeKind::Closed | OutcomeKind::Stale),
+        matches!(
+            completion.kind(),
+            OutcomeKind::Completed | OutcomeKind::Closed | OutcomeKind::Stale
+        ),
         "completion raced with close unexpectedly: {:?}",
         completion.to_json()
     );
@@ -587,7 +651,10 @@ fn repeated_lifecycle_cycles_leave_old_handles_unusable() {
             state.cancel(generation, operation)
         };
         assert!(
-            matches!(terminal.kind(), OutcomeKind::Completed | OutcomeKind::Cancelled),
+            matches!(
+                terminal.kind(),
+                OutcomeKind::Completed | OutcomeKind::Cancelled
+            ),
             "cycle {cycle} failed terminal admission: {:?}",
             terminal.to_json()
         );
@@ -599,7 +666,10 @@ fn repeated_lifecycle_cycles_leave_old_handles_unusable() {
         );
         let handle = state.handle();
         assert_kind(&state.close(handle.generation), OutcomeKind::Closed);
-        assert_kind(&state.resume(generation, operation, true, "late"), OutcomeKind::Stale);
+        assert_kind(
+            &state.resume(generation, operation, true, "late"),
+            OutcomeKind::Stale,
+        );
     }
 }
 
@@ -616,21 +686,35 @@ fn pure_lua_interruptions_are_state_local_and_compute_still_completes() {
         let interrupted = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 1_000, 16, 16)
             .unwrap_or_else(|outcome| panic!("state creation failed: {:?}", outcome.to_json()));
         let handle = interrupted.handle();
-        assert_kind(&interrupted.load(handle.generation, workload, "main"), OutcomeKind::Completed);
+        assert_kind(
+            &interrupted.load(handle.generation, workload, "main"),
+            OutcomeKind::Completed,
+        );
         let outcome = interrupted.start(handle.generation);
         assert_kind(&outcome, OutcomeKind::Interrupted);
         assert!(
-            outcome.to_json().get("elapsedNanos").and_then(|value| value.as_u64()).is_some(),
+            outcome
+                .to_json()
+                .get("elapsedNanos")
+                .and_then(|value| value.as_u64())
+                .is_some(),
             "interruption omitted elapsed-time evidence: {:?}",
             outcome.to_json()
         );
         assert_kind(&interrupted.close(handle.generation), OutcomeKind::Closed);
 
         let unaffected = engine();
-        let healthy = load_and_start(&unaffected, "function main() return 'unaffected' end", "main");
+        let healthy = load_and_start(
+            &unaffected,
+            "function main() return 'unaffected' end",
+            "main",
+        );
         assert_kind(&healthy, OutcomeKind::Completed);
         assert_eq!(string_field(&healthy, "value"), "unaffected");
-        assert_kind(&unaffected.close(unaffected.handle().generation), OutcomeKind::Closed);
+        assert_kind(
+            &unaffected.close(unaffected.handle().generation),
+            OutcomeKind::Closed,
+        );
     }
 
     let compute = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 100_000, 16, 16)
@@ -642,7 +726,10 @@ fn pure_lua_interruptions_are_state_local_and_compute_still_completes() {
     );
     assert_kind(&computed, OutcomeKind::Completed);
     assert_eq!(string_field(&computed, "value"), "125250");
-    assert_kind(&compute.close(compute.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &compute.close(compute.handle().generation),
+        OutcomeKind::Closed,
+    );
 }
 
 #[test]
@@ -671,9 +758,16 @@ fn interrupting_a_suspended_operation_suppresses_its_later_lua_and_native_effect
     assert_kind(&interrupted.interrupt(generation), OutcomeKind::Interrupted);
 
     let survivor = engine();
-    let survivor_outcome = load_and_start(&survivor, "function main() return 'survives-suspended-interrupt' end", "main");
+    let survivor_outcome = load_and_start(
+        &survivor,
+        "function main() return 'survives-suspended-interrupt' end",
+        "main",
+    );
     assert_kind(&survivor_outcome, OutcomeKind::Completed);
-    assert_eq!(string_field(&survivor_outcome, "value"), "survives-suspended-interrupt");
+    assert_eq!(
+        string_field(&survivor_outcome, "value"),
+        "survives-suspended-interrupt"
+    );
 
     let late = interrupted.resume(generation, operation, true, "foobar");
     assert!(
@@ -682,7 +776,11 @@ fn interrupting_a_suspended_operation_suppresses_its_later_lua_and_native_effect
         late.to_json()
     );
     assert_kind(
-        &interrupted.load(generation, "function observe() return tostring(native_effects) end", "observe"),
+        &interrupted.load(
+            generation,
+            "function observe() return tostring(native_effects) end",
+            "observe",
+        ),
         OutcomeKind::Completed,
     );
     let observed = interrupted.start(generation);
@@ -692,15 +790,24 @@ fn interrupting_a_suspended_operation_suppresses_its_later_lua_and_native_effect
         "0",
         "the interrupted continuation entered Lua and produced its later effect"
     );
-    assert_kind(&interrupted.close(interrupted.handle().generation), OutcomeKind::Closed);
-    assert_kind(&survivor.close(survivor.handle().generation), OutcomeKind::Closed);
+    assert_kind(
+        &interrupted.close(interrupted.handle().generation),
+        OutcomeKind::Closed,
+    );
+    assert_kind(
+        &survivor.close(survivor.handle().generation),
+        OutcomeKind::Closed,
+    );
 }
 
 #[test]
 fn yielding_host_boundary_returns_before_external_completion() {
     let state = engine();
     let generation = state.handle().generation;
-    assert_kind(&state.load(generation, YIELDING_COUNTER, "main"), OutcomeKind::Completed);
+    assert_kind(
+        &state.load(generation, YIELDING_COUNTER, "main"),
+        OutcomeKind::Completed,
+    );
     let yielded = state.start(generation);
     assert_kind(&yielded, OutcomeKind::Yielded);
     let operation = i64_field(&yielded, "operationId");
@@ -824,21 +931,25 @@ fn allocator_denial_is_normalized_at_every_deterministic_mlua_phase() {
         "source loading denial did not record a denied allocation: {:?}",
         load_denied.to_json()
     );
-    assert_kind(&constrained.close(constrained_handle.generation), OutcomeKind::Closed);
+    assert_kind(
+        &constrained.close(constrained_handle.generation),
+        OutcomeKind::Closed,
+    );
 
     let coroutine = engine();
     let coroutine_handle = coroutine.handle();
     assert_kind(
-        &coroutine.load(coroutine_handle.generation, "function main() return 'never-created' end", "main"),
+        &coroutine.load(
+            coroutine_handle.generation,
+            "function main() return 'never-created' end",
+            "main",
+        ),
         OutcomeKind::Completed,
     );
     let coroutine_before = coroutine.snapshot(coroutine_handle.generation);
     assert_kind(&coroutine_before, OutcomeKind::Completed);
     assert_kind(
-        &coroutine.lower_memory_limit(
-            coroutine_handle.generation,
-            1,
-        ),
+        &coroutine.lower_memory_limit(coroutine_handle.generation, 1),
         OutcomeKind::Completed,
     );
     let coroutine_denied = coroutine.start(coroutine_handle.generation);
@@ -848,7 +959,10 @@ fn allocator_denial_is_normalized_at_every_deterministic_mlua_phase() {
         "coroutine creation denial did not record a denied allocation: {:?}",
         coroutine_denied.to_json()
     );
-    assert_kind(&coroutine.close(coroutine_handle.generation), OutcomeKind::Closed);
+    assert_kind(
+        &coroutine.close(coroutine_handle.generation),
+        OutcomeKind::Closed,
+    );
 
     let table_growth = engine();
     let table_handle = table_growth.handle();
@@ -890,7 +1004,10 @@ fn allocator_denial_is_normalized_at_every_deterministic_mlua_phase() {
         "table-growth denial did not record a denied allocation: {:?}",
         table_denied.to_json()
     );
-    assert_kind(&table_growth.close(table_handle.generation), OutcomeKind::Closed);
+    assert_kind(
+        &table_growth.close(table_handle.generation),
+        OutcomeKind::Closed,
+    );
 
     let error_formatting = engine();
     let error_handle = error_formatting.handle();
@@ -930,7 +1047,10 @@ fn allocator_denial_is_normalized_at_every_deterministic_mlua_phase() {
         "error-formatting denial did not record a denied allocation: {:?}",
         formatting_denied.to_json()
     );
-    assert_kind(&error_formatting.close(error_handle.generation), OutcomeKind::Closed);
+    assert_kind(
+        &error_formatting.close(error_handle.generation),
+        OutcomeKind::Closed,
+    );
 
     let peer_after = peer.snapshot(peer_handle.generation);
     assert_kind(&peer_after, OutcomeKind::Completed);
@@ -975,13 +1095,19 @@ fn concurrent_callers_serialize_without_double_execution() {
     let second = second.join().expect("second caller panicked");
     let outcomes = [first, second];
     assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.kind() == OutcomeKind::Completed).count(),
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.kind() == OutcomeKind::Completed)
+            .count(),
         1,
         "concurrent callers entered one Lua state more than once: {:?}",
         outcomes.iter().map(Outcome::to_json).collect::<Vec<_>>()
     );
     assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.kind() == OutcomeKind::ValidationFailure).count(),
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.kind() == OutcomeKind::ValidationFailure)
+            .count(),
         1,
         "serialized second start was not rejected after terminal completion: {:?}",
         outcomes.iter().map(Outcome::to_json).collect::<Vec<_>>()
@@ -1002,7 +1128,7 @@ fn concurrent_callers_serialize_without_double_execution() {
 #[cfg(feature = "registry-test")]
 fn stale_close_does_not_tombstone_live_engine() {
     use subspace_lua_actor::registry_test;
- 
+
     // A close with a stale generation must NOT tombstone the live engine.
     let state = engine();
     let handle = state.handle();
@@ -1015,7 +1141,9 @@ fn stale_close_does_not_tombstone_live_engine() {
     // The live engine must be untouched.
     assert_eq!(
         registry_test::entry(handle.state_id),
-        registry_test::Entry::Live { generation: handle.generation }
+        registry_test::Entry::Live {
+            generation: handle.generation
+        }
     );
 
     // The same engine is still usable through the registry.
@@ -1029,14 +1157,16 @@ fn stale_close_does_not_tombstone_live_engine() {
     assert_kind(&closed, OutcomeKind::Closed);
     assert_eq!(
         registry_test::entry(handle.state_id),
-        registry_test::Entry::Tombstone { closed_generation: handle.generation }
+        registry_test::Entry::Tombstone {
+            closed_generation: handle.generation
+        }
     );
     // A stale close on a tombstone always returns Closed (idempotent).
     let late_stale = registry_test::close(handle.state_id, stale_gen);
     assert_kind(&late_stale, OutcomeKind::Closed);
 
     registry_test::remove(handle.state_id);
- }
+}
 
 #[test]
 #[cfg(feature = "registry-test")]
@@ -1047,7 +1177,10 @@ fn unknown_close_does_not_create_or_mutate_registry_entry() {
     let unknown_id = 99999;
     let outcome = registry_test::close(unknown_id, 1);
     assert_kind(&outcome, OutcomeKind::InvalidOwnership);
-    assert_eq!(registry_test::entry(unknown_id), registry_test::Entry::Missing);
+    assert_eq!(
+        registry_test::entry(unknown_id),
+        registry_test::Entry::Missing
+    );
 
     // A totally separate state must still register and dispatch fine (the
     // unknown id does not "block" or poison the registry).
@@ -1055,7 +1188,11 @@ fn unknown_close_does_not_create_or_mutate_registry_entry() {
     let fresh_handle = fresh.handle();
     registry_test::register(fresh.clone());
     let load = registry_test::dispatch(fresh_handle.state_id, fresh_handle.generation, |e| {
-        e.load(fresh_handle.generation, "function main() return 'fresh' end", "main")
+        e.load(
+            fresh_handle.generation,
+            "function main() return 'fresh' end",
+            "main",
+        )
     });
     assert_kind(&load, OutcomeKind::Completed);
     let start = registry_test::dispatch(fresh_handle.state_id, fresh_handle.generation, |e| {
@@ -1066,90 +1203,93 @@ fn unknown_close_does_not_create_or_mutate_registry_entry() {
 
     registry_test::remove(fresh_handle.state_id);
 }
- 
- #[test]
- #[cfg(feature = "registry-test")]
- fn cross_state_dispatch_not_serialized_by_global_registry() {
-     use subspace_lua_actor::registry_test;
- 
-     // Two states executing concurrently through the registry. The split-lock
-     // guarantee: the global registry mutex is never held across Lua, so an
-     // unrelated state's dispatch is NOT serialized behind a long-running one.
-     //
-     // This test proves the split-lock deterministically: the long state enters
-     // the dispatch closure (where the registry lock would be held under old
-     // code) while main thread probes registry_lock_available_for_test(). With
-     // the split-lock fix, the lock is free inside the closure, returning true.
-     // Old global-lock code holds it across the closure, returning false.
-     let long_state = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 5_000, 16, 16)
-         .unwrap_or_else(|outcome| panic!("long state creation failed: {:?}", outcome.to_json()));
-     let quick_state = engine();
- 
-     let long_handle = long_state.handle();
-     let quick_handle = quick_state.handle();
-     registry_test::register(long_state.clone());
-     registry_test::register(quick_state.clone());
- 
-     // Pre-load both states.
-     assert_kind(
-         &long_state.load(long_handle.generation, "function main() while true do end end", "main"),
-         OutcomeKind::Completed,
-     );
-     assert_kind(
-         &quick_state.load(
-             quick_handle.generation,
-             "function main() return 'quick' end",
-             "main",
-         ),
-         OutcomeKind::Completed,
-     );
- 
-     let about_to_run = Arc::new(Barrier::new(2));
-     let long_proceed = Arc::new(Barrier::new(2));
-     let long_sid = long_handle.state_id;
-     let long_gen = long_handle.generation;
-     let about_to_run_clone = Arc::clone(&about_to_run);
-     let long_proceed_clone = Arc::clone(&long_proceed);
-     let long = thread::spawn(move || {
-         let outcome = registry_test::dispatch(long_sid, long_gen, |e| {
-             // Inside closure: split-lock releases registry before calling f;
-             // old global-lock holds it across f.
-             about_to_run_clone.wait();
-             long_proceed_clone.wait();
-             e.start(long_gen)
-         });
-         outcome
-     });
- 
-     // Wait for long to enter the dispatch closure.
-     about_to_run.wait();
- 
-     // Deterministic proof: registry lock is NOT held inside the dispatch closure.
-     // With split-lock: released before f → try_lock succeeds.
-     // With old global-lock: held across f → try_lock fails.
-     assert!(
-         registry_test::registry_lock_available_for_test(),
-         "registry lock held inside dispatch closure — global-lock regression"
-     );
- 
-     // Release long to start Lua execution.
-     long_proceed.wait();
- 
-     // Dispatch quick: completes independently because registry is not serialized.
-     let quick_outcome = registry_test::dispatch(
-         quick_handle.state_id,
-         quick_handle.generation,
-         |e| e.start(quick_handle.generation),
-     );
-     assert_kind(&quick_outcome, OutcomeKind::Completed);
-     assert_eq!(string_field(&quick_outcome, "value"), "quick");
- 
-     let long_outcome = long.join().expect("long-state thread panicked");
-     assert_kind(&long_outcome, OutcomeKind::Interrupted);
- 
-     registry_test::remove(long_handle.state_id);
-     registry_test::remove(quick_handle.state_id);
- }
+
+#[test]
+#[cfg(feature = "registry-test")]
+fn cross_state_dispatch_not_serialized_by_global_registry() {
+    use subspace_lua_actor::registry_test;
+
+    // Two states executing concurrently through the registry. The split-lock
+    // guarantee: the global registry mutex is never held across Lua, so an
+    // unrelated state's dispatch is NOT serialized behind a long-running one.
+    //
+    // This test proves the split-lock deterministically: the long state enters
+    // the dispatch closure (where the registry lock would be held under old
+    // code) while main thread probes registry_lock_available_for_test(). With
+    // the split-lock fix, the lock is free inside the closure, returning true.
+    // Old global-lock code holds it across the closure, returning false.
+    let long_state = StateEngine::new(MEMORY_LIMIT, HOOK_INTERVAL, 5_000, 16, 16)
+        .unwrap_or_else(|outcome| panic!("long state creation failed: {:?}", outcome.to_json()));
+    let quick_state = engine();
+
+    let long_handle = long_state.handle();
+    let quick_handle = quick_state.handle();
+    registry_test::register(long_state.clone());
+    registry_test::register(quick_state.clone());
+
+    // Pre-load both states.
+    assert_kind(
+        &long_state.load(
+            long_handle.generation,
+            "function main() while true do end end",
+            "main",
+        ),
+        OutcomeKind::Completed,
+    );
+    assert_kind(
+        &quick_state.load(
+            quick_handle.generation,
+            "function main() return 'quick' end",
+            "main",
+        ),
+        OutcomeKind::Completed,
+    );
+
+    let about_to_run = Arc::new(Barrier::new(2));
+    let long_proceed = Arc::new(Barrier::new(2));
+    let long_sid = long_handle.state_id;
+    let long_gen = long_handle.generation;
+    let about_to_run_clone = Arc::clone(&about_to_run);
+    let long_proceed_clone = Arc::clone(&long_proceed);
+    let long = thread::spawn(move || {
+        let outcome = registry_test::dispatch(long_sid, long_gen, |e| {
+            // Inside closure: split-lock releases registry before calling f;
+            // old global-lock holds it across f.
+            about_to_run_clone.wait();
+            long_proceed_clone.wait();
+            e.start(long_gen)
+        });
+        outcome
+    });
+
+    // Wait for long to enter the dispatch closure.
+    about_to_run.wait();
+
+    // Deterministic proof: registry lock is NOT held inside the dispatch closure.
+    // With split-lock: released before f → try_lock succeeds.
+    // With old global-lock: held across f → try_lock fails.
+    assert!(
+        registry_test::registry_lock_available_for_test(),
+        "registry lock held inside dispatch closure — global-lock regression"
+    );
+
+    // Release long to start Lua execution.
+    long_proceed.wait();
+
+    // Dispatch quick: completes independently because registry is not serialized.
+    let quick_outcome =
+        registry_test::dispatch(quick_handle.state_id, quick_handle.generation, |e| {
+            e.start(quick_handle.generation)
+        });
+    assert_kind(&quick_outcome, OutcomeKind::Completed);
+    assert_eq!(string_field(&quick_outcome, "value"), "quick");
+
+    let long_outcome = long.join().expect("long-state thread panicked");
+    assert_kind(&long_outcome, OutcomeKind::Interrupted);
+
+    registry_test::remove(long_handle.state_id);
+    registry_test::remove(quick_handle.state_id);
+}
 
 #[test]
 fn source_only_lua_cannot_use_base_load_for_constructed_bytecode() {
@@ -1277,7 +1417,9 @@ fn bounded_tombstone_history_evicts_oldest_and_allows_new_ids() {
     let newest_gen = generations[bound];
     assert_eq!(
         registry_test::entry(newest_id),
-        registry_test::Entry::Tombstone { closed_generation: newest_gen }
+        registry_test::Entry::Tombstone {
+            closed_generation: newest_gen
+        }
     );
 
     let final_tomb_count = registry_test::tombstone_count();
@@ -1305,7 +1447,10 @@ fn bounded_tombstone_history_evicts_oldest_and_allows_new_ids() {
     let matching = registry_test::dispatch(recent_id, recent_gen, |_| {
         panic!("dispatch must not call closure for closed state")
     });
-    assert!(matches!(matching.kind(), OutcomeKind::Closed | OutcomeKind::Stale));
+    assert!(matches!(
+        matching.kind(),
+        OutcomeKind::Closed | OutcomeKind::Stale
+    ));
 
     // A fresh state_id (brand new engine) registers and dispatches fine,
     // confirming eviction does not block new state IDs.
@@ -1317,9 +1462,7 @@ fn bounded_tombstone_history_evicts_oldest_and_allows_new_ids() {
         e.load(fresh_gen, "function main() return 'fresh' end", "main")
     });
     assert_kind(&load, OutcomeKind::Completed);
-    let start = registry_test::dispatch(fresh_id, fresh_gen, |e| {
-        e.start(fresh_gen)
-    });
+    let start = registry_test::dispatch(fresh_id, fresh_gen, |e| e.start(fresh_gen));
     assert_kind(&start, OutcomeKind::Completed);
     assert_eq!(string_field(&start, "value"), "fresh");
 
@@ -1399,7 +1542,10 @@ fn concurrent_interrupt_resume_is_linearizable_per_state() {
     let resumed = state.resume(generation, op1, true, "first-resume");
     assert_kind(&resumed, OutcomeKind::Yielded);
     let op2 = i64_field(&resumed, "operationId");
-    assert_ne!(op2, op1, "resume did not replace op1 with a fresh operation");
+    assert_ne!(
+        op2, op1,
+        "resume did not replace op1 with a fresh operation"
+    );
 
     release.wait();
     let interrupted = interrupt.join().expect("interrupt thread panicked");
@@ -1420,7 +1566,11 @@ fn concurrent_interrupt_resume_is_linearizable_per_state() {
         "success:first-resume:second-resume"
     );
     assert_kind(
-        &state.load(generation, "function observe() return tostring(hits) end", "observe"),
+        &state.load(
+            generation,
+            "function observe() return tostring(hits) end",
+            "observe",
+        ),
         OutcomeKind::Completed,
     );
     assert_eq!(string_field(&state.start(generation), "value"), "2");
@@ -1433,8 +1583,6 @@ fn concurrent_interrupt_resume_is_linearizable_per_state() {
     assert_kind(&state.close(state.handle().generation), OutcomeKind::Closed);
     assert_kind(&peer.close(peer.handle().generation), OutcomeKind::Closed);
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Plugin coroutine boundary
@@ -1476,7 +1624,11 @@ fn plugin_cannot_create_or_resume_an_unhooked_infinite_child_coroutine() {
     // Rejection is isolated to the attempted child API: the same state can
     // subsequently execute a normal host-owned entry coroutine.
     assert_kind(
-        &state.load(generation, "function healthy() return 'same-state-usable' end", "healthy"),
+        &state.load(
+            generation,
+            "function healthy() return 'same-state-usable' end",
+            "healthy",
+        ),
         OutcomeKind::Completed,
     );
     let healthy = state.start(generation);
@@ -1499,7 +1651,10 @@ fn terminal_operation_outcomes_are_bounded_and_evictions_remain_typed() {
     let state = engine();
     let generation = state.handle().generation;
     let capacity = StateEngine::terminal_operation_cache_capacity();
-    assert!(capacity > 0, "terminal outcome cache capacity must be nonzero");
+    assert!(
+        capacity > 0,
+        "terminal outcome cache capacity must be nonzero"
+    );
     let operation_count = capacity + 1;
     let source = format!(
         r#"
@@ -1513,7 +1668,10 @@ fn terminal_operation_outcomes_are_bounded_and_evictions_remain_typed() {
         end
         "#
     );
-    assert_kind(&state.load(generation, &source, "main"), OutcomeKind::Completed);
+    assert_kind(
+        &state.load(generation, &source, "main"),
+        OutcomeKind::Completed,
+    );
 
     let first = state.start(generation);
     assert_kind(&first, OutcomeKind::Yielded);
@@ -1569,7 +1727,11 @@ fn terminal_operation_outcomes_are_bounded_and_evictions_remain_typed() {
     // Both the exercised state and an independent peer remain usable after
     // eviction handling.
     assert_kind(
-        &state.load(generation, "function healthy() return 'state-usable' end", "healthy"),
+        &state.load(
+            generation,
+            "function healthy() return 'state-usable' end",
+            "healthy",
+        ),
         OutcomeKind::Completed,
     );
     let healthy = state.start(generation);

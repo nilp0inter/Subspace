@@ -305,6 +305,21 @@ class CarMediaSessionService : MediaBrowserService() {
             }
         }
 
+        override fun onPlayFromSearch(query: String?, extras: Bundle?) {
+            if (query.isNullOrBlank()) {
+                onPlay()
+                return
+            }
+            val entry = latestBrowseEntries.firstOrNull {
+                it.name.contains(query, ignoreCase = true)
+            }
+            if (entry != null) {
+                CarPttCommandBus.setActiveChannel(entry.id)
+            } else {
+                rejectPlayback(null)
+            }
+        }
+
         override fun onSkipToNext() {
             dispatchSkip(next = true)
         }

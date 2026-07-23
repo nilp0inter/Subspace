@@ -504,7 +504,12 @@ class LuaProviderRegistryIntegrationTest {
                     "values" to LuaValue.Map(emptyMap()),
                 ))),
                 CallbackCall("handle_lifecycle", LuaValue.Map(mapOf("event" to LuaValue.StringValue("ready")))),
-                CallbackCall("handle_readiness", LuaValue.Map(mapOf("capabilities" to LuaValue.Map(emptyMap())))),
+                CallbackCall("handle_readiness", LuaValue.Map(mapOf(
+                    "capabilities" to LuaValue.Map(emptyMap()),
+                    "resources" to LuaValue.Map(
+                        mapOf("mounts" to LuaValue.Map(emptyMap())),
+                    ),
+                ))),
                 CallbackCall("handle_sos", LuaValue.Map(mapOf("event" to LuaValue.StringValue("sos")))),
             ),
             bridge.callbackCalls.map { CallbackCall(it.name, it.arguments) },
@@ -810,6 +815,10 @@ class LuaProviderRegistryIntegrationTest {
             return LuaKernelOutcome.Created(id, id, LUA_VERSION, API_VERSION, "recording")
         }
 
+        override fun setResourceContext(
+            handle: LuaStateHandle,
+            resourceContextJson: String,
+        ): LuaKernelOutcome = completed(handle)
         override fun load(handle: LuaStateHandle, source: String, entrypoint: String): LuaKernelOutcome = completed(handle)
 
         override fun start(handle: LuaStateHandle): LuaKernelOutcome = completed(handle)
