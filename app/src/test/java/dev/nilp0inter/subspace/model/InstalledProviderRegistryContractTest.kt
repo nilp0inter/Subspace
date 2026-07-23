@@ -19,6 +19,7 @@ import dev.nilp0inter.subspace.dependency.PackageManifest
 import dev.nilp0inter.subspace.dependency.PackageCapability
 import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
 import dev.nilp0inter.subspace.dependency.PackagePresentation
+import dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration
 import dev.nilp0inter.subspace.dependency.PackageSourceRecord
 import dev.nilp0inter.subspace.dependency.PackageConfigurationLimits
 import dev.nilp0inter.subspace.dependency.RuntimeRequirements
@@ -182,6 +183,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Test package", "Non-empty configuration test"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = setOf(
                     PackageCapability.AUDIO_TRANSCRIPTION,
                     PackageCapability.AUDIO_SYNTHESIS,
@@ -294,6 +296,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Empty config package", "Empty configuration test"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),
@@ -370,19 +373,41 @@ class InstalledProviderRegistryContractTest {
     }
 
     @Test
-    fun `all three public capabilities compile to exactly four internal requirements`() {
+    fun `storage dot files compiles to exactly StorageFiles`() {
+        val caps = materializeCapabilities(setOf(PackageCapability.STORAGE_FILES))
+        assertEquals(
+            "storage.files must compile to exactly {StorageFiles}",
+            setOf(ChannelCapability.StorageFiles),
+            caps,
+        )
+    }
+
+    @Test
+    fun `audio dot files compiles to exactly AudioFiles`() {
+        val caps = materializeCapabilities(setOf(PackageCapability.AUDIO_FILES))
+        assertEquals(
+            "audio.files must compile to exactly {AudioFiles}",
+            setOf(ChannelCapability.AudioFiles),
+            caps,
+        )
+    }
+
+    @Test
+    fun `all five public capabilities compile to exactly six internal requirements`() {
         val caps = materializeCapabilities(PackageCapability.ALL)
         assertEquals(
-            "all three public IDs must compile to exactly {Transcription, Synthesis, AudioOperation, DeferredAudioPlayback}",
+            "all five public IDs must compile to exactly {Transcription, Synthesis, AudioOperation, DeferredAudioPlayback, StorageFiles, AudioFiles}",
             setOf(
                 ChannelCapability.Transcription,
                 ChannelCapability.Synthesis,
                 ChannelCapability.AudioOperation,
                 ChannelCapability.DeferredAudioPlayback,
+                ChannelCapability.StorageFiles,
+                ChannelCapability.AudioFiles,
             ),
             caps,
         )
-        assertEquals("all-three must produce exactly 4 internal requirements", 4, caps.size)
+        assertEquals("all-five must produce exactly 6 internal requirements", 6, caps.size)
     }
 
     @Test
@@ -400,6 +425,7 @@ class InstalledProviderRegistryContractTest {
                     ConfigurationDataDeclaration(emptyList()),
                     ConfigurationUiDeclaration(emptyList()),
                 ),
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = setOf("audio.transcription", "audio.unknown"),
             )
         }
@@ -418,8 +444,8 @@ class InstalledProviderRegistryContractTest {
         val caps = materializeCapabilities(PackageCapability.ALL)
         val serializedStableIds = caps.map { it.stableId }.toSet()
         assertEquals(
-            "serialized stableId set must be exactly the four internal stable IDs",
-            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback"),
+            "serialized stableId set must be exactly the six internal stable IDs",
+            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files"),
             serializedStableIds,
         )
         val serializedBlob = caps.joinToString(",", prefix = "[", postfix = "]") { it.stableId }
@@ -441,6 +467,8 @@ class InstalledProviderRegistryContractTest {
             PackageCapability.AUDIO_TRANSCRIPTION,
             PackageCapability.AUDIO_SYNTHESIS,
             PackageCapability.AUDIO_PLAYBACK,
+            PackageCapability.STORAGE_FILES,
+            PackageCapability.AUDIO_FILES,
         )
         publicIds.forEach { publicId ->
             assertFalse(
@@ -469,6 +497,7 @@ class InstalledProviderRegistryContractTest {
                     ConfigurationDataDeclaration(emptyList()),
                     ConfigurationUiDeclaration(emptyList()),
                 ),
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = PackageCapability.ALL,
             ),
             sourceRecord = sourceRecord(identity),
@@ -480,10 +509,10 @@ class InstalledProviderRegistryContractTest {
         val descriptor = binding.provider.descriptor
         val requiredCaps = descriptor.requiredCapabilities
 
-        assertEquals(4, requiredCaps.size)
+        assertEquals(6, requiredCaps.size)
         val stableIds = requiredCaps.map { it.stableId }.toSet()
         assertEquals(
-            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback"),
+            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files"),
             stableIds,
         )
 
@@ -529,6 +558,7 @@ class InstalledProviderRegistryContractTest {
                     ConfigurationDataDeclaration(emptyList()),
                     ConfigurationUiDeclaration(emptyList()),
                 ),
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = publicCapabilities,
             ),
             sourceRecord = sourceRecord(identity),
@@ -574,6 +604,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Order test", "UI order preservation"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),
@@ -622,6 +653,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Help test", "Help text compilation"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),
@@ -682,6 +714,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Choice test", "Choice value/label mapping"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),
@@ -1032,6 +1065,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Validation test", "Payload validation"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),
@@ -1231,6 +1265,7 @@ class InstalledProviderRegistryContractTest {
                 presentation = PackagePresentation("Coherence test", "Full agreement check"),
                 runtime = RuntimeRequirements(LUA_VERSION, API_VERSION),
                 configuration = declaration,
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = setOf(PackageCapability.AUDIO_PLAYBACK),
             ),
             sourceRecord = sourceRecord(identity),
@@ -1368,6 +1403,7 @@ class InstalledProviderRegistryContractTest {
                     ConfigurationDataDeclaration(emptyList()),
                     ConfigurationUiDeclaration(emptyList())
                 ),
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = emptySet(),
             ),
             sourceRecord = sourceRecord(identity),

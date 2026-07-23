@@ -57,7 +57,7 @@ class PackageValidatorContractTest {
             ManifestCase("duplicate key", base.replace("\"repositoryId\":\"123\"", "\"repositoryId\":\"123\",\"repositoryId\":\"123\""), PackageFailure.FormatDetail.DUPLICATE_KEYS),
             ManifestCase("mistyped manifest version", base.replace("\"manifestVersion\":1", "\"manifestVersion\":\"1\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("mistyped repository identity", base.replace("\"repositoryId\":\"123\"", "\"repositoryId\":123"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
-            ManifestCase("mistyped presentation", "{\"manifestVersion\":1,\"repositoryId\":\"123\",\"packageVersion\":\"1.0.0\",\"entryModule\":\"main\",\"presentation\":[],\"runtime\":{\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\":\"$API_VERSION\"},\"configuration\":{\"data\":{\"fields\":[]},\"ui\":{\"fields\":[]}},\"capabilities\":[]}", PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped presentation", "{\"manifestVersion\":1,\"repositoryId\":\"123\",\"packageVersion\":\"1.0.0\",\"entryModule\":\"main\",\"presentation\":[],\"runtime\":{\"luaVersion\":\"$LUA_VERSION\",\"apiVersion\":\"$API_VERSION\"},\"configuration\":{\"data\":{\"fields\":[]},\"ui\":{\"fields\":[]}},\"resources\":{\"mounts\":[]},\"capabilities\":[]}", PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank package version", base.replace("\"packageVersion\":\"1.0.0\"", "\"packageVersion\":\" \\t\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank label", base.replace("\"label\":\"Package\"", "\"label\":\"\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
             ManifestCase("blank summary", base.replace("\"summary\":\"Package summary\"", "\"summary\":\" \\n\""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
@@ -285,6 +285,7 @@ class PackageValidatorContractTest {
         packageVersion: String = "1.0.0",
         entryModule: String = "main",
         configuration: String = """{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}}""",
+        resources: String = """{"mounts":[]}""",
         capabilities: String = "[]",
         injectAdditionalProperties: Boolean = true,
     ): String {
@@ -292,7 +293,7 @@ class PackageValidatorContractTest {
         if (injectAdditionalProperties && resolvedConfig.contains("\"data\":{") && !resolvedConfig.contains("\"additionalProperties\"")) {
             resolvedConfig = resolvedConfig.replace("\"data\":{", "\"data\":{\"additionalProperties\":false,")
         }
-        return """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$packageVersion","entryModule":"$entryModule","presentation":{"label":"Package","summary":"Package summary"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":$resolvedConfig,"capabilities":$capabilities}"""
+        return """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$packageVersion","entryModule":"$entryModule","presentation":{"label":"Package","summary":"Package summary"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":$resolvedConfig,"resources":$resources,"capabilities":$capabilities}"""
     }
 
     private fun archiveBytes(
@@ -521,9 +522,11 @@ class PackageValidatorContractTest {
         assertEquals("audio.transcription", PackageCapability.AUDIO_TRANSCRIPTION)
         assertEquals("audio.synthesis", PackageCapability.AUDIO_SYNTHESIS)
         assertEquals("audio.playback", PackageCapability.AUDIO_PLAYBACK)
+        assertEquals("storage.files", PackageCapability.STORAGE_FILES)
+        assertEquals("audio.files", PackageCapability.AUDIO_FILES)
 
         assertEquals(
-            setOf("audio.transcription", "audio.synthesis", "audio.playback"),
+            setOf("audio.transcription", "audio.synthesis", "audio.playback", "storage.files", "audio.files"),
             PackageCapability.ALL
         )
 
@@ -932,6 +935,7 @@ class PackageValidatorContractTest {
             presentation = PackagePresentation("Label", "Summary"),
             runtime = RuntimeRequirements("lua-test", "api-test"),
             configuration = config,
+            resources = PackageResourcesDeclaration(emptyList()),
             capabilities = capabilities
         )
 
@@ -1298,6 +1302,51 @@ class PackageValidatorContractTest {
             PackageFailure.FormatDetail.MALFORMED_MANIFEST,
             "old artifact without configuration and capabilities",
         )
+    }
+
+    @Test
+    fun `resources declaration is required strictly validated and retained`() = withTemporaryDirectory { root ->
+        // Empty mounts array is valid and retained.
+        val emptyRevision = expectSuccess(validate(root, archiveBytes(manifest = manifest()), sourceRecord()))
+        assertTrue("empty mounts should be retained", emptyRevision.manifest.resources.mounts.isEmpty())
+
+        // A single canonical directory-tree mount is retained exactly.
+        val mountedJson = manifest(
+            resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":"Output","help":"Where recordings are written"}]}"""
+        )
+        val mountedRevision = expectSuccess(validate(root, archiveBytes(manifest = mountedJson), sourceRecord()))
+        assertEquals(1, mountedRevision.manifest.resources.mounts.size)
+        val mount = mountedRevision.manifest.resources.mounts.single()
+        assertEquals("output", mount.id)
+        assertEquals(PackageMountKind.DIRECTORY_TREE, mount.kind)
+        assertEquals(PackageMountAccess.READ_WRITE, mount.access)
+        assertTrue("v1 mounts must be required", mount.required)
+        assertEquals("Output", mount.label)
+        assertEquals("Where recordings are written", mount.help)
+
+        val validMount = """{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":"Output"}"""
+        val resourceCases = listOf(
+            ManifestCase("omitted resources", manifest().replace(",\"resources\":{\"mounts\":[]}", ""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown resources key", manifest(resources = """{"mounts":[],"extra":1}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("mistyped resources", manifest(resources = "[]"), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("mistyped mounts", manifest(resources = """{"mounts":{}}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unknown mount key", manifest(resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":"Output","extra":1}]}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("missing mount label", manifest(resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":true}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unsupported mount kind", manifest(resources = """{"mounts":[{"id":"output","kind":"file","access":"read-write","required":true,"label":"Output"}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("unsupported mount access", manifest(resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-only","required":true,"label":"Output"}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("optional mount rejected", manifest(resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":false,"label":"Output"}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("non-canonical mount id", manifest(resources = """{"mounts":[{"id":"Output-Dir","kind":"directory-tree","access":"read-write","required":true,"label":"Output"}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("blank mount label", manifest(resources = """{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":" "}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("duplicate mount id", manifest(resources = """{"mounts":[$validMount,{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":"Second"}]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+
+        resourceCases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = case.json), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name
+            )
+        }
     }
 
     @Test

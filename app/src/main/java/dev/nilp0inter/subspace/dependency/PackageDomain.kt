@@ -241,6 +241,7 @@ public data class PackageManifest(
     val presentation: PackagePresentation,
     val runtime: RuntimeRequirements,
     val configuration: PackageConfigurationDeclaration,
+    val resources: PackageResourcesDeclaration,
     val capabilities: Set<String>
 ) {
     init {
@@ -549,15 +550,118 @@ public object PackageConfigurationLimits {
 }
 
 /**
+ * Finite manifest-v1 resource declaration limits.
+ */
+public object PackageResourceLimits {
+    public const val MAX_MOUNTS: Int = 8
+    public const val MAX_MOUNT_ID_BYTES: Int = 64
+    public const val MAX_LABEL_BYTES: Int = 128
+    public const val MAX_HELP_BYTES: Int = 512
+}
+
+/**
+ * Portable resource kinds accepted by manifest v1.
+ */
+public enum class PackageMountKind(public val value: String) {
+    DIRECTORY_TREE("directory-tree")
+}
+
+/**
+ * Portable mount access modes accepted by manifest v1.
+ */
+public enum class PackageMountAccess(public val value: String) {
+    READ_WRITE("read-write")
+}
+
+/**
+ * One immutable package-declared mount.
+ */
+public data class PackageMountDeclaration(
+    val id: String,
+    val kind: PackageMountKind,
+    val access: PackageMountAccess,
+    val required: Boolean,
+    val label: String,
+    val help: String?
+) {
+    init {
+        require(id.matches(FIELD_ID_REGEX)) {
+            "Mount ID does not match pattern ^[a-z][a-z0-9_]*$: $id"
+        }
+        require(
+            id.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <=
+                PackageResourceLimits.MAX_MOUNT_ID_BYTES
+        ) {
+            "Mount ID exceeds ${PackageResourceLimits.MAX_MOUNT_ID_BYTES} bytes: $id"
+        }
+        require(required) { "Manifest v1 mounts must be required" }
+        require(label.isNotBlank()) { "Mount label must not be blank" }
+        require(
+            label.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <=
+                PackageResourceLimits.MAX_LABEL_BYTES
+        ) {
+            "Mount label exceeds ${PackageResourceLimits.MAX_LABEL_BYTES} bytes"
+        }
+        if (help != null) {
+            require(help.isNotBlank()) { "Mount help must not be blank" }
+            require(
+                help.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <=
+                    PackageResourceLimits.MAX_HELP_BYTES
+            ) {
+                "Mount help exceeds ${PackageResourceLimits.MAX_HELP_BYTES} bytes"
+            }
+        }
+    }
+}
+
+/**
+ * Exact immutable `resources` declaration from manifest v1.
+ */
+public class PackageResourcesDeclaration(mounts: List<PackageMountDeclaration>) {
+    public val mounts: List<PackageMountDeclaration> =
+        Collections.unmodifiableList(ArrayList(mounts))
+
+    init {
+        require(this.mounts.size <= PackageResourceLimits.MAX_MOUNTS) {
+            "Mount count exceeds ${PackageResourceLimits.MAX_MOUNTS}: ${this.mounts.size}"
+        }
+        val ids = HashSet<String>(this.mounts.size)
+        for (mount in this.mounts) {
+            require(ids.add(mount.id)) { "Duplicate mount ID: ${mount.id}" }
+        }
+    }
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PackageResourcesDeclaration) return false
+        return mounts == other.mounts
+    }
+
+    override fun hashCode(): Int = mounts.hashCode()
+
+    override fun toString(): String = "PackageResourcesDeclaration(mounts=$mounts)"
+}
+
+/**
  * 1.1: Stable public capability identifiers.
  */
 public object PackageCapability {
     public const val AUDIO_TRANSCRIPTION: String = "audio.transcription"
     public const val AUDIO_SYNTHESIS: String = "audio.synthesis"
     public const val AUDIO_PLAYBACK: String = "audio.playback"
+    public const val STORAGE_FILES: String = "storage.files"
+    public const val AUDIO_FILES: String = "audio.files"
 
     public val ALL: Set<String> = Collections.unmodifiableSet(
-        LinkedHashSet(listOf(AUDIO_TRANSCRIPTION, AUDIO_SYNTHESIS, AUDIO_PLAYBACK))
+        LinkedHashSet(
+            listOf(
+                AUDIO_TRANSCRIPTION,
+                AUDIO_SYNTHESIS,
+                AUDIO_PLAYBACK,
+                STORAGE_FILES,
+                AUDIO_FILES,
+            )
+        )
     )
 }
 

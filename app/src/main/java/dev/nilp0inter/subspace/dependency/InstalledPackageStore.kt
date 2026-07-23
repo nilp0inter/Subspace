@@ -142,6 +142,7 @@ internal object StrictIndexCodec {
         val evolvedFields = if (trust == CachedManifestTrust.EVOLVED_VERIFIED) {
             """,
   "configuration": ${encodeConfiguration(manifest.configuration).replace("\n", "\n  ")},
+  "resources": ${encodeResources(manifest.resources).replace("\n", "\n  ")},
   "capabilities": ${encodeCapabilities(manifest.capabilities)}"""
         } else {
             ""
@@ -269,6 +270,33 @@ internal object StrictIndexCodec {
         return sb.toString()
     }
 
+
+    private fun encodeResources(resources: PackageResourcesDeclaration): String {
+        val sb = StringBuilder()
+        sb.append("{\n")
+        sb.append("  \"mounts\": [")
+        if (resources.mounts.isNotEmpty()) {
+            sb.append("\n")
+            for ((idx, mount) in resources.mounts.withIndex()) {
+                sb.append("    {\n")
+                sb.append("      \"id\": ").append(encodeJsonString(mount.id)).append(",\n")
+                sb.append("      \"kind\": ").append(encodeJsonString(mount.kind.value)).append(",\n")
+                sb.append("      \"access\": ").append(encodeJsonString(mount.access.value)).append(",\n")
+                sb.append("      \"required\": ").append(mount.required).append(",\n")
+                sb.append("      \"label\": ").append(encodeJsonString(mount.label))
+                if (mount.help != null) {
+                    sb.append(",\n      \"help\": ").append(encodeJsonString(mount.help))
+                }
+                sb.append("\n    }")
+                if (idx < resources.mounts.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("  ")
+        }
+        sb.append("]\n")
+        sb.append("}")
+        return sb.toString()
+    }
     private fun encodeSourceRecord(source: PackageSourceRecord): String {
         return """{
   "repositoryId": ${encodeJsonString(source.repositoryId.value)},
@@ -384,7 +412,7 @@ internal object StrictIndexCodec {
     )
 
     private fun decodeManifest(map: Map<String, Any?>, expectedRepoId: GitHubRepositoryIdentity): DecodedManifest {
-        validateNoUnknownKeys(map, setOf("manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "capabilities"))
+        validateNoUnknownKeys(map, setOf("manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "resources", "capabilities"))
 
         val manifestVersion = requireNonNullKey(map, "manifestVersion").asInt()
         val repositoryIdStr = requireNonNullKey(map, "repositoryId").asString()
@@ -410,14 +438,16 @@ internal object StrictIndexCodec {
 
         val hasConfiguration = map.containsKey("configuration")
         val hasCapabilities = map.containsKey("capabilities")
-        val legacyCarrier = !hasConfiguration && !hasCapabilities
-        if (hasConfiguration != hasCapabilities) {
+        val hasResources = map.containsKey("resources")
+        val legacyCarrier = !hasConfiguration && !hasCapabilities && !hasResources
+        if (hasConfiguration != hasCapabilities || hasConfiguration != hasResources) {
             throw IllegalArgumentException(
-                "configuration and capabilities must be present together or both absent for the pre-cutover carrier"
+                "configuration, resources, and capabilities must be present together or all absent for the pre-cutover carrier"
             )
         }
 
         val configuration: PackageConfigurationDeclaration
+        val resources: PackageResourcesDeclaration
         val capabilities: Set<String>
         val trust: CachedManifestTrust
         if (legacyCarrier) {
@@ -428,6 +458,7 @@ internal object StrictIndexCodec {
                 ConfigurationUiDeclaration(emptyList())
             )
             capabilities = emptySet()
+            resources = PackageResourcesDeclaration(emptyList())
             trust = CachedManifestTrust.LEGACY_PRE_CUTOVER
         } else {
             val configVal = requireNonNullKey(map, "configuration").asMap()
@@ -450,6 +481,8 @@ internal object StrictIndexCodec {
                 }
             }
             capabilities = decodedCapabilities
+            val resourcesVal = requireNonNullKey(map, "resources").asMap()
+            resources = decodeResources(resourcesVal)
             trust = CachedManifestTrust.EVOLVED_VERIFIED
         }
 
@@ -462,6 +495,7 @@ internal object StrictIndexCodec {
                 presentation = presentation,
                 runtime = runtime,
                 configuration = configuration,
+                resources = resources,
                 capabilities = capabilities
             ),
             trust = trust
@@ -481,6 +515,35 @@ internal object StrictIndexCodec {
         val ui = decodeConfigurationUi(uiVal)
 
         return PackageConfigurationDeclaration(data, ui)
+    }
+
+    private fun decodeResources(map: Map<String, Any?>): PackageResourcesDeclaration {
+        validateNoUnknownKeys(map, setOf("mounts"))
+        val mountsVal = requireNonNullKey(map, "mounts")
+        if (mountsVal !is List<*>) {
+            throw IllegalArgumentException("Expected mounts to be array")
+        }
+        val mounts = ArrayList<PackageMountDeclaration>()
+        for (mountVal in mountsVal) {
+            val mountMap = mountVal.asMap()
+            validateNoUnknownKeys(mountMap, setOf("id", "kind", "access", "required", "label", "help"))
+            val id = requireNonNullKey(mountMap, "id").asString()
+            val kindStr = requireNonNullKey(mountMap, "kind").asString()
+            val kind = PackageMountKind.entries.firstOrNull { it.value == kindStr }
+                ?: throw IllegalArgumentException("Unsupported mount kind: $kindStr")
+            val accessStr = requireNonNullKey(mountMap, "access").asString()
+            val access = PackageMountAccess.entries.firstOrNull { it.value == accessStr }
+                ?: throw IllegalArgumentException("Unsupported mount access: $accessStr")
+            val required = requireNonNullKey(mountMap, "required").asBoolean()
+            val label = requireNonNullKey(mountMap, "label").asString()
+            val help = if (mountMap.containsKey("help")) {
+                mountMap["help"].asString()
+            } else {
+                null
+            }
+            mounts.add(PackageMountDeclaration(id, kind, access, required, label, help))
+        }
+        return PackageResourcesDeclaration(mounts)
     }
 
     private fun decodeConfigurationData(map: Map<String, Any?>): ConfigurationDataDeclaration {

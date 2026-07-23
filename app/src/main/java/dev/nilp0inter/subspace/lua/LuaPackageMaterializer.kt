@@ -63,6 +63,7 @@ internal object LuaPackageMaterializer {
             configurationProvider = configurationProvider,
             configurationFields = fields,
             requiredCapabilities = capabilities,
+            resourceDeclarations = revision.manifest.resources,
         )
         return InstalledProviderBinding(
             repositoryId = revision.manifest.repositoryId,
@@ -134,6 +135,8 @@ internal object LuaPackageMaterializer {
                     result.add(ChannelCapability.AudioOperation)
                     result.add(ChannelCapability.DeferredAudioPlayback)
                 }
+                PackageCapability.STORAGE_FILES -> result.add(ChannelCapability.StorageFiles)
+                PackageCapability.AUDIO_FILES -> result.add(ChannelCapability.AudioFiles)
                 else -> throw IllegalArgumentException(
                     "Unknown package capability ID: $cap. " +
                         "Expected one of ${PackageCapability.ALL}.",

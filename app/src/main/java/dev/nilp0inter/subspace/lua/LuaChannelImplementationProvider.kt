@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.lua
 
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
+import dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration
 import dev.nilp0inter.subspace.channel.capability.ChannelCapabilityScope
 import dev.nilp0inter.subspace.model.GenerationExecutionContext
 import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
@@ -45,6 +46,7 @@ internal class LuaChannelImplementationProvider private constructor(
     private val configurationProvider: ChannelConfigurationProvider,
     private val configurationProviderFields: List<ChannelConfigurationField> = emptyList(),
     private val configurationRequiredCapabilities: Set<ChannelCapability> = emptySet(),
+    private val resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
 ) : ChannelImplementationProvider {
 
     companion object {
@@ -65,6 +67,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProvider: ChannelConfigurationProvider,
             configurationFields: List<ChannelConfigurationField> = emptyList(),
             requiredCapabilities: Set<ChannelCapability> = emptySet(),
+            resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -78,6 +81,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProvider = configurationProvider,
             configurationProviderFields = configurationFields,
             configurationRequiredCapabilities = requiredCapabilities,
+            resourceDeclarations = resourceDeclarations,
         )
 
         /**
@@ -97,6 +101,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProvider: ChannelConfigurationProvider,
             configurationFields: List<ChannelConfigurationField> = emptyList(),
             requiredCapabilities: Set<ChannelCapability> = emptySet(),
+            resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -110,6 +115,7 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationProvider = configurationProvider,
             configurationProviderFields = configurationFields,
             configurationRequiredCapabilities = requiredCapabilities,
+            resourceDeclarations = resourceDeclarations,
         )
     }
 
@@ -120,6 +126,7 @@ internal class LuaChannelImplementationProvider private constructor(
         configurationFields = configurationProviderFields,
         requiredCapabilities = configurationRequiredCapabilities,
         preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
+        resourceDeclarations = resourceDeclarations,
     )
 
     /**

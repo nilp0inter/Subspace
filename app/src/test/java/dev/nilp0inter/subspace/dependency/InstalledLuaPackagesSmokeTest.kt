@@ -274,7 +274,7 @@ class InstalledLuaPackagesSmokeTest {
             val repository = repository(root, bridge, providers)
 
             // Package with non-empty configuration and capabilities
-            val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
+            val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"2.0.0","entryModule":"plugin","presentation":{"label":"Evolved Package","summary":"Non-empty declarations fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"mode","type":"string","default":"ECHO","allowedValues":["ECHO","DELAYED_ECHO","STT","TTS","STT_TTS"]},{"id":"verbose","type":"boolean","default":false},{"id":"retry_count","type":"integer","default":3,"minimum":0,"maximum":10}],"additionalProperties":false},"ui":{"fields":[{"field":"mode","control":"choice","label":"Mode","choices":[{"value":"ECHO","label":"ECHO"},{"value":"DELAYED_ECHO","label":"Delayed Echo"},{"value":"STT","label":"STT"},{"value":"TTS","label":"TTS"},{"value":"STT_TTS","label":"STT+TTS"}]},{"field":"verbose","control":"toggle","label":"Verbose"},{"field":"retry_count","control":"number","label":"Retry Count"}]}},"resources":{"mounts":[]},"capabilities":["audio.transcription","audio.synthesis","audio.playback"]}"""
             val luaSource = "-- evolved fixture\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
             val archive = strictUnixStoredZip(
                 listOf(
@@ -341,6 +341,65 @@ class InstalledLuaPackagesSmokeTest {
             assertEquals(3L, defaults.getLong("retry_count"))
 
             // Verify restart materialization does not create Lua states (only runtime does)
+            assertEquals(0, restartedBridge.createdStateIds.size)
+        }
+    }
+
+    @Test
+    fun `1_7 empty and mounted resource fixtures install and project declarations without Lua`() = runTest {
+        // Empty-resource fixture installs and carries zero mounts.
+        withTemporaryDirectory { root ->
+            val bridge = RecordingLuaKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val repository = repository(root, bridge, providers)
+            val archive = packageArchive("1.0.0", "empty-resources")
+            val source = sourceRecord()
+            success(repository.installOrUpdate(ByteArrayInputStream(archive), source))
+            val index = success(InstalledPackageStore(root).loadIndex()).index
+            val record = requireNotNull(index.providers[source.repositoryId])
+            assertTrue("empty-resource fixture must carry zero mounts", record.active.manifest.resources.mounts.isEmpty())
+            assertEquals(0, bridge.createdStateIds.size)
+        }
+
+        // Mounted-resource fixture installs, retains the exact declaration, and projects it into the descriptor.
+        withTemporaryDirectory { root ->
+            val bridge = RecordingLuaKernelBridge()
+            val providers = ChannelImplementationProviderRegistry()
+            val repository = repository(root, bridge, providers)
+            val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"3.0.0","entryModule":"plugin","presentation":{"label":"Mounted Package","summary":"Mounted resource fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[{"id":"output","kind":"directory-tree","access":"read-write","required":true,"label":"Output","help":"Where recordings are written"}]},"capabilities":[]}"""
+            val luaSource = "-- mounted fixture\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+            val archive = strictUnixStoredZip(
+                listOf(
+                    ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
+                    ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                    ZipFixtureEntry("lua/plugin.lua", luaSource.toByteArray(UTF_8), 0b1000000110100100),
+                ),
+            )
+            val source = sourceRecord()
+            success(repository.installOrUpdate(ByteArrayInputStream(archive), source))
+            val index = success(InstalledPackageStore(root).loadIndex()).index
+            val record = requireNotNull(index.providers[source.repositoryId])
+            val mounts = record.active.manifest.resources.mounts
+            assertEquals(1, mounts.size)
+            val mount = mounts.single()
+            assertEquals("output", mount.id)
+            assertEquals(PackageMountKind.DIRECTORY_TREE, mount.kind)
+            assertEquals(PackageMountAccess.READ_WRITE, mount.access)
+            assertTrue("v1 mounts must be required", mount.required)
+            assertEquals("Output", mount.label)
+            assertEquals("Where recordings are written", mount.help)
+
+            val restartedBridge = RecordingLuaKernelBridge()
+            val restartedProviders = ChannelImplementationProviderRegistry()
+            val restartedRepository = repository(root, restartedBridge, restartedProviders)
+            assertEquals(Unit, success(restartedRepository.loadAndPublish()))
+            val implementationId = InstalledProviderId.derive(source.repositoryId)
+            val descriptor = (restartedProviders.resolve(implementationId) as? ChannelProviderResolution.Available)
+                ?.provider?.descriptor
+                ?: throw AssertionError("Provider must be available after restart")
+            val descriptorMounts = descriptor.resourceDeclarations.mounts
+            assertEquals(1, descriptorMounts.size)
+            assertEquals("output", descriptorMounts.single().id)
             assertEquals(0, restartedBridge.createdStateIds.size)
         }
     }
@@ -430,7 +489,7 @@ class InstalledLuaPackagesSmokeTest {
 
     private fun packageArchive(version: String, sourceMarker: String): ByteArray {
         val source = "-- $sourceMarker\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
-        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Smoke package","summary":"Installed Lua smoke package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"capabilities":[]}"""
+        val manifest = """{"manifestVersion":1,"repositoryId":"123","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Smoke package","summary":"Installed Lua smoke package"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[],"additionalProperties":false},"ui":{"fields":[]}},"resources":{"mounts":[]},"capabilities":[]}"""
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),

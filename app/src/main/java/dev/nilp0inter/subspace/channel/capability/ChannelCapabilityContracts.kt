@@ -27,6 +27,8 @@ sealed interface ChannelCapability {
     data object AsynchronousConversation : ChannelCapability { override val stableId = "asynchronous-conversation" }
     data object DelayedPlayback : ChannelCapability { override val stableId = "delayed-playback" }
     data object DeferredAudioPlayback : ChannelCapability { override val stableId = "deferred-audio-playback" }
+    data object StorageFiles : ChannelCapability { override val stableId = "storage-files" }
+    data object AudioFiles : ChannelCapability { override val stableId = "audio-files" }
 }
 
 /**

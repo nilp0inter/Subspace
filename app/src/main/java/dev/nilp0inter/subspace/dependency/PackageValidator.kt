@@ -622,7 +622,7 @@ public object PackageValidator {
 
             // Validate manifest structure and exact v1 constraints
             val allowedRootKeys = setOf(
-                "manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "capabilities"
+                "manifestVersion", "repositoryId", "packageVersion", "entryModule", "presentation", "runtime", "configuration", "resources", "capabilities"
             )
             if (manifestMap.keys != allowedRootKeys) {
                 val missing = allowedRootKeys - manifestMap.keys
@@ -700,7 +700,7 @@ public object PackageValidator {
                 return PackageOutcome.Failure(PackageFailure.Compatibility(CompatibilityDetail.API_VERSION_INCOMPATIBLE))
             }
 
-            if (!manifestMap.containsKey("configuration") || !manifestMap.containsKey("capabilities")) {
+            if (!manifestMap.containsKey("configuration") || !manifestMap.containsKey("capabilities") || !manifestMap.containsKey("resources")) {
                 return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
             }
 
@@ -720,6 +720,68 @@ public object PackageValidator {
                 if (!capabilities.add(cap)) {
                     return PackageOutcome.Failure(PackageFailure.Capability(PackageFailure.CapabilityDetail.DUPLICATE_CAPABILITY_ID))
                 }
+            }
+
+            val resourcesMap = manifestMap["resources"] as? Map<*, *>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            val allowedResourceKeys = setOf("mounts")
+            if (resourcesMap.keys != allowedResourceKeys) {
+                val extra = resourcesMap.keys - allowedResourceKeys
+                if (extra.isNotEmpty()) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                }
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            }
+            val mountsRaw = resourcesMap["mounts"] as? List<*>
+                ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+            val parsedMounts = ArrayList<PackageMountDeclaration>()
+            for (mountItem in mountsRaw) {
+                val mountMap = mountItem as? Map<*, *>
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val requiredMountKeys = setOf("id", "kind", "access", "required", "label")
+                val allowedMountKeys = setOf("id", "kind", "access", "required", "label", "help")
+                for (k in mountMap.keys) {
+                    if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    if (!allowedMountKeys.contains(k)) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.UNKNOWN_FIELDS))
+                    }
+                }
+                for (k in requiredMountKeys) {
+                    if (!mountMap.containsKey(k)) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    }
+                }
+                val mountId = mountMap["id"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val kindStr = mountMap["kind"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val kind = PackageMountKind.entries.firstOrNull { it.value == kindStr }
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val accessStr = mountMap["access"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val access = PackageMountAccess.entries.firstOrNull { it.value == accessStr }
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val requiredFlag = mountMap["required"] as? Boolean
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val mountLabel = mountMap["label"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val mountHelp = if (mountMap.containsKey("help")) {
+                    mountMap["help"] as? String
+                        ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                } else {
+                    null
+                }
+                val mount = try {
+                    PackageMountDeclaration(mountId, kind, access, requiredFlag, mountLabel, mountHelp)
+                } catch (e: Exception) {
+                    return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+                parsedMounts.add(mount)
+            }
+            val resources = try {
+                PackageResourcesDeclaration(parsedMounts)
+            } catch (e: Exception) {
+                return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
             }
 
             val configurationMap = manifestMap["configuration"] as? Map<*, *>
@@ -957,6 +1019,7 @@ public object PackageValidator {
                 presentation = PackagePresentation(label, summary),
                 runtime = RuntimeRequirements(luaVersion, apiVersion),
                 configuration = configuration,
+                resources = resources,
                 capabilities = capabilities
             )
 

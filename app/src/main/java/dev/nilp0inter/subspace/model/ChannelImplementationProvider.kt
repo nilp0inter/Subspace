@@ -7,6 +7,7 @@ import dev.nilp0inter.subspace.lua.actor.ActorGenerationGate
 import dev.nilp0inter.subspace.service.ChannelRuntime
 import kotlinx.coroutines.CoroutineScope
 import org.json.JSONObject
+import dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration
 
 /** Typed failures returned by provider registration, configuration, and construction. */
 sealed interface ChannelProviderError {
@@ -359,6 +360,7 @@ data class ChannelImplementationDescriptor(
     val configurationFields: List<ChannelConfigurationField>,
     val requiredCapabilities: Set<ChannelCapability>,
     val preparationTraits: ChannelPreparationTraits,
+    val resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
 ) {
     init {
         require(configuration.implementationId == implementationId) {
@@ -453,6 +455,7 @@ data class ChannelRuntimeConstructionRequest(
     val configuration: ValidatedChannelConfiguration,
     val capabilities: ChannelCapabilityScope,
     val generationContext: GenerationExecutionContext,
+    val resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
 ) {
     init {
         require(definition.implementationId == configuration.implementationId) {

@@ -51,6 +51,7 @@ class PackageSourceRecordContractTest {
                                 ConfigurationDataDeclaration(emptyList()),
                                 ConfigurationUiDeclaration(emptyList())
                             ),
+                            resources = PackageResourcesDeclaration(emptyList()),
                             capabilities = emptySet(),
                         ),
                         sourceRecord = source,

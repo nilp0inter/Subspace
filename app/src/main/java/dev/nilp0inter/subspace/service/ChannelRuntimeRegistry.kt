@@ -264,6 +264,35 @@ class ChannelRuntimeRegistry(
     }
 
     /**
+     * 2.7: Force exactly one fresh runtime generation for a single instance after
+     * a resource mount binding replacement. The catalogue definition is unchanged,
+     * so the generic [reconcile] retention condition would keep the existing
+     * generation; this method applies the same atomic retire / predecessor-barrier
+     * / reinstall / construct path to one instance keyed by [channelInstanceId].
+     * Predecessor authority is revoked before the successor is authorized.
+     */
+    suspend fun reconcileResourceBinding(snapshot: ChannelCatalogueSnapshot, channelInstanceId: String) {
+        val definition = snapshot.definitions.firstOrNull { it.id == channelInstanceId } ?: return
+        if (!definition.enabled) return
+        val constructionPlans = mutableListOf<ConstructionPlan>()
+        val stops = mutableListOf<LifecycleEntry>()
+        val closures = mutableListOf<LifecycleEntry>()
+
+        synchronized(lock) {
+            if (isShutdown) return
+            val existing = entries[definition.id] ?: return
+            val predecessorBarrier = inheritedPredecessorBarrier(existing)
+            retireLocked(existing, stops, closures)
+            installDefinitionLocked(definition, constructionPlans, predecessorBarrier)
+            publishAggregateLocked()
+        }
+
+        stops.forEach { it.gate.stopAdmission() }
+        for (entry in closures) closeLifecycleEntry(entry)
+        for (plan in constructionPlans) construct(plan)
+    }
+
+    /**
      * Returns the original unresolved predecessor close barrier for [entry], carrying forward
      * the root through PendingEntry replacement chains. For PendingEntry with a non-null
      * predecessor barrier, returns that inherited barrier; otherwise returns entry.closed.
@@ -559,6 +588,7 @@ class ChannelRuntimeRegistry(
                     configuration,
                     entry.capabilities,
                     entry.generationContext,
+                    provider.descriptor.resourceDeclarations,
                 ),
             )
         ) {

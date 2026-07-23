@@ -27,6 +27,7 @@ import dev.nilp0inter.subspace.dependency.PackageCapability
 import dev.nilp0inter.subspace.dependency.PackageConfigurationDeclaration
 import dev.nilp0inter.subspace.dependency.PackageManifest
 import dev.nilp0inter.subspace.dependency.PackagePresentation
+import dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration
 import dev.nilp0inter.subspace.dependency.PackageSourceRecord
 import dev.nilp0inter.subspace.model.ProviderRevisionFingerprint
 import dev.nilp0inter.subspace.dependency.RuntimeRequirements
@@ -78,6 +79,7 @@ class ServiceChannelCapabilityHostTest {
                     ConfigurationDataDeclaration(emptyList()),
                     ConfigurationUiDeclaration(emptyList()),
                 ),
+                resources = PackageResourcesDeclaration(emptyList()),
                 capabilities = linkedSetOf(
                     PackageCapability.AUDIO_TRANSCRIPTION,
                     PackageCapability.AUDIO_SYNTHESIS,
