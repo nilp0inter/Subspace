@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Defines how PTT input events and asynchronous response playbacks are routed and scheduled based on channel instance readiness, active input modes, audio contention, and explicit RSM skip/reselection commands.
+
+## Requirements
 
 ### Requirement: Channel readiness state
 The system SHALL obtain readiness from the runtime entry associated with each channel instance. Readiness SHALL combine valid enabled provider configuration with the provider/runtime-declared availability of semantic capabilities required by that instance. Readiness and preparation eligibility SHALL be instance-specific even when multiple instances reference the same provider. Core routing SHALL NOT inspect provider identity, a built-in channel kind, or platform transport state to derive readiness.
@@ -112,7 +116,6 @@ The system SHALL emit a characteristic two-tone error beep over the host-resolve
 - **THEN** the system SHALL play the two-tone error beep on the resolved input-mode route when possible
 - **AND** it SHALL drop the PTT capture without playing the ready beep
 
-## ADDED Requirements
 
 ### Requirement: Selection-aware asynchronous response playback
 The host-owned channel router SHALL admit a synthesized assistant response for playback independently of the PTT session that produced its user turn. Admission SHALL require that the response's channel instance is the current active channel and that the audio subsystem accepts a playback operation. A response that is not admitted SHALL remain pending and unheard in the durable channel message projection rather than being discarded or played on an unrelated channel.

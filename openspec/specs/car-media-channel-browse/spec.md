@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Defines how Subspace channel instances are exposed as playable media items in the Android Auto Media browse tree, projecting active, processing, and pending backlog states, and supporting channel selection and OpenAI Agent connection profiles.
+
+## Requirements
 
 ### Requirement: Media browse tree lists each Subspace channel as a playable media item
 The system SHALL expose every instance in the authoritative ordered channel catalogue as a distinct playable Media item in the Android Auto Media browse tree, including instances whose implementation provider is absent, incompatible, or failed to load. Each item SHALL retain the instance's stable ID as `mediaId`, use its display name as title, and present host-rendered runtime or availability status as subtitle. Selecting any existing item SHALL set that instance as the single active channel regardless of preparation state. Provider code, configuration payloads, and implementation exceptions SHALL NOT control Android UI rendering or selection eligibility. Runtime readiness SHALL be enforced only when PTT is attempted.
@@ -77,7 +81,6 @@ The system SHALL expose every instance in the authoritative ordered channel cata
 - **THEN** the system SHALL NOT return the legacy item with `mediaId = "subspace-car-ptt"`
 - **AND** consumers SHALL enumerate catalogue channel items
 
-## ADDED Requirements
 
 ### Requirement: Android Auto projects processing and pending response state
 The Android Auto browse projection SHALL derive each channel item's status metadata from the host-owned channel projection. For an agent channel, the projection SHALL identify processing state and pending unheard assistant response count without exposing provider SDK, Android, audio-route, or transport objects. A non-zero pending count SHALL remain visible while another channel is active, and status changes SHALL invalidate subscribed browse clients through the existing browse-change notification path.

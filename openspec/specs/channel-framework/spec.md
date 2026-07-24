@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Defines the channel framework, including active selection, configuration persistence, generic lifecycle/input event consumption, durable background operation scheduling, serialization of channel turns, and language-neutral interfaces.
+
+## Requirements
 
 ### Requirement: Active channel selection
 The system SHALL maintain exactly one active channel instance at any time, identified by a stable ID present in the persisted ordered channel catalogue. The active channel instance is the intended destination for PTT audio captures, subject to its runtime readiness evaluation. The migrated default catalogue SHALL include provider-backed Journal, Debug, and Keyboard instances, while the runtime SHALL support catalogue additions, removals, and multiple instances referencing the same implementation provider.
@@ -68,7 +72,6 @@ Channels SHALL consume PTT input through generic channel-level session events an
 - **THEN** the selected channel SHALL receive only a generic cancellation or failure event if a committed channel target exists
 - **AND** the channel SHALL NOT receive Android route objects, transport state, route-gate internals, or detailed host diagnostics
 
-## ADDED Requirements
 
 ### Requirement: Channel runtimes depend only on generic events and host capabilities
 A channel implementation SHALL express behavior through provider-validated configuration, generic lifecycle and input events, and semantic host capability interfaces. Host capabilities SHALL expose opaque high-level handles or domain results and SHALL retain ownership of Android resources, hardware transports, connection and reconnection policy, concurrency, cleanup, and detailed diagnostics. Core channel dispatch SHALL NOT branch on built-in implementation identity to deliver events or capabilities.

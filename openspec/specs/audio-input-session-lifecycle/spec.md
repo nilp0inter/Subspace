@@ -1,3 +1,7 @@
+## Purpose
+
+Defines the lifecycle of audio input sessions, ensuring atomic ownership of terminal signals, forced cancellation, and clean resource release under timeouts, failures, and service teardowns.
+
 ## Requirements
 
 ### Requirement: Audio input terminal ownership is atomic

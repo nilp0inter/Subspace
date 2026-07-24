@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Defines the host-owned phone dashboard user interface, including channel card rendering, configuration form generation, profile management, and projection of asynchronous channel execution and responses.
+
+## Requirements
 
 ### Requirement: Dashboard shows channels
 The system SHALL render one host-owned functional card per channel instance in the authoritative catalogue order, including instances whose implementation provider is absent, incompatible, or failed to load. Each card SHALL retain the instance's stable ID and display name and SHALL present its readiness, execution status, active state, and provider-defined presentation metadata when that metadata is available. The host SHALL interpret descriptor metadata into native Android UI and SHALL NOT allow a provider, configuration payload, or script to supply or control Android views, composables, navigation, or other platform UI objects. Functional cards for available instances SHALL remain mutually exclusive activation zones and phone-side PTT zones. Dedicated configuration and catalogue-management controls SHALL remain outside the phone PTT gesture surface.
@@ -112,7 +116,6 @@ The dashboard SHALL support a developer shortcut where long-pressing the applica
 - **WHEN** the user long-presses the application title ("SUBSPACE") in the dashboard header
 - **THEN** the system SHALL navigate to the Log Analysis screen
 
-## ADDED Requirements
 
 ### Requirement: Dashboard projects asynchronous channel execution and responses
 The dashboard SHALL render each channel's host-owned asynchronous projection alongside its existing catalogue identity, readiness, active state, and execution status. The projection SHALL expose queued user-turn count, processing state, pending unheard response count, and playback-pending state when a response is waiting for channel selection or audio admission. The dashboard SHALL update these values from host projections without importing provider SDK types, Android media objects, audio-route objects, or transport objects.

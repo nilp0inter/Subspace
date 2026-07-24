@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Defines the built-in Keyboard channel implementation, including instance configuration, readiness derived from host text-output capabilities, PTT lifecycle for text submission, and Sleepwalker BLE bridge connection management.
+
+## Requirements
 
 ### Requirement: Keyboard channel identity and configuration
 The system SHALL provide a built-in Keyboard channel implementation identified by a stable implementation identifier. Each persisted Keyboard channel instance SHALL have its own stable instance ID, human-readable name, and independently configurable logical host profile drawn from the supported Sleepwalker host profiles. The provider-owned versioned configuration payload SHALL preserve the selected profile across app restarts and SHALL default an instance with no persisted profile to `LINUX_US`. No singleton Keyboard instance ID SHALL be used for configuration lookup, routing, runtime ownership, or status association.
@@ -227,7 +231,6 @@ When an enabled and configured Keyboard channel instance is selected for PTT whi
 - **THEN** preparation SHALL complete without starting another hardware connection attempt
 - **AND** the normal Keyboard PTT lifecycle SHALL proceed unchanged
 
-## ADDED Requirements
 
 ### Requirement: Keyboard text delivery has typed non-replay outcomes
 Each semantic Keyboard text-delivery request SHALL have a host-assigned operation identity and exactly one typed terminal outcome: `Delivered` when full delivery is confirmed, `Rejected` when delivery is proven not to have begun, `Failed` when delivery is proven to have begun but no text was delivered, or `Indeterminate` when cancellation, timeout, disconnect, acknowledgement loss, transport failure, or shutdown makes partial delivery ambiguous. A Keyboard runtime SHALL NOT automatically replay a request after `Delivered`, `Failed`, or `Indeterminate`. Any later user-initiated PTT cycle SHALL create a new request rather than retry the ambiguous operation.
