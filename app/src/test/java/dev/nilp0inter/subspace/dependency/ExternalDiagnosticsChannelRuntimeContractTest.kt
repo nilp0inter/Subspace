@@ -841,6 +841,13 @@ class ExternalDiagnosticsChannelRuntimeContractTest {
             else -> completed(handle)
         }
 
+        override fun invokeSosCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome = invokeCallback(handle, callbackHandle, arguments, spawnAdmission)
+
         override fun invokeInputCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,

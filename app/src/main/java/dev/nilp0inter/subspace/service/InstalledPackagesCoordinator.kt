@@ -15,6 +15,11 @@ import dev.nilp0inter.subspace.dependency.toPackageUnavailable
 import dev.nilp0inter.subspace.dependency.toPackageUnavailableProjection
 import dev.nilp0inter.subspace.lua.LuaKernelBridge
 import dev.nilp0inter.subspace.lua.PluginLogSink
+import dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProviderRegistry
 import dev.nilp0inter.subspace.model.ChannelProviderError
@@ -97,12 +102,18 @@ internal class InstalledPackagesCoordinator(
     private val serviceScope: CoroutineScope,
     ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     bounds: PackageValidationBounds = PackageValidationBounds.DEFAULT,
+    preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+    dynamicChoiceResolver: DynamicConfigurationChoiceResolver? = null,
+    keyboardOutputAdapterFactory: ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
 ) {
-    private val store = if (runtimeResourcesFactory == null) {
-        InstalledPackageStore(storeRoot, logSink)
-    } else {
-        InstalledPackageStore(storeRoot, logSink, runtimeResourcesFactory)
-    }
+    private val store = InstalledPackageStore(
+        storeRoot,
+        logSink,
+        runtimeResourcesFactory,
+        preparerRegistry,
+        dynamicChoiceResolver,
+        keyboardOutputAdapterFactory,
+    )
     private val closed = AtomicBoolean(false)
 
     private val operationMutex = Mutex()

@@ -6,6 +6,11 @@ import dev.nilp0inter.subspace.lua.LuaRuntimeResourcesFactory
 import dev.nilp0inter.subspace.lua.PluginLogSink
 import dev.nilp0inter.subspace.lua.NoOpPluginLogSink
 import dev.nilp0inter.subspace.lua.actor.ActorPolicy
+import dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.InstalledProviderBinding
 import java.io.File
@@ -254,6 +259,12 @@ internal object StrictIndexCodec {
                 sb.append("\n")
             }
             sb.append("  ]")
+        }
+        if (field.source != null) {
+            sb.append(",\n  \"source\": ").append(encodeJsonString(field.source))
+        }
+        if (field.dependsOnFieldId != null) {
+            sb.append(",\n  \"dependsOn\": ").append(encodeJsonString(field.dependsOnFieldId))
         }
         sb.append("\n}")
         return sb.toString()
@@ -633,16 +644,25 @@ internal object StrictIndexCodec {
         val fields = ArrayList<UiFieldDeclaration>()
         for (fieldVal in fieldsVal) {
             val fieldMap = fieldVal.asMap()
-            validateNoUnknownKeys(fieldMap, setOf("field", "control", "label", "help", "choices"))
-            val field = requireNonNullKey(fieldMap, "field").asString()
             val controlStr = requireNonNullKey(fieldMap, "control").asString()
             val control = when (controlStr) {
                 "text" -> UiControl.TEXT
                 "toggle" -> UiControl.TOGGLE
                 "number" -> UiControl.NUMBER
                 "choice" -> UiControl.CHOICE
+                "dynamic-choice" -> UiControl.DYNAMIC_CHOICE
                 else -> throw IllegalArgumentException("Unknown ui control: $controlStr")
             }
+            // Per-control exact-key validation mirrors the manifest validator: a
+            // dynamic-choice entry carries a bounded `source` and no static `choices`,
+            // while every static control carries optional `choices` and no `source`.
+            val allowedKeys = if (control == UiControl.DYNAMIC_CHOICE) {
+                setOf("field", "control", "label", "help", "source", "dependsOn")
+            } else {
+                setOf("field", "control", "label", "help", "choices")
+            }
+            validateNoUnknownKeys(fieldMap, allowedKeys)
+            val field = requireNonNullKey(fieldMap, "field").asString()
             val label = requireNonNullKey(fieldMap, "label").asString()
             val help = if (fieldMap.containsKey("help")) {
                 val h = fieldMap["help"]
@@ -675,7 +695,20 @@ internal object StrictIndexCodec {
             } else {
                 null
             }
-            fields.add(UiFieldDeclaration(field, control, label, help, choices))
+            // Round-trip the raw dynamic-choice source exactly. Authority over which
+            // sources are valid belongs to reparse-revalidation (PackageValidator) and
+            // the immutable UiFieldDeclaration invariant, not to this index codec.
+            val source = if (control == UiControl.DYNAMIC_CHOICE) {
+                requireNonNullKey(fieldMap, "source").asString()
+            } else {
+                null
+            }
+            val dependsOn = if (control == UiControl.DYNAMIC_CHOICE && fieldMap.containsKey("dependsOn")) {
+                requireNonNullKey(fieldMap, "dependsOn").asString()
+            } else {
+                null
+            }
+            fields.add(UiFieldDeclaration(field, control, label, help, choices, source, dependsOn))
         }
         return ConfigurationUiDeclaration(fields)
     }
@@ -907,6 +940,10 @@ public class InstalledPackageStore internal constructor(
     private val faultInjector: FaultInjector,
     private val logSink: PluginLogSink = NoOpPluginLogSink,
     private val runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
+    private val preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+    private val dynamicChoiceResolver: DynamicConfigurationChoiceResolver? = null,
+    private val keyboardOutputAdapterFactory:
+        ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
 ) {
     public constructor(storeRoot: File) : this(storeRoot, FaultInjector.NOOP)
     internal constructor(storeRoot: File, logSink: PluginLogSink) : this(storeRoot, FaultInjector.NOOP, logSink)
@@ -915,6 +952,22 @@ public class InstalledPackageStore internal constructor(
         logSink: PluginLogSink,
         runtimeResourcesFactory: LuaRuntimeResourcesFactory,
     ) : this(storeRoot, FaultInjector.NOOP, logSink, runtimeResourcesFactory)
+    internal constructor(
+        storeRoot: File,
+        logSink: PluginLogSink,
+        runtimeResourcesFactory: LuaRuntimeResourcesFactory?,
+        preparerRegistry: CapabilityPreparerRegistry,
+        dynamicChoiceResolver: DynamicConfigurationChoiceResolver?,
+        keyboardOutputAdapterFactory: ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)?,
+    ) : this(
+        storeRoot,
+        FaultInjector.NOOP,
+        logSink,
+        runtimeResourcesFactory,
+        preparerRegistry,
+        dynamicChoiceResolver,
+        keyboardOutputAdapterFactory,
+    )
     internal val stagingDir = File(storeRoot, "staging")
     internal val contentDir = File(storeRoot, "content/sha256")
     private val currentFile = File(storeRoot, "index.json")
@@ -1266,6 +1319,9 @@ public class InstalledPackageStore internal constructor(
                     ActorPolicy.startingEvidence(),
                     logSink = logSink,
                     runtimeResourcesFactory = runtimeResourcesFactory,
+                    preparerRegistry = preparerRegistry,
+                    keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
+                    dynamicChoiceResolver = dynamicChoiceResolver,
                 )
                 // Binding coherence: every descriptor value (implementation ID,
                 // configuration-provider ID, snapshot key, repository-derived ID,

@@ -490,6 +490,15 @@ value class TextOutputProfile(val id: String) {
     init {
         require(id.isNotBlank()) { "Text output profile must not be blank" }
     }
+
+    companion object {
+        /**
+         * 1.4: Shared keyboard-output logical-profile UTF-8 byte bound. Mirrors the
+         * native kernel's KEYBOARD_MAX_PROFILE_BYTES so host call-time revalidation
+         * and the native pre-yield check agree on one named constant.
+         */
+        const val MAX_BYTES: Int = 256
+    }
 }
 
 data class TextKeyRequest(

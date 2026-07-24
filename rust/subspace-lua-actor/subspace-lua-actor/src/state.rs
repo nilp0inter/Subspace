@@ -377,6 +377,30 @@ subspace.fs = {
   end,
 }
 
+-- Keyboard output operations validate synchronously, register a typed
+-- host-operation request in the native registry, and yield only its opaque
+-- identity. No text, profile, key, JSON, or transport data crosses in the
+-- label; the host obtains the bounded payload only through exactly-once
+-- typed claim.
+local function keyboard_output_yield(kind, request)
+  if subspace._evaluating and subspace._evaluating > 0 then error("effect-call-during-load") end
+  local ok, request_or_error = subspace.host_keyboard_output(kind, request)
+  if not ok then return nil, { error = request_or_error } end
+  local success, value = subspace.yield_operation(request_or_error)
+  if success then return value, nil end
+  return nil, { error = value }
+end
+subspace.keyboard_output = {
+  send_text = function(request, ...)
+    if select(string.char(35), ...) ~= 0 or type(request) ~= "table" then return nil, { error = "E_INVALID_ARGUMENT" } end
+    return keyboard_output_yield("send_text", request)
+  end,
+  send_key = function(request, ...)
+    if select(string.char(35), ...) ~= 0 or type(request) ~= "table" then return nil, { error = "E_INVALID_ARGUMENT" } end
+    return keyboard_output_yield("send_key", request)
+  end,
+}
+
 -- Preloaded host modules
 subspace._preloaded = {
   ["subspace.runtime"] = subspace.runtime,
@@ -387,6 +411,7 @@ subspace._preloaded = {
   ["subspace.playback"] = subspace.playback,
   ["subspace.fs"] = subspace.fs,
   ["subspace.audio"] = subspace.audio,
+  ["subspace.keyboard_output"] = subspace.keyboard_output,
 }
 
 subspace.runtime.spawn = function(fn, ...)
@@ -504,7 +529,7 @@ function subspace._new_image_namespace(sources, modules, image_env)
       __metatable = false,
     })
   end
-  local runtime, channel, log, transcription, synthesis, playback, audio, fs = {}, {}, {}, {}, {}, {}, {}, {}
+  local runtime, channel, log, transcription, synthesis, playback, audio, fs, keyboard_output = {}, {}, {}, {}, {}, {}, {}, {}, {}
   for key, value in pairs(host.runtime) do runtime[key] = value end
   runtime.INSTANCE_ID = host.runtime.INSTANCE_ID
   for key, value in pairs(host.channel) do channel[key] = value end
@@ -514,6 +539,7 @@ function subspace._new_image_namespace(sources, modules, image_env)
   for key, value in pairs(host.playback) do playback[key] = value end
   for key, value in pairs(host.audio) do audio[key] = value end
   for key, value in pairs(host.fs) do fs[key] = value end
+  for key, value in pairs(host.keyboard_output) do keyboard_output[key] = value end
   local private = {
     _sources = sources,
     _modules = modules,
@@ -528,6 +554,7 @@ function subspace._new_image_namespace(sources, modules, image_env)
     playback = readonly(playback),
     audio = readonly(audio),
     fs = readonly(fs),
+    keyboard_output = readonly(keyboard_output),
   }
   private.module_put = function(name, value)
     name = tostring(name)
@@ -550,6 +577,7 @@ function subspace._new_image_namespace(sources, modules, image_env)
     ["subspace.playback"] = private.playback,
     ["subspace.audio"] = private.audio,
     ["subspace.fs"] = private.fs,
+    ["subspace.keyboard_output"] = private.keyboard_output,
   }
   local proxy = readonly(private)
   return proxy
@@ -684,8 +712,16 @@ struct CoroutineState {
     managed_task: bool,
     /// True only for the terminal-bound `handle_input` invocation owner.
     input_callback: bool,
+    /// True only for the bounded `handle_sos` invocation owner. The SOS
+    /// owner may yield only explicitly authorized typed operations; sleep,
+    /// spawn, defer, and raw yields remain rejected.
+    sos_callback: bool,
     /// Whether the currently executing callback/coroutine may issue audio operations.
     audio_operation_eligible: bool,
+    /// Whether the currently executing callback/coroutine may issue
+    /// keyboard-output operations. Authorized owners are host-managed input,
+    /// host-managed SOS, and runtime-managed task coroutines.
+    keyboard_operation_eligible: bool,
     /// Opaque host-operation request id currently yielded by this coroutine.
     host_operation_id: Option<i64>,
 }
@@ -781,6 +817,9 @@ enum Command {
     InvokeInputCallback {
         arguments_json: String,
         captured_audio_token: String,
+    },
+    InvokeSosCallback {
+        arguments_json: String,
     },
     StartCoroutine {
         coroutine_id: i64,
@@ -947,6 +986,10 @@ pub struct MountDeclaration {
 pub struct ResourceContext {
     pub storage_files_declared: bool,
     pub audio_files_declared: bool,
+    /// Declared `keyboard.output` public capability eligibility. Rechecked by
+    /// the kernel before every keyboard-output admission; the authoritative
+    /// declaration check lives in the host runtime.
+    pub keyboard_output_declared: bool,
     pub instance_id: Option<String>,
     pub mounts: HashMap<String, MountDeclaration>,
 }
@@ -975,6 +1018,10 @@ impl ResourceContext {
         };
         let audio_files_declared = obj
             .get("audioFiles")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let keyboard_output_declared = obj
+            .get("keyboardOutput")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
         let storage_files_declared = obj
@@ -1019,6 +1066,7 @@ impl ResourceContext {
             storage_files_declared,
             instance_id,
             audio_files_declared,
+            keyboard_output_declared,
             mounts,
         })
     }
@@ -1151,6 +1199,121 @@ fn normalize_fs_error_code(value: &str) -> &'static str {
     }
 }
 
+// Keyboard-output request bounds. Host policy numbers, not Lua compatibility
+// promises: every validated request is finite before queue admission,
+// capability acquisition, keymap compilation, or physical output.
+const KEYBOARD_MAX_TEXT_BYTES: usize = 16 * 1024;
+const KEYBOARD_MAX_PROFILE_BYTES: usize = 256;
+
+/// Validate an exact-key keyboard-output request table into a bounded typed
+/// payload. Shape, type, UTF-8, and byte bounds are enforced before any
+/// admission or effect; the semantic key vocabulary (`enter`/`escape`) is the
+/// only accepted value domain.
+fn validate_keyboard_request(
+    kind: &str,
+    table: &Table,
+) -> Result<HostOperationPayload, &'static str> {
+    let mut text: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut profile: Option<String> = None;
+    let mut count = 0usize;
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (field, field_value) = pair.map_err(|_| "E_INVALID_ARGUMENT")?;
+        count += 1;
+        if count > 2 {
+            return Err("E_INVALID_ARGUMENT");
+        }
+        let field = match field {
+            Value::String(field) => field
+                .to_str()
+                .map(|value| value.to_string())
+                .map_err(|_| "E_INVALID_ARGUMENT")?,
+            _ => return Err("E_INVALID_ARGUMENT"),
+        };
+        match field.as_str() {
+            "text" if kind == "send_text" => {
+                let value = match field_value {
+                    Value::String(value) => value,
+                    _ => return Err("E_INVALID_ARGUMENT"),
+                };
+                let value = value
+                    .to_str()
+                    .map(|value| value.to_string())
+                    .map_err(|_| "E_INVALID_ARGUMENT")?;
+                if value.is_empty() || value.len() > KEYBOARD_MAX_TEXT_BYTES {
+                    return Err("E_INVALID_ARGUMENT");
+                }
+                text = Some(value);
+            }
+            "key" if kind == "send_key" => {
+                let value = match field_value {
+                    Value::String(value) => value,
+                    _ => return Err("E_INVALID_ARGUMENT"),
+                };
+                let value = value
+                    .to_str()
+                    .map(|value| value.to_string())
+                    .map_err(|_| "E_INVALID_ARGUMENT")?;
+                if value != "enter" && value != "escape" {
+                    return Err("E_INVALID_VALUE");
+                }
+                key = Some(value);
+            }
+            "profile" => {
+                let value = match field_value {
+                    Value::String(value) => value,
+                    _ => return Err("E_INVALID_ARGUMENT"),
+                };
+                let value = value
+                    .to_str()
+                    .map(|value| value.to_string())
+                    .map_err(|_| "E_INVALID_ARGUMENT")?;
+                if value.trim().is_empty() || value.len() > KEYBOARD_MAX_PROFILE_BYTES {
+                    return Err("E_INVALID_ARGUMENT");
+                }
+                profile = Some(value);
+            }
+            _ => return Err("E_INVALID_ARGUMENT"),
+        }
+    }
+    match kind {
+        "send_text" => match (text, profile) {
+            (Some(text), Some(profile)) if count == 2 => {
+                Ok(HostOperationPayload::KeyboardSendText { text, profile })
+            }
+            _ => Err("E_INVALID_ARGUMENT"),
+        },
+        "send_key" => match (key, profile) {
+            (Some(key), Some(profile)) if count == 2 => {
+                Ok(HostOperationPayload::KeyboardSendKey { key, profile })
+            }
+            _ => Err("E_INVALID_ARGUMENT"),
+        },
+        _ => Err("E_INVALID_ARGUMENT"),
+    }
+}
+
+/// Normalize host-facing keyboard-output failures before they cross into
+/// Lua. Unknown diagnostics intentionally collapse to a language-neutral
+/// code so transport detail never reaches package source.
+fn normalize_keyboard_error_code(value: &str) -> &'static str {
+    match value {
+        "E_INVALID_ARGUMENT" => "E_INVALID_ARGUMENT",
+        "E_INVALID_VALUE" => "E_INVALID_VALUE",
+        "E_INVALID_CONTEXT" => "E_INVALID_CONTEXT",
+        "E_CAPABILITY_UNDECLARED" => "E_CAPABILITY_UNDECLARED",
+        "E_BUSY" => "E_BUSY",
+        "E_TIMEOUT" => "E_TIMEOUT",
+        "E_CANCELLED" => "E_CANCELLED",
+        "E_CLOSED" => "E_CLOSED",
+        "E_STALE" => "E_STALE",
+        "E_UNAVAILABLE" => "E_UNAVAILABLE",
+        "E_UNSUPPORTED" => "E_UNSUPPORTED",
+        "E_HOST_FAILURE" => "E_HOST_FAILURE",
+        _ => "E_HOST_FAILURE",
+    }
+}
+
 /// State exclusively owned by host callbacks while Lua is executing.  It is
 /// deliberately disjoint from `EngineInner`: callbacks never borrow, alias, or
 /// re-lock the Lua-owning engine.  Dispatch drains their bounded pending work
@@ -1162,6 +1325,11 @@ struct CallbackState {
     /// and runtime-managed tasks; gates every audio AND filesystem host effect.
     /// Startup, readiness, lifecycle, SOS, and unmanaged coroutines are ineligible.
     audio_operation_eligible: bool,
+    /// Keyboard-output host-effect eligibility. True only for host-managed
+    /// input, host-managed SOS, and runtime-managed task owners; gates every
+    /// `subspace.keyboard_output` operation. Startup, readiness, lifecycle,
+    /// synchronous callbacks, and unmanaged coroutines are ineligible.
+    keyboard_operation_eligible: bool,
     module_effect_attempted: bool,
     /// Spawned work admitted by `host_spawn`, including work awaiting dispatch.
     active_managed_tasks: usize,
@@ -1211,6 +1379,7 @@ impl CallbackState {
             dispatch_active: false,
             evaluating_module: false,
             audio_operation_eligible: false,
+            keyboard_operation_eligible: false,
             module_effect_attempted: false,
             active_managed_tasks: 0,
             pending_sleep_reservations: 0,
@@ -1263,6 +1432,7 @@ impl Drop for CallbackDispatchGuard {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.dispatch_active = false;
         state.audio_operation_eligible = false;
+        state.keyboard_operation_eligible = false;
         state.spawn_authority = None;
         state.defer_authority = None;
     }
@@ -2052,6 +2222,48 @@ impl EngineInner {
             })
             .map_err(|e| Outcome::runtime_failure(format!("failed to bind host_fs_io: {e}")))?;
 
+        // Keyboard-output host function. Validates the exact request table
+        // and all byte/value bounds, rechecks declared eligibility and owner
+        // authorization, registers one typed host-operation request, and
+        // returns only its opaque identity for yielding. No text, profile,
+        // key, JSON, or transport data ever crosses in a yielded label.
+        let keyboard_state = Arc::clone(&callback_state);
+        let host_keyboard_output_fn = lua
+            .create_function(move |_lua, (kind, request): (String, Value)| {
+                let mut state = keyboard_state.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.dispatch_active {
+                    return Ok((false, "E_INVALID_CONTEXT".to_string()));
+                }
+                if state.evaluating_module {
+                    state.module_effect_attempted = true;
+                    return Err(LuaError::runtime("effect-call-during-load"));
+                }
+                if !state.keyboard_operation_eligible {
+                    return Ok((false, "E_INVALID_CONTEXT".to_string()));
+                }
+                if !state.resource_context.keyboard_output_declared {
+                    return Ok((false, "E_CAPABILITY_UNDECLARED".to_string()));
+                }
+                let table = match request {
+                    Value::Table(table) => table,
+                    _ => return Ok((false, "E_INVALID_ARGUMENT".to_string())),
+                };
+                if table.metatable().is_some() {
+                    return Ok((false, "E_INVALID_ARGUMENT".to_string()));
+                }
+                let payload = match validate_keyboard_request(&kind, &table) {
+                    Ok(payload) => payload,
+                    Err(code) => return Ok((false, code.to_string())),
+                };
+                let request_id = state.next_host_operation_id;
+                state.next_host_operation_id += 1;
+                state.pending_host_operations.insert(request_id, payload);
+                Ok((true, request_id.to_string()))
+            })
+            .map_err(|e| {
+                Outcome::runtime_failure(format!("failed to bind host_keyboard_output: {e}"))
+            })?;
+
         let audio_describe_state = Arc::clone(&callback_state);
         let host_audio_describe_fn = lua
             .create_function(move |lua, value: Value| {
@@ -2239,6 +2451,7 @@ impl EngineInner {
             let _ = subspace.set("host_create_coroutine", host_create_coroutine_fn);
             let _ = subspace.set("host_fs_mount", host_fs_mount_fn);
             let _ = subspace.set("host_fs_io", host_fs_io_fn);
+            let _ = subspace.set("host_keyboard_output", host_keyboard_output_fn);
             let _ = subspace.set("host_instance_id", host_instance_id_fn);
         }
 
@@ -2493,6 +2706,9 @@ impl EngineInner {
                 arguments_json,
                 captured_audio_token,
             } => self.handle_invoke_input_callback(arguments_json, captured_audio_token),
+            Command::InvokeSosCallback { arguments_json } => {
+                self.handle_invoke_sos_callback(arguments_json)
+            }
             Command::StartCoroutine { coroutine_id } => self.handle_start_coroutine(coroutine_id),
             Command::ClaimHostOperation { request_id } => {
                 self.handle_claim_host_operation(request_id)
@@ -2552,7 +2768,9 @@ impl EngineInner {
                     label: None,
                     managed_task: true,
                     input_callback: false,
+                    sos_callback: false,
                     audio_operation_eligible: true,
+                    keyboard_operation_eligible: true,
                     host_operation_id: None,
                 },
             );
@@ -2824,7 +3042,9 @@ impl EngineInner {
                 label: None,
                 managed_task: false,
                 input_callback: false,
+                sos_callback: false,
                 audio_operation_eligible: false,
+                keyboard_operation_eligible: false,
                 host_operation_id: None,
             },
         );
@@ -2874,7 +3094,14 @@ impl EngineInner {
         if self.active_sleep_operations.remove(&operation_id) {
             self.release_sleep_reservation();
         }
-        let (thread, audio_operation_eligible, input_callback, host_operation_id) = {
+        let (
+            thread,
+            audio_operation_eligible,
+            keyboard_operation_eligible,
+            input_callback,
+            sos_callback,
+            host_operation_id,
+        ) = {
             let state = self
                 .coroutines
                 .get_mut(&coroutine_id)
@@ -2886,7 +3113,9 @@ impl EngineInner {
             (
                 state.thread.clone(),
                 state.audio_operation_eligible,
+                state.keyboard_operation_eligible,
                 state.input_callback,
+                state.sos_callback,
                 host_operation_id,
             )
         };
@@ -2903,7 +3132,10 @@ impl EngineInner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             state.audio_operation_eligible = audio_operation_eligible;
-            state.spawn_authority = Some(SpawnAuthority {
+            state.keyboard_operation_eligible = keyboard_operation_eligible;
+            // The bounded SOS owner never receives spawn authority on any
+            // slice: sleep, spawn, and defer remain synchronously rejected.
+            state.spawn_authority = (!sos_callback).then_some(SpawnAuthority {
                 thread_identity: thread.to_pointer() as usize,
             });
             state.defer_authority = input_callback.then_some(DeferAuthority {
@@ -2916,6 +3148,7 @@ impl EngineInner {
             host_kind,
             Some(HostOperationKind::AudioOpen | HostOperationKind::AudioExport)
         );
+        let is_keyboard = host_kind.is_some_and(|kind| kind.is_keyboard());
         let mut resume_success = success;
         let resume_value = if success && host_kind == Some(HostOperationKind::Synthesize) {
             match self.lua.as_ref().and_then(|lua| {
@@ -2970,7 +3203,7 @@ impl EngineInner {
                     Value::String(lua.create_string("E_HOST_FAILURE").unwrap())
                 }
             }
-        } else if success && (is_fs || host_kind == Some(HostOperationKind::AudioExport)) {
+        } else if success && (is_fs || is_keyboard || host_kind == Some(HostOperationKind::AudioExport)) {
             let lua = self.lua.as_ref().unwrap();
             match serde_json::from_str::<serde_json::Value>(&value)
                 .ok()
@@ -2990,6 +3223,8 @@ impl EngineInner {
                 normalize_fs_error_code(&value)
             } else if is_audio_file {
                 normalize_audio_file_error_code(&value)
+            } else if is_keyboard {
+                normalize_keyboard_error_code(&value)
             } else {
                 normalize_audio_error_code(&value)
             };
@@ -3418,6 +3653,21 @@ impl EngineInner {
             }
             Ok(value) => {
                 self.discard_pending_sleep_reservation();
+                // The bounded SOS owner enforces the exact terminal result
+                // shape on every slice, like the synchronous callback path.
+                if self
+                    .coroutines
+                    .get(&coroutine_id)
+                    .is_some_and(|state| state.sos_callback)
+                {
+                    if let Err(err_msg) = validate_callback_return("handle_sos", &value) {
+                        self.release_coroutine(coroutine_id);
+                        self.lifecycle = Lifecycle::Failed;
+                        return Outcome::runtime_failure(format!(
+                            "callback contract violation: {err_msg}"
+                        ));
+                    }
+                }
                 let normalized = match normalize_lua_value(&value, 0) {
                     Ok(value) => value,
                     Err(error) => {
@@ -4020,7 +4270,9 @@ impl EngineInner {
                 label: None,
                 managed_task: false,
                 input_callback: true,
+                sos_callback: false,
                 audio_operation_eligible: true,
+                keyboard_operation_eligible: true,
                 host_operation_id: None,
             },
         );
@@ -4045,6 +4297,7 @@ impl EngineInner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             state.audio_operation_eligible = true;
+            state.keyboard_operation_eligible = true;
             state.audio_registry.insert(
                 captured_audio_token,
                 AudioRegistryEntry {
@@ -4071,22 +4324,121 @@ impl EngineInner {
         self.outcome_with_telemetry(outcome)
     }
 
-    fn handle_start_coroutine(&mut self, coroutine_id: i64) -> Outcome {
-        let (thread, audio_operation_eligible) = match self.coroutines.get_mut(&coroutine_id) {
-            Some(state) if state.lifecycle == Lifecycle::Loaded => {
-                state.lifecycle = Lifecycle::Running;
-                (state.thread.clone(), state.audio_operation_eligible)
-            }
-            Some(_) => {
-                return self.outcome_with_telemetry(Outcome::invalid_ownership(
-                    "coroutine is not ready to start",
-                ))
-            }
-            None => {
-                return self
-                    .outcome_with_telemetry(Outcome::invalid_ownership("coroutine id not found"))
+    /// Invoke handle_sos inside a bounded host-managed coroutine. The SOS
+    /// owner may yield only explicitly authorized typed operations (initially
+    /// keyboard output); sleep, spawn, defer, and raw yields remain rejected.
+    /// A handle_sos that never yields completes in this one slice exactly
+    /// like the synchronous callback path, with the same terminal result
+    /// shape validation.
+    fn handle_invoke_sos_callback(&mut self, arguments_json: String) -> Outcome {
+        let lua = match &self.lua {
+            Some(l) => l,
+            None => return self.outcome_with_telemetry(Outcome::new(OutcomeKind::Closed)),
+        };
+        let args_val: serde_json::Value = if arguments_json.is_empty() {
+            serde_json::Value::Null
+        } else {
+            match serde_json::from_str(&arguments_json) {
+                Ok(value) => value,
+                Err(e) => {
+                    return self.outcome_with_telemetry(Outcome::validation_failure(format!(
+                        "invalid arguments JSON: {e}"
+                    )))
+                }
             }
         };
+        let lua_args = match json_to_lua(lua, &args_val) {
+            Ok(v) => v,
+            Err(e) => {
+                return self.outcome_with_telemetry(Outcome::validation_failure(format!(
+                    "failed to convert arguments to Lua: {e}"
+                )))
+            }
+        };
+        let callbacks: Table = match lua
+            .globals()
+            .get::<Table>("subspace")
+            .and_then(|subspace: Table| subspace.get("_callbacks"))
+        {
+            Ok(table) => table,
+            Err(e) => {
+                return self.outcome_with_telemetry(Outcome::runtime_failure(format!(
+                    "_callbacks missing: {e}"
+                )))
+            }
+        };
+        let callback_fn: Function = match callbacks.raw_get("handle_sos") {
+            Ok(Value::Function(function)) => function,
+            _ => {
+                return self.outcome_with_telemetry(Outcome::validation_failure(
+                    "callback 'handle_sos' not found",
+                ))
+            }
+        };
+        let thread = match lua.create_thread(callback_fn) {
+            Ok(thread) => thread,
+            Err(e) => {
+                return self.outcome_with_telemetry(Outcome::runtime_failure(format!(
+                    "failed to create SOS coroutine: {e}"
+                )))
+            }
+        };
+        self.reset_execution_budget();
+        self.setup_hook(&thread);
+        self.lifecycle = Lifecycle::Running;
+        let coroutine_id = self.next_coroutine_id;
+        self.next_coroutine_id += 1;
+        self.coroutines.insert(
+            coroutine_id,
+            CoroutineState {
+                thread: thread.clone(),
+                lifecycle: Lifecycle::Running,
+                operation: None,
+                label: None,
+                managed_task: false,
+                input_callback: false,
+                sos_callback: true,
+                audio_operation_eligible: false,
+                keyboard_operation_eligible: true,
+                host_operation_id: None,
+            },
+        );
+        {
+            let mut state = self
+                .callback_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.keyboard_operation_eligible = true;
+            // Deliberately no spawn authority, no defer authority, and no
+            // audio eligibility: the SOS owner may yield only authorized
+            // typed keyboard operations.
+        }
+        let result = thread.resume::<Value>(lua_args);
+        let outcome = self.classify_resume_result(result, &thread, coroutine_id);
+        self.outcome_with_telemetry(outcome)
+    }
+    fn handle_start_coroutine(&mut self, coroutine_id: i64) -> Outcome {
+        let (thread, audio_operation_eligible, keyboard_operation_eligible) =
+            match self.coroutines.get_mut(&coroutine_id) {
+                Some(state) if state.lifecycle == Lifecycle::Loaded => {
+                    state.lifecycle = Lifecycle::Running;
+                    (
+                        state.thread.clone(),
+                        state.audio_operation_eligible,
+                        state.keyboard_operation_eligible,
+                    )
+                }
+                Some(_) => {
+                    return self.outcome_with_telemetry(Outcome::invalid_ownership(
+                        "coroutine is not ready to start",
+                    ))
+                }
+                None => {
+                    return self.outcome_with_telemetry(Outcome::invalid_ownership(
+                        "coroutine id not found",
+                    ))
+                }
+            };
         self.lifecycle = Lifecycle::Running;
         self.reset_execution_budget();
         self.setup_hook(&thread);
@@ -4097,6 +4449,7 @@ impl EngineInner {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             state.audio_operation_eligible = audio_operation_eligible;
+            state.keyboard_operation_eligible = keyboard_operation_eligible;
             state.spawn_authority = Some(SpawnAuthority {
                 thread_identity: thread.to_pointer() as usize,
             });
@@ -4362,6 +4715,26 @@ impl StateEngine {
         )
     }
 
+    /// Invoke handle_sos in a dedicated bounded host-managed coroutine. The
+    /// SOS owner may yield only explicitly authorized typed operations
+    /// (initially keyboard output); the caller retains the yielded
+    /// coroutine/operation pair as its execution owner and completes it
+    /// through the same claim/resume path. A handle_sos that never yields
+    /// completes in one slice like the synchronous callback.
+    pub fn invoke_sos_callback_with_spawn_admitter(
+        &self,
+        generation: Generation,
+        arguments_json: &str,
+        admitter: Arc<dyn SpawnAdmitter>,
+    ) -> Outcome {
+        self.dispatch_with_spawn_admitter(
+            generation,
+            Command::InvokeSosCallback {
+                arguments_json: arguments_json.to_string(),
+            },
+            admitter,
+        )
+    }
     pub fn start_coroutine_with_spawn_admitter(
         &self,
         generation: Generation,

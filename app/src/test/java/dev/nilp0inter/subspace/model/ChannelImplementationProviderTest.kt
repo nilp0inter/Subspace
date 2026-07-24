@@ -162,7 +162,7 @@ class ChannelImplementationProviderTest {
             ChannelConfigurationField.DynamicChoiceField(
                 id = "model",
                 label = "Model",
-                source = DynamicConfigurationChoiceSource.OPENAI_MODELS,
+                source = DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
             )
         }
 
@@ -170,7 +170,7 @@ class ChannelImplementationProviderTest {
         val modelField = ChannelConfigurationField.DynamicChoiceField(
             id = "model",
             label = "Model",
-            source = DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            source = DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
             dependsOnFieldId = "profile",
         )
         assertThrows(IllegalArgumentException::class.java) {

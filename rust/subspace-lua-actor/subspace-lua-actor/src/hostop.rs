@@ -31,6 +31,8 @@ pub enum HostOperationKind {
     FsReadText,
     FsWriteText,
     FsRemove,
+    KeyboardSendText,
+    KeyboardSendKey,
 }
 
 impl HostOperationKind {
@@ -48,6 +50,8 @@ impl HostOperationKind {
             HostOperationKind::FsReadText => "FS_READ_TEXT",
             HostOperationKind::FsWriteText => "FS_WRITE_TEXT",
             HostOperationKind::FsRemove => "FS_REMOVE",
+            HostOperationKind::KeyboardSendText => "KEYBOARD_SEND_TEXT",
+            HostOperationKind::KeyboardSendKey => "KEYBOARD_SEND_KEY",
         }
     }
 
@@ -61,6 +65,15 @@ impl HostOperationKind {
                 | HostOperationKind::FsReadText
                 | HostOperationKind::FsWriteText
                 | HostOperationKind::FsRemove
+        )
+    }
+
+    /// True for keyboard-output operations that resume with a semantic
+    /// result table (`delivered`/`rejected`/`failed`/`indeterminate`).
+    pub fn is_keyboard(self) -> bool {
+        matches!(
+            self,
+            HostOperationKind::KeyboardSendText | HostOperationKind::KeyboardSendKey
         )
     }
 }
@@ -135,6 +148,19 @@ pub enum HostOperationPayload {
         path: String,
         missing_ok: bool,
     },
+    /// Bounded UTF-8 text plus logical profile for one semantic keyboard
+    /// text operation. Validated byte bounds are enforced by the kernel
+    /// before this payload exists; the host revalidates profile, capacity,
+    /// and generation ownership before effect.
+    KeyboardSendText {
+        text: String,
+        profile: String,
+    },
+    /// Exactly one semantic key (`enter` or `escape`) plus logical profile.
+    KeyboardSendKey {
+        key: String,
+        profile: String,
+    },
 }
 
 impl HostOperationPayload {
@@ -151,6 +177,8 @@ impl HostOperationPayload {
             HostOperationPayload::FsReadText { .. } => HostOperationKind::FsReadText,
             HostOperationPayload::FsWriteText { .. } => HostOperationKind::FsWriteText,
             HostOperationPayload::FsRemove { .. } => HostOperationKind::FsRemove,
+            HostOperationPayload::KeyboardSendText { .. } => HostOperationKind::KeyboardSendText,
+            HostOperationPayload::KeyboardSendKey { .. } => HostOperationKind::KeyboardSendKey,
         }
     }
 
@@ -268,6 +296,12 @@ impl HostOperationPayload {
                 .with("mountToken", json!(mount_token))
                 .with("path", json!(path))
                 .with("missingOk", json!(missing_ok)),
+            HostOperationPayload::KeyboardSendText { text, profile } => outcome
+                .with("text", json!(text))
+                .with("profile", json!(profile)),
+            HostOperationPayload::KeyboardSendKey { key, profile } => outcome
+                .with("key", json!(key))
+                .with("profile", json!(profile)),
         }
     }
 }

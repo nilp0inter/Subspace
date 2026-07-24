@@ -423,6 +423,7 @@ fn namespace_enumeration_has_only_allowed_modules_and_missing_require_is_side_ef
             "subspace.audio",
             "subspace.channel",
             "subspace.fs",
+            "subspace.keyboard_output",
             "subspace.log",
             "subspace.playback",
             "subspace.runtime",

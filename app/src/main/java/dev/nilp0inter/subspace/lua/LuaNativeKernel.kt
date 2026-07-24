@@ -140,6 +140,13 @@ internal object LuaNativeKernel {
         capturedAudioToken: String,
         spawnAdmission: LuaSpawnAdmission,
     ): String
+    /** Host-managed bounded yield-capable handle_sos coroutine entrypoint. */
+    external fun nativeInvokeSosCallback(
+        stateId: Long,
+        generation: Long,
+        argumentsJson: String,
+        spawnAdmission: LuaSpawnAdmission,
+    ): String
 
     external fun nativeStartCoroutine(
         stateId: Long,

@@ -148,6 +148,22 @@ internal class ActorRuntime(
             bridge.invokeInputCallback(handle, callback, arguments, capturedAudioToken, spawnAdmission)
         }
     }
+    /**
+     * Invokes handle_sos in a bounded host-managed yield-capable coroutine
+     * while the actor is live. A handle_sos that never yields completes in
+     * one slice exactly like the synchronous path; a yielded keyboard-output
+     * request surfaces as [LuaKernelOutcome.Yielded] and is driven by the
+     * caller through the same claim/resume path used for input.
+     */
+    suspend fun invokeProgramImageSosCallback(
+        callback: dev.nilp0inter.subspace.lua.LuaCallbackHandle,
+        arguments: dev.nilp0inter.subspace.lua.LuaValue,
+        spawnAdmission: LuaSpawnAdmission,
+    ): ActorGateResult<LuaKernelOutcome> {
+        val handle = stateHandle ?: return ActorGateResult.Closed
+        if (!latch.isLive || isClosed) return ActorGateResult.Closed
+        return trackGateContinuation { bridge.invokeSosCallback(handle, callback, arguments, spawnAdmission) }
+    }
 
     /** Starts one host-admitted background coroutine through the generation gate. */
     suspend fun startProgramImageCoroutine(

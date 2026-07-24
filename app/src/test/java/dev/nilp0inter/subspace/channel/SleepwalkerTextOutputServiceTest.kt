@@ -10,6 +10,8 @@ import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
 import dev.nilp0inter.subspace.model.KeyboardConnectionState
 import io.sleepwalker.core.hid.LowLevelHidImpl
 import io.sleepwalker.core.hid.LowLevelOp
+import io.sleepwalker.core.keymap.HostProfile
+import io.sleepwalker.core.keymap.KeymapDatabase
 import io.sleepwalker.core.keymap.SeedKeymapDatabase
 import io.sleepwalker.core.protocol.Opcodes
 import kotlinx.coroutines.CompletableDeferred
@@ -86,6 +88,31 @@ class SleepwalkerTextOutputServiceTest {
         assertEquals(1, connection.count(Opcodes.DISARM))
         assertEquals(0, connection.count(Opcodes.KILL))
         assertTrue(connection.sent.size > 2)
+    }
+
+    @Test
+    fun normalizedProfileIdResolvesCanonicalMixedCaseDatabaseProfile() = runTest {
+        val canonical = HostProfile(hostOs = "macos", layout = "ABC")
+        val entries = checkNotNull(SeedKeymapDatabase.lookup(HostProfile.LINUX_US))
+        val database = object : KeymapDatabase {
+            override val profiles: Collection<HostProfile> = listOf(canonical)
+
+            override fun lookup(profile: HostProfile) = if (profile == canonical) entries else null
+        }
+        val connection = RecordingConnection().apply { setState(KeyboardConnectionState.Connected) }
+        val service = service(
+            connection = connection,
+            keymapDatabase = database,
+        ) {
+            error("connected service must not reconnect")
+        }
+
+        assertEquals(
+            TextDeliveryOutcome.Delivered("office:1"),
+            service.capabilityFor("office").sendText(
+                TextOutputRequest("hello", TextOutputProfile("macos:abc")),
+            ),
+        )
     }
 
     @Test
@@ -270,12 +297,13 @@ class SleepwalkerTextOutputServiceTest {
     private fun kotlinx.coroutines.test.TestScope.service(
         connection: RecordingConnection,
         deliveryTimeoutMs: Long = 1_000,
+        keymapDatabase: KeymapDatabase = SeedKeymapDatabase,
         connectOperation: suspend () -> SleepwalkerConnectionResult,
     ): SleepwalkerTextOutputService = SleepwalkerTextOutputService(
         scope = backgroundScope,
         connection = connection,
         hid = LowLevelHidImpl(),
-        keymapDatabase = SeedKeymapDatabase,
+        keymapDatabase = keymapDatabase,
         connect = { _: Long -> connectOperation() },
         preparationTimeoutMs = 1_000,
         deliveryTimeoutMs = deliveryTimeoutMs,

@@ -13,6 +13,15 @@ import dev.nilp0inter.subspace.channel.capability.TextOutputKey
 import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
 import dev.nilp0inter.subspace.channel.capability.TextOutputRejectionReason
 import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
+import dev.nilp0inter.subspace.channel.capability.AdmissionResult
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputSubmission
+import dev.nilp0inter.subspace.channel.capability.OutputAdmissionScheduler
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwnerKind
+import dev.nilp0inter.subspace.channel.capability.OutputOperationAttribution
+import dev.nilp0inter.subspace.dependency.PackageConfigurationLimits
 import dev.nilp0inter.subspace.model.KeyboardConnectionState
 import io.sleepwalker.core.hid.LowLevelHid
 import io.sleepwalker.core.keymap.HostProfile
@@ -58,10 +67,16 @@ class SleepwalkerTextOutputService(
     private val connect: suspend (timeoutMs: Long) -> SleepwalkerConnectionResult,
     private val preparationTimeoutMs: Long = DEFAULT_PREPARATION_TIMEOUT_MS,
     private val deliveryTimeoutMs: Long = DEFAULT_DELIVERY_TIMEOUT_MS,
+    private val admission: OutputAdmissionScheduler = OutputAdmissionScheduler(),
 ) {
     companion object {
         const val DEFAULT_PREPARATION_TIMEOUT_MS = SleepwalkerBleConnection.CONNECTION_TIMEOUT_MS
         const val DEFAULT_DELIVERY_TIMEOUT_MS = 15_000L
+        /** Per-operation text bound, aligned with PackageConfigurationLimits.MAX_STRING_VALUE_BYTES. */
+        val MAX_KEYBOARD_TEXT_BYTES: Long = PackageConfigurationLimits.MAX_STRING_VALUE_BYTES.toLong()
+
+        /** A semantic key retains no text payload. */
+        private const val KEY_PAYLOAD_BYTES: Long = 0L
     }
 
     private val operationMutex = Mutex()
@@ -70,6 +85,10 @@ class SleepwalkerTextOutputService(
     private var preparation: Deferred<SleepwalkerConnectionResult>? = null
     private var activeDelivery: Job? = null
     private var closed = false
+
+    private val hostProfilesByKey: Map<String, HostProfile> by lazy {
+        keymapDatabase.profiles.associateBy(HostProfile::key)
+    }
 
     private val _availability = MutableStateFlow<TextOutputAvailability>(TextOutputAvailability.Unavailable)
     val availability: StateFlow<TextOutputAvailability> = _availability.asStateFlow()
@@ -96,28 +115,158 @@ class SleepwalkerTextOutputService(
      */
     fun capabilityFor(instanceId: String): TextOutputCapability {
         require(instanceId.isNotBlank()) { "Text output instance ID must not be blank" }
+        val attribution = OutputOperationAttribution(
+            channelInstanceId = instanceId,
+            generation = null,
+            owner = OutputExecutionOwner(OutputExecutionOwnerKind.BUILT_IN, instanceId),
+        )
         return object : TextOutputCapability {
             override suspend fun sendText(request: TextOutputRequest): TextDeliveryOutcome {
                 val operationId = nextOperationId(instanceId)
-                val profile = request.profile.toHostProfile()
+                val profile = resolveProfile(request.profile)
                     ?: return TextOutputOutcome.Rejected(
                         operationId,
                         TextOutputRejectionReason.INVALID_PROFILE,
                     ).toCapabilityOutcome()
-                return sendText(operationId, profile, request.text).toCapabilityOutcome()
+                val payloadBytes = request.text.toByteArray(Charsets.UTF_8).size.toLong()
+                if (request.text.isEmpty()) {
+                    Log.i(CHANNEL_EFFECT_TAG, "TEXT_OUTPUT_REJECTED operation=${operationId.value} reason=empty_text")
+                    return TextOutputOutcome.Rejected(operationId, TextOutputRejectionReason.EMPTY_TEXT).toCapabilityOutcome()
+                }
+                if (payloadBytes > MAX_KEYBOARD_TEXT_BYTES) {
+                    Log.i(
+                        CHANNEL_EFFECT_TAG,
+                        "TEXT_OUTPUT_REJECTED operation=${operationId.value} reason=over_bound text_length=${request.text.length}",
+                    )
+                    return TextOutputOutcome.Rejected(operationId, TextOutputRejectionReason.POLICY_REFUSED).toCapabilityOutcome()
+                }
+                return admitBuiltIn(attribution, payloadBytes, operationId) {
+                    sendText(operationId, profile, request.text).toCapabilityOutcome()
+                }
             }
 
             override suspend fun sendKey(request: TextKeyRequest): TextDeliveryOutcome {
                 val operationId = nextOperationId(instanceId)
-                if (request.profile.toHostProfile() == null) {
+                if (resolveProfile(request.profile) == null) {
                     return TextOutputOutcome.Rejected(
                         operationId,
                         TextOutputRejectionReason.INVALID_PROFILE,
                     ).toCapabilityOutcome()
                 }
-                return sendKey(operationId, request.key).toCapabilityOutcome()
+                if (request.key == TextOutputKey.ESCAPE) {
+                    return TextOutputOutcome.Rejected(operationId, TextOutputRejectionReason.POLICY_REFUSED).toCapabilityOutcome()
+                }
+                return admitBuiltIn(attribution, KEY_PAYLOAD_BYTES, operationId) {
+                    sendKey(operationId, request.key).toCapabilityOutcome()
+                }
             }
         }
+    }
+
+    /**
+     * Creates a generation-scoped keyboard-output adapter for one execution owner. The adapter
+     * revalidates the logical profile and request bounds, attributes each operation to the instance,
+     * generation, and owner, and admits it through the same host-wide bounded FIFO scheduler as the
+     * built-in port. It exposes no shared service, connection, keymap, HID, acknowledgement, or
+     * transport control, so shared-service ownership is never transferred to a runtime.
+     */
+    fun keyboardOutputAdapter(
+        identity: CapabilityScopeIdentity,
+        owner: OutputExecutionOwner,
+    ): KeyboardOutputAdapter {
+        val scopeIdentity = identity
+        val attribution = OutputOperationAttribution(
+            channelInstanceId = scopeIdentity.channelInstanceId,
+            generation = scopeIdentity.runtimeGeneration,
+            owner = owner,
+        )
+        val instanceId = scopeIdentity.channelInstanceId
+        return object : KeyboardOutputAdapter {
+            override val identity: CapabilityScopeIdentity = scopeIdentity
+
+            override suspend fun sendText(request: TextOutputRequest): KeyboardOutputSubmission {
+                val operationId = nextOperationId(instanceId)
+                val profile = resolveProfile(request.profile)
+                    ?: return KeyboardOutputSubmission.Completed(
+                        TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.INVALID_PROFILE),
+                    )
+                val payloadBytes = request.text.toByteArray(Charsets.UTF_8).size.toLong()
+                if (request.text.isEmpty()) {
+                    return KeyboardOutputSubmission.Completed(
+                        TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.EMPTY_TEXT),
+                    )
+                }
+                if (payloadBytes > MAX_KEYBOARD_TEXT_BYTES) {
+                    return KeyboardOutputSubmission.Completed(
+                        TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.POLICY_REFUSED),
+                    )
+                }
+                return admitAdapter(attribution, payloadBytes, operationId) {
+                    sendText(operationId, profile, request.text).toCapabilityOutcome()
+                }
+            }
+
+            override suspend fun sendKey(request: TextKeyRequest): KeyboardOutputSubmission {
+                val operationId = nextOperationId(instanceId)
+                if (resolveProfile(request.profile) == null) {
+                    return KeyboardOutputSubmission.Completed(
+                        TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.INVALID_PROFILE),
+                    )
+                }
+                if (request.key == TextOutputKey.ESCAPE) {
+                    return KeyboardOutputSubmission.Completed(
+                        TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.POLICY_REFUSED),
+                    )
+                }
+                return admitAdapter(attribution, KEY_PAYLOAD_BYTES, operationId) {
+                    sendKey(operationId, request.key).toCapabilityOutcome()
+                }
+            }
+        }
+    }
+
+    /**
+     * 10.6: Revokes every queued (not-yet-effective) keyboard-output operation belonging to one
+     * instance+generation scope, proving no effect began for them. Invoked by the capability host on
+     * generation revocation so a predecessor's queued keyboard work is drained before a successor
+     * readies. Active physical delivery and sibling scopes are untouched; idempotent.
+     */
+    suspend fun revokeKeyboardGeneration(identity: CapabilityScopeIdentity) {
+        admission.revokeScope(identity)
+    }
+
+    /** Maps a built-in admission to the port's terminal delivery outcome (no E_BUSY surface). */
+    private suspend fun admitBuiltIn(
+        attribution: OutputOperationAttribution,
+        payloadBytes: Long,
+        operationId: TextOutputOperationId,
+        effect: suspend () -> TextDeliveryOutcome,
+    ): TextDeliveryOutcome = when (val result = admission.admit(attribution, payloadBytes, effect)) {
+        is AdmissionResult.Admitted -> result.value
+        AdmissionResult.Busy ->
+            TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.POLICY_REFUSED)
+        AdmissionResult.Rejected ->
+            TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.POLICY_REFUSED)
+        AdmissionResult.Closed ->
+            TextDeliveryOutcome.Failed(operationId.value, TextOutputFailureReason.UNAVAILABLE)
+        AdmissionResult.Revoked ->
+            TextDeliveryOutcome.Failed(operationId.value, TextOutputFailureReason.CANCELLED)
+    }
+
+    /** Maps a generation-scoped admission to the keyboard-output submission contract (busy is explicit). */
+    private suspend fun admitAdapter(
+        attribution: OutputOperationAttribution,
+        payloadBytes: Long,
+        operationId: TextOutputOperationId,
+        effect: suspend () -> TextDeliveryOutcome,
+    ): KeyboardOutputSubmission = when (val result = admission.admit(attribution, payloadBytes, effect)) {
+        is AdmissionResult.Admitted -> KeyboardOutputSubmission.Completed(result.value)
+        AdmissionResult.Busy -> KeyboardOutputSubmission.Busy
+        AdmissionResult.Rejected -> KeyboardOutputSubmission.Completed(
+            TextDeliveryOutcome.Rejected(operationId.value, TextOutputRejectionReason.POLICY_REFUSED),
+        )
+        AdmissionResult.Closed -> KeyboardOutputSubmission.Closed
+        AdmissionResult.Revoked -> KeyboardOutputSubmission.Revoked
     }
 
     /**
@@ -138,6 +287,18 @@ class SleepwalkerTextOutputService(
 
     internal suspend fun isReadyForDelivery(): Boolean = lifecycleMutex.withLock {
         !closed && connection.connectionState.value == KeyboardConnectionState.Connected
+    }
+
+    /**
+     * Stable public profile IDs are normalized by [HostProfile.key], while imported
+     * keymap metadata can retain platform-specific casing. Return the canonical
+     * database key object so case-sensitive [HostProfile] equality still resolves
+     * the exact keymap selected by the public scalar.
+     */
+    private fun resolveProfile(profile: TextOutputProfile): HostProfile? {
+        val parts = profile.id.split(":")
+        if (parts.size !in 2..3 || parts.any(String::isBlank)) return null
+        return hostProfilesByKey[profile.id.lowercase()]
     }
 
     /** Submits one non-replayable text operation addressed to a channel instance. */
@@ -197,6 +358,7 @@ class SleepwalkerTextOutputService(
         }
         delivery?.cancel()
         pending?.cancelAndJoin()
+        admission.shutdown()
         operationMutex.withLock {
             connection.disconnect()
             _availability.value = TextOutputAvailability.Closed
@@ -384,15 +546,6 @@ sealed interface TextOutputOutcome {
     ) : TextOutputOutcome
 }
 
-private fun TextOutputProfile.toHostProfile(): HostProfile? {
-    val parts = id.split(":")
-    if (parts.size !in 2..3 || parts.any { it.isBlank() }) return null
-    return HostProfile(
-        hostOs = parts[0],
-        layout = parts[1],
-        variant = parts.getOrNull(2),
-    )
-}
 
 private fun TextOutputOutcome.toCapabilityOutcome(): TextDeliveryOutcome = when (this) {
     is TextOutputOutcome.Delivered -> TextDeliveryOutcome.Delivered(operationId.value)

@@ -8,6 +8,14 @@ import dev.nilp0inter.subspace.service.ChannelRuntime
 import kotlinx.coroutines.CoroutineScope
 import org.json.JSONObject
 import dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration
+import dev.nilp0inter.subspace.dependency.PackageConfigurationLimits
+import java.nio.charset.StandardCharsets
+import kotlin.time.Duration
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 
 /** Typed failures returned by provider registration, configuration, and construction. */
 sealed interface ChannelProviderError {
@@ -262,7 +270,7 @@ sealed interface ChannelConfigurationField {
     data class DynamicChoiceField(
         override val id: String,
         override val label: String,
-        val source: DynamicConfigurationChoiceSource,
+        val source: DynamicConfigurationChoiceSourceId,
         override val help: String? = null,
         val dependsOnFieldId: String? = null,
         /** Optional scalar condition for rendering a dependent field. */
@@ -280,7 +288,7 @@ sealed interface ChannelConfigurationField {
             require((visibleWhenFieldId == null) == (visibleWhenValue == null)) {
                 "Dynamic choice visibility requires both field ID and expected value"
             }
-            require(source != DynamicConfigurationChoiceSource.OPENAI_MODELS || dependsOnFieldId != null) {
+            require(source != DynamicConfigurationChoiceSourceId.OPENAI_MODELS || dependsOnFieldId != null) {
                 "OpenAI model choices must depend on a profile field"
             }
         }
@@ -304,16 +312,34 @@ sealed interface ChannelConfigurationField {
     ) : ChannelConfigurationField
 }
 
-/** Host-owned resources that providers may reference declaratively from configuration schema. */
-enum class DynamicConfigurationChoiceSource {
-    OPENAI_CONNECTION_PROFILES,
-    OPENAI_MODELS,
-    TEXT_OUTPUT_PROFILES,
+/**
+ * Public identifier for a host-owned dynamic choice source. Configuration schema references a
+ * source by this bounded scalar ID; the host registry maps it to a resolver without exposing
+ * repository, SDK, keymap, or profile objects to providers or packages.
+ */
+@JvmInline
+value class DynamicConfigurationChoiceSourceId(val value: String) {
+    init {
+        require(value.isNotBlank()) { "Dynamic choice source ID must not be blank" }
+        val bytes = value.toByteArray(StandardCharsets.UTF_8)
+        require(bytes.size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+            "Dynamic choice source ID must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes"
+        }
+        require(String(bytes, StandardCharsets.UTF_8) == value) {
+            "Dynamic choice source ID must be valid UTF-8"
+        }
+    }
+
+    companion object {
+        val OPENAI_CONNECTION_PROFILES = DynamicConfigurationChoiceSourceId("openai-connection-profiles")
+        val OPENAI_MODELS = DynamicConfigurationChoiceSourceId("openai-models")
+        val KEYBOARD_OUTPUT_PROFILES = DynamicConfigurationChoiceSourceId("keyboard-output-profiles")
+    }
 }
 
 /** Input passed by an editor to its host resolver; it carries scalar dependency values only. */
 data class DynamicConfigurationChoiceRequest(
-    val source: DynamicConfigurationChoiceSource,
+    val source: DynamicConfigurationChoiceSourceId,
     val dependencyValue: String? = null,
 )
 
@@ -347,6 +373,112 @@ enum class DynamicConfigurationChoiceUnavailableReason {
     SOURCE_UNAVAILABLE,
     DISCOVERY_FAILED,
     HOST_NOT_READY,
+    RESOLUTION_TIMED_OUT,
+}
+
+/** Detached state for one required dynamic reference, projected without host profile objects. */
+enum class DynamicConfigurationReferenceState {
+    AVAILABLE,
+    UNAVAILABLE,
+}
+
+/**
+ * Projects the detached reference state of a persisted scalar selection against this resolution.
+ * A selection is AVAILABLE only when the resolved source currently contains its exact scalar ID;
+ * loading, unavailable, blank, or missing-membership outcomes project UNAVAILABLE without
+ * mutating configuration, so callers preserve the scalar for repair or later recovery.
+ */
+fun DynamicConfigurationChoiceResolution.referenceState(
+    selectedValue: String?,
+): DynamicConfigurationReferenceState {
+    if (selectedValue.isNullOrBlank()) return DynamicConfigurationReferenceState.UNAVAILABLE
+    val available = this as? DynamicConfigurationChoiceResolution.Available
+        ?: return DynamicConfigurationReferenceState.UNAVAILABLE
+    return if (available.choices.any { it.id == selectedValue }) {
+        DynamicConfigurationReferenceState.AVAILABLE
+    } else {
+        DynamicConfigurationReferenceState.UNAVAILABLE
+    }
+}
+
+/**
+ * Generic host registry keyed by public dynamic source ID. Registration validates positive
+ * deadlines and rejects duplicate sources. Resolution enforces each source deadline, maps
+ * source failure and timeout to typed unavailable states, and validates published choices
+ * all-or-nothing: an over-bound, duplicate, or unrepresentable publication becomes a typed
+ * unavailable state and never a partial choice list.
+ */
+class DynamicConfigurationChoiceSourceRegistry : DynamicConfigurationChoiceResolver {
+    private data class Registration(
+        val deadline: Duration,
+        val resolver: DynamicConfigurationChoiceResolver,
+    )
+
+    private val registrations = LinkedHashMap<DynamicConfigurationChoiceSourceId, Registration>()
+
+    fun register(
+        source: DynamicConfigurationChoiceSourceId,
+        deadline: Duration,
+        resolver: DynamicConfigurationChoiceResolver,
+    ) {
+        require(deadline.isPositive()) {
+            "Dynamic choice source deadline must be positive: ${source.value}"
+        }
+        require(source !in registrations) {
+            "Dynamic choice source already registered: ${source.value}"
+        }
+        registrations[source] = Registration(deadline, resolver)
+    }
+
+    override suspend fun resolve(request: DynamicConfigurationChoiceRequest): DynamicConfigurationChoiceResolution {
+        val registration = registrations[request.source]
+            ?: return DynamicConfigurationChoiceResolution.Unavailable(
+                DynamicConfigurationChoiceUnavailableReason.SOURCE_UNAVAILABLE,
+            )
+        val raw = try {
+            withContext(Dispatchers.Default) {
+                withTimeout(registration.deadline) { registration.resolver.resolve(request) }
+            }
+        } catch (timeout: TimeoutCancellationException) {
+            return DynamicConfigurationChoiceResolution.Unavailable(
+                DynamicConfigurationChoiceUnavailableReason.RESOLUTION_TIMED_OUT,
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return DynamicConfigurationChoiceResolution.Unavailable(
+                DynamicConfigurationChoiceUnavailableReason.DISCOVERY_FAILED,
+            )
+        }
+        if (raw is DynamicConfigurationChoiceResolution.Available && !isValidPublication(raw.choices)) {
+            return DynamicConfigurationChoiceResolution.Unavailable(
+                DynamicConfigurationChoiceUnavailableReason.SOURCE_UNAVAILABLE,
+            )
+        }
+        return raw
+    }
+
+    /**
+     * All-or-nothing validation of a source publication: bounded count, UTF-8 representable
+     * IDs and labels within byte bounds, and unique IDs and labels. Any violation discards
+     * the complete publication.
+     */
+    private fun isValidPublication(choices: List<DynamicConfigurationChoice>): Boolean {
+        if (choices.size > PackageConfigurationLimits.MAX_CHOICES) return false
+        val uniqueIds = HashSet<String>(choices.size)
+        val uniqueLabels = HashSet<String>(choices.size)
+        return choices.all { choice ->
+            isBoundedUtf8(choice.id, PackageConfigurationLimits.MAX_STRING_VALUE_BYTES) &&
+                isBoundedUtf8(choice.label, PackageConfigurationLimits.MAX_LABEL_BYTES) &&
+                uniqueIds.add(choice.id) &&
+                uniqueLabels.add(choice.label)
+        }
+    }
+
+    private fun isBoundedUtf8(value: String, maximumBytes: Int): Boolean {
+        val bytes = value.toByteArray(StandardCharsets.UTF_8)
+        return bytes.size <= maximumBytes && String(bytes, StandardCharsets.UTF_8) == value
+    }
 }
 
 data class ChannelPreparationTraits(
@@ -1043,14 +1175,14 @@ object BuiltInChannelDescriptors {
         ),
         configuration = OpenAiAgentConfigurationProvider,
         configurationFields = listOf(
-            ChannelConfigurationField.DynamicChoiceField("connectionProfileId", "Connection profile", source = DynamicConfigurationChoiceSource.OPENAI_CONNECTION_PROFILES),
-            ChannelConfigurationField.DynamicChoiceField("modelId", "Model", source = DynamicConfigurationChoiceSource.OPENAI_MODELS, dependsOnFieldId = "connectionProfileId"),
+            ChannelConfigurationField.DynamicChoiceField("connectionProfileId", "Connection profile", source = DynamicConfigurationChoiceSourceId.OPENAI_CONNECTION_PROFILES),
+            ChannelConfigurationField.DynamicChoiceField("modelId", "Model", source = DynamicConfigurationChoiceSourceId.OPENAI_MODELS, dependsOnFieldId = "connectionProfileId"),
             ChannelConfigurationField.TextField("systemPrompt", "System prompt", multiline = true),
             ChannelConfigurationField.BooleanField("keyboardEnabled", "Enable Keyboard tools"),
             ChannelConfigurationField.DynamicChoiceField(
                 id = "keyboardProfileId",
                 label = "Keyboard profile",
-                source = DynamicConfigurationChoiceSource.TEXT_OUTPUT_PROFILES,
+                source = DynamicConfigurationChoiceSourceId.KEYBOARD_OUTPUT_PROFILES,
                 visibleWhenFieldId = "keyboardEnabled",
                 visibleWhenValue = "true",
                 required = false,

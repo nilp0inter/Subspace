@@ -345,6 +345,48 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
         return LuaKernelOutcomeCodec.decode(json)
     }
 
+    override fun invokeSosCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        spawnAdmission: LuaSpawnAdmission,
+    ): LuaKernelOutcome {
+        if (callbackHandle.stateHandle != handle || callbackHandle.name != "handle_sos") {
+            return invalidCallbackOwnership(handle, callbackHandle)
+        }
+        val argumentsJson = when (val encoding = arguments.toJsonString()) {
+            is JsonEncodingResult.Success -> encoding.json
+            is JsonEncodingResult.Failure -> {
+                return LuaKernelOutcome.ValidationFailure(
+                    stateId = handle.stateId.value,
+                    generation = handle.generation.value,
+                    diagnostic = encoding.diagnostic,
+                )
+            }
+        }
+        if (!LuaNativeKernel.ensureLoaded()) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "subspace_lua_actor native library not available",
+            )
+        }
+        val json = try {
+            LuaNativeKernel.nativeInvokeSosCallback(
+                handle.stateId.value,
+                handle.generation.value,
+                argumentsJson,
+                spawnAdmission,
+            )
+        } catch (e: UnsatisfiedLinkError) {
+            return LuaKernelOutcome.RuntimeFailure(
+                stateId = handle.stateId.value,
+                generation = handle.generation.value,
+                diagnostic = "nativeInvokeSosCallback link error: ${e.message}",
+            )
+        }
+        return LuaKernelOutcomeCodec.decode(json)
+    }
     private fun invalidCallbackOwnership(
         handle: LuaStateHandle,
         callbackHandle: LuaCallbackHandle,
@@ -476,6 +518,8 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
                     "FS_READ_TEXT" -> HostOperationKind.FS_READ_TEXT
                     "FS_WRITE_TEXT" -> HostOperationKind.FS_WRITE_TEXT
                     "FS_REMOVE" -> HostOperationKind.FS_REMOVE
+                    "KEYBOARD_SEND_TEXT" -> HostOperationKind.KEYBOARD_SEND_TEXT
+                    "KEYBOARD_SEND_KEY" -> HostOperationKind.KEYBOARD_SEND_KEY
                     else -> return HostOperationClaim.Rejected("E_HOST_FAILURE")
                 }
                 HostOperationClaim.Admitted(
@@ -497,6 +541,8 @@ internal class LuaNativeKernelBridge : LuaKernelBridge {
                     mode = if (root.has("mode")) root.optString("mode") else null,
                     missingOk = root.optBoolean("missingOk", false),
                     format = if (root.has("format")) root.optString("format") else null,
+                    profile = if (root.has("profile")) root.optString("profile") else null,
+                    key = if (root.has("key")) root.optString("key") else null,
                 )
             }
             "closed" -> HostOperationClaim.Rejected("E_CLOSED")

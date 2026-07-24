@@ -1,6 +1,7 @@
 package dev.nilp0inter.subspace.lua
 import dev.nilp0inter.subspace.channel.capability.*
 import dev.nilp0inter.subspace.dependency.PackageCapability
+import dev.nilp0inter.subspace.dependency.PackageConfigurationLimits
 import dev.nilp0inter.subspace.storage.FilesystemOutcome
 import dev.nilp0inter.subspace.storage.ListCursor
 import dev.nilp0inter.subspace.storage.ListOptions
@@ -42,6 +43,7 @@ import dev.nilp0inter.subspace.model.GenerationExecutionContext
 import dev.nilp0inter.subspace.model.AgentRunId
 import dev.nilp0inter.subspace.model.AgentOperationId
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
+import dev.nilp0inter.subspace.model.referenceState
 import dev.nilp0inter.subspace.service.ChannelActivationResult
 import dev.nilp0inter.subspace.service.ChannelExecutionStatus
 import dev.nilp0inter.subspace.service.ChannelPreparationAvailability
@@ -59,6 +61,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import dev.nilp0inter.subspace.lua.actor.ActorOperationIdentity
 import dev.nilp0inter.subspace.lua.actor.ActorOperationToken
 import dev.nilp0inter.subspace.lua.actor.ActorTaskIdentity
@@ -82,6 +86,7 @@ private fun ChannelCapabilityScope.isPublicCapabilityDeclared(id: String): Boole
         ChannelCapability.DeferredAudioPlayback in declaredCapabilities
     PackageCapability.STORAGE_FILES -> ChannelCapability.StorageFiles in declaredCapabilities
     PackageCapability.AUDIO_FILES -> ChannelCapability.AudioFiles in declaredCapabilities
+    PackageCapability.KEYBOARD_OUTPUT -> ChannelCapability.TextOutput in declaredCapabilities
     else -> false
 }
 
@@ -109,6 +114,16 @@ internal fun interface LuaAudioFilePortFactory {
 internal fun interface LuaMountReadinessStatus {
     fun status(declarationId: String): String
 }
+
+/**
+ * 5.3: Atomic readiness cache entry. The ready flag and the bounded preparation
+ * request are cached together so a preparation decision can never observe a
+ * ready flag from one refresh and a prepare list from another.
+ */
+private data class CachedReadiness(
+    val ready: Boolean,
+    val prepare: List<String>,
+)
 
 
 /**
@@ -142,6 +157,13 @@ internal class LuaAdapterRuntime(
         dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
     private val mountReadinessStatus: LuaMountReadinessStatus? = null,
     private val resourceClose: (() -> Unit)? = null,
+    private val preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+    private val preparationTimeoutMillis: Long = DEFAULT_PREPARATION_TIMEOUT_MILLIS,
+    private val keyboardOutputAdapterFactory:
+        ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+    private val dynamicChoiceResolver: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver? = null,
+    private val requiredDynamicFields:
+        List<dev.nilp0inter.subspace.model.ChannelConfigurationField.DynamicChoiceField> = emptyList(),
 ) : ChannelRuntime {
     @Volatile
     private var audioRegistry: LuaOpaqueAudioRegistry? = null
@@ -181,9 +203,16 @@ internal class LuaAdapterRuntime(
     internal val localDiagnosticSnapshot: List<String>
         get() = synchronized(logLock) { localDiagnostics.toList() }
 
-    // Cached readiness, initially false per spec neutral default.
-    // Updated by refreshReadiness -> handle_readiness; read by prepareInput.
-    private val cachedReadiness = AtomicBoolean(false)
+    // Cached readiness projection: ready flag plus the bounded, duplicate-free
+    // preparation request declared by the last valid handle_readiness result.
+    // Initially not-ready with no preparation per the spec neutral default.
+    // Updated atomically by refreshReadiness -> handle_readiness; read by prepareInput.
+    private val cachedReadiness = AtomicReference(CachedReadiness(ready = false, prepare = emptyList()))
+
+    // Monotonic input-preparation attempt token. Bumped when an attempt is
+    // released, cancelled, replaced, or closed so a preparation that completes
+    // for a terminated attempt is suppressed before any acceptance (5.7).
+    private val preparationAttempt = AtomicLong(0)
 
 
     private val _snapshot = MutableStateFlow(
@@ -219,6 +248,15 @@ internal class LuaAdapterRuntime(
         // Default page size for fs.list when the package omits a bounded limit.
         const val FS_DEFAULT_LIST_LIMIT = 100
         const val FS_DIAGNOSTIC_TAG = "SubspaceStorage"
+        // 5.1: bound on the optional readiness `prepare` capability-ID list.
+        const val MAX_READINESS_PREPARE_REQUESTS = 4
+        // 4.4/5.4: per-capability host preparation deadline used for the
+        // PrepareRecoverable acquisition. Bounded by the PREPARE_INPUT gate.
+        const val DEFAULT_PREPARATION_TIMEOUT_MILLIS = 15_000L
+        // 5.1: exact readiness result key vocabulary (ready required, status/prepare optional).
+        val ALLOWED_READINESS_KEYS: Set<String> = setOf("ready", "status", "prepare")
+        // 5.2: byte bound for a single public capability ID in a prepare list.
+        const val MAX_PREPARE_CAPABILITY_ID_BYTES = 64
     }
 
     // ── Activate ──────────────────────────────────────────────────────────
@@ -301,11 +339,18 @@ internal class LuaAdapterRuntime(
     // ── prepareInput ──────────────────────────────────────────────────────
 
     /**
-     * Returns input acceptance based entirely on cached readiness + presence
-     * of handle_input. NEVER enters Lua.
+     * Returns input acceptance from cached readiness plus the presence of
+     * handle_input.
      *
-     * Per spec: readiness is cached from [refreshReadiness] calls.
-     * handle_input presence is determined at construction.
+     * Per spec: readiness is cached from [refreshReadiness] calls. When cached
+     * readiness is ready, acceptance is immediate and never enters Lua. When
+     * cached readiness is not-ready with a valid, nonempty preparation request
+     * (5.4), the runtime runs the declared host preparers sequentially under the
+     * current attempt, refreshes readiness exactly once (5.5), and accepts only
+     * if the refreshed result is ready. Target commitment, ready beep, capture,
+     * and all later effects stay gated behind acceptance (5.6); a failed,
+     * timed-out, cancelled, stale, or still-not-ready preparation suppresses
+     * acceptance entirely (5.7).
      */
     override suspend fun prepareInput(): ChannelInputAcceptance {
         if (closed.get()) return ChannelInputAcceptance.Unavailable("Lua runtime is closed")
@@ -316,12 +361,65 @@ internal class LuaAdapterRuntime(
         if (!hasHandleInput) {
             return ChannelInputAcceptance.Refused("Input not supported (no handle_input callback)")
         }
-        if (!cachedReadiness.get()) {
+
+        val attempt = preparationAttempt.get()
+        val readiness = cachedReadiness.get()
+        if (readiness.ready) {
+            return ChannelInputAcceptance.Accepted(LuaInputTarget())
+        }
+        if (readiness.prepare.isEmpty()) {
             return ChannelInputAcceptance.Refused("Channel is not ready")
         }
 
-        return ChannelInputAcceptance.Accepted(LuaInputTarget())
+        for (publicCapabilityId in readiness.prepare) {
+            if (isPreparationStale(attempt)) {
+                return ChannelInputAcceptance.Unavailable("Lua runtime is closed")
+            }
+            val preparer = preparerRegistry.preparerFor(publicCapabilityId)
+                ?: return ChannelInputAcceptance.Refused("Channel is not ready")
+            when (
+                preparer.prepare(
+                    capabilities,
+                    CapabilityPreparationRequest(
+                        publicCapabilityId = publicCapabilityId,
+                        identity = capabilities.identity,
+                        attempt = attempt,
+                        timeoutMillis = preparationTimeoutMillis,
+                    ),
+                )
+            ) {
+                CapabilityPreparationOutcome.Prepared -> Unit
+                is CapabilityPreparationOutcome.Unavailable ->
+                    return ChannelInputAcceptance.Refused("Channel is not ready")
+                CapabilityPreparationOutcome.Cancelled ->
+                    return ChannelInputAcceptance.Refused("Channel preparation was cancelled")
+                CapabilityPreparationOutcome.Closed ->
+                    return ChannelInputAcceptance.Unavailable("Lua runtime is closed")
+                is CapabilityPreparationOutcome.Failed ->
+                    return ChannelInputAcceptance.Refused("Channel is not ready")
+            }
+        }
+        if (isPreparationStale(attempt)) {
+            return ChannelInputAcceptance.Unavailable("Lua runtime is closed")
+        }
+        refreshReadiness()
+        if (isPreparationStale(attempt)) {
+            return ChannelInputAcceptance.Unavailable("Lua runtime is closed")
+        }
+        return if (cachedReadiness.get().ready) {
+            ChannelInputAcceptance.Accepted(LuaInputTarget())
+        } else {
+            ChannelInputAcceptance.Refused("Channel is not ready")
+        }
     }
+
+    /**
+     * 5.7/4.6: A preparation is stale once the runtime closed, the generation
+     * retired, or the attempt token advanced (release, cancellation, replacement,
+     * or shutdown). A stale preparation can never commit an accepted target.
+     */
+    private fun isPreparationStale(attempt: Long): Boolean =
+        closed.get() || !generationContext.isActive() || preparationAttempt.get() != attempt
 
     /** Current suspended input owner, or null when no semantic operation is pending. */
     internal fun pendingInput(): LuaInputPending? = synchronized(inputLock) {
@@ -455,7 +553,12 @@ internal class LuaAdapterRuntime(
 
         val readinessHandle = callbacks["handle_readiness"]
         if (readinessHandle == null) {
-            cachedReadiness.set(false)
+            cachedReadiness.set(CachedReadiness(ready = false, prepare = emptyList()))
+            updateSnapshot(
+                preparation = ChannelPreparationAvailability.Unavailable(
+                    ChannelPreparationReason.RuntimeReadiness(),
+                ),
+            )
             return
         }
 
@@ -466,13 +569,36 @@ internal class LuaAdapterRuntime(
         )
         when (val projection = outcome.readinessProjection()) {
             is ReadinessProjection.Valid -> {
-                cachedReadiness.set(projection.ready)
-                if (projection.statusPresent) {
-                    updateSnapshot(summary = projection.status)
+                // Cache readiness and preparation atomically, then publish the same
+                // decision to host-visible runtime state. Input admission and card/
+                // catalogue readiness must never diverge.
+                cachedReadiness.set(CachedReadiness(ready = projection.ready, prepare = projection.prepare))
+                val readinessMessage = projection.status?.takeIf(String::isNotBlank)
+                val preparation = when {
+                    projection.ready -> ChannelPreparationAvailability.Available
+                    projection.prepare.isNotEmpty() -> ChannelPreparationAvailability.Recoverable(
+                        ChannelPreparationReason.RuntimeReadiness(
+                            readinessMessage ?: "Channel can prepare for input",
+                        ),
+                    )
+                    else -> ChannelPreparationAvailability.Unavailable(
+                        ChannelPreparationReason.RuntimeReadiness(
+                            readinessMessage ?: "Channel is not ready",
+                        ),
+                    )
                 }
+                updateSnapshot(
+                    preparation = preparation,
+                    summary = projection.status.takeIf { projection.statusPresent },
+                )
             }
             ReadinessProjection.Malformed -> {
-                cachedReadiness.set(false)
+                cachedReadiness.set(CachedReadiness(ready = false, prepare = emptyList()))
+                updateSnapshot(
+                    preparation = ChannelPreparationAvailability.Unavailable(
+                        ChannelPreparationReason.RuntimeReadiness("Channel readiness is invalid"),
+                    ),
+                )
                 recordDiagnostic(READINESS_MALFORMED_DIAGNOSTIC)
             }
         }
@@ -481,22 +607,68 @@ internal class LuaAdapterRuntime(
     // ── handleSos ─────────────────────────────────────────────────────────
 
     /**
-     * Fire-and-forget SOS dispatch. Invokes handle_sos({event = "sos"}) if
-     * present. All failures are local-contained: logged, no snapshot mutation,
-     * no generation failure.
+     * 9.1-9.7: Bounded yield-capable SOS dispatch. Invokes handle_sos through the
+     * host-managed SOS coroutine entrypoint. A callback that never yields completes
+     * in one slice exactly like the legacy synchronous path; a yielded keyboard
+     * output operation is claimed and completed through the same typed
+     * claim/resume path under an SOS execution owner, then the coroutine resumes
+     * under the same generation gate. Sleep, spawn, defer, and raw yields are
+     * rejected natively before suspension. Every failure is local-contained: no
+     * snapshot mutation and no generation failure, and a generation that closes
+     * while suspended suppresses every late resume.
      */
     override suspend fun handleSos() {
-        if (closed.get()) return
-        val sosHandle = callbacks["handle_sos"]
-        if (sosHandle == null) return
-
+        if (closed.get() || !generationContext.isActive()) return
+        val sosHandle = callbacks["handle_sos"] ?: return
         val sosArg = LuaValue.Map(mapOf("event" to LuaValue.StringValue("sos")))
-        when (invokeCallbackHandle(sosHandle, sosArg).asGeneralCallbackOutcome()) {
-            is CallbackInvocationResult.Success -> Unit
-            is CallbackInvocationResult.Failure,
-            is CallbackInvocationResult.YieldViolation,
-            is CallbackInvocationResult.InvalidOutcome -> Unit // local-contained
-            is CallbackInvocationResult.Pending -> Unit // synchronous SOS rejects yield
+        val ownerToken = UUID.randomUUID().toString()
+
+        val admission = ScopedSpawnAdmission()
+        val gateOutcome = try {
+            actor.invokeProgramImageSosCallback(sosHandle, sosArg, admission)
+        } catch (_: Throwable) {
+            admission.release(false)
+            return
+        }
+        when (admission.releaseFor(gateOutcome)) {
+            SpawnAdmissionRelease.Matched -> Unit
+            is SpawnAdmissionRelease.Mismatch -> return
+        }
+        var outcome = (gateOutcome as? ActorGateResult.Success)?.value ?: return
+
+        // Drive yielded keyboard-output operations until the SOS coroutine reaches
+        // a terminal outcome. A non-yielding callback skips the loop entirely.
+        while (outcome is LuaKernelOutcome.Yielded) {
+            if (closed.get() || !generationContext.isActive()) return
+            consumeNativeLogs(outcome.logs)
+            val operation = try {
+                LuaOperationHandle(stateHandle, LuaCoroutineId(outcome.coroutineId), LuaOperationId(outcome.operationId))
+            } catch (_: IllegalArgumentException) {
+                return
+            }
+            val claim = outcome.value?.toLongOrNull()?.let { bridge.claimHostOperation(stateHandle, it) }
+            val completion = if (claim is HostOperationClaim.Admitted) {
+                val (success, value) = submitKeyboardOperation(claim, OutputExecutionOwnerKind.SOS, ownerToken)
+                HostOperationCompletion(success, value)
+            } else {
+                HostOperationCompletion(false, (claim as? HostOperationClaim.Rejected)?.errorCode ?: "E_INVALID_YIELD")
+            }
+            if (closed.get() || !generationContext.isActive()) return
+            val resumeAdmission = ScopedSpawnAdmission()
+            val resumeGate = try {
+                actor.resumeProgramImageCoroutine(operation, completion.success, completion.value, resumeAdmission)
+            } catch (_: Throwable) {
+                resumeAdmission.release(false)
+                return
+            }
+            when (resumeAdmission.releaseFor(resumeGate)) {
+                SpawnAdmissionRelease.Matched -> Unit
+                is SpawnAdmissionRelease.Mismatch -> return
+            }
+            outcome = (resumeGate as? ActorGateResult.Success)?.value ?: return
+        }
+        if (outcome is LuaKernelOutcome.Completed) {
+            consumeNativeLogs(outcome.logs)
         }
     }
 
@@ -519,7 +691,8 @@ internal class LuaAdapterRuntime(
         audioRegistry = null
         mountHandleCache.clear()
         resourceClose?.invoke()
-        cachedReadiness.set(false)
+        cachedReadiness.set(CachedReadiness(ready = false, prepare = emptyList()))
+        preparationAttempt.incrementAndGet()
         synchronized(logLock) {
             logs.clear()
             localDiagnostics.clear()
@@ -835,6 +1008,15 @@ internal class LuaAdapterRuntime(
                             HostOperationKind.FS_READ_TEXT,
                             HostOperationKind.FS_WRITE_TEXT,
                             HostOperationKind.FS_REMOVE -> performFsOperation(claim)
+                            HostOperationKind.KEYBOARD_SEND_TEXT,
+                            HostOperationKind.KEYBOARD_SEND_KEY -> {
+                                val (success, value) = submitKeyboardOperation(
+                                    claim,
+                                    OutputExecutionOwnerKind.MANAGED_TASK,
+                                    audioOwner.id,
+                                )
+                                HostOperationCompletion(success, value)
+                            }
                             else -> HostOperationCompletion(false, "E_UNSUPPORTED")
                         }
                         gateOutcome = resumeSlice(
@@ -1163,6 +1345,7 @@ internal class LuaAdapterRuntime(
                     if (storagePort != null) "available" else "unavailable"
                 PackageCapability.AUDIO_FILES ->
                     if (audioFilePort != null) "available" else "unavailable"
+                PackageCapability.KEYBOARD_OUTPUT -> availabilityFor(CapabilityKey.TextOutput)
                 else -> return@forEach
             }
             capabilityContext[capabilityId] = LuaValue.StringValue(availability)
@@ -1177,12 +1360,58 @@ internal class LuaAdapterRuntime(
                 ?: "unavailable"
             declaration.id to LuaValue.StringValue(status)
         }
-        return mapOf(
+        val result = linkedMapOf<String, LuaValue>(
             "capabilities" to LuaValue.Map(capabilityContext),
             "resources" to LuaValue.Map(
                 mapOf("mounts" to LuaValue.Map(mounts)),
             ),
         )
+        // 3.8: project detached reference states only when the package declares
+        // required dynamic fields, preserving the exact context shape otherwise.
+        if (requiredDynamicFields.isNotEmpty()) {
+            result["references"] = LuaValue.Map(projectDynamicReferences())
+        }
+        return result
+    }
+
+    /**
+     * 3.8/3.9: Project a detached `available`/`unavailable` scalar state for every
+     * required dynamic field, resolved against the host choice registry without
+     * retaining host profile objects. Re-resolved on each readiness refresh because
+     * [readinessContext] is rebuilt on every call. Resolution failure or a missing
+     * resolver projects `unavailable`; the persisted scalar is never replaced and
+     * call-time profile revalidation stays in the host output service.
+     */
+    private suspend fun projectDynamicReferences(): Map<String, LuaValue> {
+        val resolver = dynamicChoiceResolver
+        if (resolver == null) {
+            return requiredDynamicFields.associate { field ->
+                field.id to LuaValue.StringValue("unavailable")
+            }
+        }
+        val payload = runCatching { configuration.payload.toJsonObject() }.getOrNull()
+        val result = linkedMapOf<String, LuaValue>()
+        for (field in requiredDynamicFields) {
+            val state = try {
+                val selectedValue = payload?.optString(field.id, "")?.takeIf { it.isNotBlank() }
+                val dependencyValue = field.dependsOnFieldId
+                    ?.let { dependencyId -> payload?.optString(dependencyId, "")?.takeIf { it.isNotBlank() } }
+                val resolution = resolver.resolve(
+                    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceRequest(
+                        source = field.source,
+                        dependencyValue = dependencyValue,
+                    ),
+                )
+                when (resolution.referenceState(selectedValue)) {
+                    dev.nilp0inter.subspace.model.DynamicConfigurationReferenceState.AVAILABLE -> "available"
+                    dev.nilp0inter.subspace.model.DynamicConfigurationReferenceState.UNAVAILABLE -> "unavailable"
+                }
+            } catch (_: Exception) {
+                "unavailable"
+            }
+            result[field.id] = LuaValue.StringValue(state)
+        }
+        return result
     }
 
     private suspend fun availabilityFor(key: CapabilityKey<*>): String = try {
@@ -1209,6 +1438,7 @@ internal class LuaAdapterRuntime(
             val ready: Boolean,
             val statusPresent: Boolean,
             val status: String?,
+            val prepare: List<String>,
         ) : ReadinessProjection
 
         data object Malformed : ReadinessProjection
@@ -1218,18 +1448,51 @@ internal class LuaAdapterRuntime(
         val value = (this as? CallbackInvocationResult.Success)?.value as? LuaValue.Map
             ?: return ReadinessProjection.Malformed
         val keys = value.pairs.keys
-        if (keys != setOf("ready") && keys != setOf("ready", "status")) {
+        // 5.1: exact-key result; `ready` is required, `status` and `prepare` optional.
+        if ("ready" !in keys || !ALLOWED_READINESS_KEYS.containsAll(keys)) {
             return ReadinessProjection.Malformed
         }
         val ready = (value.pairs["ready"] as? LuaValue.Bool)?.value
             ?: return ReadinessProjection.Malformed
-        if ("status" !in keys) return ReadinessProjection.Valid(ready, false, null)
-        val status = (value.pairs["status"] as? LuaValue.StringValue)?.value
-            ?: return ReadinessProjection.Malformed
-        if (!isWellFormedUtf16(status) || status.toByteArray(Charsets.UTF_8).size > MAX_READINESS_STATUS_BYTES) {
-            return ReadinessProjection.Malformed
+        val statusPresent = "status" in keys
+        val status: String? = if (statusPresent) {
+            val raw = (value.pairs["status"] as? LuaValue.StringValue)?.value
+                ?: return ReadinessProjection.Malformed
+            if (!isWellFormedUtf16(raw) || raw.toByteArray(Charsets.UTF_8).size > MAX_READINESS_STATUS_BYTES) {
+                return ReadinessProjection.Malformed
+            }
+            raw
+        } else {
+            null
         }
-        return ReadinessProjection.Valid(ready, true, status)
+        val prepare = decodePrepareRequest(value.pairs["prepare"], ready)
+            ?: return ReadinessProjection.Malformed
+        return ReadinessProjection.Valid(ready, statusPresent, status, prepare)
+    }
+
+    /**
+     * 5.1/5.2: Decode the optional bounded, duplicate-free preparation request.
+     * Returns null when the readiness result must be treated as malformed: a
+     * non-array (including metatable-backed) value, an over-bound list, a
+     * non-string/blank/over-bound element, a duplicate, an unknown or undeclared
+     * capability, a non-preparable capability, or a ready result carrying a
+     * nonempty preparation request.
+     */
+    private fun decodePrepareRequest(value: LuaValue?, ready: Boolean): List<String>? {
+        if (value == null) return emptyList()
+        val array = value as? LuaValue.Array ?: return null
+        if (array.values.size > MAX_READINESS_PREPARE_REQUESTS) return null
+        val ids = LinkedHashSet<String>()
+        for (element in array.values) {
+            val id = (element as? LuaValue.StringValue)?.value ?: return null
+            if (!isWellFormedUtf16(id)) return null
+            if (id.toByteArray(Charsets.UTF_8).size > MAX_PREPARE_CAPABILITY_ID_BYTES) return null
+            if (!ids.add(id)) return null
+            if (!capabilities.isPublicCapabilityDeclared(id)) return null
+            if (!preparerRegistry.isPreparable(id)) return null
+        }
+        if (ready && ids.isNotEmpty()) return null
+        return ids.toList()
     }
 
     private fun isWellFormedUtf16(value: String): Boolean {
@@ -1580,6 +1843,8 @@ internal class LuaAdapterRuntime(
                 HostOperationKind.FS_READ_TEXT,
                 HostOperationKind.FS_WRITE_TEXT,
                 HostOperationKind.FS_REMOVE -> executeFsOperation(pending, claim)
+                HostOperationKind.KEYBOARD_SEND_TEXT,
+                HostOperationKind.KEYBOARD_SEND_KEY -> executeKeyboardOperation(pending, claim)
             }
         }
     }
@@ -1863,6 +2128,83 @@ internal class LuaAdapterRuntime(
             }
             is FilesystemOutcome.Failure -> result
         }
+    }
+
+    /**
+     * 8.5-8.9: Submits one claimed keyboard-output operation through the
+     * generation-scoped adapter and returns the normalized resume pair
+     * `(success, value)`. The native broker has already validated the request
+     * table shape, bounds, and execution ownership; the host rechecks capability
+     * declaration, profile liveness, and admission capacity before any physical
+     * effect. Terminal outcomes map to the normalized result/error contract:
+     * `delivered`/`rejected`/`failed`/`indeterminate` produce a JSON result table
+     * (success=true); capacity/closed/revoked produce stable error codes.
+     * [ownerKind] distinguishes input, yielded-SOS, and managed-task owners; the
+     * current active channel selection is never an authorization condition.
+     */
+    private suspend fun submitKeyboardOperation(
+        claim: HostOperationClaim.Admitted,
+        ownerKind: OutputExecutionOwnerKind,
+        ownerToken: String,
+    ): Pair<Boolean, String> {
+        if (!capabilities.isPublicCapabilityDeclared(PackageCapability.KEYBOARD_OUTPUT)) {
+            return false to "E_CAPABILITY_UNDECLARED"
+        }
+        val factory = keyboardOutputAdapterFactory ?: return false to "E_UNAVAILABLE"
+        val profile = claim.profile
+        if (profile.isNullOrBlank()) return false to "E_INVALID_ARGUMENT"
+        // 1.4: call-time UTF-8 bound revalidation mirroring the native pre-yield
+        // check, using the central TextOutputProfile.MAX_BYTES constant.
+        if (profile.toByteArray(Charsets.UTF_8).size > TextOutputProfile.MAX_BYTES) {
+            return false to "E_INVALID_ARGUMENT"
+        }
+        val adapter = factory(capabilities.identity, OutputExecutionOwner(ownerKind, ownerToken))
+        val submission = when (claim.kind) {
+            HostOperationKind.KEYBOARD_SEND_TEXT -> {
+                val text = claim.text
+                if (text.isNullOrEmpty()) return false to "E_INVALID_ARGUMENT"
+                if (text.toByteArray(Charsets.UTF_8).size > PackageConfigurationLimits.MAX_STRING_VALUE_BYTES) {
+                    return false to "E_INVALID_ARGUMENT"
+                }
+                adapter.sendText(TextOutputRequest(text, TextOutputProfile(profile)))
+            }
+            HostOperationKind.KEYBOARD_SEND_KEY -> {
+                val key = when (claim.key) {
+                    "enter" -> TextOutputKey.ENTER
+                    "escape" -> TextOutputKey.ESCAPE
+                    else -> return false to "E_INVALID_ARGUMENT"
+                }
+                adapter.sendKey(TextKeyRequest(key, TextOutputProfile(profile)))
+            }
+            else -> return false to "E_HOST_FAILURE"
+        }
+        return when (submission) {
+            is KeyboardOutputSubmission.Completed -> {
+                val json = org.json.JSONObject()
+                when (val outcome = submission.outcome) {
+                    is TextDeliveryOutcome.Delivered -> json.put("status", "delivered")
+                    is TextDeliveryOutcome.Rejected ->
+                        json.put("status", "rejected").put("reason", outcome.reason.name.lowercase())
+                    is TextDeliveryOutcome.Failed ->
+                        json.put("status", "failed").put("reason", outcome.reason.name.lowercase())
+                    is TextDeliveryOutcome.Indeterminate ->
+                        json.put("status", "indeterminate").put("reason", outcome.reason.name.lowercase())
+                }
+                true to json.toString()
+            }
+            KeyboardOutputSubmission.Busy -> false to "E_BUSY"
+            KeyboardOutputSubmission.Closed -> false to "E_CLOSED"
+            KeyboardOutputSubmission.Revoked -> false to "E_CLOSED"
+        }
+    }
+
+    /** 8.5-8.9: Input-path keyboard dispatch; resumes the suspended input owner. */
+    private suspend fun executeKeyboardOperation(
+        pending: PendingInputExecution,
+        claim: HostOperationClaim.Admitted,
+    ) {
+        val (success, value) = submitKeyboardOperation(claim, OutputExecutionOwnerKind.INPUT, pending.ownerToken)
+        resumeInput(pending.ownerToken, pending.operation.operationId.value, success, value, normalizeAudioError = false)
     }
 
     /** Serialize one portable filesystem result to the exact JSON the Lua module returns. */

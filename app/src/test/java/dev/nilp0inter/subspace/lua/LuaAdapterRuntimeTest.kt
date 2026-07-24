@@ -20,6 +20,19 @@ import dev.nilp0inter.subspace.channel.capability.OpaqueSynthesizedAudio
 import dev.nilp0inter.subspace.channel.capability.CapabilityOperationResult
 import dev.nilp0inter.subspace.channel.capability.AudioOperationCapability
 import dev.nilp0inter.subspace.channel.capability.TranscriptionCapability
+import dev.nilp0inter.subspace.channel.capability.TextOutputCapability
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputSubmission
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwnerKind
+import dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome
+import dev.nilp0inter.subspace.channel.capability.TextKeyRequest
+import dev.nilp0inter.subspace.channel.capability.TextOutputFailureReason
+import dev.nilp0inter.subspace.channel.capability.TextOutputIndeterminateReason
+import dev.nilp0inter.subspace.channel.capability.TextOutputKey
+import dev.nilp0inter.subspace.channel.capability.TextOutputProfile
+import dev.nilp0inter.subspace.channel.capability.TextOutputRejectionReason
+import dev.nilp0inter.subspace.channel.capability.TextOutputRequest
 import dev.nilp0inter.subspace.channel.capability.SynthesisCapability
 import dev.nilp0inter.subspace.channel.capability.Transcription
 import dev.nilp0inter.subspace.channel.capability.SpeechSynthesisRequest
@@ -95,6 +108,10 @@ private fun testLuaProvider(
         dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
     audioFilePortFactory: LuaAudioFilePortFactory? = null,
     mountReadinessStatus: LuaMountReadinessStatus? = null,
+    preparerRegistry: dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry =
+        dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.empty(),
+    declaredPublicCapabilities: Set<String> = emptySet(),
+    keyboardOutputAdapterFactory: ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
 ): LuaChannelImplementationProvider = LuaChannelImplementationProvider.create(
     implementationId = TEST_LUA_IMPLEMENTATION_ID,
     presentation = ChannelPresentationMetadata(
@@ -114,6 +131,9 @@ private fun testLuaProvider(
     storagePort = storagePort,
     audioFilePortFactory = audioFilePortFactory,
     mountReadinessStatus = mountReadinessStatus,
+    preparerRegistry = preparerRegistry,
+    declaredPublicCapabilities = declaredPublicCapabilities,
+    keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
 )
 
 /**
@@ -560,6 +580,48 @@ class LuaAdapterRuntimeTest {
     }
 
     @Test
+    fun `readiness refresh publishes recoverable unavailable and available runtime state`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue(
+                "handle_readiness",
+                completed("""{"ready":false,"status":"keyboard preparing","prepare":["keyboard.output"]}"""),
+            )
+            enqueue("handle_readiness", completed("""{"ready":false,"status":"keyboard unavailable"}"""))
+            enqueue("handle_readiness", completed("""{"ready":true,"status":"ready"}"""))
+        }
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+
+            harness.runtime.refreshReadiness()
+            val recoverable = harness.runtime.snapshot.value.preparation
+                as? ChannelPreparationAvailability.Recoverable
+                ?: throw AssertionError("Expected recoverable readiness")
+            assertEquals("keyboard preparing", recoverable.reason.message)
+
+            harness.runtime.refreshReadiness()
+            val unavailable = harness.runtime.snapshot.value.preparation
+                as? ChannelPreparationAvailability.Unavailable
+                ?: throw AssertionError("Expected unavailable readiness")
+            assertEquals("keyboard unavailable", unavailable.reason.message)
+
+            harness.runtime.refreshReadiness()
+            assertEquals(
+                ChannelPreparationAvailability.Available,
+                harness.runtime.snapshot.value.preparation,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `readiness context contains exactly declared public capabilities and projects valid status`() = runTest {
         val bridge = RecordingBridge().apply {
             enqueue("handle_readiness", completed("""{"ready":true,"status":"STT"}"""))
@@ -662,6 +724,10 @@ class LuaAdapterRuntimeTest {
                 assertEquals("prior", harness.runtime.snapshot.value.summary)
                 harness.runtime.refreshReadiness()
                 assertTrue(
+                    "$name: malformed readiness must publish unavailable runtime state",
+                    harness.runtime.snapshot.value.preparation is ChannelPreparationAvailability.Unavailable,
+                )
+                assertTrue(
                     "$name: malformed readiness must refuse input",
                     harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
                 )
@@ -683,9 +749,12 @@ class LuaAdapterRuntimeTest {
         val harness = harness(bridge, setOf("startup"))
         try {
             assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
-            val snapshotBeforeSos = harness.runtime.snapshot.value
-
             harness.runtime.refreshReadiness()
+            assertTrue(
+                "A plugin without readiness must publish unavailable runtime state.",
+                harness.runtime.snapshot.value.preparation is ChannelPreparationAvailability.Unavailable,
+            )
+            val snapshotBeforeSos = harness.runtime.snapshot.value
             val acceptance = harness.runtime.prepareInput()
             harness.runtime.handleSos()
 
@@ -1309,6 +1378,754 @@ class LuaAdapterRuntimeTest {
             )
         } finally {
             harness.close()
+        }
+    }
+
+    // ── Readiness-declared capability preparation (5.1-5.9) ──────────────
+
+    @Test
+    fun `recoverable keyboard output prepares once then accepts on refreshed readiness`() = runTest {
+        val textOutput = NoOpTextOutput()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            textOutput = textOutput,
+            textOutputAvailability = CapabilityAvailability.Recoverable,
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            harness.capabilityHost.prepareTextOutputOutcome =
+                HostedCapabilityAcquisition.Available(textOutput) { }
+            val acceptance = harness.runtime.prepareInput()
+            assertTrue(
+                "Successful preparation plus refreshed ready=true must accept input.",
+                acceptance is ChannelInputAcceptance.Accepted,
+            )
+            assertEquals("Exactly one host preparation call", 1, harness.capabilityHost.prepareCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `failed preparation refuses input without a second readiness refresh`() = runTest {
+        val textOutput = NoOpTextOutput()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            textOutput = textOutput,
+            textOutputAvailability = CapabilityAvailability.Recoverable,
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            harness.capabilityHost.prepareTextOutputOutcome =
+                HostedCapabilityAcquisition.Failed(dev.nilp0inter.subspace.channel.capability.CapabilityFailureReason.PREPARATION_FAILED)
+            val acceptance = harness.runtime.prepareInput()
+            assertTrue(
+                "Failed preparation must refuse input.",
+                acceptance is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(
+                "Failed preparation must not trigger a second readiness refresh.",
+                1,
+                bridge.callbackCalls.count { it.name == "handle_readiness" },
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `preparation that leaves readiness not ready refuses input`() = runTest {
+        val textOutput = NoOpTextOutput()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+            enqueue("handle_readiness", completed("""{"ready":false}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            textOutput = textOutput,
+            textOutputAvailability = CapabilityAvailability.Recoverable,
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            harness.capabilityHost.prepareTextOutputOutcome =
+                HostedCapabilityAcquisition.Available(textOutput) { }
+            val acceptance = harness.runtime.prepareInput()
+            assertTrue(
+                "Preparation that leaves readiness not-ready must refuse input.",
+                acceptance is ChannelInputAcceptance.Refused,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `readiness prepare naming an undeclared capability is malformed and refuses`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = emptySet(),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            val acceptance = harness.runtime.prepareInput()
+            assertTrue(
+                "A prepare list naming an undeclared capability must be malformed and refuse.",
+                acceptance is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(
+                "Malformed readiness must record exactly one diagnostic.",
+                1,
+                harness.runtime.localDiagnosticSnapshot.size,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `readiness prepare naming a non-preparable capability is malformed`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["audio.transcription"]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.Transcription),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.AUDIO_TRANSCRIPTION),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "A prepare list naming a non-preparable capability must be malformed.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(1, harness.runtime.localDiagnosticSnapshot.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `ready result carrying a preparation request is malformed`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true,"prepare":["keyboard.output"]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "A ready=true result with a nonempty prepare list must be malformed.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(1, harness.runtime.localDiagnosticSnapshot.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `duplicate preparation capability ids are malformed`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output","keyboard.output"]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "Duplicate prepare capability IDs must be malformed.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(1, harness.runtime.localDiagnosticSnapshot.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `over-bound preparation list is malformed`() = runTest {
+        val ids = (1..5).joinToString(",") { "\"cap.$it\"" }
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":[$ids]}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "A prepare list exceeding the bound must be malformed.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(1, harness.runtime.localDiagnosticSnapshot.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `non-array preparation value is malformed`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":"keyboard.output"}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "A non-array prepare value must be malformed.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(1, harness.runtime.localDiagnosticSnapshot.size)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `a later not-ready refresh clears a cached preparation request`() = runTest {
+        val textOutput = NoOpTextOutput()
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+            enqueue("handle_readiness", completed("""{"ready":false}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            textOutput = textOutput,
+            textOutputAvailability = CapabilityAvailability.Recoverable,
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            harness.runtime.refreshReadiness()
+            harness.capabilityHost.prepareTextOutputOutcome =
+                HostedCapabilityAcquisition.Available(textOutput) { }
+            val acceptance = harness.runtime.prepareInput()
+            assertTrue(
+                "A later not-ready refresh without prepare must clear the cached preparation request.",
+                acceptance is ChannelInputAcceptance.Refused,
+            )
+            assertEquals(
+                "No preparation may run once the cached prepare list is cleared.",
+                0,
+                harness.capabilityHost.prepareCalls,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `available output accepts input without preparation`() = runTest {
+        val bridge = RecordingBridge().apply {
+            enqueue("handle_readiness", completed("""{"ready":true}"""))
+        }
+        val harness = harness(
+            bridge, setOf("startup", "handle_readiness", "handle_input"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.refreshReadiness()
+            assertTrue(
+                "A ready=true result must accept input without any preparation.",
+                harness.runtime.prepareInput() is ChannelInputAcceptance.Accepted,
+            )
+            assertEquals("No preparation may run for an already-ready result.", 0, harness.capabilityHost.prepareCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `keyboard claim bounds revalidate profile and text bytes before adapter effects`() = runTest {
+        data class BoundaryCase(
+            val label: String,
+            val text: String,
+            val profile: String,
+            val expectedFactoryCalls: Int,
+            val accepted: Boolean,
+        )
+
+        val cases = listOf(
+            BoundaryCase("profile-256", "x", "p".repeat(256), 1, true),
+            BoundaryCase("profile-257", "x", "p".repeat(257), 0, false),
+            BoundaryCase("text-16384", "é".repeat(8_192), "linux:us", 1, true),
+            BoundaryCase("text-16385", "é".repeat(8_192) + "b", "linux:us", 1, false),
+        )
+        cases.forEach { case ->
+            val bridge = RecordingBridge()
+            bridge.enqueue(
+                "handle_sos",
+                yielded(
+                    value = bridge.registerKeyboardClaim(
+                        HostOperationKind.KEYBOARD_SEND_TEXT,
+                        text = case.text,
+                        profile = case.profile,
+                    ),
+                ),
+            )
+            val factoryCalls = AtomicInteger()
+            val adapters = mutableListOf<RecordingKeyboardOutputAdapter>()
+            val harness = harness(
+                bridge = bridge,
+                callbacks = setOf("startup", "handle_sos"),
+                declaredCapabilities = setOf(ChannelCapability.TextOutput),
+                declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+                keyboardOutputAdapterFactory = { identity, owner ->
+                    factoryCalls.incrementAndGet()
+                    RecordingKeyboardOutputAdapter(identity, owner).also(adapters::add)
+                },
+            )
+            try {
+                assertEquals(case.label, ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.handleSos()
+
+                assertEquals(case.label, case.expectedFactoryCalls, factoryCalls.get())
+                val sent = adapters.flatMap { it.textRequests }
+                if (case.accepted) {
+                    assertEquals(case.label, listOf(TextOutputRequest(case.text, TextOutputProfile(case.profile))), sent)
+                    val (success, value) = bridge.resumeCalls.single()
+                    assertTrue(case.label, success)
+                    assertEquals(case.label, "delivered", org.json.JSONObject(value).getString("status"))
+                } else {
+                    assertTrue("$case must have no adapter effect", sent.isEmpty())
+                    assertEquals(case.label, listOf(false to "E_INVALID_ARGUMENT"), bridge.resumeCalls)
+                }
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `keyboard outcomes normalize under SOS ownership without exposing content`() = runTest {
+        data class OutcomeCase(
+            val label: String,
+            val submission: KeyboardOutputSubmission,
+            val success: Boolean,
+            val status: String?,
+            val reason: String?,
+        )
+
+        val cases = listOf(
+            OutcomeCase(
+                "delivered",
+                KeyboardOutputSubmission.Completed(TextDeliveryOutcome.Delivered("op-delivered")),
+                true,
+                "delivered",
+                null,
+            ),
+            OutcomeCase(
+                "rejected",
+                KeyboardOutputSubmission.Completed(
+                    TextDeliveryOutcome.Rejected("op-rejected", TextOutputRejectionReason.INVALID_PROFILE),
+                ),
+                true,
+                "rejected",
+                "invalid_profile",
+            ),
+            OutcomeCase(
+                "failed",
+                KeyboardOutputSubmission.Completed(
+                    TextDeliveryOutcome.Failed("op-failed", TextOutputFailureReason.HOST_FAILURE),
+                ),
+                true,
+                "failed",
+                "host_failure",
+            ),
+            OutcomeCase(
+                "indeterminate",
+                KeyboardOutputSubmission.Completed(
+                    TextDeliveryOutcome.Indeterminate(
+                        "op-indeterminate",
+                        TextOutputIndeterminateReason.DISCONNECTED,
+                    ),
+                ),
+                true,
+                "indeterminate",
+                "disconnected",
+            ),
+            OutcomeCase("busy", KeyboardOutputSubmission.Busy, false, null, null),
+            OutcomeCase("closed", KeyboardOutputSubmission.Closed, false, null, null),
+            OutcomeCase("revoked", KeyboardOutputSubmission.Revoked, false, null, null),
+        )
+        cases.forEach { case ->
+            val secretText = "secret-${case.label}"
+            val secretProfile = "private:${case.label}"
+            val bridge = RecordingBridge()
+            bridge.enqueue(
+                "handle_sos",
+                yielded(
+                    value = bridge.registerKeyboardClaim(
+                        HostOperationKind.KEYBOARD_SEND_TEXT,
+                        text = secretText,
+                        profile = secretProfile,
+                    ),
+                ),
+            )
+            val adapters = mutableListOf<RecordingKeyboardOutputAdapter>()
+            val harness = harness(
+                bridge = bridge,
+                callbacks = setOf("startup", "handle_sos"),
+                declaredCapabilities = setOf(ChannelCapability.TextOutput),
+                declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+                keyboardOutputAdapterFactory = { identity, owner ->
+                    RecordingKeyboardOutputAdapter(identity, owner).also {
+                        it.nextSubmission = case.submission
+                        adapters += it
+                    }
+                },
+            )
+            try {
+                assertEquals(case.label, ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.handleSos()
+
+                val adapter = adapters.single()
+                assertEquals(case.label, OutputExecutionOwnerKind.SOS, adapter.owner.kind)
+                assertEquals(case.label, harness.capabilityScope.identity, adapter.identity)
+                assertEquals(case.label, listOf(TextOutputRequest(secretText, TextOutputProfile(secretProfile))), adapter.textRequests)
+                val (success, value) = bridge.resumeCalls.single()
+                assertEquals(case.label, case.success, success)
+                assertFalse(case.label, value.contains(secretText))
+                assertFalse(case.label, value.contains(secretProfile))
+                if (case.success) {
+                    val json = org.json.JSONObject(value)
+                    assertTrue(case.label, json.keySet().all { it == "status" || it == "reason" })
+                    assertEquals(case.label, case.status, json.getString("status"))
+                    if (case.reason == null) assertFalse(case.label, json.has("reason"))
+                    else assertEquals(case.label, case.reason, json.getString("reason"))
+                } else {
+                    val expectedError = if (case.submission == KeyboardOutputSubmission.Busy) "E_BUSY" else "E_CLOSED"
+                    assertEquals(case.label, expectedError, value)
+                }
+            } finally {
+                harness.close()
+            }
+        }
+
+        val bridge = RecordingBridge()
+        bridge.enqueue(
+            "handle_sos",
+            yielded(
+                value = bridge.registerKeyboardClaim(
+                    HostOperationKind.KEYBOARD_SEND_TEXT,
+                    text = "undeclared",
+                ),
+            ),
+        )
+        val factoryCalls = AtomicInteger()
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup", "handle_sos"),
+            keyboardOutputAdapterFactory = { identity, owner ->
+                factoryCalls.incrementAndGet()
+                RecordingKeyboardOutputAdapter(identity, owner)
+            },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.runtime.handleSos()
+            assertEquals(0, factoryCalls.get())
+            assertEquals(listOf(false to "E_CAPABILITY_UNDECLARED"), bridge.resumeCalls)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `managed keyboard output keeps its owner and replacement suppresses late effects`() = runTest {
+        val bridge = RecordingBridge()
+        val claim = bridge.registerKeyboardClaim(
+            HostOperationKind.KEYBOARD_SEND_TEXT,
+            text = "managed",
+        )
+        bridge.enqueue("startup", completed(spawnedCoroutines = listOf(201)))
+        bridge.startCoroutineOutcomes += yielded(coroutineId = 201, operationId = 301, value = claim)
+        val adapters = mutableListOf<RecordingKeyboardOutputAdapter>()
+        val harness = harness(
+            bridge = bridge,
+            callbacks = setOf("startup"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            keyboardOutputAdapterFactory = { identity, owner ->
+                RecordingKeyboardOutputAdapter(identity, owner).also(adapters::add)
+            },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, harness.runtime.activate())
+            harness.authorizeStagedTasks()
+            runCurrent()
+
+            assertEquals(OutputExecutionOwnerKind.MANAGED_TASK, adapters.single().owner.kind)
+            assertEquals(listOf(TextOutputRequest("managed", TextOutputProfile("linux:us"))), adapters.single().textRequests)
+            assertTrue(bridge.resumeCalls.single().first)
+        } finally {
+            harness.close()
+        }
+
+        val replacementBridge = RecordingBridge()
+        val replacementClaim = replacementBridge.registerKeyboardClaim(
+            HostOperationKind.KEYBOARD_SEND_TEXT,
+            text = "must-not-escape",
+        )
+        replacementBridge.enqueue("startup", completed(spawnedCoroutines = listOf(202)))
+        replacementBridge.startCoroutineOutcomes += yielded(
+            coroutineId = 202,
+            operationId = 302,
+            value = replacementClaim,
+        )
+        val sendStarted = CompletableDeferred<Unit>()
+        val allowSend = CompletableDeferred<Unit>()
+        lateinit var replacementAdapter: RecordingKeyboardOutputAdapter
+        val replacementHarness = harness(
+            bridge = replacementBridge,
+            callbacks = setOf("startup"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            keyboardOutputAdapterFactory = { identity, owner ->
+                RecordingKeyboardOutputAdapter(identity, owner).also {
+                    it.beforeSendText = {
+                        sendStarted.complete(Unit)
+                        allowSend.await()
+                    }
+                    replacementAdapter = it
+                }
+            },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, replacementHarness.runtime.activate())
+            replacementHarness.authorizeStagedTasks()
+            sendStarted.await()
+
+            replacementHarness.retireGeneration()
+            allowSend.complete(Unit)
+            runCurrent()
+
+            assertTrue("Retirement must cancel the suspended adapter call before its effect.", replacementAdapter.textRequests.isEmpty())
+            assertTrue("Retirement must suppress every late managed-task resume.", replacementBridge.resumeCalls.isEmpty())
+        } finally {
+            allowSend.complete(Unit)
+            replacementHarness.close()
+        }
+    }
+
+    @Test
+    fun `SOS malformed failures raw yields and late completions remain contained`() = runTest {
+        data class ContainmentCase(
+            val label: String,
+            val outcome: LuaKernelOutcome,
+            val expectedResume: List<Pair<Boolean, String>>,
+        )
+
+        val cases = listOf(
+            ContainmentCase("malformed-return", completed("not-json"), emptyList()),
+            ContainmentCase(
+                "application-failure",
+                LuaKernelOutcome.RuntimeFailure(41, 7, "application failure"),
+                emptyList(),
+            ),
+            ContainmentCase(
+                "phase-timeout",
+                LuaKernelOutcome.Interrupted(41, 7, "instruction budget exceeded", 1),
+                emptyList(),
+            ),
+            ContainmentCase("raw-yield", yielded(value = "not-an-admitted-claim"), listOf(false to "E_INVALID_YIELD")),
+        )
+        cases.forEach { case ->
+            val bridge = RecordingBridge().apply { enqueue("handle_sos", case.outcome) }
+            val harness = harness(bridge, setOf("startup", "handle_sos"))
+            try {
+                assertEquals(case.label, ChannelActivationResult.Ready, harness.runtime.activate())
+                val before = harness.runtime.snapshot.value
+                harness.runtime.handleSos()
+                assertEquals(case.label, before, harness.runtime.snapshot.value)
+                assertEquals(case.label, 1, bridge.callbackCalls.count { it.name == "handle_sos" })
+                assertEquals(case.label, case.expectedResume, bridge.resumeCalls)
+            } finally {
+                harness.close()
+            }
+        }
+
+        val throwingBridge = RecordingBridge().apply {
+            beforeCallback = { name -> if (name == "handle_sos") throw IllegalStateException("callback failure") }
+        }
+        val throwingHarness = harness(throwingBridge, setOf("startup", "handle_sos"))
+        try {
+            assertEquals(ChannelActivationResult.Ready, throwingHarness.runtime.activate())
+            val before = throwingHarness.runtime.snapshot.value
+            throwingHarness.runtime.handleSos()
+            assertEquals(before, throwingHarness.runtime.snapshot.value)
+            assertEquals(1, throwingBridge.callbackCalls.count { it.name == "handle_sos" })
+        } finally {
+            throwingHarness.close()
+        }
+
+        val lateBridge = RecordingBridge()
+        lateBridge.enqueue(
+            "handle_sos",
+            yielded(
+                value = lateBridge.registerKeyboardClaim(
+                    HostOperationKind.KEYBOARD_SEND_TEXT,
+                    text = "late",
+                ),
+            ),
+        )
+        val sendStarted = CompletableDeferred<Unit>()
+        val allowCompletion = CompletableDeferred<Unit>()
+        val lateHarness = harness(
+            bridge = lateBridge,
+            callbacks = setOf("startup", "handle_sos"),
+            declaredCapabilities = setOf(ChannelCapability.TextOutput),
+            declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+            keyboardOutputAdapterFactory = { identity, owner ->
+                RecordingKeyboardOutputAdapter(identity, owner).also {
+                    it.beforeSendText = {
+                        sendStarted.complete(Unit)
+                        allowCompletion.await()
+                    }
+                }
+            },
+        )
+        try {
+            assertEquals(ChannelActivationResult.Ready, lateHarness.runtime.activate())
+            val sos = async { lateHarness.runtime.handleSos() }
+            sendStarted.await()
+            lateHarness.runtime.close()
+            allowCompletion.complete(Unit)
+            sos.await()
+
+            assertEquals(1, lateBridge.callbackCalls.count { it.name == "handle_sos" })
+            assertTrue("A completion after close must not re-enter the SOS coroutine.", lateBridge.resumeCalls.isEmpty())
+            assertEquals(
+                ChannelPreparationAvailability.Unavailable(ChannelPreparationReason.RuntimeClosed),
+                lateHarness.runtime.snapshot.value.preparation,
+            )
+        } finally {
+            allowCompletion.complete(Unit)
+            lateHarness.close()
+        }
+    }
+
+    @Test
+    fun `every preparation race suppresses acceptance and post preparation refresh`() = runTest {
+        data class PreparationRace(
+            val label: String,
+            val action: suspend (
+                AdapterHarness,
+                kotlinx.coroutines.Deferred<ChannelInputAcceptance>,
+            ) -> Unit,
+        )
+
+        val races = listOf(
+            PreparationRace("release") { harness, _ -> harness.capabilityScope.revoke() },
+            PreparationRace("cancellation") { _, preparation -> preparation.cancel() },
+            PreparationRace("disconnect") { harness, _ ->
+                harness.capabilityHost.prepareTextOutputOutcome =
+                    HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
+            },
+            PreparationRace("replacement") { harness, _ -> harness.retireGeneration() },
+            PreparationRace("disablement") { harness, _ -> harness.stopAdmission() },
+            PreparationRace("runtime-close") { harness, _ -> harness.runtime.close() },
+            PreparationRace("service-shutdown") { harness, _ -> harness.close() },
+        )
+        races.forEach { race ->
+            val textOutput = NoOpTextOutput()
+            val bridge = RecordingBridge().apply {
+                enqueue("handle_readiness", completed("""{"ready":false,"prepare":["keyboard.output"]}"""))
+                enqueue("handle_readiness", completed("""{"ready":true}"""))
+            }
+            val gate = CompletableDeferred<Unit>()
+            val harness = harness(
+                bridge = bridge,
+                callbacks = setOf("startup", "handle_readiness", "handle_input"),
+                declaredCapabilities = setOf(ChannelCapability.TextOutput),
+                preparerRegistry = dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+                declaredPublicCapabilities = setOf(PackageCapability.KEYBOARD_OUTPUT),
+                textOutput = textOutput,
+                textOutputAvailability = CapabilityAvailability.Recoverable,
+            )
+            harness.capabilityHost.prepareGate = gate
+            harness.capabilityHost.prepareTextOutputOutcome =
+                HostedCapabilityAcquisition.Available(textOutput) { }
+            try {
+                assertEquals(race.label, ChannelActivationResult.Ready, harness.runtime.activate())
+                harness.runtime.refreshReadiness()
+                val preparation = async { harness.runtime.prepareInput() }
+                runCurrent()
+                assertEquals(race.label, 1, harness.capabilityHost.prepareCalls)
+
+                val raceAction = async { race.action(harness, preparation) }
+                runCurrent()
+                gate.complete(Unit)
+                raceAction.await()
+                runCurrent()
+
+                if (race.label == "cancellation") {
+                    assertTrue(race.label, preparation.isCancelled)
+                } else {
+                    assertFalse(race.label, preparation.await() is ChannelInputAcceptance.Accepted)
+                }
+                assertEquals(
+                    "${race.label}: stale preparation must not run the queued success refresh.",
+                    1,
+                    bridge.callbackCalls.count { it.name == "handle_readiness" },
+                )
+            } finally {
+                gate.complete(Unit)
+                harness.close()
+            }
         }
     }
 
@@ -2790,6 +3607,13 @@ class LuaAdapterRuntimeTest {
             dev.nilp0inter.subspace.dependency.PackageResourcesDeclaration(emptyList()),
         audioFilePortFactory: LuaAudioFilePortFactory? = null,
         mountReadinessStatus: LuaMountReadinessStatus? = null,
+        preparerRegistry: dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry =
+            dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.empty(),
+        declaredPublicCapabilities: Set<String> = emptySet(),
+        textOutput: TextOutputCapability? = null,
+        textOutputAvailability: CapabilityAvailability = CapabilityAvailability.Recoverable,
+        keyboardOutputAdapterFactory: ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+        enabled: Boolean = true,
     ): AdapterHarness {
         val instanceId = "lua-adapter"
         val generation = hostRuntimeGeneration
@@ -2803,7 +3627,7 @@ class LuaAdapterRuntimeTest {
             id = instanceId,
             name = "Lua adapter",
             implementationId = TEST_LUA_IMPLEMENTATION_ID,
-            enabled = true,
+            enabled = enabled,
             configSchemaVersion = 1,
             configPayload = configPayload,
         )
@@ -2820,6 +3644,8 @@ class LuaAdapterRuntimeTest {
             audioOperation = audioOperation,
             deferredAudioPlayback = deferredAudioPlayback,
             unavailableByCapability = unavailableCapabilities,
+            textOutput = textOutput,
+            textOutputAvailability = textOutputAvailability,
         )
         val capabilities = RevocableChannelCapabilityScope(
             identity = CapabilityScopeIdentity(instanceId, generation),
@@ -2835,6 +3661,9 @@ class LuaAdapterRuntimeTest {
             resourceDeclarations = resourceDeclarations,
             audioFilePortFactory = audioFilePortFactory,
             mountReadinessStatus = mountReadinessStatus,
+            preparerRegistry = preparerRegistry,
+            declaredPublicCapabilities = declaredPublicCapabilities,
+            keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
         ).constructRuntime(
             ChannelRuntimeConstructionRequest(
                 definition = definition,
@@ -2969,6 +3798,8 @@ class LuaAdapterRuntimeTest {
         private val audioOperation: AudioOperationCapability? = null,
         private val deferredAudioPlayback: DeferredAudioPlaybackCapability? = null,
         private val unavailableByCapability: Map<ChannelCapability, CapabilityUnavailableReason> = emptyMap(),
+        private val textOutput: TextOutputCapability? = null,
+        private val textOutputAvailability: CapabilityAvailability = CapabilityAvailability.Recoverable,
     ) : ChannelCapabilityHost {
         var availabilityCalls = 0
             private set
@@ -2979,6 +3810,7 @@ class LuaAdapterRuntimeTest {
 
         override suspend fun availability(identity: CapabilityScopeIdentity, key: CapabilityKey<*>): CapabilityAvailability {
             availabilityCalls++
+            if (key == CapabilityKey.TextOutput) return textOutputAvailability
             return availabilityByCapability[key.capability] ?: CapabilityAvailability.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
         }
 
@@ -2993,6 +3825,7 @@ class LuaAdapterRuntimeTest {
             }
             acquireCalls++
             return when (key) {
+                CapabilityKey.TextOutput -> textOutputAcquisition() as HostedCapabilityAcquisition<T>
                 CapabilityKey.Transcription -> transcription?.let { HostedCapabilityAcquisition.Available(it) { } }
                     ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.UNSUPPORTED)
                 CapabilityKey.Synthesis -> synthesis?.let { HostedCapabilityAcquisition.Available(it) { } }
@@ -3011,8 +3844,26 @@ class LuaAdapterRuntimeTest {
             timeoutMillis: Long,
         ): HostedCapabilityAcquisition<T> {
             prepareCalls++
+            if (key == CapabilityKey.TextOutput) {
+                prepareGate?.await()
+                return (prepareTextOutputOutcome ?: textOutputAcquisition()) as HostedCapabilityAcquisition<T>
+            }
             return acquire(identity, key)
         }
+
+        var prepareTextOutputOutcome: HostedCapabilityAcquisition<TextOutputCapability>? = null
+        /** 5.8: when set, suspends TextOutput preparation until completed so a race can be triggered mid-flight. */
+        var prepareGate: CompletableDeferred<Unit>? = null
+
+        private fun textOutputAcquisition(): HostedCapabilityAcquisition<TextOutputCapability> =
+            when (textOutputAvailability) {
+                CapabilityAvailability.Available -> textOutput?.let { HostedCapabilityAcquisition.Available(it) { } }
+                    ?: HostedCapabilityAcquisition.Unavailable(CapabilityUnavailableReason.HOST_NOT_READY)
+                CapabilityAvailability.Recoverable ->
+                    HostedCapabilityAcquisition.Recoverable(CapabilityUnavailableReason.HOST_NOT_READY)
+                is CapabilityAvailability.Unavailable ->
+                    HostedCapabilityAcquisition.Unavailable(textOutputAvailability.reason)
+            }
     }
     private class ControlledDeferredPlayback : DeferredAudioPlaybackCapability {
         var calls = 0
@@ -3024,6 +3875,32 @@ class LuaAdapterRuntimeTest {
             return deferred.await()
         }
         fun release(outcome: DelayedPlaybackOutcome) { waiter?.complete(outcome); consumeCount++ }
+    }
+    private class NoOpTextOutput : TextOutputCapability {
+        override suspend fun sendText(request: dev.nilp0inter.subspace.channel.capability.TextOutputRequest) =
+            dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome.Delivered("op-1")
+        override suspend fun sendKey(request: dev.nilp0inter.subspace.channel.capability.TextKeyRequest) =
+            dev.nilp0inter.subspace.channel.capability.TextDeliveryOutcome.Delivered("op-1")
+    }
+    /** 8.9/9.7: records keyboard-output submissions and the execution-owner kind that authorized them. */
+    private class RecordingKeyboardOutputAdapter(
+        override val identity: CapabilityScopeIdentity,
+        val owner: OutputExecutionOwner,
+    ) : KeyboardOutputAdapter {
+        val textRequests = mutableListOf<TextOutputRequest>()
+        val keyRequests = mutableListOf<TextKeyRequest>()
+        var nextSubmission: KeyboardOutputSubmission =
+            KeyboardOutputSubmission.Completed(TextDeliveryOutcome.Delivered("op-1"))
+        var beforeSendText: suspend () -> Unit = { }
+        override suspend fun sendText(request: TextOutputRequest): KeyboardOutputSubmission {
+            beforeSendText()
+            textRequests += request
+            return nextSubmission
+        }
+        override suspend fun sendKey(request: TextKeyRequest): KeyboardOutputSubmission {
+            keyRequests += request
+            return nextSubmission
+        }
     }
 
     private data class InputCase(
@@ -3122,6 +3999,29 @@ class LuaAdapterRuntimeTest {
         ): String {
             val id = nextRequestId++
             claims[id] = HostOperationClaim.Admitted(id, kind, audioToken, text, language, voice, speed, delaySeconds)
+            return id.toString()
+        }
+
+        /** Registers a keyboard-output claim (text/key + logical profile); returns its request-id string. */
+        fun registerKeyboardClaim(
+            kind: HostOperationKind,
+            text: String? = null,
+            profile: String? = "linux:us",
+            key: String? = null,
+        ): String {
+            val id = nextRequestId++
+            claims[id] = HostOperationClaim.Admitted(
+                requestId = id,
+                kind = kind,
+                audioToken = null,
+                text = text,
+                language = null,
+                voice = null,
+                speed = 1.0,
+                delaySeconds = 0.0,
+                profile = profile,
+                key = key,
+            )
             return id.toString()
         }
 
@@ -3255,6 +4155,20 @@ class LuaAdapterRuntimeTest {
         }
 
         override fun invokeCallback(
+            handle: LuaStateHandle,
+            callbackHandle: LuaCallbackHandle,
+            arguments: LuaValue,
+            spawnAdmission: LuaSpawnAdmission,
+        ): LuaKernelOutcome {
+            callbackCalls += CallbackCall(callbackHandle.name, arguments)
+            beforeCallback?.invoke(callbackHandle.name)
+            return admitSpawned(
+                callbackHandle.name,
+                scriptedCallbacks[callbackHandle.name]?.removeFirstOrNull() ?: completed(),
+                spawnAdmission,
+            )
+        }
+        override fun invokeSosCallback(
             handle: LuaStateHandle,
             callbackHandle: LuaCallbackHandle,
             arguments: LuaValue,

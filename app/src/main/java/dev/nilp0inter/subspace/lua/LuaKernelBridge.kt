@@ -132,6 +132,25 @@ internal interface LuaKernelBridge {
         diagnostic = "opaque audio input requires a native kernel bridge",
     )
     /**
+     * Invoke handle_sos in a bounded host-managed yield-capable coroutine.
+     * A handle_sos that never yields completes in one slice exactly like the
+     * synchronous path; a yielded keyboard-output operation surfaces as
+     * [LuaKernelOutcome.Yielded] carrying only the opaque request identity,
+     * claimed and completed through the same [claimHostOperation]/[resume]
+     * path. Sleep, spawn, defer, and raw yields remain rejected for the SOS
+     * owner. Lightweight bridges default to a fail-closed runtime failure.
+     */
+    fun invokeSosCallback(
+        handle: LuaStateHandle,
+        callbackHandle: LuaCallbackHandle,
+        arguments: LuaValue,
+        spawnAdmission: LuaSpawnAdmission = LuaSpawnAdmission.rejecting(),
+    ): LuaKernelOutcome = LuaKernelOutcome.RuntimeFailure(
+        stateId = handle.stateId.value,
+        generation = handle.generation.value,
+        diagnostic = "yield-capable SOS requires a native kernel bridge",
+    )
+    /**
      * Start a spawned background coroutine.
      */
     fun startCoroutine(
@@ -184,6 +203,7 @@ internal interface LuaSpawnAdmission {
 internal enum class HostOperationKind {
     TRANSCRIBE, SYNTHESIZE, PLAYBACK, AUDIO_OPEN, AUDIO_EXPORT,
     FS_MKDIR, FS_STAT, FS_LIST, FS_READ_TEXT, FS_WRITE_TEXT, FS_REMOVE,
+    KEYBOARD_SEND_TEXT, KEYBOARD_SEND_KEY,
 }
 
 /**
@@ -213,6 +233,12 @@ internal sealed interface HostOperationClaim {
         val mode: String? = null,
         val missingOk: Boolean = false,
         val format: String? = null,
+        // Keyboard-output payload fields (present only for KEYBOARD_* kinds).
+        // `text` above carries the bounded UTF-8 text for KEYBOARD_SEND_TEXT;
+        // `profile` is the bounded logical profile id; `key` is exactly
+        // "enter" or "escape" for KEYBOARD_SEND_KEY.
+        val profile: String? = null,
+        val key: String? = null,
     ) : HostOperationClaim
 
     data class Rejected(val errorCode: String) : HostOperationClaim

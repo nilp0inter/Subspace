@@ -4,7 +4,6 @@ import dev.nilp0inter.subspace.model.DynamicConfigurationChoice
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceRequest
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolution
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver
-import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSource
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason
 import dev.nilp0inter.subspace.model.OpenAiAvailabilityReason
 import dev.nilp0inter.subspace.model.OpenAiConnectionProfileId
@@ -24,13 +23,18 @@ import dev.nilp0inter.subspace.ui.OpenAiProfileUiMutationResult
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceRegistry
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
+import dev.nilp0inter.subspace.dependency.DynamicChoiceSource
 internal class ServiceOpenAiProfileFacade(
     scope: kotlinx.coroutines.CoroutineScope,
     private val repository: OpenAiProfileRepository,
     private val credentials: OpenAiBearerCredentialStore,
     private val operations: OpenAiProfileOperations,
     private val models: OpenAiSdkModelDiscoveryService,
-    textOutputProfiles: () -> List<DynamicConfigurationChoice>,
+    keyboardChoices: KeyboardOutputChoiceHierarchy,
 ) {
     val profileUiState: StateFlow<List<OpenAiProfileUiItem>> = combine(repository.profiles, models.states) { profiles, states ->
         profiles.map { profile ->
@@ -44,29 +48,50 @@ internal class ServiceOpenAiProfileFacade(
         }
     }.stateIn(scope, kotlinx.coroutines.flow.SharingStarted.Eagerly, emptyList())
 
-    val dynamicChoiceResolver = DynamicConfigurationChoiceResolver { request ->
-        when (request.source) {
-            DynamicConfigurationChoiceSource.OPENAI_CONNECTION_PROFILES ->
-                DynamicConfigurationChoiceResolution.Available(
-                    repository.profiles.value.map { DynamicConfigurationChoice(it.id.value, it.displayName) },
+    val dynamicChoiceResolver: DynamicConfigurationChoiceResolver = DynamicConfigurationChoiceSourceRegistry().apply {
+        register(
+            DynamicConfigurationChoiceSourceId.OPENAI_CONNECTION_PROFILES,
+            PROFILE_CHOICE_DEADLINE,
+        ) { _ ->
+            DynamicConfigurationChoiceResolution.Available(
+                repository.profiles.value.map { DynamicConfigurationChoice(it.id.value, it.displayName) },
+            )
+        }
+        register(
+            DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
+            MODEL_DISCOVERY_DEADLINE,
+        ) { request ->
+            val profileId = request.dependencyValue?.takeIf(String::isNotBlank)
+                ?: return@register DynamicConfigurationChoiceResolution.Unavailable(
+                    DynamicConfigurationChoiceUnavailableReason.DEPENDENCY_MISSING,
                 )
-            DynamicConfigurationChoiceSource.OPENAI_MODELS -> {
-                val profileId = request.dependencyValue?.takeIf(String::isNotBlank)
-                    ?: return@DynamicConfigurationChoiceResolver DynamicConfigurationChoiceResolution.Unavailable(
-                        DynamicConfigurationChoiceUnavailableReason.DEPENDENCY_MISSING,
-                    )
-                when (val outcome = models.discover(OpenAiConnectionProfileId(profileId))) {
-                    is OpenAiModelDiscoveryOutcome.Available -> DynamicConfigurationChoiceResolution.Available(
-                        outcome.models.map { DynamicConfigurationChoice(it.id.value, it.label) },
-                    )
-                    is OpenAiModelDiscoveryOutcome.Loading -> DynamicConfigurationChoiceResolution.Loading
-                    is OpenAiModelDiscoveryOutcome.Unavailable -> DynamicConfigurationChoiceResolution.Unavailable(
-                        outcome.reason.toChoiceUnavailableReason(),
-                    )
-                }
+            when (val outcome = models.discover(OpenAiConnectionProfileId(profileId))) {
+                is OpenAiModelDiscoveryOutcome.Available -> DynamicConfigurationChoiceResolution.Available(
+                    outcome.models.map { DynamicConfigurationChoice(it.id.value, it.label) },
+                )
+                is OpenAiModelDiscoveryOutcome.Loading -> DynamicConfigurationChoiceResolution.Loading
+                is OpenAiModelDiscoveryOutcome.Unavailable -> DynamicConfigurationChoiceResolution.Unavailable(
+                    outcome.reason.toChoiceUnavailableReason(),
+                )
             }
-            DynamicConfigurationChoiceSource.TEXT_OUTPUT_PROFILES ->
-                DynamicConfigurationChoiceResolution.Available(textOutputProfiles())
+        }
+        register(
+            DynamicConfigurationChoiceSourceId(DynamicChoiceSource.KEYBOARD_OUTPUT_PLATFORMS),
+            PROFILE_CHOICE_DEADLINE,
+        ) { _ ->
+            keyboardChoices.resolvePlatforms()
+        }
+        register(
+            DynamicConfigurationChoiceSourceId(DynamicChoiceSource.KEYBOARD_OUTPUT_LAYOUTS),
+            PROFILE_CHOICE_DEADLINE,
+        ) { request ->
+            keyboardChoices.resolveLayouts(request)
+        }
+        register(
+            DynamicConfigurationChoiceSourceId.KEYBOARD_OUTPUT_PROFILES,
+            PROFILE_CHOICE_DEADLINE,
+        ) { request ->
+            keyboardChoices.resolveProfiles(request)
         }
     }
 
@@ -138,3 +163,9 @@ internal class ServiceOpenAiProfileFacade(
         else -> DynamicConfigurationChoiceUnavailableReason.DISCOVERY_FAILED
     }
 }
+
+/** In-memory profile and keymap choice reads; the deadline only guards a wedged source. */
+private val PROFILE_CHOICE_DEADLINE: Duration = 5.seconds
+
+/** Model discovery crosses the SDK network client, matching the 15s host invocation deadline. */
+private val MODEL_DISCOVERY_DEADLINE: Duration = 15.seconds

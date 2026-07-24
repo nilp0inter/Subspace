@@ -51,7 +51,7 @@ A Lua channel package SHALL be one ZIP artifact containing exactly one root `man
 - **AND** it SHALL NOT treat the omission as an empty mount declaration or change API versions
 
 #### Scenario: Manifest declares invalid capability identifier
-- **WHEN** a manifest contains an identifier outside the revised stable allowlist, whose permitted values are exactly `audio.transcription`, `audio.synthesis`, `audio.playback`, `audio.files`, and `storage.files`
+- **WHEN** a manifest contains an identifier outside the revised stable allowlist, whose permitted values are exactly `audio.transcription`, `audio.synthesis`, `audio.playback`, `audio.files`, `storage.files`, and `keyboard.output`
 - **THEN** the host SHALL reject the complete package with a typed capability-validation error
 - **AND** it SHALL NOT register the provider or authorize execution
 

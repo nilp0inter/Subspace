@@ -50,6 +50,19 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import dev.nilp0inter.subspace.channel.capability.AgentOperationContext
+import dev.nilp0inter.subspace.channel.capability.CapabilityLeaseTermination
+import dev.nilp0inter.subspace.channel.capability.DeferredAudioPlaybackCapability
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputSubmission
+import dev.nilp0inter.subspace.channel.capability.OpaqueAudioOperation
+import dev.nilp0inter.subspace.channel.capability.OutputAdmissionBounds
+import dev.nilp0inter.subspace.channel.capability.OutputAdmissionScheduler
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwnerKind
+import dev.nilp0inter.subspace.model.DelayedPlaybackOutcome
+import io.sleepwalker.core.hid.LowLevelOp
+import io.sleepwalker.core.protocol.Opcodes
+import kotlinx.coroutines.test.advanceUntilIdle
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ServiceChannelCapabilityHostTest {
@@ -211,6 +224,76 @@ class ServiceChannelCapabilityHostTest {
         assertEquals(0, connectCalls)
     }
 
+    @Test
+    fun generationTerminationRevokesQueuedKeyboardGenerationWhilePreservingSiblingAndDeferredAudio() = runTest {
+        val connection = HoldingConnection().apply {
+            setState(KeyboardConnectionState.Connected)
+            holdFirstTextOperation = CompletableDeferred()
+        }
+        val scheduler = OutputAdmissionScheduler(OutputAdmissionBounds(maxQueuedPerProcess = 8))
+        val output = holdingService(connection, scheduler)
+        val terminatedIdentity = identity("lua-victim", generation = 11)
+        val siblingIdentity = identity("lua-sibling", generation = 12)
+
+        val deferredTerminations = mutableListOf<Pair<CapabilityScopeIdentity, CapabilityLeaseTermination>>()
+        val deferredAudio = object : DeferredAudioPlaybackCapability, GenerationCapabilityResource {
+            var queuedCountWhenTerminated = -1
+
+            override suspend fun scheduleAudio(
+                context: AgentOperationContext,
+                audio: OpaqueAudioOperation,
+                eligibilityDelayMillis: Long,
+            ): DelayedPlaybackOutcome = error("deferred audio is not exercised by this termination test")
+
+            override suspend fun onGenerationTermination(
+                identity: CapabilityScopeIdentity,
+                termination: CapabilityLeaseTermination,
+            ) {
+                deferredTerminations += identity to termination
+                queuedCountWhenTerminated = scheduler.queuedCount()
+            }
+        }
+        val host = host(output) { deferredAudio }
+
+        val revoked = output.keyboardOutputAdapter(
+            terminatedIdentity,
+            OutputExecutionOwner(OutputExecutionOwnerKind.MANAGED_TASK, "victim-owner"),
+        )
+        val sibling = output.keyboardOutputAdapter(
+            siblingIdentity,
+            OutputExecutionOwner(OutputExecutionOwnerKind.MANAGED_TASK, "sibling-owner"),
+        )
+
+        // Occupy the single active delivery slot so both adapter operations queue deterministically.
+        val builtIn = output.capabilityFor("built-in")
+        val holder = async { builtIn.sendText(TextOutputRequest("aaa", TextOutputProfile("linux:us"))) }
+        connection.firstTextOperation.await()
+        runCurrent()
+        val revokedResult = async { revoked.sendText(TextOutputRequest("bbb", TextOutputProfile("linux:us"))) }
+        val siblingResult = async { sibling.sendText(TextOutputRequest("ccc", TextOutputProfile("linux:us"))) }
+        runCurrent()
+        assertEquals(2, scheduler.queuedCount())
+
+        // Terminating generation A through the capability host drains only A's queued keyboard work.
+        host.onGenerationTermination(terminatedIdentity, CapabilityLeaseTermination.REVOKED)
+        runCurrent()
+
+        // Queued generation-A operation is revoked effect-not-begun; sibling B stays queued.
+        assertEquals(KeyboardOutputSubmission.Revoked, revokedResult.await())
+        assertEquals(1, scheduler.queuedCount())
+        // Existing deferred-audio termination forwarding is preserved and runs before the keyboard drain.
+        assertEquals(listOf(terminatedIdentity to CapabilityLeaseTermination.REVOKED), deferredTerminations)
+        assertEquals(2, deferredAudio.queuedCountWhenTerminated)
+
+        // Sibling B remains admitted and deliverable once the active slot frees.
+        checkNotNull(connection.holdFirstTextOperation).complete(Unit)
+        advanceUntilIdle()
+        val siblingOutcome = siblingResult.await()
+        assertTrue(siblingOutcome is KeyboardOutputSubmission.Completed)
+        assertTrue((siblingOutcome as KeyboardOutputSubmission.Completed).outcome is TextDeliveryOutcome.Delivered)
+        assertTrue(holder.await() is TextDeliveryOutcome.Delivered)
+    }
+
     private fun TestScope.service(
         connection: ControllableConnection,
         preparationTimeoutMs: Long = 1_000,
@@ -225,6 +308,20 @@ class ServiceChannelCapabilityHostTest {
         deliveryTimeoutMs = 1_000,
     )
 
+    private fun TestScope.holdingService(
+        connection: HoldingConnection,
+        scheduler: OutputAdmissionScheduler,
+    ): SleepwalkerTextOutputService = SleepwalkerTextOutputService(
+        scope = backgroundScope,
+        connection = connection,
+        hid = LowLevelHidImpl(),
+        keymapDatabase = SeedKeymapDatabase,
+        connect = { _: Long -> SleepwalkerConnectionResult.Connected },
+        preparationTimeoutMs = 1_000,
+        deliveryTimeoutMs = 1_000,
+        admission = scheduler,
+    )
+
     private fun host(textOutputService: SleepwalkerTextOutputService): ServiceChannelCapabilityHost =
         ServiceChannelCapabilityHost(
             textOutputService = textOutputService,
@@ -234,8 +331,21 @@ class ServiceChannelCapabilityHostTest {
             journal = { null },
         )
 
-    private fun identity(instanceId: String): CapabilityScopeIdentity =
-        CapabilityScopeIdentity(instanceId, RuntimeGeneration(0))
+    private fun host(
+        textOutputService: SleepwalkerTextOutputService,
+        deferredAudioPlayback: (CapabilityScopeIdentity) -> DeferredAudioPlaybackCapability?,
+    ): ServiceChannelCapabilityHost =
+        ServiceChannelCapabilityHost(
+            textOutputService = textOutputService,
+            transcription = { null },
+            synthesis = { null },
+            audioOperation = { null },
+            journal = { null },
+            deferredAudioPlayback = deferredAudioPlayback,
+        )
+
+    private fun identity(instanceId: String, generation: Long = 0): CapabilityScopeIdentity =
+        CapabilityScopeIdentity(instanceId, RuntimeGeneration(generation))
 
     private fun availablePort(
         acquisition: HostedCapabilityAcquisition<TextOutputCapability>,
@@ -252,5 +362,34 @@ class ServiceChannelCapabilityHostTest {
         fun setState(state: KeyboardConnectionState) {
             _connectionState.value = state
         }
+    }
+
+    private class HoldingConnection : SleepwalkerBleConnection() {
+        val sent = mutableListOf<LowLevelOp>()
+        val firstTextOperation = CompletableDeferred<Unit>()
+        var holdFirstTextOperation: CompletableDeferred<Unit>? = null
+        private var sawTextOperation = false
+
+        fun setState(state: KeyboardConnectionState) {
+            _connectionState.value = state
+        }
+
+        override fun disconnect() {
+            _connectionState.value = KeyboardConnectionState.Disconnected
+        }
+
+        override suspend fun sendOp(op: LowLevelOp) {
+            val safetyOperation = op.opcode == Opcodes.ARM || op.opcode == Opcodes.KILL || op.opcode == Opcodes.DISARM
+            if (!safetyOperation && !sawTextOperation) {
+                sawTextOperation = true
+                firstTextOperation.complete(Unit)
+                sent += op
+                holdFirstTextOperation?.await()
+                return
+            }
+            sent += op
+        }
+
+        override suspend fun awaitAck(seqId: Int, timeoutMs: Long): Boolean = true
     }
 }

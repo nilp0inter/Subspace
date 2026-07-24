@@ -677,6 +677,219 @@ class InstalledPackageTransactionsTest {
             assertContent(root, digestA, archiveA)
         }
     }
+    @Test
+    fun `index codec round-trips a keyboard output revision with dynamic choice exactly`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("200", "800", "801")
+            success(repository(root, RecordingPublisher(root)).installOrUpdate(ByteArrayInputStream(keyboardArchive("200", "1.0.0")), source))
+            val original = index(root)
+
+            val decoded = StrictIndexCodec.decodeIndex(StrictIndexCodec.encodeIndex(original))
+
+            assertEquals(original.version, decoded.version)
+            assertEquals("dynamic-choice source and keyboard.output must survive an exact encode/decode round-trip", original.providers, decoded.providers)
+            val active = decoded.providers.getValue(source.repositoryId).active
+            assertEquals(CachedManifestTrust.EVOLVED_VERIFIED, active.cachedManifestTrust)
+            val uiField = active.manifest.configuration.ui.fields.single()
+            assertEquals(UiControl.DYNAMIC_CHOICE, uiField.control)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, uiField.source)
+            assertNull(uiField.choices)
+            assertTrue(active.manifest.capabilities.contains(PackageCapability.KEYBOARD_OUTPUT))
+            assertTrue(active.manifest.capabilities.contains(PackageCapability.AUDIO_TRANSCRIPTION))
+        }
+    }
+    @Test
+    fun `index codec round-trips a three stage keyboard hierarchy with dependsOn exactly`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("240", "840", "841")
+            success(repository(root, RecordingPublisher(root)).installOrUpdate(ByteArrayInputStream(keyboardHierarchyArchive("240", "1.0.0")), source))
+            val original = index(root)
+
+            val decoded = StrictIndexCodec.decodeIndex(StrictIndexCodec.encodeIndex(original))
+
+            assertEquals(original.version, decoded.version)
+            assertEquals("three-stage dependsOn chain must survive an exact encode/decode round-trip", original.providers, decoded.providers)
+            val uiFields = decoded.providers.getValue(source.repositoryId).active.manifest.configuration.ui.fields
+            assertEquals(listOf("host_os", "host_layout", "host_profile"), uiFields.map { it.field })
+            assertNull(uiFields[0].dependsOnFieldId)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PLATFORMS, uiFields[0].source)
+            assertEquals("host_os", uiFields[1].dependsOnFieldId)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_LAYOUTS, uiFields[1].source)
+            assertEquals("host_layout", uiFields[2].dependsOnFieldId)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, uiFields[2].source)
+        }
+    }
+
+    @Test
+    fun `keyboard output package preserves dynamic choice through install reparse and rollback revalidation`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("201", "802", "803")
+            val archive = keyboardArchive("201", "1.0.0")
+            success(repository(root, RecordingPublisher(root)).installOrUpdate(ByteArrayInputStream(archive), source))
+
+            // Store-level preservation: the committed cached index retains the exact
+            // dynamic-choice source declaration and keyboard.output eligibility.
+            val stored = index(root).providers.getValue(source.repositoryId).active
+            assertEquals(digest(archive), stored.digest.value)
+            val storedUi = stored.manifest.configuration.ui.fields.single()
+            assertEquals(UiControl.DYNAMIC_CHOICE, storedUi.control)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, storedUi.source)
+            assertTrue(stored.manifest.capabilities.contains(PackageCapability.KEYBOARD_OUTPUT))
+
+            // Reparse-from-artifact recovery (rollback path): revalidating the stored
+            // revision reparses exact bytes into identical declarations.
+            val reparsed = success(InstalledPackageStore(root).revalidateStoredRevision(stored))
+            assertEquals(stored.manifest, reparsed.manifest)
+            assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, reparsed.manifest.configuration.ui.fields.single().source)
+            assertTrue(reparsed.manifest.capabilities.contains(PackageCapability.KEYBOARD_OUTPUT))
+        }
+    }
+
+    @Test
+    fun `keyboard output package survives restart through reparse without Lua or host effect`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("202", "804", "805")
+            val provider = InstalledProviderId.derive(source.repositoryId)
+            val archive = keyboardArchive("202", "1.0.0")
+            val expectedDigest = digest(archive)
+            success(repository(root, RecordingPublisher(root)).installOrUpdate(ByteArrayInputStream(archive), source))
+
+            // Restart: a fresh repository reparses exact stored bytes and publishes the
+            // provider. NoopLuaKernelBridge throws if any Lua state creation is attempted,
+            // proving catalogue restoration performs no Lua or host effect.
+            val restartedPublisher = RecordingPublisher(root)
+            assertEquals(Unit, success(repository(root, restartedPublisher).loadAndPublish()))
+            restartedPublisher.assertLast(setOf(provider), emptySet())
+            val binding = restartedPublisher.snapshots.last().bindings.getValue(provider)
+            assertEquals(expectedDigest, binding.provider.fingerprint.value)
+        }
+    }
+
+    @Test
+    fun `cached metadata cannot add remove or alter keyboard output eligibility or dynamic source declarations`() = runTest {
+        val keyboardConfig = PackageConfigurationDeclaration(
+            ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.StringField("host_profile", "linux:us", null))),
+            ConfigurationUiDeclaration(listOf(UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)))
+        )
+        val relabelled = PackageConfigurationDeclaration(
+            ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.StringField("host_profile", "linux:us", null))),
+            ConfigurationUiDeclaration(listOf(UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Tampered label", null, null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)))
+        )
+        val renamedField = PackageConfigurationDeclaration(
+            ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.StringField("tampered_profile", "linux:us", null))),
+            ConfigurationUiDeclaration(listOf(UiFieldDeclaration("tampered_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)))
+        )
+        val emptyConfig = PackageConfigurationDeclaration(ConfigurationDataDeclaration(emptyList()), ConfigurationUiDeclaration(emptyList()))
+
+        class Case(val name: String, val keyboard: Boolean, val mutate: (PackageManifest) -> PackageManifest)
+        val cases = listOf(
+            Case("remove keyboard.output capability", true) { it.copy(capabilities = it.capabilities - PackageCapability.KEYBOARD_OUTPUT) },
+            Case("add foreign capability", true) { it.copy(capabilities = it.capabilities + PackageCapability.AUDIO_PLAYBACK) },
+            Case("remove dynamic-choice declaration", true) { it.copy(configuration = emptyConfig) },
+            Case("alter dynamic-choice label", true) { it.copy(configuration = relabelled) },
+            Case("alter dynamic-choice field id", true) { it.copy(configuration = renamedField) },
+            Case("add keyboard.output capability", false) { it.copy(capabilities = it.capabilities + PackageCapability.KEYBOARD_OUTPUT) },
+            Case("add dynamic-choice declaration", false) { it.copy(configuration = keyboardConfig) },
+        )
+
+        for (case in cases) {
+            withTemporaryDirectory { root ->
+                val sourceA = sourceRecord("210", "810", "811")
+                val sourceB = sourceRecord("211", "812", "813")
+                val providerA = InstalledProviderId.derive(sourceA.repositoryId)
+                val providerB = InstalledProviderId.derive(sourceB.repositoryId)
+                val archiveA = if (case.keyboard) keyboardArchive("210", "1.0.0") else packageArchive("210", "1.0.0", "plain")
+                val archiveB = packageArchive("211", "1.0.0", "sibling")
+                val repository = repository(root, RecordingPublisher(root))
+                success(repository.installOrUpdate(ByteArrayInputStream(archiveA), sourceA))
+                success(repository.installOrUpdate(ByteArrayInputStream(archiveB), sourceB))
+
+                // Tamper only the cached index metadata; the authoritative archive bytes stay untouched.
+                val oldIndex = index(root)
+                val recordA = oldIndex.providers.getValue(sourceA.repositoryId)
+                val mutatedActive = recordA.active.copy(manifest = case.mutate(recordA.active.manifest))
+                val mutatedIndex = StoredInstalledIndex(
+                    version = oldIndex.version,
+                    providers = oldIndex.providers + (sourceA.repositoryId to recordA.copy(active = mutatedActive))
+                )
+                File(root, "index.json").writeText(StrictIndexCodec.encodeIndex(mutatedIndex), UTF_8)
+
+                val matResult = success(InstalledPackageStore(root).loadAndMaterialize(NoopLuaKernelBridge))
+                val failureA = matResult.failures[providerA]
+                assertTrue("${case.name}: expected SERIALIZATION_VIOLATION but got $failureA", failureA is PackageFailure.Mutation)
+                assertEquals(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, (failureA as PackageFailure.Mutation).detail)
+                assertTrue("${case.name}: sibling provider B must still bind from its own exact bytes", matResult.bindings.containsKey(providerB))
+            }
+        }
+    }
+
+    @Test
+    fun `rollback revalidation rejects cached metadata that alters keyboard output or a dynamic source`() = runTest {
+        withTemporaryDirectory { root ->
+            val source = sourceRecord("220", "820", "821")
+            val archive = keyboardArchive("220", "1.0.0")
+            success(repository(root, RecordingPublisher(root)).installOrUpdate(ByteArrayInputStream(archive), source))
+            val stored = index(root).providers.getValue(source.repositoryId).active
+            val store = InstalledPackageStore(root)
+
+            // A legitimate stored revision revalidates: reparse round-trips declarations.
+            assertEquals(stored.manifest, success(store.revalidateStoredRevision(stored)).manifest)
+
+            fun assertSerializationViolation(revision: StoredPackageRevision, label: String) {
+                val outcome = store.revalidateStoredRevision(revision)
+                assertTrue("$label must be rejected against exact bytes", outcome is PackageOutcome.Failure)
+                val error = (outcome as PackageOutcome.Failure).error
+                assertTrue("$label must be a Mutation failure but was $error", error is PackageFailure.Mutation)
+                assertEquals(PackageFailure.MutationDetail.SERIALIZATION_VIOLATION, (error as PackageFailure.Mutation).detail)
+            }
+
+            assertSerializationViolation(
+                stored.copy(manifest = stored.manifest.copy(capabilities = stored.manifest.capabilities - PackageCapability.KEYBOARD_OUTPUT)),
+                "removing keyboard.output",
+            )
+            assertSerializationViolation(
+                stored.copy(manifest = stored.manifest.copy(capabilities = stored.manifest.capabilities + PackageCapability.AUDIO_PLAYBACK)),
+                "adding a foreign capability",
+            )
+            assertSerializationViolation(
+                stored.copy(manifest = stored.manifest.copy(configuration = PackageConfigurationDeclaration(ConfigurationDataDeclaration(emptyList()), ConfigurationUiDeclaration(emptyList())))),
+                "removing the dynamic source declaration",
+            )
+        }
+    }
+
+    @Test
+    fun `cached index decode rejects unknown dynamic source stray source on static control and missing source`() {
+        fun indexJson(uiFieldJson: String): String = """
+{
+  "version": 1,
+  "providers": {
+    "230": {
+      "active": {
+        "digest": "${"a".repeat(64)}",
+        "manifest": {"manifestVersion":1,"repositoryId":"230","packageVersion":"1.0.0","entryModule":"plugin","presentation":{"label":"Keyboard Package","summary":"Keyboard output fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[$uiFieldJson]}},"resources":{"mounts":[]},"capabilities":["keyboard.output"]},
+        "sourceRecord": {"repositoryId":"230","coordinates":{"owner":"owner-230","repository":"repository-230"},"release":{"releaseId":"830","tag":"v830","isPrerelease":false},"asset":{"assetId":"831","name":"package-831.zip"},"ownerId":"9000001"}
+      },
+      "rollback": null
+    }
+  }
+}
+"""
+        fun assertDecodeRejects(json: String, label: String) {
+            try {
+                StrictIndexCodec.decodeIndex(json)
+                throw AssertionError("expected decode rejection for $label")
+            } catch (e: IllegalArgumentException) {
+                // expected: cached metadata cannot grant an unknown, stray, or missing source
+            }
+        }
+
+        assertDecodeRejects(indexJson("""{"field":"host_profile","control":"dynamic-choice","label":"Host profile","source":"not-a-real-source"}"""), "unknown dynamic-choice source")
+        assertDecodeRejects(indexJson("""{"field":"host_profile","control":"text","label":"Host profile","source":"keyboard-output-profiles"}"""), "stray source on a static control")
+        assertDecodeRejects(indexJson("""{"field":"host_profile","control":"dynamic-choice","label":"Host profile"}"""), "dynamic-choice missing source")
+        assertDecodeRejects(indexJson("""{"field":"host_profile","control":"text","label":"Host profile","dependsOn":"host_profile"}"""), "dependsOn on a static control")
+        assertDecodeRejects(indexJson("""{"field":"host_profile","control":"dynamic-choice","label":"Host profile","source":"keyboard-output-profiles","dependsOn":123}"""), "non-string dependsOn")
+    }
 
     private fun repository(root: File, publisher: RecordingPublisher): InstalledPackageRepository =
         repository(InstalledPackageStore(root), publisher)
@@ -764,6 +977,31 @@ class InstalledPackageTransactionsTest {
         return strictUnixStoredZip(
             listOf(
                 ZipFixtureEntry("manifest.json", manifest.toByteArray(UTF_8), 0b1000000110100100),
+                ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                ZipFixtureEntry("lua/plugin.lua", source.toByteArray(UTF_8), 0b1000000110100100),
+            ),
+        )
+    }
+    private fun keyboardManifest(repositoryId: String, version: String): String =
+        """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Keyboard Package","summary":"Keyboard output fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[{"field":"host_profile","control":"dynamic-choice","label":"Host profile","source":"keyboard-output-profiles"}]}},"resources":{"mounts":[]},"capabilities":["audio.transcription","keyboard.output"]}"""
+    private fun keyboardHierarchyManifest(repositoryId: String, version: String): String =
+        """{"manifestVersion":1,"repositoryId":"$repositoryId","packageVersion":"$version","entryModule":"plugin","presentation":{"label":"Keyboard Package","summary":"Keyboard output fixture"},"runtime":{"luaVersion":"$LUA_VERSION","apiVersion":"$API_VERSION"},"configuration":{"schemaVersion":1,"data":{"fields":[{"id":"host_os","type":"string","default":"linux"},{"id":"host_layout","type":"string","default":"linux:us"},{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[{"field":"host_os","control":"dynamic-choice","label":"Host OS","source":"keyboard-output-platforms"},{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_os"},{"field":"host_profile","control":"dynamic-choice","label":"Host profile","source":"keyboard-output-profiles","dependsOn":"host_layout"}]}},"resources":{"mounts":[]},"capabilities":["keyboard.output"]}"""
+
+    private fun keyboardArchive(repositoryId: String, version: String): ByteArray {
+        val source = "-- keyboard\\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+        return strictUnixStoredZip(
+            listOf(
+                ZipFixtureEntry("manifest.json", keyboardManifest(repositoryId, version).toByteArray(UTF_8), 0b1000000110100100),
+                ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
+                ZipFixtureEntry("lua/plugin.lua", source.toByteArray(UTF_8), 0b1000000110100100),
+            ),
+        )
+    }
+    private fun keyboardHierarchyArchive(repositoryId: String, version: String): ByteArray {
+        val source = "-- keyboard-hierarchy\\nreturn { startup = function() end, handle_readiness = function() return { ready = true } end }"
+        return strictUnixStoredZip(
+            listOf(
+                ZipFixtureEntry("manifest.json", keyboardHierarchyManifest(repositoryId, version).toByteArray(UTF_8), 0b1000000110100100),
                 ZipFixtureEntry("lua/", ByteArray(0), 0b0100000111101101),
                 ZipFixtureEntry("lua/plugin.lua", source.toByteArray(UTF_8), 0b1000000110100100),
             ),

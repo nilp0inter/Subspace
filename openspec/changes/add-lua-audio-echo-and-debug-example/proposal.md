@@ -1,3 +1,5 @@
+> Abandoned: this plan targets the superseded synchronous Lua callback and bundled-provider architecture. The implemented installed-package, typed-operation, and managed-coroutine contracts are the only supported direction; do not apply or sync this change.
+
 ## Why
 
 Subspace Lua Runtime v1 defines the public contract and proves it with black-box fixtures, but no Lua program performs a real channel behavior: the Lua input path discards every callback return value except an execution status and always yields `ChannelInputResult.None`, so a Lua channel cannot produce audio. Exercise the engine with a first real behavior — PTT audio echo — through the live, host-owned playback seam, before packaging, installation, or configurable channel migration come to depend on an unproven input path.

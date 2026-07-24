@@ -79,16 +79,22 @@ data class RuntimeInvocationPolicy(
     val callbackTimeoutMillis: Long = 15_000,
     val inputReleasedTimeoutMillis: Long = 120_000,
     val closeTimeoutMillis: Long = 5_000,
+    val prepareInputTimeoutMillis: Long = 20_000,
+    val handleSosTimeoutMillis: Long = 15_000,
 ) {
     init {
         require(perGenerationQueueCapacity > 0) { "Per-generation queue capacity must be positive" }
         require(callbackTimeoutMillis > 0) { "Callback timeout must be positive" }
         require(inputReleasedTimeoutMillis > 0) { "Input release timeout must be positive" }
         require(closeTimeoutMillis > 0) { "Close timeout must be positive" }
+        require(prepareInputTimeoutMillis > 0) { "Prepare-input timeout must be positive" }
+        require(handleSosTimeoutMillis > 0) { "Handle-SOS timeout must be positive" }
     }
 
     fun timeoutFor(phase: RuntimeInvocationPhase): Long = when (phase) {
         RuntimeInvocationPhase.INPUT_RELEASED -> inputReleasedTimeoutMillis
+        RuntimeInvocationPhase.PREPARE_INPUT -> prepareInputTimeoutMillis
+        RuntimeInvocationPhase.HANDLE_SOS -> handleSosTimeoutMillis
         else -> callbackTimeoutMillis
     }
 }

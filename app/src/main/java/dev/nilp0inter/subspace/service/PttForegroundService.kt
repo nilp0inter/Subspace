@@ -445,16 +445,8 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
             openAiCredentials,
             openAiProfileOperations,
             openAiModels,
-        ) {
-            (keymapDatabase.profiles.ifEmpty { listOf(io.sleepwalker.core.keymap.HostProfile.LINUX_US) }).distinctBy { it.key }.sortedBy { it.key }.map { p ->
-                val label = buildString {
-                    append(p.layout)
-                    p.variant?.let { append(" ($it)") }
-                    append(" [${p.hostOs}]")
-                }
-                dev.nilp0inter.subspace.model.DynamicConfigurationChoice(p.key, label)
-            }
-        }
+            KeyboardOutputChoiceHierarchy { keymapDatabase.profiles },
+        )
         val keyboardProvider = KeyboardBuiltInProvider()
         providerRegistry = ChannelImplementationProviderRegistry().also { providers ->
             check(providers.register(JournalBuiltInProvider()) is dev.nilp0inter.subspace.model.ChannelProviderRegistrationResult.Registered)
@@ -622,6 +614,10 @@ class PttForegroundService : Service(), CarPttCommandListener, TelecomCarPttCoor
                     grants = safGrantController,
                     stagingRoot = java.io.File(cacheDir, "lua-audio-staging"),
                 ),
+            preparerRegistry =
+                dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry.default(),
+            dynamicChoiceResolver = dynamicChoiceResolver,
+            keyboardOutputAdapterFactory = textOutputService::keyboardOutputAdapter,
             onCatalogueReconcile = {
                 _channelDescriptors.value = providerRegistry.descriptors()
                 runtimeRegistry.reconcile(channelRepository.catalogueState.value)

@@ -393,10 +393,10 @@ class InstalledProviderRegistryContractTest {
     }
 
     @Test
-    fun `all five public capabilities compile to exactly six internal requirements`() {
+    fun `all six public capabilities compile to exactly seven internal requirements`() {
         val caps = materializeCapabilities(PackageCapability.ALL)
         assertEquals(
-            "all five public IDs must compile to exactly {Transcription, Synthesis, AudioOperation, DeferredAudioPlayback, StorageFiles, AudioFiles}",
+            "all six public IDs must compile to exactly {Transcription, Synthesis, AudioOperation, DeferredAudioPlayback, StorageFiles, AudioFiles, TextOutput}",
             setOf(
                 ChannelCapability.Transcription,
                 ChannelCapability.Synthesis,
@@ -404,10 +404,11 @@ class InstalledProviderRegistryContractTest {
                 ChannelCapability.DeferredAudioPlayback,
                 ChannelCapability.StorageFiles,
                 ChannelCapability.AudioFiles,
+                ChannelCapability.TextOutput,
             ),
             caps,
         )
-        assertEquals("all-five must produce exactly 6 internal requirements", 6, caps.size)
+        assertEquals("all-six must produce exactly 7 internal requirements", 7, caps.size)
     }
 
     @Test
@@ -444,8 +445,8 @@ class InstalledProviderRegistryContractTest {
         val caps = materializeCapabilities(PackageCapability.ALL)
         val serializedStableIds = caps.map { it.stableId }.toSet()
         assertEquals(
-            "serialized stableId set must be exactly the six internal stable IDs",
-            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files"),
+            "serialized stableId set must be exactly the seven internal stable IDs",
+            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files", "text-output"),
             serializedStableIds,
         )
         val serializedBlob = caps.joinToString(",", prefix = "[", postfix = "]") { it.stableId }
@@ -469,6 +470,7 @@ class InstalledProviderRegistryContractTest {
             PackageCapability.AUDIO_PLAYBACK,
             PackageCapability.STORAGE_FILES,
             PackageCapability.AUDIO_FILES,
+            PackageCapability.KEYBOARD_OUTPUT,
         )
         publicIds.forEach { publicId ->
             assertFalse(
@@ -509,10 +511,10 @@ class InstalledProviderRegistryContractTest {
         val descriptor = binding.provider.descriptor
         val requiredCaps = descriptor.requiredCapabilities
 
-        assertEquals(6, requiredCaps.size)
+        assertEquals(7, requiredCaps.size)
         val stableIds = requiredCaps.map { it.stableId }.toSet()
         assertEquals(
-            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files"),
+            setOf("transcription", "synthesis", "audio-operation", "deferred-audio-playback", "storage-files", "audio-files", "text-output"),
             stableIds,
         )
 

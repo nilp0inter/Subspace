@@ -56,11 +56,11 @@ Every source-map module chunk evaluation—the entry module and every module loa
 - **AND** no background task, timer, log, capability operation, or partial module result SHALL be admitted or retained
 
 ### Requirement: Event callbacks have explicit yield contexts and exact terminal results
-`startup`, `handle_lifecycle`, `handle_sos`, and `handle_readiness` SHALL execute synchronously and SHALL NOT suspend across the host boundary. The host SHALL reject a raw `coroutine.yield` escaping any of those callback stacks as a typed callback-contract failure. Outside source/module evaluation, a context-restricted host operation called from an ineligible callback SHALL return its normal `(nil, {error = "E_INVALID_CONTEXT"})` pair before suspension or effect; that denied call SHALL NOT by itself fail the callback if Lua handles or ignores it. `startup` MAY call `subspace.runtime.spawn` to admit managed background tasks. Lifecycle, SOS, and readiness callbacks SHALL receive `E_INVALID_CONTEXT` from `spawn` and `defer` without task admission. Input SHALL receive `E_INVALID_CONTEXT` from `spawn` but MAY call `subspace.runtime.defer` under its terminal-bound contract.
+`startup`, `handle_lifecycle`, and `handle_readiness` SHALL execute synchronously and SHALL NOT suspend across the host boundary. `handle_input` and `handle_sos` SHALL execute in host-managed yield-capable coroutines. The host SHALL reject a raw `coroutine.yield` escaping any callback stack as a typed callback-contract failure. Outside source/module evaluation, a context-restricted host operation called from an ineligible callback SHALL return its normal `(nil, {error = "E_INVALID_CONTEXT"})` pair before suspension or effect; that denied call SHALL NOT by itself fail the callback if Lua handles or ignores it. `startup` MAY call `subspace.runtime.spawn` to admit managed background tasks. Lifecycle, SOS, and readiness callbacks SHALL receive `E_INVALID_CONTEXT` from `spawn` and `defer` without task admission. Input SHALL receive `E_INVALID_CONTEXT` from `spawn` but MAY call `subspace.runtime.defer` under its terminal-bound contract.
 
-`handle_input` SHALL execute in a host-managed yield-capable coroutine. It MAY invoke authorized yielding operations defined by `lua-audio-api`, `lua-audio-file-api`, and `lua-filesystem-api`; each admitted operation MAY suspend the coroutine, release the serialized Lua execution slot, and resume it exactly once with a terminal result. `subspace.runtime.sleep`, `subspace.runtime.spawn`, and raw escaping `coroutine.yield` are not authorized input suspension paths. Sleep and spawn SHALL return `E_INVALID_CONTEXT`; raw escaping yield SHALL fail the callback. `runtime.defer` is synchronous task reservation and SHALL NOT itself suspend or run its function before input success.
+`handle_input` MAY invoke authorized yielding operations defined by the public Lua capability APIs available to input execution owners. `handle_sos` MAY invoke authorized yielding operations explicitly permitted for SOS execution owners, including declared `keyboard.output`. Each admitted operation MAY suspend its callback, release the serialized Lua execution slot, and resume it exactly once with a terminal result while the owner and generation remain current. `subspace.runtime.sleep`, `subspace.runtime.spawn`, and raw escaping `coroutine.yield` are not authorized input or SOS suspension paths. Sleep and spawn SHALL return `E_INVALID_CONTEXT`; raw escaping yield SHALL fail the callback. `runtime.defer` is synchronous input-only task reservation and SHALL return `E_INVALID_CONTEXT` from SOS.
 
-For `startup`, `handle_lifecycle`, and `handle_sos`, a normal return without an `error` field SHALL be success/no-op according to callback role. An application failure SHALL be exactly `{error = {code = <non-empty string>, detail = <non-empty string>}}`; any other table containing `error` SHALL be a typed callback-contract failure. `handle_input` and `handle_readiness` SHALL use their separately defined exact result shapes.
+For `startup` and `handle_lifecycle`, a normal return without an `error` field SHALL be success/no-op according to callback role. `handle_sos` SHALL return exactly `{ok = true}` or `{error = {code = <non-empty string>, detail = <non-empty string>}}`. An application failure for other general callbacks SHALL be exactly `{error = {code = <non-empty string>, detail = <non-empty string>}}`; any malformed table containing `error` SHALL be a typed callback-contract failure. `handle_input` and `handle_readiness` SHALL use their separately defined exact result shapes.
 
 #### Scenario: Startup admits a background task
 - **WHEN** `startup` calls `subspace.runtime.spawn(function() ... end)` and returns successfully
@@ -74,10 +74,16 @@ For `startup`, `handle_lifecycle`, and `handle_sos`, a normal return without an 
 - **AND** the callback MAY handle that result and continue
 
 #### Scenario: Input callback uses authorized yielding operation
-- **WHEN** `handle_input` invokes an authorized semantic-audio, audio-file, or filesystem operation
+- **WHEN** `handle_input` invokes an authorized semantic-audio, audio-file, filesystem, or keyboard-output operation
 - **THEN** the host SHALL suspend that callback and release the execution slot
 - **AND** it SHALL resume the callback exactly once while its execution owner remains current
 - **AND** it SHALL evaluate the callback result only after terminal completion
+
+#### Scenario: SOS callback uses authorized yielding operation
+- **WHEN** `handle_sos` invokes an authorized keyboard-output operation
+- **THEN** the host SHALL suspend that callback and release the execution slot
+- **AND** it SHALL resume the callback at most once while its SOS execution owner remains current
+- **AND** raw yield, sleep, spawn, and defer SHALL remain unavailable
 
 #### Scenario: Input callback defers post-input work
 - **WHEN** `handle_input` successfully calls `runtime.defer(function() ... end)`
@@ -130,71 +136,81 @@ The `subspace.channel` module SHALL be a host-injected, reserved module that plu
 
 #### Scenario: Lifecycle callback is invoked after startup before Ready publication
 - **WHEN** the host has completed `startup` successfully and is about to publish the channel as Ready, and the plugin has supplied `handle_lifecycle`
-- **THEN** the host SHALL invoke the callback with a table containing `event` set to `"ready"` (matching `subspace.channel.LIFECYCLE_READY`)
+- **THEN** the host SHALL invoke the callback with a table containing `event` set to `"ready"` matching `subspace.channel.LIFECYCLE_READY`
 - **AND** the callback SHALL receive no platform objects, actor identities, or audio data
 - **AND** the host SHALL publish Ready immediately after the callback returns successfully
 
-#### Scenario: Lifecycle callback is absent (neutral default)
+#### Scenario: Lifecycle callback is absent
 - **WHEN** the callback table lacks `handle_lifecycle`
-- **THEN** the host SHALL apply the neutral default: lifecycle events produce no effect
+- **THEN** lifecycle events SHALL produce no effect
 - **AND** the host SHALL proceed directly from `startup` success to Ready publication
 
-#### Scenario: Readiness callback projects exact readiness and status
+#### Scenario: Readiness callback projects readiness status and preparation
 - **WHEN** the host refreshes readiness and `handle_readiness` is present
-- **THEN** it SHALL invoke the callback synchronously with one context table whose `capabilities` map contains every declared public capability ID exactly once with value `"available"`, `"recoverable"`, or `"unavailable"`
-- **AND** the callback SHALL return a plain table containing required boolean `ready` and only optional bounded valid-UTF-8 string `status`
-- **AND** a missing callback SHALL use the neutral not-ready default
-- **AND** a thrown error, raw yield, non-table, error table, missing or non-boolean `ready`, unknown result key, metatable, or non-string/over-bound `status` SHALL cache not-ready and record one local typed failure for that refresh
+- **THEN** it SHALL invoke the callback synchronously with one context table whose `capabilities` map contains every declared public capability ID exactly once with value `available`, `recoverable`, or `unavailable`, whose resource map follows declared resource contracts, and whose configuration-reference map contains every required dynamic scalar reference exactly once with value `available` or `unavailable`
+- **AND** the callback SHALL return a plain exact-key table containing required boolean `ready`, optional bounded valid-UTF-8 string `status`, and optional bounded duplicate-free array `prepare`
+- **AND** every `prepare` entry SHALL name a declared host-preparable public capability, and nonempty `prepare` SHALL be valid only when `ready = false`
+- **AND** a missing callback SHALL use the neutral not-ready default with no preparation request
+- **AND** a thrown error, raw yield, non-table, error table, missing or non-boolean `ready`, unknown result key, metatable, invalid status, invalid prepare array, unknown/duplicate/undeclared/non-preparable capability, or `ready = true` with nonempty prepare SHALL cache not-ready with no preparation and record one local typed failure
 
-#### Scenario: Readiness callback filters by selected mode's dependency subset
-- **WHEN** `handle_readiness` is invoked for a provider that supports multiple modes depending on different capabilities
-- **THEN** it SHALL evaluate the capability availability map for only the selected mode's dependency subset
-- **AND** it SHALL return `ready = true` only if the required capabilities for that specific mode are available
+#### Scenario: Readiness callback updates host-visible availability
+- **WHEN** the host obtains a valid or invalid readiness projection
+- **THEN** `ready = true` SHALL publish the runtime snapshot as available
+- **AND** `ready = false` with a nonempty valid `prepare` array SHALL publish it as recoverable
+- **AND** `ready = false` without a preparation path, a missing callback, or a malformed result SHALL publish it as unavailable
+- **AND** the phone and car catalogue projections SHALL derive their readiness status from that current runtime snapshot rather than activation state
 
-#### Scenario: Input is accepted synchronously based on cached readiness
-- **WHEN** the cached readiness projection (obtained from prior `handle_readiness` or its neutral default) is `ready = true` and the callback table contains a valid `handle_input` function
-- **THEN** the host SHALL accept the input synchronously without making a new Lua call at input-acceptance time
+#### Scenario: Readiness callback filters by selected dependency subset
+- **WHEN** `handle_readiness` supports configurations or modes depending on different capabilities
+- **THEN** it SHALL evaluate only the selected dependency subset
+- **AND** it MAY request preparation only for the selected subset's declared recoverable dependencies
+
+#### Scenario: Cached readiness accepts input
+- **WHEN** cached readiness is `ready = true` and `handle_input` is valid
+- **THEN** the host SHALL accept input without a new Lua call at initial acceptance
 - **AND** capture SHALL proceed
 
+#### Scenario: Cached readiness requests preparation
+- **WHEN** cached readiness is false with a nonempty valid `prepare` array
+- **THEN** the host SHALL run bounded generic preparation before accepting input
+- **AND** it SHALL refresh readiness after successful preparation
+- **AND** capture SHALL proceed only if refreshed readiness is true
+
 #### Scenario: Input is rejected because readiness is false
-- **WHEN** the cached readiness projection is not ready or `handle_input` is absent
-- **THEN** the host SHALL refuse the input with a typed not-ready or input-not-supported result
+- **WHEN** cached readiness is false with no successful preparation path or `handle_input` is absent
+- **THEN** the host SHALL refuse input with a typed result
 - **AND** capture SHALL NOT start
 
-#### Scenario: Input capture lifecycle maps to snapshot states and delivers opaque audio userdata
-- **WHEN** the host starts capture, the snapshot SHALL enter RECORDING; when capture completes and is released for processing, the snapshot SHALL enter PROCESSING before `handle_input` is invoked
-- **THEN** the host SHALL invoke `handle_input` with a table having `event` set to `"capture"` (matching `subspace.channel.CAPTURE_COMPLETE`), a `session` identifier string, and a `metadata` table of bounded scalars
-- **AND** the table SHALL contain a host-supplied `audio` field holding an opaque, unforgeable native full userdata representing the captured audio recording
-- **AND** the callback SHALL be executed in the yield-capable context
+#### Scenario: Input capture lifecycle delivers opaque audio userdata
+- **WHEN** capture completes successfully after the snapshot entered RECORDING
+- **THEN** the snapshot SHALL enter PROCESSING and the host SHALL invoke `handle_input` with event `capture`, session identity, bounded metadata, and opaque unforgeable recording userdata
+- **AND** the callback SHALL execute in its yield-capable context
 
-#### Scenario: Input capture is cancelled by the host
-- **WHEN** the host cancels an in-progress capture before release
+#### Scenario: Input capture is cancelled by host
+- **WHEN** capture is cancelled before release
 - **THEN** the snapshot SHALL enter IDLE
 - **AND** `handle_input` SHALL NOT be invoked
 
-#### Scenario: Input capture fails due to host capture error
-- **WHEN** the host's capture subsystem fails before release
+#### Scenario: Input capture fails before release
+- **WHEN** the host capture subsystem fails before release
 - **THEN** the snapshot SHALL enter FAILED
 - **AND** `handle_input` SHALL NOT be invoked
 
-#### Scenario: SOS callback is invoked as fire-and-forget
-- **WHEN** an SOS event occurs for the channel and the plugin has supplied `handle_sos`
-- **THEN** the host SHALL invoke the callback with a table containing `event` set to `"sos"` (matching `subspace.channel.SOS_TRIGGERED`) and host-domain values
-- **AND** the callback's normal return value SHALL be ignored (SOS is fire-and-forget)
-- **AND** if the callback throws, returns an application error table, or lets a raw coroutine yield escape, the host SHALL local-contain and diagnostically log that failure without mutating the runtime snapshot, crashing the actor, or failing the generation
-- **AND** the callback SHALL NOT produce a terminal SOS outcome classification exposed to the host
+#### Scenario: SOS callback completes through managed coroutine
+- **WHEN** SOS occurs and `handle_sos` is present
+- **THEN** the host SHALL invoke it with event `sos` matching `subspace.channel.SOS_TRIGGERED` under one bounded SOS execution owner
+- **AND** exact success SHALL complete the SOS invocation once
+- **AND** application failure, malformed result, throw, invalid yield, cancellation, timeout, or revocation SHALL be locally contained and diagnosed without crashing the actor or unrelated generation
 
-#### Scenario: SOS callback is absent (neutral default)
+#### Scenario: SOS callback is absent
 - **WHEN** the callback table lacks `handle_sos`
-- **THEN** the host SHALL apply the neutral default: SOS events are unhandled
-- **AND** no Lua callback SHALL be invoked for SOS events
+- **THEN** SOS events SHALL be unhandled
+- **AND** no Lua callback SHALL be invoked
 
-#### Scenario: No optional event callbacks are supplied (proactive-only plugin)
-- **WHEN** the callback table contains only the required `startup` entry and no `handle_lifecycle`, `handle_input`, `handle_sos`, or `handle_readiness`
-- **THEN** the plugin SHALL be considered a proactive-only plugin
-- **AND** the host SHALL keep the plugin live: background tasks admitted via `spawn` SHALL execute and timers SHALL fire
-- **AND** the channel SHALL NOT be available for PTT input selection
-- **AND** readiness SHALL default to not ready
+#### Scenario: Proactive-only plugin omits optional callbacks
+- **WHEN** the callback table contains only required `startup`
+- **THEN** the host SHALL keep successfully admitted managed background tasks live
+- **AND** the channel SHALL not be available for PTT input selection and readiness SHALL default to not ready
 
 ### Requirement: `subspace.runtime` provides runtime identity and cooperative timer operations with validated arguments
 The `subspace.runtime` module SHALL be a host-injected, reserved module. It SHALL expose exact runtime and API version constants: `LUA_VERSION` as `"Lua 5.4"`, `LUA_RELEASE` as `"5.4.8"`, and `API_VERSION` as `"subspace-lua-v1"`. There SHALL be no `version()` function, no integer runtime version, and no integer API version. The module SHALL provide cooperative timer operations: `sleep(seconds)` to suspend the current coroutine for at least the specified duration (usable only from runtime-managed spawned background tasks, not from event callbacks, entry evaluation, or plugin-created child coroutines), and `spawn(function)` to synchronously admit a background task (usable only from `startup` and runtime-managed spawned tasks, not from event callbacks, entry evaluation, or plugin-created child coroutines).

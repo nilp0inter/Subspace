@@ -544,7 +544,7 @@ public object PackageConfigurationLimits {
     public const val MAX_FIELD_ID_BYTES: Int = 64
     public const val MAX_LABEL_BYTES: Int = 128
     public const val MAX_HELP_BYTES: Int = 512
-    public const val MAX_CHOICES: Int = 64
+    public const val MAX_CHOICES: Int = 256
     public const val MAX_STRING_VALUE_BYTES: Int = 16384 // 16 KiB
     public const val MAX_PAYLOAD_BYTES: Int = 65536 // 64 KiB
 }
@@ -651,6 +651,7 @@ public object PackageCapability {
     public const val AUDIO_PLAYBACK: String = "audio.playback"
     public const val STORAGE_FILES: String = "storage.files"
     public const val AUDIO_FILES: String = "audio.files"
+    public const val KEYBOARD_OUTPUT: String = "keyboard.output"
 
     public val ALL: Set<String> = Collections.unmodifiableSet(
         LinkedHashSet(
@@ -660,6 +661,28 @@ public object PackageCapability {
                 AUDIO_PLAYBACK,
                 STORAGE_FILES,
                 AUDIO_FILES,
+                KEYBOARD_OUTPUT,
+            )
+        )
+    )
+}
+
+/**
+ * 2.3: Stable public dynamic-choice source identifiers accepted by manifest v1.
+ * Static validation accepts only these bounded public source IDs; it never
+ * resolves them, executes Lua, or touches host profile objects.
+ */
+public object DynamicChoiceSource {
+    public const val KEYBOARD_OUTPUT_PLATFORMS: String = "keyboard-output-platforms"
+    public const val KEYBOARD_OUTPUT_LAYOUTS: String = "keyboard-output-layouts"
+    public const val KEYBOARD_OUTPUT_PROFILES: String = "keyboard-output-profiles"
+
+    public val ALL: Set<String> = Collections.unmodifiableSet(
+        LinkedHashSet(
+            listOf(
+                KEYBOARD_OUTPUT_PLATFORMS,
+                KEYBOARD_OUTPUT_LAYOUTS,
+                KEYBOARD_OUTPUT_PROFILES,
             )
         )
     )
@@ -853,7 +876,8 @@ public enum class UiControl(val value: String) {
     TEXT("text"),
     TOGGLE("toggle"),
     NUMBER("number"),
-    CHOICE("choice")
+    CHOICE("choice"),
+    DYNAMIC_CHOICE("dynamic-choice")
 }
 
 /**
@@ -894,7 +918,9 @@ public class UiFieldDeclaration(
     val control: UiControl,
     val label: String,
     val help: String?,
-    choices: List<UiChoice>?
+    choices: List<UiChoice>?,
+    val source: String? = null,
+    val dependsOnFieldId: String? = null,
 ) {
     public val choices: List<UiChoice>? = choices?.let { Collections.unmodifiableList(ArrayList(it)) }
 
@@ -933,9 +959,36 @@ public class UiFieldDeclaration(
                     "Duplicate choice label: ${choice.label}"
                 }
             }
+            require(this.source == null) {
+                "Source must be null for CHOICE control"
+            }
+        } else if (control == UiControl.DYNAMIC_CHOICE) {
+            require(this.choices == null) {
+                "Choices must be null for DYNAMIC_CHOICE control"
+            }
+            require(this.source != null) {
+                "Source must not be null for DYNAMIC_CHOICE control"
+            }
+            require(DynamicChoiceSource.ALL.contains(this.source)) {
+                "Unknown dynamic-choice source: ${this.source}"
+            }
         } else {
             require(this.choices == null) {
                 "Choices must be null for non-CHOICE control: $control"
+            }
+            require(this.source == null) {
+                "Source must be null for non-dynamic-choice control: $control"
+            }
+        }
+        if (dependsOnFieldId != null) {
+            require(control == UiControl.DYNAMIC_CHOICE) {
+                "dependsOnFieldId is only permitted for DYNAMIC_CHOICE control: $control"
+            }
+            require(dependsOnFieldId.matches(FIELD_ID_REGEX)) {
+                "Dependency field ID does not match pattern ^[a-z][a-z0-9_]*$: $dependsOnFieldId"
+            }
+            require(dependsOnFieldId.toByteArray(java.nio.charset.StandardCharsets.UTF_8).size <= PackageConfigurationLimits.MAX_FIELD_ID_BYTES) {
+                "Dependency field ID length must not exceed ${PackageConfigurationLimits.MAX_FIELD_ID_BYTES} bytes: $dependsOnFieldId"
             }
         }
     }
@@ -947,7 +1000,9 @@ public class UiFieldDeclaration(
                 control == other.control &&
                 label == other.label &&
                 help == other.help &&
-                choices == other.choices
+                choices == other.choices &&
+                source == other.source &&
+                dependsOnFieldId == other.dependsOnFieldId
     }
 
     override fun hashCode(): Int {
@@ -956,11 +1011,13 @@ public class UiFieldDeclaration(
         result = 31 * result + label.hashCode()
         result = 31 * result + (help?.hashCode() ?: 0)
         result = 31 * result + (choices?.hashCode() ?: 0)
+        result = 31 * result + (source?.hashCode() ?: 0)
+        result = 31 * result + (dependsOnFieldId?.hashCode() ?: 0)
         return result
     }
 
     override fun toString(): String =
-        "UiFieldDeclaration(field='$field', control=$control, label='$label', help=$help, choices=$choices)"
+        "UiFieldDeclaration(field='$field', control=$control, label='$label', help=$help, choices=$choices, source=$source, dependsOnFieldId=$dependsOnFieldId)"
 }
 
 /**
@@ -1014,8 +1071,8 @@ public class PackageConfigurationDeclaration(
             when (dataField) {
                 is ConfigurationFieldDeclaration.StringField -> {
                     if (dataField.allowedValues == null) {
-                        require(uiField.control == UiControl.TEXT) {
-                            "String field without allowedValues must use TEXT control, got: ${uiField.control}"
+                        require(uiField.control == UiControl.TEXT || uiField.control == UiControl.DYNAMIC_CHOICE) {
+                            "String field without allowedValues must use TEXT or DYNAMIC_CHOICE control, got: ${uiField.control}"
                         }
                     } else {
                         require(uiField.control == UiControl.CHOICE) {
@@ -1038,6 +1095,20 @@ public class PackageConfigurationDeclaration(
                         "Integer field must use NUMBER control, got: ${uiField.control}"
                     }
                 }
+            }
+        }
+        for ((index, uiField) in ui.fields.withIndex()) {
+            val dependencyId = uiField.dependsOnFieldId ?: continue
+            val dependencyIndex = ui.fields.indexOfFirst { it.field == dependencyId }
+            require(dependencyIndex >= 0) {
+                "dependsOn references an unknown field: $dependencyId"
+            }
+            require(dependencyIndex < index) {
+                "dependsOn must reference an earlier UI field, not self or later: $dependencyId"
+            }
+            val dependencyData = dataMap[dependencyId]
+            require(dependencyData is ConfigurationFieldDeclaration.StringField && dependencyData.allowedValues == null) {
+                "dependsOn must reference an unconstrained string data field: $dependencyId"
             }
         }
     }

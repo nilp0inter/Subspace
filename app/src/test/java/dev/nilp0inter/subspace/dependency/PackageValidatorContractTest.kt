@@ -16,6 +16,8 @@ import java.util.zip.Deflater
 import kotlin.io.path.createTempDirectory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -524,9 +526,10 @@ class PackageValidatorContractTest {
         assertEquals("audio.playback", PackageCapability.AUDIO_PLAYBACK)
         assertEquals("storage.files", PackageCapability.STORAGE_FILES)
         assertEquals("audio.files", PackageCapability.AUDIO_FILES)
+        assertEquals("keyboard.output", PackageCapability.KEYBOARD_OUTPUT)
 
         assertEquals(
-            setOf("audio.transcription", "audio.synthesis", "audio.playback", "storage.files", "audio.files"),
+            setOf("audio.transcription", "audio.synthesis", "audio.playback", "storage.files", "audio.files", "keyboard.output"),
             PackageCapability.ALL
         )
 
@@ -541,7 +544,7 @@ class PackageValidatorContractTest {
         assertEquals(64, PackageConfigurationLimits.MAX_FIELD_ID_BYTES)
         assertEquals(128, PackageConfigurationLimits.MAX_LABEL_BYTES)
         assertEquals(512, PackageConfigurationLimits.MAX_HELP_BYTES)
-        assertEquals(64, PackageConfigurationLimits.MAX_CHOICES)
+        assertEquals(256, PackageConfigurationLimits.MAX_CHOICES)
         assertEquals(16384, PackageConfigurationLimits.MAX_STRING_VALUE_BYTES)
         assertEquals(65536, PackageConfigurationLimits.MAX_PAYLOAD_BYTES)
     }
@@ -728,7 +731,7 @@ class PackageValidatorContractTest {
             UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, emptyList())
         }
 
-        val oversizedChoices = (1..65).map { i -> UiChoice("v_$i", "L_$i") }
+        val oversizedChoices = (1..257).map { i -> UiChoice("v_$i", "L_$i") }
         assertThrows<IllegalArgumentException> {
             UiFieldDeclaration("choice_field", UiControl.CHOICE, "Select", null, oversizedChoices)
         }
@@ -1200,18 +1203,18 @@ class PackageValidatorContractTest {
         val invalidHelpManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"boolean","default":true}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"toggle","label":"label","help":"$invalidHelp"}]}}""")
         assertFormat(validate(root, archiveBytes(manifest = invalidHelpManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Help over 512 bytes")
 
-        // 4. Choice count limit (64 choices)
-        // Boundary (64 choices)
-        val validChoicesList = (1..64).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
-        val validAllowedValuesList = (1..64).map { "\"v$it\"" }.joinToString(",")
+        // 4. Choice count limit (256 choices)
+        // Boundary (256 choices)
+        val validChoicesList = (1..256).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
+        val validAllowedValuesList = (1..256).map { "\"v$it\"" }.joinToString(",")
         val validChoiceManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"v1","allowedValues":[$validAllowedValuesList]}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"choice","label":"label","choices":[$validChoicesList]}]}}""")
         expectSuccess(validate(root, archiveBytes(manifest = validChoiceManifest), sourceRecord()))
 
-        // Over limit (65 choices)
-        val invalidChoicesList = (1..65).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
-        val invalidAllowedValuesList = (1..65).map { "\"v$it\"" }.joinToString(",")
+        // Over limit (257 choices)
+        val invalidChoicesList = (1..257).map { """{"value":"v$it","label":"L$it"}""" }.joinToString(",")
+        val invalidAllowedValuesList = (1..257).map { "\"v$it\"" }.joinToString(",")
         val invalidChoiceManifest = manifest(configuration = """{"schemaVersion":1,"data":{"fields":[{"id":"foo","type":"string","default":"v1","allowedValues":[$invalidAllowedValuesList]}],"additionalProperties":false},"ui":{"fields":[{"field":"foo","control":"choice","label":"label","choices":[$invalidChoicesList]}]}}""")
-        assertFormat(validate(root, archiveBytes(manifest = invalidChoiceManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Choices count over 64")
+        assertFormat(validate(root, archiveBytes(manifest = invalidChoiceManifest), sourceRecord()), PackageFailure.FormatDetail.MALFORMED_MANIFEST, "Choices count over 256")
 
         // 5. Individual string limit (16 KiB = 16384 bytes)
         // Boundary (16384 bytes)
@@ -1512,6 +1515,208 @@ class PackageValidatorContractTest {
             PackageFailure.FormatDetail.MALFORMED_MANIFEST,
             "null additionalProperties",
         )
+    }
+
+    @Test
+    fun `keyboard output capability is accepted and preserved through validation`() = withTemporaryDirectory { root ->
+        val single = expectSuccess(validate(root, archiveBytes(manifest = manifest(capabilities = "[\"keyboard.output\"]")), sourceRecord()))
+        assertEquals(setOf("keyboard.output"), single.manifest.capabilities)
+        assertTrue(single.manifest.capabilities.contains(PackageCapability.KEYBOARD_OUTPUT))
+
+        val combined = expectSuccess(validate(root, archiveBytes(manifest = manifest(capabilities = "[\"audio.transcription\",\"keyboard.output\"]")), sourceRecord()))
+        assertEquals(listOf("audio.transcription", "keyboard.output"), combined.manifest.capabilities.toList())
+    }
+
+    @Test
+    fun `keyboard output capability rejects duplicate near-miss and mistyped declarations`() = withTemporaryDirectory { root ->
+        assertCapability(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[\"keyboard.output\",\"keyboard.output\"]")), sourceRecord()),
+            PackageFailure.CapabilityDetail.DUPLICATE_CAPABILITY_ID,
+            "duplicate keyboard.output",
+        )
+        assertCapability(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[\"keyboard.outputs\"]")), sourceRecord()),
+            PackageFailure.CapabilityDetail.UNKNOWN_CAPABILITY_ID,
+            "near-miss keyboard.outputs",
+        )
+        assertFormat(
+            validate(root, archiveBytes(manifest = manifest(capabilities = "[\"keyboard.output\",123]")), sourceRecord()),
+            PackageFailure.FormatDetail.MALFORMED_MANIFEST,
+            "mistyped member beside keyboard.output",
+        )
+    }
+
+    @Test
+    fun `dynamic choice source identifiers are bounded and immutable`() {
+        assertEquals("keyboard-output-platforms", DynamicChoiceSource.KEYBOARD_OUTPUT_PLATFORMS)
+        assertEquals("keyboard-output-layouts", DynamicChoiceSource.KEYBOARD_OUTPUT_LAYOUTS)
+        assertEquals("keyboard-output-profiles", DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        assertEquals(setOf("keyboard-output-platforms", "keyboard-output-layouts", "keyboard-output-profiles"), DynamicChoiceSource.ALL)
+        assertThrows<UnsupportedOperationException> {
+            (DynamicChoiceSource.ALL as MutableSet<String>).add("extra.source")
+        }
+        assertEquals("dynamic-choice", UiControl.DYNAMIC_CHOICE.value)
+    }
+
+    @Test
+    fun `dynamic choice ui field declaration constructor invariants equality and immutability`() {
+        val valid = UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", "Help", null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        assertEquals("host_profile", valid.field)
+        assertEquals(UiControl.DYNAMIC_CHOICE, valid.control)
+        assertEquals("Host profile", valid.label)
+        assertEquals("Help", valid.help)
+        assertNull(valid.choices)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, valid.source)
+
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, null, null)
+        }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, null, "bogus-source")
+        }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, listOf(UiChoice("a", "A")), DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("name", UiControl.TEXT, "Name", null, null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        }
+        assertThrows<IllegalArgumentException> {
+            UiFieldDeclaration("opt", UiControl.CHOICE, "Opt", null, listOf(UiChoice("a", "A")), DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        }
+
+        val twin = UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", "Help", null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        assertEquals(valid, twin)
+        assertEquals(valid.hashCode(), twin.hashCode())
+        val differentField = UiFieldDeclaration("other_profile", UiControl.DYNAMIC_CHOICE, "Host profile", "Help", null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+        assertNotEquals(valid, differentField)
+    }
+
+    @Test
+    fun `package configuration declaration accepts dynamic choice only for unconstrained string targets`() {
+        val dynamicField = UiFieldDeclaration("host_profile", UiControl.DYNAMIC_CHOICE, "Host profile", null, null, DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES)
+
+        val valid = PackageConfigurationDeclaration(
+            ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.StringField("host_profile", "linux:us", null))),
+            ConfigurationUiDeclaration(listOf(dynamicField))
+        )
+        assertEquals(UiControl.DYNAMIC_CHOICE, valid.ui.fields.single().control)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, valid.ui.fields.single().source)
+
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(
+                ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.StringField("host_profile", "linux:us", listOf("linux:us")))),
+                ConfigurationUiDeclaration(listOf(dynamicField))
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(
+                ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.BooleanField("host_profile", true))),
+                ConfigurationUiDeclaration(listOf(dynamicField))
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            PackageConfigurationDeclaration(
+                ConfigurationDataDeclaration(listOf(ConfigurationFieldDeclaration.IntegerField("host_profile", 1L, null, null))),
+                ConfigurationUiDeclaration(listOf(dynamicField))
+            )
+        }
+    }
+
+    @Test
+    fun `manifest decoder accepts valid dynamic choice and preserves source without resolution`() = withTemporaryDirectory { root ->
+        val config = """{"schemaVersion":1,"data":{"fields":[{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[{"field":"host_profile","control":"dynamic-choice","source":"keyboard-output-profiles","label":"Host profile","help":"Select host profile"}]}}"""
+        val revision = expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = config, capabilities = "[\"keyboard.output\"]", injectAdditionalProperties = false)), sourceRecord()))
+
+        val uiField = revision.manifest.configuration.ui.fields.single()
+        assertEquals("host_profile", uiField.field)
+        assertEquals(UiControl.DYNAMIC_CHOICE, uiField.control)
+        assertEquals("keyboard-output-profiles", uiField.source)
+        assertNull(uiField.choices)
+        assertEquals(setOf("keyboard.output"), revision.manifest.capabilities)
+    }
+
+    @Test
+    fun `manifest decoder rejects malformed dynamic choice declarations`() = withTemporaryDirectory { root ->
+        val unconstrained = """{"id":"host_profile","type":"string","default":"linux:us"}"""
+        val validUi = """{"field":"host_profile","control":"dynamic-choice","source":"keyboard-output-profiles","label":"Host profile"}"""
+        fun dynConfig(uiField: String, dataField: String = unconstrained) =
+            """{"schemaVersion":1,"data":{"fields":[$dataField],"additionalProperties":false},"ui":{"fields":[$uiField]}}"""
+
+        val cases = listOf(
+            ManifestCase("static choices on dynamic-choice", dynConfig("""{"field":"host_profile","control":"dynamic-choice","source":"keyboard-output-profiles","label":"Host profile","choices":[{"value":"linux:us","label":"US"}]}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("missing source on dynamic-choice", dynConfig("""{"field":"host_profile","control":"dynamic-choice","label":"Host profile"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("extra key on dynamic-choice", dynConfig("""{"field":"host_profile","control":"dynamic-choice","source":"keyboard-output-profiles","label":"Host profile","extra":1}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("unknown source", dynConfig("""{"field":"host_profile","control":"dynamic-choice","source":"bogus-source","label":"Host profile"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("non-string source", dynConfig("""{"field":"host_profile","control":"dynamic-choice","source":123,"label":"Host profile"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("null source", dynConfig("""{"field":"host_profile","control":"dynamic-choice","source":null,"label":"Host profile"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("source on static choice control", dynConfig("""{"field":"host_profile","control":"choice","source":"keyboard-output-profiles","label":"Host profile","choices":[{"value":"linux:us","label":"US"}]}""", dataField = """{"id":"host_profile","type":"string","default":"linux:us","allowedValues":["linux:us"]}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("dynamic-choice targeting constrained string", dynConfig(validUi, dataField = """{"id":"host_profile","type":"string","default":"linux:us","allowedValues":["linux:us"]}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dynamic-choice targeting boolean", dynConfig(validUi, dataField = """{"id":"host_profile","type":"boolean","default":true}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dynamic-choice targeting integer", dynConfig(validUi, dataField = """{"id":"host_profile","type":"integer","default":1}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+        cases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = manifest(configuration = case.json, injectAdditionalProperties = false)), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name,
+            )
+        }
+    }
+    @Test
+    fun `manifest decoder accepts and retains a three stage dependsOn hierarchy and rejects its violations`() = withTemporaryDirectory { root ->
+        // Acceptance: host_os -> host_layout -> host_profile validates and every
+        // dependsOn edge plus all three source identifiers are retained verbatim.
+        val hierarchy = """{"schemaVersion":1,"data":{"fields":[{"id":"host_os","type":"string","default":"linux"},{"id":"host_layout","type":"string","default":"linux:us"},{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[{"field":"host_os","control":"dynamic-choice","label":"Host OS","source":"keyboard-output-platforms"},{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_os"},{"field":"host_profile","control":"dynamic-choice","label":"Host profile","source":"keyboard-output-profiles","dependsOn":"host_layout"}]}}"""
+        val revision = expectSuccess(validate(root, archiveBytes(manifest = manifest(configuration = hierarchy, capabilities = "[\"keyboard.output\"]", injectAdditionalProperties = false)), sourceRecord()))
+        val uiFields = revision.manifest.configuration.ui.fields
+        assertEquals(listOf("host_os", "host_layout", "host_profile"), uiFields.map { it.field })
+        assertNull(uiFields[0].dependsOnFieldId)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PLATFORMS, uiFields[0].source)
+        assertEquals("host_os", uiFields[1].dependsOnFieldId)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_LAYOUTS, uiFields[1].source)
+        assertEquals("host_layout", uiFields[2].dependsOnFieldId)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, uiFields[2].source)
+
+        // Rejection: dependsOn is exact-key gated to dynamic-choice and must name an
+        // earlier unconstrained string data field (not self, later, unknown, or misshapen).
+        val twoStrings = """{"id":"host_os","type":"string","default":"linux"},{"id":"host_layout","type":"string","default":"linux:us"}"""
+        fun config(uiFields: String, data: String = twoStrings) =
+            """{"schemaVersion":1,"data":{"fields":[$data],"additionalProperties":false},"ui":{"fields":[$uiFields]}}"""
+        val platform = """{"field":"host_os","control":"dynamic-choice","label":"Host OS","source":"keyboard-output-platforms"}"""
+        val cases = listOf(
+            ManifestCase("dependsOn on a static text control", config("""{"field":"host_os","control":"text","label":"Host OS","dependsOn":"host_os"}""", data = """{"id":"host_os","type":"string","default":"linux"}"""), PackageFailure.FormatDetail.UNKNOWN_FIELDS),
+            ManifestCase("dependsOn references an unknown field", config("""$platform,{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"missing"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dependsOn references itself", config("""$platform,{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_layout"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dependsOn references a later field", config("""{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_os"},$platform"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("blank dependsOn", config("""$platform,{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":""}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dependsOn references a constrained string field", config("""{"field":"host_os","control":"choice","label":"Host OS","choices":[{"value":"linux","label":"Linux"}]},{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_os"}""", data = """{"id":"host_os","type":"string","default":"linux","allowedValues":["linux"]},{"id":"host_layout","type":"string","default":"linux:us"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+            ManifestCase("dependsOn references a non-string field", config("""{"field":"host_os","control":"toggle","label":"Host OS"},{"field":"host_layout","control":"dynamic-choice","label":"Host layout","source":"keyboard-output-layouts","dependsOn":"host_os"}""", data = """{"id":"host_os","type":"boolean","default":false},{"id":"host_layout","type":"string","default":"linux:us"}"""), PackageFailure.FormatDetail.MALFORMED_MANIFEST),
+        )
+        cases.forEach { case ->
+            assertFormat(
+                validate(root, archiveBytes(manifest = manifest(configuration = case.json, injectAdditionalProperties = false)), sourceRecord()),
+                case.expected as PackageFailure.FormatDetail,
+                case.name,
+            )
+        }
+    }
+
+    @Test
+    fun `keyboard output eligibility and dynamic source declarations are deterministic across revalidation`() = withTemporaryDirectory { root ->
+        val config = """{"schemaVersion":1,"data":{"fields":[{"id":"host_profile","type":"string","default":"linux:us"}],"additionalProperties":false},"ui":{"fields":[{"field":"host_profile","control":"dynamic-choice","source":"keyboard-output-profiles","label":"Host profile"}]}}"""
+        val archive = archiveBytes(manifest = manifest(configuration = config, capabilities = "[\"audio.transcription\",\"keyboard.output\"]", injectAdditionalProperties = false))
+
+        val first = expectSuccess(validate(root, archive, sourceRecord()))
+        val second = expectSuccess(validate(root, archive, sourceRecord()))
+
+        assertEquals(first.manifest.capabilities, second.manifest.capabilities)
+        assertEquals(listOf("audio.transcription", "keyboard.output"), second.manifest.capabilities.toList())
+        assertEquals(first.manifest.configuration, second.manifest.configuration)
+        assertEquals(DynamicChoiceSource.KEYBOARD_OUTPUT_PROFILES, second.manifest.configuration.ui.fields.single().source)
+
+        assertThrows<UnsupportedOperationException> {
+            (first.sourceMap as MutableMap<String, String>)["injected"] = "tampered"
+        }
     }
 
     private companion object {

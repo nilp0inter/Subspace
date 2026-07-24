@@ -46,7 +46,7 @@ class ChannelConfigurationPayloadTest {
         ChannelConfigurationField.DynamicChoiceField(
             "model",
             "Model",
-            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
             dependsOnFieldId = "profile",
         ),
         ChannelConfigurationField.NumberField("retryLimit", "Retry limit", minimum = 0, maximum = 99),
@@ -200,7 +200,7 @@ class ChannelConfigurationPayloadTest {
         val field = ChannelConfigurationField.DynamicChoiceField(
             "model",
             "Model",
-            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
             dependsOnFieldId = "profile",
         )
         val payload = JSONObject("""{"model":"gpt-4","profile":"alpha"}""")
@@ -212,7 +212,7 @@ class ChannelConfigurationPayloadTest {
         val field = ChannelConfigurationField.DynamicChoiceField(
             "model",
             "Model",
-            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSource.OPENAI_MODELS,
+            source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
             dependsOnFieldId = "profile",
         )
         val payload = JSONObject("""{"profile":"alpha"}""")
@@ -310,7 +310,7 @@ class ChannelConfigurationPayloadTest {
             )),
             ChannelConfigurationField.DynamicChoiceField(
                 "model", "Model",
-                source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSource.OPENAI_MODELS,
+                source = dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId.OPENAI_MODELS,
                 dependsOnFieldId = "profile",
             ),
             ChannelConfigurationField.DirectoryField("directory", "Directory", required = false),

@@ -1,6 +1,10 @@
 package dev.nilp0inter.subspace.lua
 
 import dev.nilp0inter.subspace.channel.capability.ChannelCapability
+import dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
 import dev.nilp0inter.subspace.dependency.ConfigurationFieldDeclaration
 import dev.nilp0inter.subspace.dependency.InstalledProviderId
 import dev.nilp0inter.subspace.dependency.PackageCapability
@@ -18,6 +22,7 @@ import dev.nilp0inter.subspace.model.ChannelConfigurationProvider
 import dev.nilp0inter.subspace.model.ChannelImplementationId
 import dev.nilp0inter.subspace.model.ChannelImplementationProvider
 import dev.nilp0inter.subspace.model.ChannelProviderError
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceSourceId
 import dev.nilp0inter.subspace.model.InstalledProviderBinding
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
 import dev.nilp0inter.subspace.model.ChannelPresentationMetadata
@@ -35,6 +40,10 @@ internal object LuaPackageMaterializer {
         validationBounds: ValidationBounds = ValidationBounds.DEFAULT,
         logSink: PluginLogSink = NoOpPluginLogSink,
         runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
+        preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+        keyboardOutputAdapterFactory:
+            ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+        dynamicChoiceResolver: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver? = null,
     ): InstalledProviderBinding {
         val implementationId = InstalledProviderId.derive(revision.manifest.repositoryId)
         val presentation = ChannelPresentationMetadata(
@@ -66,6 +75,10 @@ internal object LuaPackageMaterializer {
             requiredCapabilities = capabilities,
             resourceDeclarations = revision.manifest.resources,
             runtimeResourcesFactory = runtimeResourcesFactory,
+            preparerRegistry = preparerRegistry,
+            keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
+            dynamicChoiceResolver = dynamicChoiceResolver,
+            declaredPublicCapabilities = revision.manifest.capabilities,
         )
         return InstalledProviderBinding(
             repositoryId = revision.manifest.repositoryId,
@@ -113,6 +126,18 @@ internal object LuaPackageMaterializer {
                         )
                     } ?: emptyList(),
                 )
+                UiControl.DYNAMIC_CHOICE -> ChannelConfigurationField.DynamicChoiceField(
+                    id = uiField.field,
+                    label = uiField.label,
+                    source = DynamicConfigurationChoiceSourceId(
+                        requireNotNull(uiField.source) {
+                            "dynamic-choice field '${uiField.field}' must carry a validated source ID"
+                        },
+                    ),
+                    help = uiField.help,
+                    dependsOnFieldId = uiField.dependsOnFieldId,
+                    required = true,
+                )
             }
         }
     }
@@ -139,6 +164,11 @@ internal object LuaPackageMaterializer {
                 }
                 PackageCapability.STORAGE_FILES -> result.add(ChannelCapability.StorageFiles)
                 PackageCapability.AUDIO_FILES -> result.add(ChannelCapability.AudioFiles)
+                PackageCapability.KEYBOARD_OUTPUT ->
+                    // keyboard.output compiles to the existing channel-neutral semantic
+                    // TextOutput capability (design D1); no Keyboard-package identity,
+                    // CapabilityKey name, or implementation class appears in the set.
+                    result.add(ChannelCapability.TextOutput)
                 else -> throw IllegalArgumentException(
                     "Unknown package capability ID: $cap. " +
                         "Expected one of ${PackageCapability.ALL}.",

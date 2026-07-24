@@ -63,6 +63,14 @@ internal class ServiceChannelCapabilityHost(
                 }
             }
         }
+        // 10.6: drain queued keyboard-output operations for the revoked generation so a
+        // predecessor's not-yet-effective work cannot outlive its scope or fire after a
+        // successor readies. Idempotent; touches only this instance+generation, never siblings.
+        try {
+            textOutputService.revokeKeyboardGeneration(identity)
+        } catch (_: Exception) {
+            // Revocation is idempotent; a host cleanup failure must not block scope revocation.
+        }
     }
 
     override suspend fun availability(

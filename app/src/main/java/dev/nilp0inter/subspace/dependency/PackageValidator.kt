@@ -934,7 +934,22 @@ public object PackageValidator {
                 val uiFieldMap = uiFieldItem as? Map<*, *>
                     ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
 
-                val allowedUiFieldKeys = setOf("field", "control", "label", "help", "choices")
+                val controlStr = uiFieldMap["control"] as? String
+                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                val control = when (controlStr) {
+                    "text" -> UiControl.TEXT
+                    "toggle" -> UiControl.TOGGLE
+                    "number" -> UiControl.NUMBER
+                    "choice" -> UiControl.CHOICE
+                    "dynamic-choice" -> UiControl.DYNAMIC_CHOICE
+                    else -> return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                }
+
+                val allowedUiFieldKeys = if (control == UiControl.DYNAMIC_CHOICE) {
+                    setOf("field", "control", "label", "help", "source", "dependsOn")
+                } else {
+                    setOf("field", "control", "label", "help", "choices")
+                }
                 for (k in uiFieldMap.keys) {
                     if (k !is String) return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
                     if (!allowedUiFieldKeys.contains(k)) {
@@ -944,15 +959,6 @@ public object PackageValidator {
 
                 val field = uiFieldMap["field"] as? String
                     ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
-                val controlStr = uiFieldMap["control"] as? String
-                    ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
-                val control = when (controlStr) {
-                    "text" -> UiControl.TEXT
-                    "toggle" -> UiControl.TOGGLE
-                    "number" -> UiControl.NUMBER
-                    "choice" -> UiControl.CHOICE
-                    else -> return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
-                }
                 val label = uiFieldMap["label"] as? String
                     ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
                 val help = if (uiFieldMap.containsKey("help")) {
@@ -995,8 +1001,25 @@ public object PackageValidator {
                     null
                 }
 
+                val dynamicSource = if (control == UiControl.DYNAMIC_CHOICE) {
+                    val sourceStr = uiFieldMap["source"] as? String
+                        ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    if (!DynamicChoiceSource.ALL.contains(sourceStr)) {
+                        return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                    }
+                    sourceStr
+                } else {
+                    null
+                }
+                val dependsOn = if (control == UiControl.DYNAMIC_CHOICE && uiFieldMap.containsKey("dependsOn")) {
+                    uiFieldMap["dependsOn"] as? String
+                        ?: return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
+                } else {
+                    null
+                }
+
                 try {
-                    uiFields.add(UiFieldDeclaration(field, control, label, help, choices))
+                    uiFields.add(UiFieldDeclaration(field, control, label, help, choices, dynamicSource, dependsOn))
                 } catch (e: Exception) {
                     return PackageOutcome.Failure(PackageFailure.Format(FormatDetail.MALFORMED_MANIFEST))
                 }

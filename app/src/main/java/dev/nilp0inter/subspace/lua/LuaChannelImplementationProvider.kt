@@ -25,6 +25,11 @@ import dev.nilp0inter.subspace.model.ProviderConfigurationResult
 import dev.nilp0inter.subspace.model.ValidatedChannelConfiguration
 import org.json.JSONArray
 import org.json.JSONObject
+import dev.nilp0inter.subspace.channel.capability.CapabilityPreparerRegistry
+import dev.nilp0inter.subspace.dependency.PackageCapability
+import dev.nilp0inter.subspace.channel.capability.CapabilityScopeIdentity
+import dev.nilp0inter.subspace.channel.capability.KeyboardOutputAdapter
+import dev.nilp0inter.subspace.channel.capability.OutputExecutionOwner
 
 internal data class LuaRuntimeResources(
     val storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort,
@@ -65,6 +70,11 @@ internal class LuaChannelImplementationProvider private constructor(
     private val audioFilePortFactory: LuaAudioFilePortFactory? = null,
     private val mountReadinessStatus: LuaMountReadinessStatus? = null,
     private val runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
+    private val preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+    private val declaredPublicCapabilities: Set<String> = emptySet(),
+    private val keyboardOutputAdapterFactory:
+        ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+    private val dynamicChoiceResolver: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver? = null,
 ) : ChannelImplementationProvider {
 
     companion object {
@@ -90,6 +100,11 @@ internal class LuaChannelImplementationProvider private constructor(
             audioFilePortFactory: LuaAudioFilePortFactory? = null,
             mountReadinessStatus: LuaMountReadinessStatus? = null,
             runtimeResourcesFactory: LuaRuntimeResourcesFactory? = null,
+            preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+            declaredPublicCapabilities: Set<String> = emptySet(),
+            keyboardOutputAdapterFactory:
+                ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+            dynamicChoiceResolver: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver? = null,
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -108,6 +123,10 @@ internal class LuaChannelImplementationProvider private constructor(
             audioFilePortFactory = audioFilePortFactory,
             mountReadinessStatus = mountReadinessStatus,
             runtimeResourcesFactory = runtimeResourcesFactory,
+            preparerRegistry = preparerRegistry,
+            declaredPublicCapabilities = declaredPublicCapabilities,
+            keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
+            dynamicChoiceResolver = dynamicChoiceResolver,
         )
 
         /**
@@ -129,6 +148,11 @@ internal class LuaChannelImplementationProvider private constructor(
             requiredCapabilities: Set<ChannelCapability> = emptySet(),
             resourceDeclarations: PackageResourcesDeclaration = PackageResourcesDeclaration(emptyList()),
             storagePort: dev.nilp0inter.subspace.storage.MountedStoragePort? = null,
+            preparerRegistry: CapabilityPreparerRegistry = CapabilityPreparerRegistry.empty(),
+            declaredPublicCapabilities: Set<String> = emptySet(),
+            keyboardOutputAdapterFactory:
+                ((CapabilityScopeIdentity, OutputExecutionOwner) -> KeyboardOutputAdapter)? = null,
+            dynamicChoiceResolver: dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver? = null,
         ) = LuaChannelImplementationProvider(
             implementationId = implementationId,
             presentation = presentation,
@@ -144,6 +168,10 @@ internal class LuaChannelImplementationProvider private constructor(
             configurationRequiredCapabilities = requiredCapabilities,
             resourceDeclarations = resourceDeclarations,
             storagePort = storagePort,
+            preparerRegistry = preparerRegistry,
+            declaredPublicCapabilities = declaredPublicCapabilities,
+            keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
+            dynamicChoiceResolver = dynamicChoiceResolver,
         )
     }
 
@@ -153,7 +181,10 @@ internal class LuaChannelImplementationProvider private constructor(
         configuration = configurationProvider,
         configurationFields = configurationProviderFields,
         requiredCapabilities = configurationRequiredCapabilities,
-        preparationTraits = ChannelPreparationTraits(supportsRecoverablePreparation = false),
+        preparationTraits = ChannelPreparationTraits(
+            supportsRecoverablePreparation =
+                declaredPublicCapabilities.any { preparerRegistry.isPreparable(it) },
+        ),
         resourceDeclarations = resourceDeclarations,
     )
 
@@ -300,6 +331,12 @@ internal class LuaChannelImplementationProvider private constructor(
                 mountReadinessStatus =
                     runtimeResources?.mountReadinessStatus ?: mountReadinessStatus,
                 resourceClose = runtimeResources?.close,
+                preparerRegistry = preparerRegistry,
+                keyboardOutputAdapterFactory = keyboardOutputAdapterFactory,
+                dynamicChoiceResolver = dynamicChoiceResolver,
+                requiredDynamicFields = configurationProviderFields
+                    .filterIsInstance<ChannelConfigurationField.DynamicChoiceField>()
+                    .filter { it.required },
             ),
         )
     }
@@ -315,6 +352,7 @@ internal class LuaChannelImplementationProvider private constructor(
         val storageDeclared = ChannelCapability.StorageFiles in request.capabilities.declaredCapabilities
         val audioFilesDeclared =
             ChannelCapability.AudioFiles in request.capabilities.declaredCapabilities
+        val keyboardOutputDeclared = PackageCapability.KEYBOARD_OUTPUT in declaredPublicCapabilities
         val mounts = JSONObject()
         for (mount in resourceDeclarations.mounts) {
             mounts.put(
@@ -328,6 +366,7 @@ internal class LuaChannelImplementationProvider private constructor(
             .put("instanceId", request.definition.id)
             .put("storageFiles", storageDeclared)
             .put("audioFiles", audioFilesDeclared)
+            .put("keyboardOutput", keyboardOutputDeclared)
             .put("mounts", mounts)
             .toString()
     }

@@ -60,6 +60,7 @@ sealed interface ChannelPreparationReason {
     data object RuntimeTimedOut : ChannelPreparationReason { override val message = "Channel operation timed out" }
     data object RuntimeCancelled : ChannelPreparationReason { override val message = "Channel operation was cancelled" }
     data object RuntimeClosed : ChannelPreparationReason { override val message = "Channel is no longer available" }
+    data class RuntimeReadiness(override val message: String = "Channel is not ready") : ChannelPreparationReason
     data class RuntimeFailed(override val message: String = "Channel operation failed") : ChannelPreparationReason
     data object UnknownInstance : ChannelPreparationReason { override val message = "Channel was not found" }
     data object RegistryShutDown : ChannelPreparationReason { override val message = "Channel service is shutting down" }

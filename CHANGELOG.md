@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Added strict, app-private installed Lua channel packages with immutable ZIP validation, crash-safe active/rollback storage, atomic provider publication, revision-aware runtime replacement, isolated failure recovery, and production JNI execution without installer UI or network discovery.
 - Added package-declared SAF directory mounts, bounded portable Lua filesystem and recording-file APIs, terminal-bound deferred work, and the external Journal channel package with independent persisted instances, recovery, and built-in coexistence.
+- Added the generic Lua `keyboard.output` API, bounded dependent host-profile choices, readiness-directed recoverable preparation, yield-capable SOS handling, and the independently released external Keyboard channel package.
 
 ## [0.7.0] - 2026-07-16
 

@@ -641,6 +641,30 @@ pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeIn
     })
 }
 
+/// `nativeInvokeSosCallback(stateId: Long, generation: Long, argumentsJson: String, hostAdmitter: Object): String`
+#[no_mangle]
+pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeSosCallback(
+    mut env: JNIEnv,
+    _class: JClass,
+    state_id: jlong,
+    generation: jlong,
+    arguments_json: JString,
+    host_admitter: JObject,
+) -> jstring {
+    jni_body(&mut env, |env| {
+        let args = match jstring_to_rust(env, &arguments_json) {
+            Some(s) => s,
+            None => return Outcome::validation_failure("argumentsJson string is invalid"),
+        };
+        let admitter = match spawn_admitter(env, host_admitter) {
+            Ok(admitter) => admitter,
+            Err(outcome) => return outcome,
+        };
+        with_state(state_id as StateId, generation as Generation, |engine| {
+            engine.invoke_sos_callback_with_spawn_admitter(generation as Generation, &args, admitter)
+        })
+    })
+}
 /// `nativeStartCoroutine(stateId, generation, coroutineId, hostAdmitter): String`
 #[no_mangle]
 pub extern "system" fn Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine(
@@ -715,6 +739,7 @@ static JNI_SYMBOLS: &[&str] = &[
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeLoadProgramImage",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeCallback",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeInputCallback",
+    "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeInvokeSosCallback",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeStartCoroutine",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeClaimHostOperation",
     "Java_dev_nilp0inter_subspace_lua_LuaNativeKernel_nativeSetResourceContext",

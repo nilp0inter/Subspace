@@ -37,9 +37,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import dev.nilp0inter.subspace.dependency.PackageConfigurationLimits
 import dev.nilp0inter.subspace.model.ChannelConfigurationField
 import dev.nilp0inter.subspace.model.ChannelImplementationDescriptor
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceRequest
+import dev.nilp0inter.subspace.model.DynamicConfigurationChoice
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolution
 import dev.nilp0inter.subspace.model.DynamicConfigurationChoiceResolver
 import dev.nilp0inter.subspace.model.OpaqueJsonObject
@@ -137,8 +139,13 @@ fun ChannelConfigurationScreen(
                                 ?.dependsOnFieldId
                                 ?.let(values::get),
                             choiceResolver = choiceResolver,
-                            onValueChange = {
-                                values[field.id] = it
+                            onValueChange = { newValue ->
+                                applyExplicitFieldEdit(
+                                    descriptor.configurationFields,
+                                    values,
+                                    field.id,
+                                    newValue,
+                                )
                                 submissionError = null
                             },
                             onPickDirectory = onPickDirectory,
@@ -323,36 +330,30 @@ private fun DynamicChoiceEditor(
             )
         }
     }
-    val choices = (resolution as? DynamicConfigurationChoiceResolution.Available)?.choices.orEmpty()
-    val selected = choices.firstOrNull { it.id == selectedValue }
-    val selectedLabel = selected?.label ?: selectedValue?.let { "Unavailable: $it" }
+    val presentation = dynamicChoicePresentation(field.label, resolution, selectedValue, dependencyValue)
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(requiredLabel(field), style = MaterialTheme.typography.bodyLarge)
-        when (val state = resolution) {
-            DynamicConfigurationChoiceResolution.Loading -> Text(
-                "Loading ${field.label.lowercase()}…",
+        presentation.statusText?.let { message ->
+            Text(
+                message,
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = if (presentation.statusIsError) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
             )
-
-            is DynamicConfigurationChoiceResolution.Unavailable -> Text(
-                dynamicChoiceUnavailableMessage(state, dependencyValue),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error,
-            )
-
-            is DynamicConfigurationChoiceResolution.Available -> Unit
         }
         OutlinedButton(
-            enabled = resolution is DynamicConfigurationChoiceResolution.Available,
+            enabled = presentation.selectionEnabled,
             onClick = { expanded = true },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(selectedLabel ?: "Select ${field.label}")
+            Text(presentation.selectedLabel ?: "Select ${field.label}")
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            choices.forEach { choice ->
+            presentation.choices.forEach { choice ->
                 DropdownMenuItem(
                     text = { Text(choice.label) },
                     onClick = {
@@ -377,6 +378,53 @@ internal fun dynamicChoiceUnavailableMessage(
         "Could not load choices. Refresh the source and try again."
     dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.HOST_NOT_READY ->
         "Choices are unavailable until the host is ready."
+    dev.nilp0inter.subspace.model.DynamicConfigurationChoiceUnavailableReason.RESOLUTION_TIMED_OUT ->
+        "Loading choices timed out. Try again."
+}
+
+/** Pure editor projection for one dynamic choice field; the composable renders this verbatim. */
+internal data class DynamicChoicePresentation(
+    val choices: List<DynamicConfigurationChoice>,
+    val selectedLabel: String?,
+    val selectionEnabled: Boolean,
+    val statusText: String?,
+    val statusIsError: Boolean,
+)
+
+internal fun dynamicChoicePresentation(
+    fieldLabel: String,
+    resolution: DynamicConfigurationChoiceResolution,
+    selectedValue: String?,
+    dependencyValue: String?,
+): DynamicChoicePresentation {
+    val selectedLabel = (resolution as? DynamicConfigurationChoiceResolution.Available)
+        ?.choices
+        ?.firstOrNull { it.id == selectedValue }
+        ?.label
+        ?: selectedValue?.let { "Unavailable: $it" }
+    return when (resolution) {
+        DynamicConfigurationChoiceResolution.Loading -> DynamicChoicePresentation(
+            choices = emptyList(),
+            selectedLabel = selectedLabel,
+            selectionEnabled = false,
+            statusText = "Loading ${fieldLabel.lowercase()}…",
+            statusIsError = false,
+        )
+        is DynamicConfigurationChoiceResolution.Unavailable -> DynamicChoicePresentation(
+            choices = emptyList(),
+            selectedLabel = selectedLabel,
+            selectionEnabled = false,
+            statusText = dynamicChoiceUnavailableMessage(resolution, dependencyValue),
+            statusIsError = true,
+        )
+        is DynamicConfigurationChoiceResolution.Available -> DynamicChoicePresentation(
+            choices = resolution.choices,
+            selectedLabel = selectedLabel,
+            selectionEnabled = true,
+            statusText = null,
+            statusIsError = false,
+        )
+    }
 }
 
 private fun requiredLabel(field: ChannelConfigurationField): String =
@@ -394,6 +442,59 @@ internal fun initialFieldValue(field: ChannelConfigurationField, payload: JSONOb
         -> raw as? String
         is ChannelConfigurationField.NumberField -> (raw as? Number)?.toString()
     }
+}
+
+/**
+ * Applies one explicit user edit to [fieldId] on [values], clearing every transitive dynamic-choice
+ * descendant whose [ChannelConfigurationField.DynamicChoiceField.dependsOnFieldId] chain eventually
+ * reaches [fieldId]. Cleared descendants are nulled, never auto-selected, so the immediate child
+ * re-renders "Select <label>" and grandchildren fall back to dependency guidance instead of a stale
+ * "Unavailable: <id>". Unrelated values are left untouched.
+ *
+ * Resolver Loading/Unavailable states and initial rendering never flow through here, so passive
+ * unavailability preserves persisted scalars. Generic and cycle-safe: dependents derive from [fields]
+ * alone and each declared field is visited at most once, bounded by [PackageConfigurationLimits.MAX_FIELDS].
+ */
+internal fun applyExplicitFieldEdit(
+    fields: List<ChannelConfigurationField>,
+    values: MutableMap<String, String?>,
+    fieldId: String,
+    newValue: String?,
+) {
+    for (dependentId in transitiveDynamicDependents(fields, fieldId)) {
+        if (values.containsKey(dependentId)) values[dependentId] = null
+    }
+    values[fieldId] = newValue
+}
+
+/**
+ * IDs of every [ChannelConfigurationField.DynamicChoiceField] whose dependency chain transitively
+ * reaches [rootId]. Each field is collected at most once; bounded by [PackageConfigurationLimits.MAX_FIELDS].
+ */
+private fun transitiveDynamicDependents(
+    fields: List<ChannelConfigurationField>,
+    rootId: String,
+): Set<String> {
+    val childrenByParent = HashMap<String, MutableList<String>>()
+    for (field in fields) {
+        if (field is ChannelConfigurationField.DynamicChoiceField) {
+            field.dependsOnFieldId?.let { parent ->
+                childrenByParent.getOrPut(parent) { mutableListOf() }.add(field.id)
+            }
+        }
+    }
+    val dependents = LinkedHashSet<String>()
+    val frontier = ArrayDeque<String>()
+    frontier.addLast(rootId)
+    var visited = 0
+    while (frontier.isNotEmpty() && visited <= PackageConfigurationLimits.MAX_FIELDS) {
+        val current = frontier.removeFirst()
+        visited++
+        childrenByParent[current]?.forEach { child ->
+            if (dependents.add(child)) frontier.addLast(child)
+        }
+    }
+    return dependents
 }
 
 /**
