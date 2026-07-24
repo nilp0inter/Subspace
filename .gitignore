@@ -11,3 +11,4 @@ release.keystore
 *.keystore
 .wrangler/
 .direnv
+/result

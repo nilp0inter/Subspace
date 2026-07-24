@@ -67,14 +67,18 @@
 
         subspaceAndroidDebugAdapter = pkgs.writeShellApplication {
           name = "subspace-android-debug-adapter";
-          runtimeInputs = [ androidSdk kotlinDebugAdapter pkgs.jdk17 pkgs.coreutils ];
+          runtimeInputs = [ androidSdk kotlinDebugAdapter pkgs.jdk17 pkgs.coreutils pkgs.python3 ];
           text = ''
             set -eu
 
             readonly appId=dev.nilp0inter.subspace
             readonly forwardPort=37099
 
-            devicePid="$(adb shell pidof "$appId" | tr -d '\r' || true)"
+            # </dev/null on every adb call: `adb shell` forwards its stdin to
+            # the device, so an unredirected adb would swallow the client's DAP
+            # bytes (the initialize request) off this script's stdin before the
+            # proxy ever reads them.
+            devicePid="$(adb shell pidof "$appId" </dev/null | tr -d '\r' || true)"
             case "$devicePid" in
               "" | *[!0-9]*)
                 echo "No debuggable $appId process found. Install and launch the debug app before attaching." >&2
@@ -82,15 +86,11 @@
                 ;;
             esac
 
-            adb forward --remove "tcp:$forwardPort" >/dev/null 2>&1 || true
-            adb forward "tcp:$forwardPort" "jdwp:$devicePid" >/dev/null
+            adb forward --remove "tcp:$forwardPort" </dev/null >/dev/null 2>&1 || true
+            adb forward "tcp:$forwardPort" "jdwp:$devicePid" </dev/null >/dev/null
 
-            cleanup() {
-              adb forward --remove "tcp:$forwardPort" >/dev/null 2>&1 || true
-            }
-            trap cleanup EXIT HUP INT TERM
-
-            kotlin-debug-adapter
+            # exec: the proxy (not an intermediate bash) becomes OMP's direct child.
+            exec python3 ${./.omp/android-dap-proxy.py}
           '';
         };
       in
