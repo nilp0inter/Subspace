@@ -10,7 +10,7 @@
         "projectRoot": ".",
         "hostName": "127.0.0.1",
         "port": 37099,
-        "timeout": 10000
+        "timeout": 120000
       }
     }
   }

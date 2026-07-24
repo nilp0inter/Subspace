@@ -1,10 +1,11 @@
 {
   "servers": {
     "kotlin-lsp": {
-      "command": "kotlin-language-server",
+      "command": ".omp/kotlin-lsp-wrapper.sh",
       "args": [],
       "fileTypes": [".kt", ".kts"],
-      "rootMarkers": ["settings.gradle.kts", "build.gradle.kts"]
+      "rootMarkers": ["settings.gradle.kts", "build.gradle.kts"],
+      "warmupTimeoutMs": 300000
     }
   }
 }
